@@ -29,6 +29,9 @@ from fetch_yfinance_fallback import (
     main,
 )
 
+# Imported after fetch_yfinance_fallback, which puts the repo root on sys.path.
+from dca_provenance import matches_data_file, read_sidecar  # noqa: E402
+
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 8, 5)
 
@@ -208,6 +211,15 @@ def test_main_writes_the_documented_shape_to_out(tmp_path, monkeypatch):
     assert set(document["sources"][SOURCE_KEY]) == {"TEST"}
     assert document["sources"][SOURCE_KEY]["TEST"]["previous_close_bar"]["close"] == pytest.approx(10.5)
     assert document["sources"][SOURCE_KEY]["TEST"]["quote"]["price"] == pytest.approx(10.2)
+    # The labeled fallback payload ships with a provenance sidecar tying it to
+    # its exact bytes and fetch context.
+    record = read_sidecar(out_path)
+    assert record is not None
+    assert record["source"] == SOURCE_KEY
+    assert record["rows"] == 1
+    assert record["extra"]["tickers_requested"] == ["TEST"]
+    assert record["extra"]["interval_minutes"] == 15
+    assert matches_data_file(out_path)
 
 
 def test_main_rejects_an_empty_tickers_argument():

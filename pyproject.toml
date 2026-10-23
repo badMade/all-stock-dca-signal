@@ -109,6 +109,10 @@ py-modules = [
     "dca_net_utils",
     "dca_config",
     "dca_fileio",
+    # Provenance sidecars (SHA-256, source, fetch time) for fetched market-data
+    # files; imported by ticker-market-breadth, yfinance-prefetch and ml-forecaster,
+    # so it must ship with the wheel or those imports fail outside a checkout.
+    "dca_provenance",
     # Imported by morning/midday/alerts and by scripts/*, so it must ship with
     # the wheel or those imports fail outside a checkout.
     "dca_paths",

@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +73,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
 from dca_fileio import atomic_write_text  # noqa: E402
+from dca_provenance import write_sidecar  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from scripts.file_lock import cross_process_lock  # noqa: E402
 
@@ -281,7 +283,17 @@ def _has_usable_prices(frame):
     return mask
 
 
-def write_tick_csv(frame, history_dir: Path, *, require_existing_history_dir: bool = False) -> Path:
+#: Source label recorded in the archive's provenance sidecar.
+PROVENANCE_SOURCE = "yfinance:^TICK"
+
+
+def write_tick_csv(
+    frame,
+    history_dir: Path,
+    *,
+    require_existing_history_dir: bool = False,
+    fetched_at: datetime | None = None,
+) -> Path:
     """Atomically merge `frame` into `<history_dir>/ARCHIVE_SUBDIRECTORY/ARCHIVE_FILENAME`.
 
     Kept separate from fetch_tick_history() so tests can exercise the
@@ -303,6 +315,13 @@ def write_tick_csv(frame, history_dir: Path, *, require_existing_history_dir: bo
     itself is torn-free, not that the two read-merge-write sequences are
     serialized (Codex review: "Serialize validation with the archive
     replacement").
+
+    When ``fetched_at`` (timezone-aware) is given, a ``TICK.csv.provenance.json``
+    sidecar (dca_provenance) is written inside the same lock, right after the
+    swap, so the recorded SHA-256 always describes the bytes this call left on
+    disk. The time is a parameter, not read here, so the record stays
+    reproducible in tests; callers that omit it (existing tests) get the old
+    behavior unchanged.
     """
     # Normalized here too, not just in fetch_tick_history() -- this function
     # is its own tested unit and must not assume every caller already ran
@@ -321,6 +340,16 @@ def write_tick_csv(frame, history_dir: Path, *, require_existing_history_dir: bo
         buffer = io.StringIO()
         merged.to_csv(buffer)
         atomic_write_text(out_path, buffer.getvalue())
+        if fetched_at is not None:
+            has_rows = len(merged) > 0
+            write_sidecar(
+                out_path,
+                source=PROVENANCE_SOURCE,
+                fetched_at=fetched_at,
+                rows=len(merged),
+                first_date=merged.index.min().date() if has_rows else None,
+                last_date=merged.index.max().date() if has_rows else None,
+            )
     return out_path
 
 
@@ -382,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         frame,
         history_dir,
         require_existing_history_dir=using_default_history_dir or args.require_existing_history_dir,
+        fetched_at=datetime.now(timezone.utc),
     )
     # Re-read the actually-written file rather than reporting on `frame`
     # directly: write_tick_csv() merges the download with whatever was

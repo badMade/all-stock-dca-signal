@@ -1569,3 +1569,158 @@ def test_main_refuses_duplicate_json_keys(tmp_path):
         "--now", "2024-06-01T00:00:00+00:00",
     ])
     assert exit_code != 0
+
+
+# --- model registry (registry.py) ----------------------------------------------
+
+
+def _registry_lines(models_dir):
+    path = models_dir / "registry.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_main_dry_run_appends_one_registry_line_per_run_without_claiming_a_deploy(tmp_path):
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=42, n=260, drift=0.0004))
+    models_dir = tmp_path / "models"
+    argv = [
+        "--history-dir", str(history_dir),
+        "--tickers", "AAA",
+        "--models-dir", str(models_dir),
+        "--output", str(tmp_path / "ml_sizing_adjustment.json"),
+        "--dry-run",
+        "--now", "2022-01-03T00:00:00+00:00",
+    ]
+    assert train_module.main(argv) == 0
+    assert train_module.main(argv) == 0
+
+    lines = _registry_lines(models_dir)
+    assert len(lines) == 2
+    assert {line["status"] for line in lines} == {"dry_run_not_published"}
+    assert all(line["deployed_at"] is None for line in lines)
+    assert all(len(line["dataset_sha256"]) == 64 for line in lines)
+    assert all(len(line["model_json_sha256"]) == 64 for line in lines)
+    # Same archive + same --now => the data fingerprint is stable across runs
+    # even though the two runs have distinct model versions.
+    assert lines[0]["dataset_sha256"] == lines[1]["dataset_sha256"]
+    assert lines[0]["model_version"] != lines[1]["model_version"]
+    # No incumbent config existed, so there is no rollback target.
+    assert lines[0]["prev_model_version"] is None
+
+
+def test_main_registry_records_the_incumbent_as_the_rollback_target(tmp_path):
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=42, n=260, drift=0.0004))
+    output_path = tmp_path / "ml_sizing_adjustment.json"
+    output_path.write_text(
+        json.dumps({"model_version": "old-ver", "model_artifact_path": "models/old/model.json"}),
+        encoding="utf-8",
+    )
+    models_dir = tmp_path / "models"
+    assert train_module.main(
+        [
+            "--history-dir", str(history_dir),
+            "--tickers", "AAA",
+            "--models-dir", str(models_dir),
+            "--output", str(output_path),
+            "--dry-run",
+            "--now", "2022-01-03T00:00:00+00:00",
+        ]
+    ) == 0
+    (line,) = _registry_lines(models_dir)
+    assert line["prev_model_version"] == "old-ver"
+    assert line["prev_model_artifact_path"] == "models/old/model.json"
+    # A dry run must not touch the live config it only read.
+    assert json.loads(output_path.read_text(encoding="utf-8"))["model_version"] == "old-ver"
+
+
+def test_main_survives_a_registry_write_failure(tmp_path, monkeypatch, capsys):
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=42, n=260, drift=0.0004))
+
+    def failing_append(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(train_module.registry_module, "append_entry", failing_append)
+    exit_code = train_module.main(
+        [
+            "--history-dir", str(history_dir),
+            "--tickers", "AAA",
+            "--models-dir", str(tmp_path / "models"),
+            "--output", str(tmp_path / "ml_sizing_adjustment.json"),
+            "--dry-run",
+            "--now", "2024-06-01T00:00:00+00:00",
+        ]
+    )
+    assert exit_code == 0
+    assert "could not append to the model registry" in capsys.readouterr().err
+
+
+def test_main_registry_records_a_blocked_run_too(tmp_path):
+    """--now far past the archive tail => every snapshot is stale => the run is
+    refused, and that refusal is still a registry line (never a deployment)."""
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=42, n=260, drift=0.0004))
+    models_dir = tmp_path / "models"
+    train_module.main(
+        [
+            "--history-dir", str(history_dir),
+            "--tickers", "AAA",
+            "--models-dir", str(models_dir),
+            "--output", str(tmp_path / "ml_sizing_adjustment.json"),
+            "--dry-run",
+            "--now", "2024-06-01T00:00:00+00:00",
+        ]
+    )
+    (line,) = _registry_lines(models_dir)
+    assert line["status"] == "blocked_no_fresh_snapshot"
+    assert line["deployed_at"] is None
+
+
+def test_main_dry_run_reports_the_ticker_holdout_diagnostic_without_changing_the_gate(tmp_path):
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    for seed, ticker in ((51, "AAA"), (52, "BBB"), (53, "CCC")):
+        write_ticker_csv(history_dir, ticker, make_synthetic_ohlcv(seed=seed, n=260, drift=0.0004))
+    models_dir = tmp_path / "models"
+    assert train_module.main(
+        [
+            "--history-dir", str(history_dir),
+            "--tickers", "AAA", "BBB", "CCC",
+            "--models-dir", str(models_dir),
+            "--output", str(tmp_path / "ml_sizing_adjustment.json"),
+            "--dry-run",
+            "--now", "2022-01-03T00:00:00+00:00",
+        ]
+    ) == 0
+    (run_dir,) = [p for p in models_dir.iterdir() if p.is_dir()]
+    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    holdout = report["diagnostics"]["ticker_holdout"]
+    assert holdout["holdout_tickers"] and "overall" in holdout
+    # Never folded into the evaluation block the publish gate reads.
+    assert "holdout_tickers" not in report["evaluation"]
+    assert "ticker-held-out" in (run_dir / "eval_report.md").read_text(encoding="utf-8")
+
+
+def test_main_records_the_holdout_diagnostic_as_skipped_for_a_single_ticker_run(tmp_path):
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=42, n=260, drift=0.0004))
+    models_dir = tmp_path / "models"
+    assert train_module.main(
+        [
+            "--history-dir", str(history_dir),
+            "--tickers", "AAA",
+            "--models-dir", str(models_dir),
+            "--output", str(tmp_path / "ml_sizing_adjustment.json"),
+            "--dry-run",
+            "--now", "2022-01-03T00:00:00+00:00",
+        ]
+    ) == 0
+    (run_dir,) = [p for p in models_dir.iterdir() if p.is_dir()]
+    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    assert report["diagnostics"]["ticker_holdout"]["status"] == "skipped"

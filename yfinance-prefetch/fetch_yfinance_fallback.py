@@ -75,11 +75,21 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from datetime import time as dtime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Index 1, not 0 -- index 0 is this script's own directory (yfinance-prefetch/),
+# the same sys.path setup ticker-market-breadth/fetch_tick.py documents, so the
+# repo root never shadows this subproject's own modules.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
+
+from dca_fileio import atomic_write_text  # noqa: E402
+from dca_provenance import write_sidecar  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 
@@ -279,7 +289,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     document = build_fallback_document(args.tickers, args.trading_day, args.decision_time_et, args.interval_minutes)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
+    # Atomic (a torn fallback payload would be read as a degraded source) plus a
+    # provenance sidecar, so the labeled fallback evidence a slot consumed can be
+    # tied to the exact bytes and fetch time later (dca_provenance).
+    atomic_write_text(args.out, json.dumps(document, indent=2, sort_keys=True))
+    write_sidecar(
+        args.out,
+        source=SOURCE_KEY,
+        fetched_at=datetime.now(timezone.utc),
+        rows=len(document["sources"][SOURCE_KEY]),
+        extra={
+            "trading_day": args.trading_day.isoformat(),
+            "decision_time_et": args.decision_time_et.strftime("%H:%M"),
+            "interval_minutes": args.interval_minutes,
+            "tickers_requested": list(args.tickers),
+        },
+    )
 
     summary = {
         "out": str(args.out),

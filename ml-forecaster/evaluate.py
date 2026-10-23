@@ -267,6 +267,132 @@ def evaluate_walk_forward(
     }
 
 
+def select_holdout_tickers(tickers: list[str], *, holdout_frac: float = 0.3, seed: int = 0) -> list[str]:
+    """Deterministically pick the held-out tickers: sorted by a seeded SHA-256 of each symbol.
+
+    Hash-ordered rather than ``random``-sampled so the choice depends only on
+    the ticker set, ``holdout_frac`` and ``seed`` -- never on discovery order or
+    a process-global RNG -- and the same universe always yields the same
+    diagnostic. At least one ticker is held out and at least one is left to
+    train on; fewer than two distinct tickers cannot be split and raises.
+    """
+    unique = sorted({str(t).upper() for t in tickers})
+    if len(unique) < 2:
+        raise ValueError(f"need at least 2 distinct tickers for a ticker-held-out evaluation, got {len(unique)}")
+    if not 0.0 < holdout_frac < 1.0:
+        raise ValueError(f"holdout_frac must be strictly between 0 and 1, got {holdout_frac}")
+    ranked = sorted(unique, key=lambda t: hashlib.sha256(f"{seed}:{t}".encode("utf-8")).hexdigest())
+    n_holdout = min(len(unique) - 1, max(1, math.ceil(holdout_frac * len(unique))))
+    return sorted(ranked[:n_holdout])
+
+
+def evaluate_ticker_holdout(
+    dataset: pd.DataFrame,
+    *,
+    holdout_frac: float = 0.3,
+    seed: int = 0,
+    n_splits: int = DEFAULT_N_SPLITS,
+    alpha: float = model_module.DEFAULT_ALPHA,
+) -> dict[str, Any]:
+    """Diagnostic: does the pooled model generalize to tickers it never trained on?
+
+    ``evaluate_walk_forward`` pools every ticker into each fold, so a good score
+    can come from memorizing per-ticker behavior (the model's ticker one-hot
+    included) rather than from anything that transfers. This runs the SAME
+    chronological folds and the SAME train-eligibility rule (``label_end_date`` <
+    ``test_start``), but fits only on tickers A and scores on held-out tickers B
+    over the fold's test dates -- B's rows never reach any fit, and an unseen
+    ticker maps to an all-zero one-hot row (model.py), so no model change is
+    needed. Each fold also scores the same fitted model on A's own test-window
+    rows (``seen_ticker_model_mae``); the held-out minus seen gap is the
+    generalization cost.
+
+    DIAGNOSTIC ONLY: the result is reported under ``report["diagnostics"]`` and is
+    deliberately never merged into ``evaluate_walk_forward``'s output, its
+    ``overall`` aggregate or ``FoldResult`` -- ``publish.guarded_publish`` reads
+    only those, and ``eval_metric.evaluation_window`` (the fold-comparability
+    fingerprint) must not move because a diagnostic was added.
+
+    Folds where either side is empty after the ticker split are skipped and
+    counted in ``skipped_folds`` rather than scored on nothing.
+    """
+    if dataset.empty:
+        raise ValueError("cannot evaluate an empty dataset")
+    if "label_end_date" not in dataset.columns:
+        raise ValueError("dataset must carry a 'label_end_date' column (see features.build_dataset())")
+    holdout = select_holdout_tickers(list(dataset["ticker"].astype(str)), holdout_frac=holdout_frac, seed=seed)
+    holdout_set = set(holdout)
+    train_tickers = sorted({str(t).upper() for t in dataset["ticker"]} - holdout_set)
+
+    dataset = dataset.sort_values("date", kind="stable").reset_index(drop=True)
+    is_holdout = dataset["ticker"].astype(str).str.upper().isin(holdout_set).to_numpy()
+    splits = walk_forward_splits(dataset["date"], n_splits=n_splits, label_end_dates=dataset["label_end_date"])
+
+    folds: list[FoldResult] = []
+    seen_maes: list[float] = []
+    skipped = 0
+    for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
+        train_idx = train_idx[~is_holdout[train_idx]]
+        held_idx = test_idx[is_holdout[test_idx]]
+        seen_idx = test_idx[~is_holdout[test_idx]]
+        if len(train_idx) == 0 or len(held_idx) == 0:
+            skipped += 1
+            continue
+        train = cast(pd.DataFrame, dataset.iloc[train_idx])
+        test = cast(pd.DataFrame, dataset.iloc[held_idx])
+
+        fitted = model_module.fit(train, alpha=alpha, model_version=f"ticker-holdout-fold-{fold_number}")
+        actual = test[TARGET_COLUMN].to_numpy(dtype=float)
+        predicted = fitted.predict_return_pct(test)
+        zero_baseline = np.zeros_like(actual)
+        mean_baseline = np.full_like(actual, train[TARGET_COLUMN].mean())
+        folds.append(
+            FoldResult(
+                fold=fold_number,
+                train_start=str(pd.Timestamp(train["date"].min()).date()),
+                train_end=str(pd.Timestamp(train["date"].max()).date()),
+                test_start=str(pd.Timestamp(test["date"].min()).date()),
+                test_end=str(pd.Timestamp(test["date"].max()).date()),
+                n_train=len(train),
+                n_test=len(test),
+                test_row_fingerprint=_row_fingerprint(test),
+                model_mae=_mae(actual, predicted),
+                model_rmse=_rmse(actual, predicted),
+                model_hit_rate=_hit_rate(actual, predicted),
+                baseline_zero_mae=_mae(actual, zero_baseline),
+                baseline_zero_rmse=_rmse(actual, zero_baseline),
+                baseline_zero_hit_rate=_hit_rate(actual, zero_baseline),
+                baseline_mean_mae=_mae(actual, mean_baseline),
+                baseline_mean_rmse=_rmse(actual, mean_baseline),
+                baseline_mean_hit_rate=_hit_rate(actual, mean_baseline),
+            )
+        )
+        if len(seen_idx):
+            seen = cast(pd.DataFrame, dataset.iloc[seen_idx])
+            seen_maes.append(
+                _mae(seen[TARGET_COLUMN].to_numpy(dtype=float), fitted.predict_return_pct(seen))
+            )
+        else:
+            seen_maes.append(float("nan"))
+
+    overall = _aggregate(folds)
+    finite_seen = [m for m in seen_maes if math.isfinite(m)]
+    if finite_seen and overall:
+        overall["seen_ticker_model_mae"] = float(np.mean(finite_seen))
+        overall["generalization_gap_mae"] = overall["model_mae"] - overall["seen_ticker_model_mae"]
+    return {
+        "n_splits": len(folds),
+        "skipped_folds": skipped,
+        "alpha": alpha,
+        "holdout_frac": holdout_frac,
+        "seed": seed,
+        "holdout_tickers": holdout,
+        "train_tickers": train_tickers,
+        "folds": [asdict(fold) for fold in folds],
+        "overall": overall,
+    }
+
+
 def _aggregate(folds: list[FoldResult]) -> dict[str, float]:
     """Mean of each score metric across folds -- empty dict for zero folds."""
     if not folds:
@@ -385,7 +511,9 @@ def score_incumbent_on_folds(
 __all__ = [
     "DEFAULT_N_SPLITS",
     "FoldResult",
+    "evaluate_ticker_holdout",
     "evaluate_walk_forward",
     "score_incumbent_on_folds",
+    "select_holdout_tickers",
     "walk_forward_splits",
 ]

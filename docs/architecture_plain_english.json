@@ -42,6 +42,7 @@
   "dca_notion_sync": "Builds the short \"latest run\" text that gets copied into Notion from a run summary. It only builds the text; it does not send it.",
   "dca_order_plan": "Writes, checks and compares order-plan files: one slot's intended buys for one day. This is the backbone of the backup executor.",
   "dca_paths": "Knows where every stream keeps its files. It reads the shared data folder from the environment so nothing is hard-coded.",
+  "dca_provenance": "Stamps each downloaded market-data file with where it came from, when it was fetched and a fingerprint of its contents, so a result can later be traced to the exact data that produced it.",
   "dca_rec_models": "Defines the exact shape of a recommendation (ticker, dollars, reference id) and rejects anything that does not fit.",
   "dca_rec_publish": "Copies the buy recommendation to places the cloud agent can read, such as a private Notion page, because the cloud cannot see this Mac.",
   "dca_rec_store": "Saves recommendations to disk and applies the freshness rule: an agent may only act on a recent one.",

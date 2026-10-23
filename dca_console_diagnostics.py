@@ -75,7 +75,7 @@ def _module_name(path: Path, repo: Path) -> str:
 # A new Other module that is in no group lands in "unsorted", and a test fails until it is given a home.
 OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("config_data", "Config & data", (
-        "dca_config", "dca_env", "dca_paths", "dca_ticker_paths", "dca_fileio", "dca_intraday_archive",
+        "dca_config", "dca_env", "dca_paths", "dca_ticker_paths", "dca_fileio", "dca_provenance", "dca_intraday_archive",
         "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
         "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "scripts.backup_strategy",

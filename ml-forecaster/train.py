@@ -51,6 +51,7 @@ from typing import Any
 import evaluate as evaluate_module
 import model as model_module
 import publish as publish_module
+import registry as registry_module
 from features import (
     _TICKER_SYMBOL_PATTERN,
     build_dataset,
@@ -556,6 +557,29 @@ def _render_markdown(report: dict[str, Any]) -> str:
         )
     lines.append("")
 
+    holdout = (report.get("diagnostics") or {}).get("ticker_holdout")
+    if isinstance(holdout, dict):
+        lines.append("## Diagnostic: ticker-held-out generalization (not a publish gate)")
+        lines.append("")
+        if holdout.get("status") == "skipped":
+            lines.append(f"Skipped: {holdout.get('reason', '?')}")
+        else:
+            held = holdout.get("overall", {})
+            held_tickers = holdout.get("holdout_tickers", [])
+            lines.append(f"- Held-out tickers ({len(held_tickers)}): {', '.join(held_tickers) or 'none'}")
+            lines.append(
+                f"- Folds scored: {holdout.get('n_splits', '?')} (skipped: {holdout.get('skipped_folds', '?')})"
+            )
+            for label, key in (
+                ("Held-out MAE", "model_mae"),
+                ("Seen-ticker MAE", "seen_ticker_model_mae"),
+                ("Generalization gap (held-out minus seen)", "generalization_gap_mae"),
+                ("Baseline predict-zero MAE", "baseline_zero_mae"),
+            ):
+                value = held.get(key)
+                lines.append(f"- {label}: {value:.4f}" if isinstance(value, (int, float)) else f"- {label}: n/a")
+        lines.append("")
+
     publish_result = report.get("publish_result")
     if publish_result:
         lines.append("## Publish decision")
@@ -572,6 +596,19 @@ def _write_eval_report(run_dir: Path, report: dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "eval_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (run_dir / "eval_report.md").write_text(_render_markdown(report), encoding="utf-8")
+    # Every outcome (published, blocked_*, dry-run) funnels through here exactly
+    # once per run, so this is the one place a registry line is appended. A
+    # registry failure must never turn a completed publish into a crashed
+    # retrain: it is reported, not raised (see registry.py's docstring).
+    provenance = report.get("provenance")
+    if isinstance(provenance, dict):
+        try:
+            registry_module.append_entry(
+                run_dir.parent,
+                registry_module.build_entry(report, run_dir=run_dir, context=provenance),
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"WARNING: could not append to the model registry under {run_dir.parent}: {exc}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -698,6 +735,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REFUSED: walk-forward evaluation could not run: {exc}", file=sys.stderr)
         return 1
 
+    # Diagnostic only (evaluate.evaluate_ticker_holdout): how much the pooled
+    # model degrades on tickers it never trained on. Reported under
+    # report["diagnostics"], never passed to guarded_publish() and never merged
+    # into `evaluation`, so the publish gate and the persisted
+    # eval_metric.evaluation_window are unchanged. A failure here (e.g. a
+    # single-ticker run) is recorded as "skipped", never a refusal.
+    try:
+        ticker_holdout: dict[str, Any] = evaluate_module.evaluate_ticker_holdout(
+            dip_dataset, n_splits=args.n_splits, alpha=args.alpha
+        )
+    except ValueError as exc:
+        ticker_holdout = {"status": "skipped", "reason": str(exc)}
+
     final_model = model_module.fit(
         dip_dataset,
         alpha=args.alpha,
@@ -796,8 +846,19 @@ def main(argv: list[str] | None = None) -> int:
             "n_tickers": dataset["ticker"].nunique() if not dataset.empty else 0,
         },
         "evaluation": evaluation,
+        "diagnostics": {"ticker_holdout": ticker_holdout},
         "adjustments": adjustments,
         "status": "evaluated",
+        # Registry context (registry.py): what data and code produced this
+        # model, and which published model it would replace (the rollback
+        # target). Read BEFORE guarded_publish() overwrites the live config.
+        "provenance": {
+            "dataset_sha256": registry_module.dataset_fingerprint(history_dir, tickers, as_of_iso=as_of.isoformat()),
+            "code_git_sha": registry_module.current_git_sha(),
+            "feature_set_version": registry_module.FEATURE_SET_VERSION,
+            **registry_module.incumbent_reference(publish_module._read_current_config(args.output)),
+            "deployed_at": None,
+        },
     }
 
     if not adjustments:
@@ -987,6 +1048,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     report["status"] = result["status"]
     report["publish_result"] = result
+    if result["status"] == "published":
+        # The same real wall-clock stamp guarded_publish() wrote as generated_at.
+        report["provenance"]["deployed_at"] = real_now.isoformat()
     _write_eval_report(run_dir, report)
 
     print(f"{result['status'].upper()} model={model_version} mae={evaluation['overall'].get('model_mae'):.6f}")

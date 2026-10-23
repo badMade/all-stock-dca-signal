@@ -335,3 +335,72 @@ def test_row_fingerprint_changes_when_scored_values_change():
     # still irrelevant -- the digest stays a set comparison, not a sequence one.
     assert _row_fingerprint(base.copy()) == original
     assert _row_fingerprint(base.iloc[::-1].reset_index(drop=True)) == original
+
+
+# --- ticker-held-out diagnostic -------------------------------------------------
+
+
+def test_select_holdout_tickers_is_deterministic_and_leaves_a_training_ticker():
+    tickers = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    first = evaluate_module.select_holdout_tickers(tickers, holdout_frac=0.4, seed=7)
+    assert first == evaluate_module.select_holdout_tickers(list(reversed(tickers)), holdout_frac=0.4, seed=7)
+    assert len(first) == 2 and set(first) <= set(tickers)
+    # An extreme fraction still leaves one ticker to train on, and holds one out.
+    assert len(evaluate_module.select_holdout_tickers(tickers, holdout_frac=0.99)) == 4
+    assert len(evaluate_module.select_holdout_tickers(tickers, holdout_frac=0.01)) == 1
+
+
+def test_select_holdout_tickers_rejects_unsplittable_input():
+    with pytest.raises(ValueError, match="at least 2"):
+        evaluate_module.select_holdout_tickers(["AAA", "aaa"])
+    with pytest.raises(ValueError, match="holdout_frac"):
+        evaluate_module.select_holdout_tickers(["AAA", "BBB"], holdout_frac=1.0)
+
+
+def test_ticker_holdout_never_trains_on_a_held_out_ticker_and_uses_walk_forward_test_dates(dip_dataset, monkeypatch):
+    fitted_tickers: list[set[str]] = []
+    real_fit = model_module.fit
+
+    def spying_fit(train, **kwargs):
+        fitted_tickers.append(set(train["ticker"].astype(str).str.upper()))
+        return real_fit(train, **kwargs)
+
+    monkeypatch.setattr(model_module, "fit", spying_fit)
+    result = evaluate_module.evaluate_ticker_holdout(dip_dataset, n_splits=3, holdout_frac=0.34, seed=1)
+
+    held = set(result["holdout_tickers"])
+    assert held and held.isdisjoint(result["train_tickers"])
+    assert held | set(result["train_tickers"]) == {"AAA", "BBB", "CCC"}
+    assert fitted_tickers and all(tickers.isdisjoint(held) for tickers in fitted_tickers)
+
+    walk_forward = evaluate_walk_forward(dip_dataset, n_splits=3)
+    walk_windows = {fold["fold"]: (fold["test_start"], fold["test_end"]) for fold in walk_forward["folds"]}
+    for fold in result["folds"]:
+        start, end = walk_windows[fold["fold"]]
+        # Held-out rows only fill part of the walk-forward window, never spill outside it.
+        assert start <= fold["test_start"] <= fold["test_end"] <= end
+    assert result["n_splits"] + result["skipped_folds"] == 3
+    assert set(result["overall"]) >= {"model_mae", "baseline_zero_mae"}
+
+
+def test_ticker_holdout_does_not_change_walk_forward_output(dip_dataset):
+    before = evaluate_walk_forward(dip_dataset, n_splits=3)
+    evaluate_module.evaluate_ticker_holdout(dip_dataset, n_splits=3)
+    assert evaluate_walk_forward(dip_dataset, n_splits=3) == before
+
+
+def test_ticker_holdout_reports_a_generalization_gap_when_seen_rows_exist(dip_dataset):
+    result = evaluate_module.evaluate_ticker_holdout(dip_dataset, n_splits=3, holdout_frac=0.34, seed=1)
+    overall = result["overall"]
+    assert "seen_ticker_model_mae" in overall
+    assert overall["generalization_gap_mae"] == pytest.approx(overall["model_mae"] - overall["seen_ticker_model_mae"])
+
+
+def test_ticker_holdout_rejects_empty_missing_label_and_single_ticker_datasets(dip_dataset):
+    with pytest.raises(ValueError, match="empty"):
+        evaluate_module.evaluate_ticker_holdout(dip_dataset.iloc[0:0])
+    with pytest.raises(ValueError, match="label_end_date"):
+        evaluate_module.evaluate_ticker_holdout(dip_dataset.drop(columns=["label_end_date"]))
+    single = dip_dataset[dip_dataset["ticker"] == "AAA"].reset_index(drop=True)
+    with pytest.raises(ValueError, match="at least 2"):
+        evaluate_module.evaluate_ticker_holdout(single)

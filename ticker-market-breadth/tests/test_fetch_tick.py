@@ -7,14 +7,25 @@ directly against a synthetic in-memory frame.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import types
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
 
-from fetch_tick import ARCHIVE_FILENAME, ARCHIVE_SUBDIRECTORY, YAHOO_SYMBOL, fetch_tick_history, main, write_tick_csv
+from dca_provenance import matches_data_file, sidecar_path
+from fetch_tick import (
+    ARCHIVE_FILENAME,
+    ARCHIVE_SUBDIRECTORY,
+    PROVENANCE_SOURCE,
+    YAHOO_SYMBOL,
+    fetch_tick_history,
+    main,
+    write_tick_csv,
+)
 
 # Mirrors ml-forecaster/features.py's and wondrous-octopus/data.py's own
 # _TICKER_SYMBOL_PATTERN exactly (duplicated, not imported: sibling
@@ -128,6 +139,25 @@ def test_write_tick_csv_creates_the_archive_directory_and_file(tmp_path):
     assert out_path.is_file()
     written = pd.read_csv(out_path, index_col="Date", parse_dates=True)
     assert list(written["Close"]) == [210.0, -80.0]
+
+
+def test_write_tick_csv_writes_no_sidecar_when_fetched_at_is_omitted(tmp_path):
+    out_path = write_tick_csv(_synthetic_frame(), tmp_path / "histories")
+    assert not sidecar_path(out_path).exists()
+
+
+def test_write_tick_csv_writes_a_provenance_sidecar_matching_the_written_bytes(tmp_path):
+    fetched_at = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
+    out_path = write_tick_csv(_synthetic_frame(), tmp_path / "histories", fetched_at=fetched_at)
+
+    record = json.loads(sidecar_path(out_path).read_text(encoding="utf-8"))
+    assert record["source"] == PROVENANCE_SOURCE
+    assert record["fetched_at"] == fetched_at.isoformat()
+    assert record["rows"] == 2
+    assert record["first_date"] <= record["last_date"]
+    assert matches_data_file(out_path)
+    # The sidecar must not look like an archive CSV to a "*.csv" glob.
+    assert not sidecar_path(out_path).name.endswith(".csv")
 
 
 def test_write_tick_csv_overwrites_an_existing_file(tmp_path):
