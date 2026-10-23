@@ -2,6 +2,7 @@
 # Build one live slot's Robinhood market-data payload ahead of its Gate 5, outside any Claude session.
 #
 #   robinhood_payload.sh <0935|1030|1130|1230|1330|1430>
+#   robinhood_payload.sh 1530      # shadow build only: 'auto' never selects it and no prompt reads it yet
 #   robinhood_payload.sh auto      # the slot whose decision time passed 1-14 minutes ago (launchd)
 #
 # Why (2026-10-15): repo code cannot call Robinhood (headless clients cannot get tokens), and the live

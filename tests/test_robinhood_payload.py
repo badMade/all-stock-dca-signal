@@ -489,3 +489,96 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     assert sorted(seen) == sorted(
         [(str(i), "1", "1") for i in range(chunks)] + [(str(i), "2", "0") for i in range(chunks)]
     ), log
+
+
+# -- 3:30 PM (shadow only): plannable and buildable on demand, never scheduled, never read by a live prompt -------
+
+
+def bars_from(start_h, start_m, end_h, end_m):
+    """5-minute UTC bars (EDT = UTC-4) from start through the last bar before end, both ET wall-clock times."""
+    out, minute = [], (start_h * 60 + start_m)
+    while minute < end_h * 60 + end_m:
+        h, m = divmod(minute + 240, 60)
+        out.append(bar(f"2026-10-15T{h:02d}:{m:02d}:00Z"))
+        minute += 5
+    return out
+
+
+def final_buy_ticker(bars):
+    return {
+        "previous_close_bar": bar("2026-10-14T00:00:00Z"),
+        "intraday_bars": bars,
+        "quote": {"price": 10.1, "as_of": "2026-10-15T19:31:00Z"},  # 15:31 ET
+    }
+
+
+def final_buy_kw(**over):
+    return kw(bar_start=time(14, 30), decision=time(15, 30), **over)
+
+
+def test_1530_is_plannable_but_the_scheduled_slots_stay_the_six_prompt_wired_ones():
+    assert rp.SLOTS == ("0935", "1030", "1130", "1230", "1330", "1430")
+    assert "1530" in rp.PLANNABLE_SLOTS and "1530" not in rp.SLOTS
+    # launchd's `auto` must never pick 3:30 up: every minute of the day resolves only to a scheduled slot.
+    due = {rp.due_slot(DAY, time(h, m)) for h in range(8, 17) for m in range(60)} - {None}
+    assert due == set(rp.SLOTS)
+    assert rp.due_slot(DAY, time(15, 31)) is None and rp.due_slot(DAY, time(15, 40)) is None
+
+
+def test_1530_plan_scores_the_universe_and_interval_the_final_buy_generator_uses(monkeypatch):
+    import dca_config
+    import dca_runner
+    from scripts.generate_buy_candidates import SLOT_SPECS
+
+    class Open:  # a normal full trading day
+        is_closed = False
+        is_early_close = False
+
+    monkeypatch.setattr(dca_runner, "market_day_status", lambda day: Open())
+    monkeypatch.setattr(dca_config, "load_approved_dates", lambda config_dir: {"approved_test_dates": {DAY}})
+    plan = rp.build_plan("1530", DAY)
+    config = dca_config.load_strategy_config(dca_config.get_config_dir())
+    assert plan["tickers"] == [t for t in config.tickers if t not in config.excluded_tickers]
+    assert plan["decision_time_et"] == SLOT_SPECS["1530ET"]["decision_time_et"].strftime("%H:%M") == "15:30"
+    assert plan["interval_minutes"] == config.robinhood_interval_minutes == 5
+    assert plan["bar_start_et"] == "14:30" and plan["shadow"] is True
+    assert plan["out"].endswith("robinhood_payload_2026-10-15_1530.json")
+    assert rp.build_plan("1230", DAY)["shadow"] is False
+
+
+def test_1530_plan_refuses_an_early_close_and_an_unapproved_day(monkeypatch):
+    import dca_config
+    import dca_runner
+
+    class Early:
+        is_closed = False
+        is_early_close = True
+
+    monkeypatch.setattr(dca_runner, "market_day_status", lambda day: Early())
+    monkeypatch.setattr(dca_config, "load_approved_dates", lambda config_dir: {"approved_test_dates": {DAY}})
+    with pytest.raises(SystemExit) as early:
+        rp.build_plan("1530", DAY)
+    assert early.value.code == rp.EXIT_NOT_TRADING_DAY
+
+    class Open:
+        is_closed = False
+        is_early_close = False
+
+    monkeypatch.setattr(dca_runner, "market_day_status", lambda day: Open())
+    monkeypatch.setattr(dca_config, "load_approved_dates", lambda config_dir: {"approved_test_dates": set()})
+    with pytest.raises(SystemExit) as unapproved:
+        rp.build_plan("1530", DAY)
+    assert unapproved.value.code == rp.EXIT_OUTSIDE_WINDOW
+    with pytest.raises(SystemExit, match="cannot be planned"):
+        rp.build_plan("1545", DAY)
+
+
+def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
+    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
+    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:30") and len(ok["intraday_bars"]) == 12
+    # the generator's 60-minutes-back lookback bar (14:30) is missing: bars that start late must not pass
+    with pytest.raises(rp.PayloadError, match="do not cover"):
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
+    # the series stopped early: no completed decision bar
+    with pytest.raises(rp.PayloadError, match="far before"):
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())

@@ -19,7 +19,10 @@ consistency-checked, a quote that disagrees with its own last bar is rejected, a
 check goes to ``ticker_errors.robinhood`` (a fetch that raised) rather than being scored on doubtful data.
 Too little coverage publishes nothing, so the slot aborts at Gate 5 instead of trading a thin universe.
 
-The 3:30 PM slot is Finance-primary and is deliberately not covered here.
+The 3:30 PM slot is Finance-primary today, so it is NOT one of the six scheduled slots: ``due_slot`` (launchd's
+``auto``) never selects it and no live prompt reads a 3:30 payload. It can be planned and built on demand
+(``plan --slot 1530``, ``deploy/launchd/robinhood_payload.sh 1530``) so the Mac-side build can be shadow-tested before
+the 3:30 slot is moved onto it. See docs/robinhood_payload.md, "The 3:30 PM slot (shadow only)".
 """
 
 from __future__ import annotations
@@ -51,6 +54,15 @@ BAR_START_ET = {
     "1430": time(13, 30),
 }
 SLOTS = tuple(BAR_START_ET)
+#: Slots that can be planned and built on demand but are NOT scheduled: ``due_slot`` ignores them, so launchd's
+#: ``auto`` never fires one and no live prompt waits on one. 3:30 only needs the lookback bar (decision anchor minus
+#: ``trend_lookback_minutes`` = 14:30) and the decision bar, because ``scripts/generate_buy_candidates`` bypasses the
+#: trend filter at 1530ET; the live prompt's "09:30 onward" is wider than the generator's own check and would turn a
+#: 5-minute fetch into 72 bars per ticker for no scoring benefit.
+SHADOW_BAR_START_ET = {
+    "1530": time(14, 30),
+}
+PLANNABLE_SLOTS = SLOTS + tuple(SHADOW_BAR_START_ET)
 
 DEFAULT_CHUNK_SIZE = 8
 #: Share of the universe that must validate before a payload is published at all. It was 1.0 (2026-10-15
@@ -239,22 +251,41 @@ def output_path(day: date, slot: str) -> str:
     )
 
 
+def _final_buy_universe(config_dir: Path, day: date) -> tuple[list[str], time, int]:
+    """(tickers, decision time, Robinhood bar interval) the 1530ET generator scores, loaded the way it loads them.
+
+    ``scripts/generate_buy_candidates`` iterates ``load_strategy_config(...).tickers`` minus
+    ``excluded_tickers`` at ``SLOT_SPECS["1530ET"]["decision_time_et"]``, and reads Robinhood bars at
+    ``robinhood_interval_minutes``. Reusing those names (not a copy of their values) keeps this plan from drifting.
+    """
+    import dca_config
+    from scripts.generate_buy_candidates import SLOT_SPECS
+
+    config = dca_config.load_strategy_config(config_dir, now=datetime.combine(day, time(15, 30), ET))
+    tickers = [s for s in config.tickers if s not in config.excluded_tickers]
+    return tickers, SLOT_SPECS["1530ET"]["decision_time_et"], int(config.robinhood_interval_minutes)
+
+
 def build_plan(slot: str, day: date) -> dict[str, Any]:
     """What the slot's Gate 5 generator scores, exactly as it scores it (same loader and narrowing)."""
     import dca_config
     import dca_runner
 
-    if slot not in BAR_START_ET:
-        raise SystemExit(f"slot {slot!r} is not a Robinhood-primary slot; expected one of {', '.join(SLOTS)}")
+    if slot not in PLANNABLE_SLOTS:
+        raise SystemExit(f"slot {slot!r} cannot be planned; expected one of {', '.join(PLANNABLE_SLOTS)}")
     config_dir = dca_config.get_config_dir()
-    spec = _slot_spec(slot)
-    config = spec.config_loader(config_dir, allow_unpinned_account=True)
-    executor = spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs)
-    interval = spec.source_interval_minutes or config.interval_minutes
-    tickers = [
-        s for s in config.tickers if s not in config.excluded_tickers and s not in spec.ticker_source_overrides
-    ]
-    decision = executor.decision_time
+    shadow = slot in SHADOW_BAR_START_ET
+    if shadow:
+        tickers, decision, interval = _final_buy_universe(config_dir, day)
+    else:
+        spec = _slot_spec(slot)
+        config = spec.config_loader(config_dir, allow_unpinned_account=True)
+        executor = spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs)
+        interval = spec.source_interval_minutes or config.interval_minutes
+        tickers = [
+            s for s in config.tickers if s not in config.excluded_tickers and s not in spec.ticker_source_overrides
+        ]
+        decision = executor.decision_time
     status = dca_runner.market_day_status(day)
     if status.is_closed or (status.is_early_close and decision >= time(13, 0)):
         raise SystemExit(EXIT_NOT_TRADING_DAY)
@@ -267,10 +298,12 @@ def build_plan(slot: str, day: date) -> dict[str, Any]:
         "slot": slot,
         "trading_day": day.isoformat(),
         "decision_time_et": decision.strftime("%H:%M"),
-        "bar_start_et": BAR_START_ET[slot].strftime("%H:%M"),
+        "bar_start_et": (SHADOW_BAR_START_ET if shadow else BAR_START_ET)[slot].strftime("%H:%M"),
         "interval_minutes": int(interval),
         "tickers": tickers,
         "out": output_path(day, slot),
+        # True when nothing schedules this slot: no launchd entry, no live prompt reads the file.
+        "shadow": shadow,
     }
 
 

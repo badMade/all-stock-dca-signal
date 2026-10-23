@@ -9,7 +9,7 @@ window; the 11:30, 1:30 and 2:30 runs all aborted at Gate 5 with nothing placed.
 Robinhood MCP connection (`codex mcp list` -> `robinhood-trading`).
 
 **What runs.** `deploy/launchd/robinhood_payload.sh auto`, fired one minute after each Robinhood-primary slot's
-decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is Finance-primary and not covered):
+decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is Finance-primary and is not scheduled here; see "The 3:30 PM slot (shadow only)" below):
 
 1. `scripts/robinhood_payload.py plan` resolves the slot, the exact universe that slot's Gate 5 generator scores,
    the earliest bar the slot's 60-minute trend needs, and the output path.
@@ -67,3 +67,22 @@ predates the slot's trend-window start or falls more than 15 minutes after the d
 last trade, so a thin ticker's may legitimately be old; the payload as a whole is instead rejected when its newest
 `as_of` is earlier than one bar before the decision time (`_require_fresh_fetch`). `publish` and `check` both apply it.
 A payload built long after its slot (for example a manual after-hours test build) is therefore rejected.
+
+## The 3:30 PM slot (shadow only)
+
+Step 1 of moving the 3:30 slot onto this job (2026-10-22). Nothing about the live slot changes: no launchd entry fires
+it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy with the Robinhood-only outage fallback.
+
+- **What now works:** `python -m scripts.robinhood_payload plan --slot 1530` and `deploy/launchd/robinhood_payload.sh 1530`
+  plan and build `robinhood_payload_<day>_1530.json` on demand. `merge` and `check` need no change.
+- **What it plans:** the universe and interval the 3:30 generator itself uses (`load_strategy_config(...).tickers` minus
+  `excluded_tickers`, `robinhood_interval_minutes` = 5, `generate_buy_candidates.SLOT_SPECS["1530ET"]` decision time 15:30),
+  with bars from **14:30**. The generator bypasses the trend filter at 1530ET and only needs the 60-minutes-back lookback bar
+  (14:30), the completed decision bar (15:25) and the previous close; the live prompt's "09:30 onward" is wider than that
+  and would make each chunk reply 72 bars per ticker instead of 12.
+- **What stays off:** `due_slot` (launchd's `auto`) only ever returns the six scheduled slots, so adding a 15:31 plist
+  entry is a separate, deliberate step. A test pins this.
+- **Known risk for the next step:** 90 tickers are 12 chunks of 8, run 3 at a time (4 waves of up to 240 s), so a worst-case
+  build ends about 16 minutes after its 15:31 start, leaving little of the 15:25-15:55 window for Gates 5 to 7. The fix
+  belongs with scheduling (more parallelism or a bounded per-chunk timeout), not here; shadow builds will measure the real
+  duration first.
