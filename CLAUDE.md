@@ -164,6 +164,10 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 - **Fail closed, always.** Config loading rejects duplicate JSON keys, rejects valid-JSON-that-
   is-not-an-object, and treats a missing account number as a hard error rather than an empty
   substitution. When reconciliation cannot be proven complete, the run must not submit.
+  **One operator carve-out (2026-10-22):** unproven *order-history completeness* (e.g. no pagination
+  cursor, oldest row later than the `created_at_gte` boundary) is log-and-continue in the live
+  prompts, not an abort -- see `docs/reliability_spec.md` §4. Tool errors, unfollowable cursors,
+  malformed rows and rogue in-window orders still fail closed.
 
 ### Environment variables
 

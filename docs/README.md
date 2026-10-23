@@ -63,6 +63,7 @@ environment (see the repository README).
 | [GATE5_FIX.md](GATE5_FIX.md) | The Gate 5 failure fix: how signal generation became a real, tested entry point per slot |
 | [risk_management.md](risk_management.md) | Dynamic risk management: the rolling cash-burn report and the 7-day deployment kill switch (`dca_risk.py`) |
 | [dca_operational_todos.md](dca_operational_todos.md) | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
+| [OPEN_ISSUES_2026-10-22.md](OPEN_ISSUES_2026-10-22.md) | Open issue record: Gate 6 weekly-history completeness aborting the 0935 and 1030 live slots; operator decision is log-and-continue, fix not started |
 | [adr-octopus-ledger-filesystem-boundary.md](adr-octopus-ledger-filesystem-boundary.md) | ADR: the Octopus ledger's descriptor-relative, no-follow filesystem boundary |
 | [local_env_file.md](local_env_file.md) | The gitignored local `.env` that supplies the account number and alert address to the executor sandbox: setup, verification, troubleshooting (`dca_env.py`) |
 | [adr-dotenv-loader.md](adr-dotenv-loader.md) | ADR: why a small allowlisted, mode-0600 `.env` loader runs from `dca_paths` instead of per-command sourcing in the prompts |

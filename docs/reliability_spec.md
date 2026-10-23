@@ -81,6 +81,15 @@ with same-day broker exposure into an `effective_prior_usd` per symbol:
 
 - If coverage is not provably complete → `BROKER_HISTORY_INCOMPLETE`, `$0` buy.
   **Never** fall back to the full desired amount on an unproven-empty history.
+- **Operator carve-out for the live prompts (2026-10-22).** The 9:35 AM run aborted at Gate 6
+  because `get_equity_orders` returned 81 orders, no cursor, oldest Monday 09:59 ET. The
+  `HISTORY COMPLETENESS IS LOG-AND-CONTINUE` paragraph in every
+  `claude/dca-executor-prompts/live-mirror/` prompt now says unproven *completeness* of an
+  otherwise successful fetch is logged as a WARNING and the run sizes from the history as
+  returned. Known risk: an incomplete history can undercount weekly spend and exceed the
+  $900 weekly cap. Still fail-closed: tool errors/refusals, an unfollowable cursor, malformed
+  rows, rogue in-window orders. The engine above (`decide_effective_top_up`) is unchanged and
+  is not live-wired, so this carve-out applies to the prompts only.
 - Otherwise the strict-below top-up invariant is delegated to the existing,
   tested `run_classification.incremental_top_up_amount` (buy
   `max(0, desired − effective_prior)` only when `current_price` is strictly below
