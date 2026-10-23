@@ -15,7 +15,3 @@
 ## 2026-10-21 - [Avoid uncompiled re.match in inner loops]
 **Learning:** Python's internal regex cache (`re._cache`) caps out and incurs hash-lookup overhead per call. Uncompiled `re.match` inside a loop over rows or files causes performance sink.
 **Action:** Lift the pattern to a module-level `_PATTERN = re.compile(r"...")` and call `_PATTERN.match(...)` for ~2.3x speedup.
-
-## 2026-10-22 - [Use fromisoformat or string slicing to bypass strptime in hot loops]
-**Learning:** `datetime.strptime` involves regex compilation and locale locking, which makes it remarkably slow for fixed-format dates and times in hot loops (e.g. log ingestion, time window validation). Using `datetime.fromisoformat()` with timezone substitution or explicit string slicing is >5x faster and respects strict formatting with identical `ValueError` handling.
-**Action:** Always prefer `fromisoformat` (or `int()` slicing for simple clock times like `%H:%M`) over `strptime` to eliminate CPU overhead inside data ingestion loops.

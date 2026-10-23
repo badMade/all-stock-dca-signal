@@ -202,13 +202,11 @@ def append_model_usage_entry(entry: Mapping[str, Any], *, root: str | Path | Non
     directory if needed. Raises on I/O failure -- use ``log_model_usage`` for
     a call site that must never raise."""
     triggered_raw = entry["triggered_at_utc"]
-    if isinstance(triggered_raw, datetime):
-        triggered = triggered_raw
-    else:
-        # ⚡ Bolt optimization: Use fromisoformat to bypass slow datetime.strptime overhead
-        if not triggered_raw.endswith("Z"):
-            raise ValueError(f"time data {triggered_raw!r} does not match format '%Y-%m-%dT%H:%M:%SZ'")
-        triggered = datetime.fromisoformat(triggered_raw.replace("Z", "+00:00"))
+    triggered = (
+        triggered_raw
+        if isinstance(triggered_raw, datetime)
+        else datetime.strptime(triggered_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    )
     path = resolve_log_path(triggered, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -299,13 +297,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _main(argv: Optional[list] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    if args.triggered_at_utc:
-        # ⚡ Bolt optimization: Use fromisoformat to bypass slow datetime.strptime overhead
-        if not args.triggered_at_utc.endswith("Z"):
-            raise ValueError(f"time data {args.triggered_at_utc!r} does not match format '%Y-%m-%dT%H:%M:%SZ'")
-        triggered_at_utc = datetime.fromisoformat(args.triggered_at_utc.replace("Z", "+00:00"))
-    else:
-        triggered_at_utc = None
+    triggered_at_utc = (
+        datetime.strptime(args.triggered_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if args.triggered_at_utc
+        else None
+    )
     try:
         entry = build_entry(
             run_id=args.run_id,
