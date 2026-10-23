@@ -256,7 +256,7 @@ def notify_macos(title: str, message: str) -> None:
     subprocess.run(
         ["osascript", "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
          "-e", "end run", title, message],
-        check=False, capture_output=True, timeout=_DEFAULT_TIMEOUT_SECONDS,
+        check=True, capture_output=True, timeout=_DEFAULT_TIMEOUT_SECONDS,
     )
 
 

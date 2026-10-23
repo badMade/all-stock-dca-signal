@@ -131,3 +131,18 @@ def test_verify_schedule_has_no_second_alerting_path():
         verify_schedule.main(["--date", FAILING_DAY, "--alert"])
     assert exc.value.code == 2  # argparse rejects the unknown flag
     assert not hasattr(verify_schedule, "notify_macos")
+
+
+# PR #1870 review (Copilot): notify_macos ran osascript with check=False, so a notifier that exits nonzero
+# without raising looked like a delivered notification. Both callers already handle SubprocessError, so a
+# failed delivery must surface as one.
+def test_notify_macos_surfaces_a_nonzero_osascript_exit(monkeypatch):
+    def fake_run(args, check=False, **kwargs):
+        if check:
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 1, stdout=b"", stderr=b"osascript: not allowed")
+
+    monkeypatch.setattr(schedule_watchdog.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.SubprocessError):
+        schedule_watchdog.notify_macos("DCA schedule watchdog", "2026-10-16: 3 slots failed")

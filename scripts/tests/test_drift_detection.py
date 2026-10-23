@@ -261,6 +261,11 @@ class DriftDetectionTests(unittest.TestCase):
         # The detector must recognize the header-only signals file as unusable
         # (no signals with intent) and the run_state-confirmed order as drift:
         # a placed order with no canonical record AND no signal intent.
+        _write_csv(
+            self.run_dir / "morning_signals.csv", SIGNAL_FIELDS, [_signal("AAPL", auto_buy="false")]
+        )
+        artifacts = drift_detection.load_run_artifacts(self.run_dir)
+        self.assertEqual(artifacts.signals_path, self.run_dir / "morning_signals.csv")
         report = detect_drift(self.run_dir)
 
         # Drift should be detected: run_state shows AAPL was submitted but

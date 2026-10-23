@@ -397,3 +397,33 @@ def test_slot_evidence_before_the_slot_is_not_due(tmp_path):
 
     evidence = slot_evidence([RootSpec.of(tmp_path)], DAY, datetime(2026, 9, 8, 9, 0, tzinfo=ET))
     assert {row["status"] for row in evidence.values()} == {"not_due"}
+
+
+# PR #1874 review (Copilot): the drift units now run `/bin/sh -c 'exec "$${REPO_ROOT}/deploy/run-drift-check.sh" ...'`
+# (the quotes keep a REPO_ROOT containing a space as one word; `$$` is systemd's escaped dollar). _command_shape strips
+# the wrapper and then splits on whitespace, so the quoted executable keeps its quotes and `$${REPO_ROOT}` and the
+# console's `script` field shows that instead of the documented basename `run-drift-check.sh`.
+WRAPPED_QUOTED = "[Service]\nUser=dca-drift\nExecStart=/bin/sh -c 'exec \"$${REPO_ROOT}/deploy/run-drift-check.sh\" morning_dca 1030ET'\n"
+
+
+def test_committed_drift_services_report_the_script_basename():
+    services = [row for row in deploy_layer(REPO)["systemd"] if row["kind"] == "service"]
+    assert len(services) == 7
+    for row in services:
+        assert row["script"] == "run-drift-check.sh", f"{row['file']}: script field is {row['script']!r}"
+
+
+def test_quoted_wrapped_exec_start_reports_basename_arguments_and_slot(tmp_path):
+    repo = write_repo(tmp_path, service=WRAPPED_QUOTED)
+    service = next(row for row in deploy_layer(repo)["systemd"] if row["kind"] == "service")
+    assert service["script"] == "run-drift-check.sh"
+    assert service["arguments"] == ["morning_dca", "1030ET"]
+    assert service["slots"] == ["1030ET"]
+    assert "$$" not in json.dumps(service) and "REPO_ROOT" not in json.dumps(service)
+
+
+def test_unbalanced_quote_in_exec_start_does_not_crash_the_reader(tmp_path):
+    broken = "[Service]\nUser=dca-drift\nExecStart=/bin/sh -c 'exec \"$${REPO_ROOT}/deploy/run-drift-check.sh morning_dca 1030ET'\n"
+    repo = write_repo(tmp_path, service=broken)
+    result = deploy_layer(repo)  # must degrade to a row (or a warning), never raise
+    assert any(row["kind"] == "service" for row in result["systemd"])

@@ -119,7 +119,7 @@ def _attempt_times(base: Path, stream: str, day: date) -> List[datetime]:
     times: List[datetime] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return times
     for line in lines:
         try:

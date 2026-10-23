@@ -37,4 +37,4 @@ Type=oneshot
 User=dca-drift
 Group=dca-drift
 EnvironmentFile=-/etc/all-stock-dca.env
-ExecStart=/bin/sh -c 'exec ${REPO_ROOT}/deploy/run-drift-check.sh market_open_dca 0935ET'
+ExecStart=/bin/sh -c 'exec "$${REPO_ROOT}/deploy/run-drift-check.sh" market_open_dca 0935ET'

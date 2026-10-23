@@ -171,3 +171,17 @@ def test_verify_day_passes_once_every_slot_is_verified(tmp_path):
         (run_dir / "submitted_orders.csv").write_text("ticker,order_id,submitted_amount_usd,status\n")
     report = verify_day(DAY, AFTER_CLOSE, root=tmp_path)
     assert report["ok"] is True and {row["status"] for row in report["slots"]} == {"verified"}
+
+
+# PR #1870 review (Copilot): _attempt_times caught only OSError, but read_text(encoding="utf-8") raises
+# UnicodeDecodeError (a ValueError, not an OSError) on a truncated or non-UTF-8 log, so one corrupt attempt
+# log aborted the whole audit. Its own docstring promises a broken log degrades toward the
+# slot_did_not_fire tag, never to a crash.
+def test_attempt_times_treats_a_non_utf8_log_as_no_attempts(tmp_path, monkeypatch):
+    monkeypatch.setenv("DCA_ATTEMPT_LOG_ROOT", str(tmp_path))
+    day = date(2026, 10, 16)
+    log = tmp_path / day.strftime("%Y%m%d") / "morning.attempts.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b'{"failure_phase": "before_run_artifact"}\n\xff\xfe\x00 truncated mid-character \xc3')
+
+    assert verify_schedule._attempt_times(tmp_path, "morning", day) == []

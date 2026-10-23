@@ -34,4 +34,4 @@ Type=oneshot
 User=dca-drift
 Group=dca-drift
 EnvironmentFile=-/etc/all-stock-dca.env
-ExecStart=/bin/sh -c 'exec ${REPO_ROOT}/deploy/run-drift-check.sh morning_dca 1030ET'
+ExecStart=/bin/sh -c 'exec "$${REPO_ROOT}/deploy/run-drift-check.sh" morning_dca 1030ET'

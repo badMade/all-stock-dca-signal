@@ -326,18 +326,22 @@ def _command_shape(command: str) -> dict[str, Any]:
     systemd environment variable expansion), the actual command inside the
     quotes is extracted and parsed.
     """
-    # Handle /bin/sh -c 'exec ...' wrapping (systemd environment expansion).
-    # The quotes protect the command from immediate systemd variable expansion.
-    if command.startswith("/bin/sh -c '") and command.endswith("'"):
-        # Extract the command inside the single quotes.
-        inner_command = command[12:-1]  # Remove "/bin/sh -c '" and final "'"
-        # Handle the common pattern of "exec" at the start of the inner command.
-        if inner_command.startswith("exec "):
-            inner_command = inner_command[5:]  # Remove "exec "
-        command = inner_command
+    import shlex
 
-    tokens = command.split()
-    shown = [_text(Path(token).name if token.startswith("/") else token, 80) for token in tokens[:20]]
+    # Parse quoting without executing the command or expanding environment variables.
+    try:
+        tokens = shlex.split(command)
+        if tokens[:2] == ["/bin/sh", "-c"] and len(tokens) == 3:
+            tokens = shlex.split(tokens[2])
+            if tokens[:1] == ["exec"]:
+                tokens = tokens[1:]
+    except ValueError:
+        # Malformed quoting is unavailable command evidence, not a reader failure.
+        tokens = []
+    shown = [
+        _text(Path(token).name if index == 0 or token.startswith("/") else token, 80)
+        for index, token in enumerate(tokens[:20])
+    ]
     return {"script": shown[0] if shown else None, "arguments": [item for item in shown[1:] if item is not None],
             "slots": [token for token in tokens if _SLOT_TOKEN.fullmatch(token)][:LIST_LIMIT],
             "streams": sorted({_STREAM_SUBPATHS[token] for token in tokens if token in _STREAM_SUBPATHS})}
