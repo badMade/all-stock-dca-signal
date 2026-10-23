@@ -4085,3 +4085,23 @@ def test_preserved_latch_rejects_boolean_and_malformed_persisted_fields():
             carry_drop_metric=False,
         ) == {"rearm_reference_close": 100.0}
 
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (10**1000, False),         # Triggers OverflowError in math.isfinite
+        (-(10**1000), False),        # Negative massive integer
+        (float("inf"), False),      # Standard infinity
+        (float("-inf"), False),
+        (float("nan"), False),       # Standard NaN
+        (100.5, True),              # Valid float
+        (42, True),                 # Valid int
+        (0, True),                  # Zero boundary
+        ("invalid", False),         # Non-numeric string
+        (None, False),              # NoneType sentinel
+        (True, False),              # Boolean guard
+    ],
+)
+def test_is_finite_scalar_boundary_safeguards(value, expected):
+    from dca_inverse_martingale import _is_finite_scalar
+    assert _is_finite_scalar(value) is expected
