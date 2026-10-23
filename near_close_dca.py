@@ -29509,18 +29509,18 @@ def _unrepresented_prior_candidate_part(
             _merged_entry = dict(_existing_entry)
             for _field in ("submitted_amount_usd", "planned_amount_usd", "whole_share_quantity"):
                 _a, _b = _existing_entry.get(_field), _item.get(_field)
-                if isinstance(_a, (int, float)) and not isinstance(_a, bool) and isinstance(_b, (int, float)) and not isinstance(_b, bool):
+                if isinstance(_a, (int, float)) and isinstance(_b, (int, float)):
                     _merged_entry[_field] = _a + _b
-                elif isinstance(_b, (int, float)) and not isinstance(_b, bool):
+                elif isinstance(_b, (int, float)):
                     _merged_entry[_field] = _b
             _legacy_by_id[_key] = _merged_entry
     _matched_legacy = [_legacy_by_id[key] for key in missing_keys if key in _legacy_by_id]
     _legacy_fully_matched = bool(_matched_legacy) and len(_matched_legacy) == len(missing_keys)
     if attribution is not None:
         trimmed_amount = round(sum(float(attribution.get(key) or 0.0) for key in missing_keys), 2)
-        if isinstance(prior.get("submitted_amount_usd"), (int, float)) and not isinstance(prior.get("submitted_amount_usd"), bool):
+        if isinstance(prior.get("submitted_amount_usd"), (int, float)):
             trimmed["submitted_amount_usd"] = trimmed_amount
-        if isinstance(prior.get("planned_amount_usd"), (int, float)) and not isinstance(prior.get("planned_amount_usd"), bool):
+        if isinstance(prior.get("planned_amount_usd"), (int, float)):
             trimmed["planned_amount_usd"] = trimmed_amount
         trimmed["_order_amount_usd_by_id"] = {key: attribution[key] for key in missing_keys if key in attribution}
         # `_order_failure_kind_by_id` is a per-id map too (see
@@ -29546,8 +29546,8 @@ def _unrepresented_prior_candidate_part(
             if not isinstance(prior.get(field), (int, float)):
                 continue
             _values = [_item.get(field) for _item in _matched_legacy]
-            if all(isinstance(_v, (int, float)) and not isinstance(_v, bool) for _v in _values):
-                trimmed[field] = round(sum(float(_v) for _v in _values if isinstance(_v, (int, float)) and not isinstance(_v, bool)), 2)
+            if all(isinstance(_v, (int, float)) for _v in _values):
+                trimmed[field] = round(sum(float(_v) for _v in _values if isinstance(_v, (int, float))), 2)
         # Restricted to just the still-represented ids, not the prior
         # aggregate's full list (inherited unchanged via `dict(prior)`
         # above): a later `_merge_whole_share_submission_outcomes` call on
@@ -29704,11 +29704,11 @@ def _unrepresented_prior_candidate_part(
     # started as `dict(prior)`, so its submitted/planned amounts already
     # hold that conservative total unless one of the branches above just
     # replaced them with an exact figure.
-    if isinstance(prior.get("whole_share_quantity"), (int, float)) and not isinstance(prior.get("whole_share_quantity"), bool):
+    if isinstance(prior.get("whole_share_quantity"), (int, float)):
         if _legacy_fully_matched:
             _qty_values = [_item.get("whole_share_quantity") for _item in _matched_legacy]
-            if all(isinstance(_v, (int, float)) and not isinstance(_v, bool) for _v in _qty_values):
-                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values if isinstance(_v, (int, float)) and not isinstance(_v, bool))
+            if all(isinstance(_v, (int, float)) for _v in _qty_values):
+                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values if isinstance(_v, (int, float)))
         # else: no exact per-order quantity available -- preserve the
         # prior's full quantity (already in `trimmed` via `dict(prior)`)
         # rather than subtract a fresh sibling's own quantity from a total

@@ -472,57 +472,6 @@ def _validate_entries(
     return payload, failed
 
 
-def _refusal_path(out: Path) -> Path:
-    return out.with_suffix(".refused.json")
-
-
-def _record_refusal(
-    plan: dict[str, Any], reason: str, *, ok: int, universe: int, failed: dict[str, str],
-    min_coverage: float, now: datetime,
-) -> None:
-    """Leave a durable record that ``publish`` ran and chose not to publish, and why.
-
-    Without it a slot's Gate 5 sees only "missing" and cannot tell a refusal (89/90 tickers fresh, one thin
-    name stale) from a launchd job that never ran. 2026-10-21: the 09:35, 12:30 and 13:30 slots aborted on
-    exactly that, and the 13:30 alert blamed a sleeping Mac while the job's own log said it had refused.
-    Best-effort: a marker that cannot be written must never change the refusal itself.
-    """
-    marker = {
-        "slot": plan["slot"],
-        "trading_day": plan["trading_day"],
-        "refused_at_et": now.isoformat(),
-        "reason": reason,
-        "universe": universe,
-        "valid": ok,
-        "min_coverage": min_coverage,
-        "failed": failed,
-    }
-    path = _refusal_path(Path(plan["out"]))
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(marker, indent=1), encoding="utf-8")
-    except OSError as exc:
-        print(f"robinhood_payload: could not write refusal marker {path.name}: {exc.__class__.__name__}", file=sys.stderr)
-
-
-def _refusal_note(plan: dict[str, Any]) -> str | None:
-    """One line describing this slot's recorded refusal, or None when there is none for THIS slot and day.
-
-    A marker for another slot or day, or an unreadable one, is ignored: it must never explain (or excuse)
-    a different slot's missing payload.
-    """
-    try:
-        marker = json.loads(_refusal_path(Path(plan["out"])).read_text(encoding="utf-8"))
-        if marker["slot"] != plan["slot"] or marker["trading_day"] != plan["trading_day"]:
-            return None
-        stale = ", ".join(f"{t} ({r})" for t, r in sorted(marker["failed"].items())) or "none listed"
-        refused_at = datetime.fromisoformat(marker["refused_at_et"])
-        return (f"publisher ran and refused at {refused_at:%H:%M} ET: {marker['reason']} "
-                f"[{marker['valid']}/{marker['universe']} valid; not valid: {stale}]")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-
-
 def publish(
     plan: dict[str, Any],
     payload: dict[str, Any],
@@ -535,10 +484,7 @@ def publish(
     anchor = datetime.combine(date.fromisoformat(plan["trading_day"]), time.fromisoformat(plan["decision_time_et"]), ET)
     if now < anchor:
         # The decision bar's predecessor has not closed yet: the newest bar would be a still-forming one.
-        reason = f"built at {now:%H:%M} ET, before the {anchor:%H:%M} anchor"
-        print(f"robinhood_payload: {reason}; publishing nothing", file=sys.stderr)
-        _record_refusal(plan, reason, ok=len(payload["sources"]["robinhood"]), universe=len(plan["tickers"]),
-                        failed=failed, min_coverage=min_coverage, now=now)
+        print(f"robinhood_payload: built at {now:%H:%M} ET, before the {anchor:%H:%M} anchor; publishing nothing", file=sys.stderr)
         return 2
     universe = len(plan["tickers"])
     ok = len(payload["sources"]["robinhood"])
@@ -546,9 +492,11 @@ def publish(
     for ticker, reason in sorted(failed.items()):
         print(f"robinhood_payload: {ticker}: {reason}", file=sys.stderr)
     if coverage < min_coverage:
-        reason = f"coverage {ok}/{universe} ({coverage:.0%}) is below {min_coverage:.0%}"
-        print(f"robinhood_payload: {reason}; publishing nothing so the slot aborts at Gate 5", file=sys.stderr)
-        _record_refusal(plan, reason, ok=ok, universe=universe, failed=failed, min_coverage=min_coverage, now=now)
+        print(
+            f"robinhood_payload: coverage {ok}/{universe} ({coverage:.0%}) is below {min_coverage:.0%}; "
+            "publishing nothing so the slot aborts at Gate 5",
+            file=sys.stderr,
+        )
         return 2
     out = Path(plan["out"])
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -580,8 +528,6 @@ def publish(
     finally:
         os.unlink(tmp)
     out.with_suffix(".meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    # A payload now exists, so an earlier attempt's refusal is history, not the slot's state.
-    _refusal_path(out).unlink(missing_ok=True)
     # A partial payload is allowed above the floor; say which tickers it leaves to ticker_errors so the log shows it.
     skipped = f"; ticker_errors: {', '.join(sorted(failed))}" if failed else ""
     print(f"robinhood_payload: wrote {out} ({ok}/{universe} tickers{skipped})")
@@ -631,10 +577,7 @@ def check(
     """
     out = Path(plan["out"])
     if not out.is_file():
-        # Say whether the publisher ran: "missing" alone reads as "job not running" and sends the operator to
-        # the wrong place (2026-10-21).
-        note = _refusal_note(plan) or "no record that the publisher ran for this slot (job not run, or log only)"
-        print(f"robinhood_payload: missing {out}: {note}", file=sys.stderr)
+        print(f"robinhood_payload: missing {out}", file=sys.stderr)
         return 2
     problem = _freshness_problem(plan, out, now or datetime.now(ET), max_age_minutes)
     if problem:

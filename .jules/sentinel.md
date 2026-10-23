@@ -83,3 +83,9 @@
 **Vulnerability:** Documentation files and live executor prompts served via `/api/docs?path=...` returned raw bytes without passing through `redact_value()`, potentially revealing account numbers, registered secrets, sensitive environment variables, or local user paths.
 **Learning:** Even when files are checked into version control under strict invariant checks, dynamic operator prompts and documentation pages can contain sample accounts or local filesystem paths that should never be broadcast over HTTP.
 **Prevention:** Enforce defense-in-depth output redaction (`redact_value`) at the HTTP handler boundary for all served documentation text.
+
+## 2026-10-23 - Parameter Pollution via Duplicate JSON Keys (CRITICAL)
+
+**Vulnerability:** Standard `json.loads` in `dca_console.py` POST endpoints silently resolved duplicate keys by keeping the last occurrence. If an attacker supplied a payload like `{"action": "valid_job", "action": "malicious_job"}`, initial routing or validation could see one value while execution triggered on the other, bypassing safety checks.
+**Learning:** `json.loads` allows parameter pollution when accepting untrusted API payloads unless explicitly protected.
+**Prevention:** Always use `json.loads(body, object_pairs_hook=_reject_duplicate_keys)` when parsing safety-bound configs or untrusted POST requests to explicitly raise `ValueError` on duplicate JSON keys.

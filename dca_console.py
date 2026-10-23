@@ -1265,7 +1265,14 @@ def make_server(
                     raise ValueError("Request body must be between 1 and 1024 bytes")
                 # Retain explicit timeout before reading payload to protect against body-trickling DoS attacks.
                 self.connection.settimeout(5)
-                payload = json.loads(self.rfile.read(length))
+                def _reject_duplicate_keys(pairs):
+                    result = {}
+                    for k, v in pairs:
+                        if k in result:
+                            raise ValueError(f"duplicate key {k!r}")
+                        result[k] = v
+                    return result
+                payload = json.loads(self.rfile.read(length), object_pairs_hook=_reject_duplicate_keys)
                 if self.path == "/api/jobs/cancel":
                     # The cancel body is as closed as the start body: one string
                     # naming the job the page is looking at (GUI expansion Phase 5).

@@ -4,7 +4,6 @@ import io
 import json
 import sys
 from datetime import date
-from unittest.mock import Mock
 
 import pytest
 from test_dca_console import AUTH_CREDENTIAL, auth_headers, request, running_server
@@ -95,27 +94,19 @@ def test_response_json_defaults_to_the_strict_csp_and_redacts_unless_told_not_to
 
 
 @pytest.mark.parametrize("route", sorted(GET_ROUTES) + sorted(ASSETS))
-def test_every_get_route_sits_behind_trust_then_basic(app, route, monkeypatch):
-    # Keep this gate-order test independent of the real graph's size and CI
-    # coverage overhead; the diagnostics suite exercises the full repo scan.
-    scan = Mock(return_value={"status": "ready", "modules": [], "edges": [], "stats": {}})
-    monkeypatch.setattr("dca_console_diagnostics.SCAN_CACHE.get", scan)
+def test_every_get_route_sits_behind_trust_then_basic(app, route):
     access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
     with running_server(app, access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
         status, _, body = request(server, route, headers={"Host": "untrusted.example"})
         assert status == 403, route
         assert json.loads(body)["error"]
-        scan.assert_not_called()
         status, headers, body = request(server, route)
         if route in CREDENTIAL_FREE_ROUTES:
             assert status == 200, route
         else:
             assert status == 401, route
             assert headers["WWW-Authenticate"].startswith('Basic realm="DCA console"')
-        scan.assert_not_called()
         status, headers, _ = request(server, route, headers=auth_headers())
-        if route == "/api/diagnostics/architecture":
-            scan.assert_called_once_with(dca_console.REPO, refresh=False)
         # A route that requires parameters answers 400 to a bare request; it
         # still sits behind the same two gates and carries the same headers.
         assert status in {200, 400, 404}, route

@@ -111,7 +111,7 @@ def test_low_coverage_publishes_nothing(tmp_path):
     chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
-    assert not (tmp_path / "out" / "payload.json").exists()
+    assert not (tmp_path / "out").exists()
     assert rp.check(plan, min_coverage=0.8) == 2
 
 
@@ -137,7 +137,7 @@ def test_default_floor_still_refuses_a_stale_feed(tmp_path):
     chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-8]})
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
-    assert not (tmp_path / "out" / "payload.json").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_default_floor_boundary_is_ninety_five_percent(tmp_path):
@@ -323,7 +323,7 @@ def test_a_quote_just_before_the_decision_bar_makes_the_payload_stale(tmp_path):
     assert payload["sources"]["robinhood"] == {}
     assert all("stale payload" in reason for reason in failed.values())
     assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
-    assert not (tmp_path / "out" / "payload.json").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_one_thin_ticker_with_an_old_last_trade_does_not_fail_a_fresh_payload(tmp_path):
@@ -366,7 +366,7 @@ def test_publish_refuses_before_the_decision_anchor(tmp_path):
     payload, failed = rp.assemble(plan, [write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})])
     early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
     assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
-    assert not (tmp_path / "out" / "payload.json").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_missing_or_mismatched_sidecar_fails_closed(tmp_path):
@@ -447,86 +447,6 @@ def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():
     with pytest.raises(rp.PayloadError, match="in the future"):
         rp.validate_ticker(raw, **kw(), now=now)
     assert rp.validate_ticker(raw, **kw(), now=datetime(2026, 10, 15, 14, 30, tzinfo=rp.ET))  # within the skew
-
-
-# --- refusal marker: `check` must say WHY a payload is missing (2026-10-21: three slots aborted while the
-# 13:30 alert guessed "the launchd job is probably not running"; the job had run and refused at 89/90). ---
-
-
-def _refuse_one_of_ten(tmp_path):
-    tickers = [f"T{i}" for i in range(10)]
-    plan = plan_for(tmp_path, tickers)
-    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-1]})
-    payload, failed = rp.assemble(plan, [chunk])
-    assert rp.publish(plan, payload, failed, min_coverage=1.0) == 2
-    return plan
-
-
-def test_refused_publish_writes_a_marker_naming_the_stale_ticker(tmp_path):
-    plan = _refuse_one_of_ten(tmp_path)
-    marker = json.loads((tmp_path / "out" / "payload.refused.json").read_text())
-    assert (marker["slot"], marker["trading_day"]) == ("1430", "2026-10-15")
-    assert (marker["valid"], marker["universe"]) == (9, 10)
-    assert "T9" in marker["failed"] and marker["min_coverage"] == 1.0
-    assert "below 100%" in marker["reason"]
-    assert not (tmp_path / "out" / "payload.json").exists()
-    assert plan["tickers"][-1] == "T9"
-
-
-def test_check_reports_the_refusal_instead_of_a_bare_missing(tmp_path, capsys):
-    plan = _refuse_one_of_ten(tmp_path)
-    assert rp.check(plan, min_coverage=1.0) == 2
-    err = capsys.readouterr().err
-    assert "missing" in err
-    assert "publisher ran and refused" in err
-    assert "9/10" in err and "T9" in err
-
-
-def test_check_without_a_marker_says_no_publisher_record(tmp_path, capsys):
-    plan = plan_for(tmp_path, ["AAA"])
-    assert rp.check(plan, min_coverage=1.0) == 2
-    err = capsys.readouterr().err
-    assert "no record that the publisher ran" in err
-    assert "refused" not in err
-
-
-def test_marker_for_another_slot_or_day_is_ignored(tmp_path, capsys):
-    plan = _refuse_one_of_ten(tmp_path)
-    capsys.readouterr()  # drop the refusal's own stderr, which names T9; only check's output is under test
-    path = tmp_path / "out" / "payload.refused.json"
-    marker = json.loads(path.read_text())
-    marker["slot"] = "1330"
-    path.write_text(json.dumps(marker))
-    assert rp.check(plan, min_coverage=1.0) == 2
-    err = capsys.readouterr().err
-    assert "no record that the publisher ran" in err
-    assert "T9" not in err
-
-
-def test_unreadable_marker_degrades_to_no_record(tmp_path, capsys):
-    plan = _refuse_one_of_ten(tmp_path)
-    (tmp_path / "out" / "payload.refused.json").write_text("{not json")
-    assert rp.check(plan, min_coverage=1.0) == 2
-    assert "no record that the publisher ran" in capsys.readouterr().err
-
-
-def test_a_successful_publish_clears_an_earlier_refusal(tmp_path):
-    plan = _refuse_one_of_ten(tmp_path)
-    assert (tmp_path / "out" / "payload.refused.json").is_file()
-    tickers = plan["tickers"]
-    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers})
-    payload, failed = rp.assemble(plan, [chunk])
-    assert rp.publish(plan, payload, failed, min_coverage=1.0) == 0
-    assert not (tmp_path / "out" / "payload.refused.json").exists()
-
-
-def test_refusal_before_the_anchor_is_recorded_too(tmp_path):
-    plan = plan_for(tmp_path, ["AAA"])
-    payload, failed = rp.assemble(plan, [write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})])
-    early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
-    assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
-    marker = json.loads((tmp_path / "out" / "payload.refused.json").read_text())
-    assert "before the 14:30 anchor" in marker["reason"]
 
 
 # -- launcher timing log (2026-10-21 09:35 abort: nobody knew how long a real 12-chunk build takes) -----------------

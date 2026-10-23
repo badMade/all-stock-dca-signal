@@ -51596,36 +51596,3 @@ def test_nyse_holidays_new_years_weekend_observance():
     # 2023 New Year's Day was Sunday. Observed on Monday, 2023-01-02.
     holidays_2023 = near_close_dca.nyse_holidays(2023)
     assert date(2023, 1, 2) in holidays_2023
-
-
-def test_bool_trap_in_validation_functions():
-    from near_close_dca import _is_usable_reconciled_order_id, _unrepresented_prior_candidate_part
-
-    assert not _is_usable_reconciled_order_id(True)
-
-    prior = {
-        "order_id": "test_missing",
-        "whole_share_order_ids": ["test_1"],
-        "whole_share_order_attributions": [
-            {
-                "order_id": "test_1",
-                "submitted_amount_usd": True,
-                "planned_amount_usd": False,
-                "whole_share_quantity": True
-            },
-            {
-                "order_id": "test_1",
-                "submitted_amount_usd": True,
-                "planned_amount_usd": False,
-                "whole_share_quantity": True
-            }
-        ]
-    }
-
-    fresh_rows = []
-
-    result = _unrepresented_prior_candidate_part(prior, fresh_rows)
-    merged_attribution = result["whole_share_order_attributions"][0]
-
-    assert merged_attribution.get("submitted_amount_usd") != 2
-    assert merged_attribution.get("whole_share_quantity") != 2

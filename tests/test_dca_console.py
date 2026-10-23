@@ -193,6 +193,12 @@ def test_origin_fetch_metadata_and_host_guards_protect_reads_and_writes(app, htt
         assert "Access-Control-Allow-Origin" not in headers
 
 
+def test_duplicate_json_keys_are_rejected_as_client_errors(app, http_server):
+    status, _, body = request(http_server, "/api/jobs", method="POST", body=b'{"action": "foo", "action": "bar"}', headers=auth_headers(AUTH_CREDENTIAL) | {"X-Console-Token": app.token})
+    assert status == 400
+    assert json.loads(body) == {"error": "duplicate key 'action'"}
+
+
 def test_malformed_json_dates_and_extra_command_fields_return_client_errors(app, http_server, monkeypatch):
     monkeypatch.setattr(app, "submit", lambda _: pytest.fail("Malformed request dispatched work"))
     for body in ("{", "[]", '{"action": 1}', '{"action":"demo-dca","command":"other"}', "x" * 1025):
