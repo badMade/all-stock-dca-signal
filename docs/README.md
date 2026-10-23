@@ -21,6 +21,7 @@ environment (see the repository README).
 | [console_changelog.md](console_changelog.md) | Versioned changelog for `console/` and `dca_console*.py`; every UI change needs an entry and a version bump |
 | [robinhood_payload.md](robinhood_payload.md) | Prebuilt Robinhood slot payload: Codex on the Mac builds the market-data payload ahead of a live slot so the session does not have to pull it live |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
+| [gate6_history_completeness_abort_2026-10-22.md](gate6_history_completeness_abort_2026-10-22.md) | 2026-10-22 live-slot abort on unproven weekly-history completeness, the log-and-continue decision, its risk and a revisit trigger |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [yfinance_replacement_plan.md](yfinance_replacement_plan.md) | Where yfinance is allowed (non-buying scheduled tasks only), the `data` extra that declares it, who uses it today, and the plan to replace it |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
