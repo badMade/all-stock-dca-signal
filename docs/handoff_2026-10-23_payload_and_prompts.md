@@ -1,7 +1,7 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was written: commit `26204ac3`. Nothing below is live until the prompts are repasted
-(steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
+State of `main` when this was last updated (2026-10-23, after #1907): commit `30d5a8ff`. Nothing below is live until
+the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
 ## What happened
@@ -26,25 +26,23 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1878 (separate change) | `7e3a888` | Launcher coverage floor lowered from 100% to 95% (4 of 90 tickers may fail). |
 | #1897 | `41cddf1` | Six live-mirror prompts: abort on errored tickers only above 5% of the universe (more than 4 of 90). Up to that, continue and name them. |
 | #1902 (separate change) | `26204ac3` | Shadow 15:31 launchd agent for the 3:30 payload, and an opt-in build deadline (`DCA_BUILD_DEADLINE_SECONDS`, default none). Operator-installed; changes no trade. |
+| #1906 | `810d2564` | This note. |
+| #1907 | `30d5a8ff` | Rebuilt the committed `backup_planner.pyz` (stamp `41fc5fa0`) after it had drifted from its sources, and added two tests that fail CI if the file or the prompts ever disagree again. |
 
 ## Do these in order
 
 1. **Repaste the six live-mirror prompts** from `claude/dca-executor-prompts/live-mirror/` into the scheduled tasks.
    This brings in the 12-minute wait and the new `ticker_errors` rule together.
-2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and make sure the
-   attached `backup_planner.pyz` is the one those prompts expect. On `main` at `26204ac3` it is **not**:
-   - the prompts require content hash `41fc5fa0` (they match their generator);
-   - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` reports `DRIFT` for the committed file,
-     whose last change was #1872, before #1898 changed the planner sources.
-   Perplexity compares the attached file's hash to the prompt and stands down on any difference (step 0), so
-   repasting these prompts with the committed file would make every backup do nothing. Before pasting, on a
-   current `main`:
+2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
+   `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
+   (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
+   `main` at `30d5a8ff`: the prompts require `41fc5fa0` and the committed file carries it. Two tests in
+   `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
+   Before pasting, on a current `main`, confirm it still holds:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
    - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`).
-   If the second reports `DRIFT`, the file has to be rebuilt and committed
-   (`python -m scripts.build_backup_planner --out backup_planner.pyz`), and the prompts regenerated
-   (`python -m scripts.generate_perplexity_backup_prompts --write`), before anything is pasted. The stamp can
-   move again whenever `main` changes the planner, so always read it from the prompt, not from this note.
+   If `main` has changed the planner since, the stamp changes: read it from the prompt you are about to paste and make
+   sure the attached file's hash equals it. Never reuse a `backup_planner.pyz` from an older checkout.
 3. **Check the scheduled tasks' current Gate 5 text** against the repo copy. This was not visible when the
    changes were made. If the sentence "the launcher publishes only a complete universe" is not what a task holds,
    tell the engineer before pasting.
@@ -75,12 +73,14 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 - The prompt wording "more than 4 of the 90 tickers today" is prose. If the universe size changes, edit it by hand. The
   test only ties the 95% figure to `DEFAULT_MIN_COVERAGE`.
-- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` timed out once on CI (a socket timeout) and
-  passed on re-run. If it recurs, treat it as a real problem.
+- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` has timed out on CI (a socket timeout) on two
+  PRs, #1897 and #1907, and passed on the next run each time. It looks like a slow-runner timeout, but it has not been
+  fixed. If it fails again with anything other than a timeout, treat it as a real problem.
 - Whenever `main` changes the planner or the backup procedure, the Perplexity prompt stamps change and need
   regenerating and repasting. Two parties pushing regenerated prompts to one branch caused repeated conflicts on #1862.
-- The committed `backup_planner.pyz` can drift from its sources, as it has on `main` at `26204ac3` (see step 2). The
-  `--check` command above is how to find out; this note does not claim any test catches it.
+- The committed `backup_planner.pyz` must be rebuilt in the same PR as any change to the planner's sources. It drifted
+  once (fixed in #1907), and two tests now catch it. Concurrent planner PRs will conflict on the binary: rebuild from
+  the merged sources instead of choosing a side.
 - `config/recommendations.json` has both publishers disabled. If one is enabled, regenerate and repaste the Perplexity
   prompts so they name that channel.
 
