@@ -165,7 +165,7 @@ def classify_slot_evidence(
     is an interrupted run, not a verified one (Copilot review, PR #1514).
 
     ``attempt_times`` are the stream's failed-start marker times (ET). One inside this slot's
-    window (window start .. grace deadline) means the slot DID fire and crashed before writing
+    window (acceptance-window start, including the early-start allowance, .. grace deadline) means the slot DID fire and crashed before writing
     anything, so a ``no_evidence`` row is not tagged ``slot_did_not_fire``; it still fails.
     """
     from dca_runner import SLOTS
@@ -217,9 +217,11 @@ def classify_slot_evidence(
     else:
         status = STATUS_NO_EVIDENCE
         reasons.append("no run directory for this slot")
-        # Same start as the finalizer's acceptance window: live prompts accept a fire up to five minutes before
-        # nominal (0935 excepted), so an early crash must read as a crash, not slot_did_not_fire (PR #1869 review).
+        # The finalizer accepts a start EARLY_START_MINUTES before the nominal time (never for 0935),
+        # so a marker in that interval is a slot that fired and crashed, not a scheduler miss
+        # (Copilot review, PR #1874). Imported here because finalize_run_evidence imports this module.
         from scripts.finalize_run_evidence import acceptance_window
+
         window_start, _ = acceptance_window(slot_id, day)
         if any(window_start <= stamp <= deadline for stamp in attempt_times):
             attempted = True

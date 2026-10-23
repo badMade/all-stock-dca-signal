@@ -185,3 +185,31 @@ def test_attempt_times_treats_a_non_utf8_log_as_no_attempts(tmp_path, monkeypatc
     log.write_bytes(b'{"failure_phase": "before_run_artifact"}\n\xff\xfe\x00 truncated mid-character \xc3')
 
     assert verify_schedule._attempt_times(tmp_path, "morning", day) == []
+
+
+# Copilot review of #1874: the failed-start window began at the dca_runner window start, but
+# finalize_run_evidence.acceptance_window() also accepts a start EARLY_START_MINUTES before the
+# nominal time (every slot but 0935). A marker in that early interval is a slot that fired and
+# crashed, so it must not be tagged slot_did_not_fire.
+def _no_evidence_row(slot_id, attempt):
+    return classify_slot_evidence(
+        slot_id, DAY, AFTER_CLOSE,
+        run_dir_present=False, run_state=None, run_state_present=False,
+        market_closed=False, attempt_times=[attempt],
+    )
+
+
+def test_a_failed_start_in_the_early_start_interval_is_an_attempt_not_a_missed_fire():
+    from scripts.finalize_run_evidence import acceptance_window
+
+    start, _ = acceptance_window("1430", DAY)
+    assert start.strftime("%H:%M") == "14:25"  # the boundary the finalizer accepts
+    row = _no_evidence_row("1430", start)
+    assert row["status"] == "no_evidence"
+    assert row["failure_key"] is None  # fired and crashed: still a failure, but not a scheduler miss
+
+
+def test_a_0935_failed_start_before_9_35_is_still_a_missed_fire():
+    # 0935 gets no early-start allowance: a marker at 09:30 is not an attempt at this slot.
+    row = _no_evidence_row("0935", datetime(2026, 9, 22, 9, 30, tzinfo=ET))
+    assert row["failure_key"] == "slot_did_not_fire"
