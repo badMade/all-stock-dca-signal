@@ -350,10 +350,17 @@ def _validated_day(value: str) -> date:
 
 def _validated_clock(value: str, label: str) -> time:
     try:
-        parsed = datetime.strptime(value.strip(), "%H:%M")
+        v = value.strip()
+        # ⚡ Bolt optimization: Fast-path HH:MM parsing preserving strptime behavior
+        parts = v.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        return time(h, m)
     except ValueError as exc:
         raise IngestRefused("invalid_window", f"{label} must be HH:MM, got {value!r}") from exc
-    return time(parsed.hour, parsed.minute)
 
 
 def ingest(

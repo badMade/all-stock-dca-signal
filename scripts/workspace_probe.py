@@ -40,7 +40,10 @@ _MARKER_NAME = re.compile(r"^(?P<stamp>\d{8}T\d{6}Z)(?:-(?P<n>\d+))?\.json$")
 
 
 def _parse_time(text: str) -> datetime:
-    return datetime.strptime(text, _TIME_FORMAT).replace(tzinfo=timezone.utc)
+    # ⚡ Bolt optimization: Use fromisoformat to bypass slow datetime.strptime overhead
+    if not text.endswith("Z"):
+        raise ValueError(f"time data {text!r} does not match format {repr(_TIME_FORMAT)}")
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
 def _argparse_time(text: str) -> datetime:
