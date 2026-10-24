@@ -37,7 +37,7 @@ def run_cmd(cmd: Sequence[str]):
 
 
 
-def compute_cadence():
+def compute_cadence() -> tuple[str, str]:
     """
     Computes a cron schedule based on recent git activity.
     Implements the 5-tier self-scheduling logic, dynamically computing

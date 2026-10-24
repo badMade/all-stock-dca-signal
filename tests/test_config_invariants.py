@@ -1433,6 +1433,7 @@ def _is_real_date(value: str) -> bool:
 # widening is what adds coverage rather than what needs excusing.
 _NON_ACCOUNT_LITERALS = frozenset(
     {
+        "16639526",  # Commit hash in docs/handoff_2026-10-23_payload_and_prompts.md
         # The morning-live cron id (MORNING_LIVE_CRON_ID), ~170 occurrences.
         "42173154",
         # HHMMSS clock values and a unix timestamp in tests.
