@@ -52,6 +52,7 @@ import scripts.generate_morning_candidates as morning  # noqa: E402
 from near_close_dca import SourceName  # noqa: E402
 from scripts import assemble_market_data as amd  # noqa: E402
 from scripts import backup_planner, stream_candidates  # noqa: E402
+from scripts.validate_native_placement import native_ref_id  # noqa: E402
 
 ACCOUNT = "999000111"  # synthetic; conftest assigns the same value
 STREAM_SLOTS = ["0935", "1030", "1130", "1230", "1330", "1430"]
@@ -135,7 +136,7 @@ def test_every_planned_order_is_exactly_the_primarys_own_candidate(tmp_path, cap
         assert order["decision_price"] == pytest.approx(row["current_price"])
         assert order["prior_close"] == row["prior_close"]
         assert order["prior_low"] == row["prior_low"]  # None when the prior low is unknown: never fabricated
-        assert order["ref_id"] == f"dca-runner-{slot}-{DAY}-{symbol}"
+        assert order["ref_id"] == native_ref_id(slot, DAY, symbol)
 
 
 @pytest.mark.parametrize("slot", STREAM_SLOTS)

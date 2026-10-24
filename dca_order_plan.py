@@ -53,6 +53,7 @@ from near_close_dca import (
     graded_buy_multiplier,
     select_first_allocation_base_usd,
 )
+from scripts.validate_native_placement import native_ref_id
 
 __all__ = [
     "MAC_PATH_BUDGET_S",
@@ -251,8 +252,10 @@ def _is_cent_amount(value: float) -> bool:
 
 
 def _expected_ref_id(slot: str, trading_day: date, symbol: str) -> str:
-    # Same derivation as dca_runner.execute_plan (docs/live_wiring.md).
-    return f"dca-runner-{slot}-{trading_day.isoformat()}-{symbol}"
+    # The native UUID the broker's place_equity_order tool accepts (it rejects the readable dca-runner-… string).
+    # The readable key is hashed into the UUID by scripts.validate_native_placement, the same derivation the
+    # Claude reader sends, so an order placed from a plan carries the reference the plan validator checks.
+    return native_ref_id(slot, trading_day.isoformat(), symbol)
 
 
 def _order_errors(
