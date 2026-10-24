@@ -191,6 +191,9 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   `build_afternoon_live_run_classification` for 15:30.
 - It writes `run_state.json` and `run_summary.json`, plus header-only CSVs
   where missing, then checks them with `validate_run_artifacts`.
+- For states it builds, `generated_at` and `finalized_at` record the artifact
+  write time. Risk consumers use `dca_risk.run_timestamp_et`, which reads the
+  classification's actual start and floors it at the trading day's nominal slot.
 - It refreshes the pointer through `same_day_pointer.refresh_latest_pointer`,
   or `update_latest_scheduled_run_pointer` for 15:30, then re-validates the
   pointer and the slot. It exits 0 only when both verify.
