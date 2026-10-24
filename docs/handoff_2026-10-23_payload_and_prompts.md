@@ -31,7 +31,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1894 | `b0030620` | Changed `near_close_dca.py` (a bundled file), so the planner stamp moved to `b106fea3` (since superseded). Prompts and file were regenerated in the same PR. |
 | #1911 | `147c4faf` | Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
 | #1914 | `b396c8e3` | Unrelated Sentinel fix. It also deleted this note by accident; this PR restores it. Changed a bundled file, so it moved the planner stamp. |
-| #1916 | `16639526d` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
+| #1916 | `16639526dbae` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
 | #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Latest planner change; the stamp is `07c79aa9`. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
 
