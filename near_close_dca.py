@@ -379,6 +379,15 @@ ACTIVE_TICKERS = [
     "MCK",
     "CHD",
     "CL",
+    # OCT 23 2026 (user-requested): CCI (Crown Castle Inc.). A read-only Robinhood
+    # instrument search resolved CCI as Crown Castle Inc. (state active, prior
+    # close $78.83 on 2026-10-22). Fractional tradability was NOT verified (that
+    # check needs the account number), so the run-time is_tradable_for_fractional_buy
+    # gate admits or blocks CCI fail-closed. CCI is already in tickers.txt (the
+    # history-fetch symbol list) but has no calibrated config/per_ticker_sizing.json
+    # entry yet, so its sizing waits on scripts/generate_per_ticker_sizing.py
+    # being re-run against the ticker_data archive. See config/tickers.json's notes.
+    "CCI",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it
