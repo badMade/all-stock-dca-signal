@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-23, after #1921): commit `9c6836af`. Nothing below is live until
+State of `main` when this was last updated (2026-10-24, after #1926): commit `e1183fa8`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -30,9 +30,12 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1907 | `30d5a8ff` | Rebuilt the committed `backup_planner.pyz` (stamp `41fc5fa0`) after it had drifted from its sources, and added two tests that fail CI if the file or the prompts ever disagree again. |
 | #1894 | `b0030620` | Changed `near_close_dca.py` (a bundled file), so the planner stamp moved to `b106fea3` (since superseded). Prompts and file were regenerated in the same PR. |
 | #1911 | `147c4faf` | Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
-| #1914 | `b396c8e3` | Unrelated Sentinel fix. It also deleted this note by accident; this PR restores it. Changed a bundled file, so it moved the planner stamp. |
-| #1916 | `16639526dbae` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
+| #1914 | `b396c8e3` | Unrelated Sentinel fix. It also deleted this note by accident; #1925 restored it. Changed a bundled file, so it moved the planner stamp. |
+| #1916 | `16639526d` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
 | #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Latest planner change; the stamp is `07c79aa9`. |
+| #1925 | `5e5de7c7` | Restored this note after #1914 deleted it. |
+| #1927 | `73968ab7` | Fixed a red test on `main` caused by #1925: a short commit hash made only of digits in this note reads as an account number to `test_no_account_shaped_literal_in_tracked_config_source_or_docs`. |
+| #1926 | `9f6ae186` | Removed the stray `pr_description.txt` that came in with #1911. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
 
 ## Do these in order
@@ -70,6 +73,8 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 ## Not verified
 
+- That `main` stayed green after #1926. The last runs I read were green on #1926's and #1927's own heads.
+
 - That the scheduled tasks hold the same Gate 5 sentence as the repo.
 - The new `ticker_errors` rule and the 95% floor live. The 10-22 slots were all 90/90.
 - Whether the QTOP and DXYZ aborts were quiet tickers. Only TOPT could have been checked, and the result was not seen.
@@ -87,6 +92,8 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 - Line endings: a planner rebuilt on Windows used to stamp `f4bbe2f9` instead of CI's `675d66b7` (the hash of the same
   sources with CRLF endings), which failed three guard tests on #1911. #1915 fixed the build, so a rebuild on either OS
   should now match. If a guard test still reports a mismatch, check for an older checkout of `build_backup_planner.py`.
+- Write commit hashes in this note with at least one letter (use 9 or more characters). A hash made only of digits, such as
+  the 8-character one that broke `main` after #1925, fails the account-number scan.
 - Whenever `main` changes the planner or the backup procedure, the Perplexity prompt stamps change and need
   regenerating and repasting. Two parties pushing regenerated prompts to one branch caused repeated conflicts on #1862.
 - The committed `backup_planner.pyz` must be rebuilt in the same PR as any change to the planner's sources. It drifted
