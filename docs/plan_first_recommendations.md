@@ -68,7 +68,13 @@ two jobs with different content.
 | 3 | `NONE` | No set for today yet, or no channel enabled in `config/recommendations.json` |
 | 2 | `ERROR` | A channel failed. `--notify` raises a macOS notification; the next run retries |
 
-Install it with the same root the courier writes the store under:
+Install it with `deploy/launchd/install_recommendations_publish.sh` from the checkout on the Mac. It resolves the
+cron root the way every stream does (`$DCA_CRON_TRACKING_ROOT`, else `.env`, else `<checkout>/cron_tracking`;
+`--cron-root DIR` overrides), refuses a root with no `recommendations/` store, checks that git can push from your
+login (`git push --dry-run`), runs one `publish` by hand, then validates, unloads any old copy and loads the agent.
+Re-run it to change the root; `--uninstall` removes it; `--dry-run` renders and checks without loading anything.
+
+The same steps by hand, with the same root the courier writes the store under:
 
 ```bash
 sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$DCA_CRON_TRACKING_ROOT|g" \
