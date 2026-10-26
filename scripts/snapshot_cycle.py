@@ -1,4 +1,10 @@
-"""Run or inspect one Robinhood data-courier cycle without placing orders."""
+"""Run or inspect one Robinhood data-courier cycle without placing orders.
+
+DEPRECATED (2026-10-26): the 5-minute Claude courier is being retired in favour of one program, the payload
+launcher (``scripts/robinhood_payload.py`` + ``deploy/launchd/robinhood_payload.sh``, docs/robinhood_payload.md).
+Nothing is scheduled against this module; ``ingest`` and ``status`` stay until the order-page and buying-power
+fetch (the part the payload does not cover yet) moves into the payload program. Do not add new callers.
+"""
 
 from __future__ import annotations
 

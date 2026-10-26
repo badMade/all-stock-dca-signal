@@ -1,5 +1,7 @@
 # Plan-first recommendations
 
+> **Deprecation (2026-10-26).** The 5-minute Claude courier (`claude/dca-executor-prompts/drafts/plan-first/courier.draft.txt`, `scripts/snapshot_cycle.py fetch-plan`) is deprecated and must not be scheduled. Data fetching consolidates into one program, the payload launcher (`scripts/robinhood_payload.py`, [robinhood_payload.md](robinhood_payload.md)). Gap still to port: the courier also saved `get_equity_orders` pages and the `get_portfolio` buying power, which the payload does not fetch yet; `snapshot_cycle ingest` stays as the reference for that raw-file contract until it does. The recommender, store, reader and fill-comparison below are unchanged.
+
 Plan-first separates computation from the buying agent. The engine computes the recommendation and private expected-price evidence; the reader receives only ticker, dollar amount and reference ID. The buying agent does no sizing math and fetches no prices.
 
 ## Data flow
