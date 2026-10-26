@@ -718,6 +718,13 @@ def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
     assert done.returncode == 2 and "must be whole numbers" in done.stderr
 
 
+@pytest.mark.parametrize("size, needle", [("two", "must be whole numbers"), ("0", "must be at least 1")])
+def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
+    # 0 would make the rescue loop's step zero; refuse it before any chunk is fetched.
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_RESCUE_CHUNK_SIZE": size})
+    assert done.returncode == 2 and needle in done.stderr and "timing chunk=" not in done.stderr, done.stderr
+
+
 # -- 3:30 PM (shadow only): plannable and buildable on demand, never scheduled, never read by a live prompt -------
 
 
