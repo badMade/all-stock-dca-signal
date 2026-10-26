@@ -134,8 +134,11 @@ _DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)\b")
 _END_DATE_CONTEXT_CHARS = 80
 _END_DATE_PHRASE_RE = re.compile(r"end[_ ]date|window end|trading window ends?", re.IGNORECASE)
 _LONG_DIGITS_RE = re.compile(r"\d{6,}")
-# A whole 6+ digit run (not a slice of a longer one) -- an account candidate.
-_ACCOUNT_CANDIDATE_RE = re.compile(r"(?<!\d)\d{6,}(?!\d)")
+_ACCOUNT_REFERENCE_RE = re.compile(
+    r"(?:--account(?:\s*=\s*|\s+)|[\"']account_number[\"']\s*:\s*[\"']?|"
+    r"\baccount(?:_number|\s+number)?\s*(?:[:=]\s*|\s+(?:is\s+)?)[\"']?)(\d{6,})(?!\d)",
+    re.IGNORECASE,
+)
 
 
 def default_scheduled_dir() -> Path:
@@ -363,27 +366,32 @@ def check(
 
 
 def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
-    """The one account-shaped value every live slot carries, when the env var is unset.
+    """The one account referenced by every live slot, when the env var is unset.
 
     Without ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` the literal-vs-placeholder
     lines were never normalized, so the plain command reported every slot as
     ``differs`` right after a faithful repaste (2026-09-22: 13 false changed
-    lines per slot). The live bodies already hold the account, so use it --
-    but only when exactly ONE 6+ digit value is common to every live slot.
-    Anything else (a slot missing, two candidates, a slot on a different
-    account) returns None and the comparison stays strict, so a live task
-    pointed at the wrong account still reads as drift. Never printed.
+    lines per slot). The live bodies already hold the account in account-specific
+    references, so use it only when each slot references exactly one account and
+    every slot agrees. Unrelated numbers are ignored. Anything else (a slot
+    missing or carrying multiple/different account references) returns None.
+    Never printed.
     """
-    common: Optional[set] = None
+    shared: Optional[str] = None
     for mirror in sorted(Path(mirror_dir).glob("*.txt")):
         if mirror.name.startswith("."):
             continue
         live = Path(scheduled_dir) / str(task_id_for(mirror)) / "SKILL.md"
         if not live.is_file():
             return None
-        values = set(_ACCOUNT_CANDIDATE_RE.findall(live.read_text(encoding="utf-8")))
-        common = values if common is None else common & values
-    return next(iter(common)) if common and len(common) == 1 else None
+        references = set(_ACCOUNT_REFERENCE_RE.findall(live.read_text(encoding="utf-8")))
+        if len(references) != 1:
+            return None
+        account = next(iter(references))
+        if shared is not None and account != shared:
+            return None
+        shared = account
+    return shared
 
 
 def mirror_set_problem(mirror_dir: Path) -> Optional[str]:

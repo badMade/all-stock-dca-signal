@@ -147,6 +147,7 @@
   "scripts.slot_attribution": "Reads each slot's saved run record and works out which broker order IDs belong to which slot. Read-only; it never contacts the broker.",
   "scripts.snapshot_cycle": "Runs or inspects one data-gathering cycle of the plan-first design. It never places orders.",
   "scripts.stream_candidates": "The shared machinery behind the morning, midday, market-open and intraday signal steps.",
+  "scripts.sync_live_prompts": "Brings the live scheduled-task text up to date with the copies saved in the repo. It backs each file up first and does nothing unless told to write.",
   "scripts.validate_native_placement": "Checks the broker's reply to each order the agent places and stops the batch if something looks wrong.",
   "scripts.verify_perplexity_pair": "Checks that the backup prompts and the backup planner file belong to the same version before you paste them.",
   "scripts.verify_schedule": "Daily audit: did each live slot leave same-day evidence that it ran?",
