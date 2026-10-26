@@ -47,7 +47,16 @@ STATUS_NONE = "none"
 STATUS_DIPPING = "dipping"
 STATUS_FIRING = "firing"
 
+
 def _is_finite_scalar(val: object) -> bool:
+    """True only for a real, finite int/float; never raises.
+
+    bool is rejected because it is an int subclass that carries no amount. The OverflowError guard
+    exists because json.loads() parses an arbitrarily large JSON integer into an unbounded Python int,
+    which passes isinstance() but makes math.isfinite() RAISE rather than return False; uncaught, that
+    escaped the per-ticker CorruptedLedgerStateError boundary and aborted the whole scheduled run
+    (#1912, restored after #1914 rolled it back).
+    """
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         return False
     try:
