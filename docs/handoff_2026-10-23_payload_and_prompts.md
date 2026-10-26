@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-24, after #1926): commit `e1183fa8`. Nothing below is live until
+State of `main` when this was last updated (2026-10-26, after #1937): commit `830d2340`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -32,10 +32,16 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1911 | `147c4faf` | Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
 | #1914 | `b396c8e3` | Unrelated Sentinel fix. It also deleted this note by accident; #1925 restored it. Changed a bundled file, so it moved the planner stamp. |
 | #1916 | `16639526d` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
-| #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Latest planner change; the stamp is `07c79aa9`. |
+| #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Moved the planner stamp to `07c79aa9` (since superseded). |
+| #1922, #1923 | `297430ac`, `4e8aa8dc` | Changed bundled files (titles: "Rebase pr 1893", "Perf opt path resolve"), so the planner stamp moved to `61cbe8ec`. Prompts and file were regenerated. Not reviewed here. |
 | #1925 | `5e5de7c7` | Restored this note after #1914 deleted it. |
 | #1927 | `73968ab7` | Fixed a red test on `main` caused by #1925: a short commit hash made only of digits in this note reads as an account number to `test_no_account_shaped_literal_in_tracked_config_source_or_docs`. |
 | #1926 | `9f6ae186` | Removed the stray `pr_description.txt` that came in with #1911. |
+| #1930 | `205ae99e` | Restored `recorded_pr_number` handling in `triage_reconcile` that #1911 had dropped. |
+| #1931 | `943ecac3` | Previous refresh of this note. |
+| #1933 | `c6d6632b` | CI: every push to `main` gets its own concurrency group. |
+| #1935 | `5aa6653f` | Console routes test module stubs the architecture scan for every test (autouse fixture), and the gate-order test asserts the untrusted-host request never reaches it. |
+| #1937 | `830d2340` | Payload refusal marker change in `scripts/robinhood_payload.py` (see `docs/robinhood_payload.md`). Not reviewed here. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
 
 ## Do these in order
@@ -45,7 +51,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
    `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
    (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
-   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `9c6836af` both carry `07c79aa9` (read the stamp from the prompt you paste, not from this note). Two tests in
+   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `830d2340` both carry `61cbe8ec` (read the stamp from the prompt you paste, not from this note). Two tests in
    `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
    Before pasting, on a current `main`, confirm it still holds:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
@@ -73,7 +79,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 ## Not verified
 
-- That `main` stayed green after #1926. The last runs I read were green on #1926's and #1927's own heads.
+- That `main` stayed green after #1937. The last run I read was green on #1935's own head.
 
 - That the scheduled tasks hold the same Gate 5 sentence as the repo.
 - The new `ticker_errors` rule and the 95% floor live. The 10-22 slots were all 90/90.
@@ -85,10 +91,14 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 - The prompt wording "more than 4 of the 90 tickers today" is prose and is now stale: #1916 made the universe 91. The
   threshold still holds (5% of 91 is 4.55, so more than 4 still aborts), only the count in the wording is out of date.
   Edit it by hand with the next prompt change. The test only ties the 95% figure to `DEFAULT_MIN_COVERAGE`.
-- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` timed out on CI (a socket timeout) on two PRs,
-  #1897 and #1907, and passed on the next run each time. #1880 (merged 2026-10-23 06:21 UTC, after both failures) made
-  that test stub the architecture scan, so it no longer runs the real repo scan; the CI run on #1908 passed. The cause
-  of the original timeouts was never proven. If a console route test times out again, treat it as a real problem.
+- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` timed out on CI (a socket timeout) on #1897,
+  #1907 and #1931, and passed on the next run each time. The cause is a real whole-repo scan on a background thread under
+  CI coverage tracing starving the request. #1880 stubbed the scan in that test; #1914 silently reverted the stub with
+  unrelated files; #1935 restored it for the whole module and added a guard test. One green run does not prove it is gone
+  and the link is inferred, not reproduced. If it times out again, treat it as a real problem.
+- Two PRs overwrote files unrelated to their own fix: #1914 (deleted this note, reverted #1880's stub) and #1911 (dropped
+  the `triage_reconcile` change, fixed in #1930). #1914 also deleted the three `cloud-clone-*` drafts and changed
+  `dca_console.py`, `dca_inverse_martingale.py` and `config/scheduled_tasks.json`; those were not audited.
 - Line endings: a planner rebuilt on Windows used to stamp `f4bbe2f9` instead of CI's `675d66b7` (the hash of the same
   sources with CRLF endings), which failed three guard tests on #1911. #1915 fixed the build, so a rebuild on either OS
   should now match. If a guard test still reports a mismatch, check for an older checkout of `build_backup_planner.py`.
