@@ -61,6 +61,7 @@ BACKUPS = (
 
 PROCEDURE_TEMPLATE = """\
 STEP 1 - GATES
+The STAND-DOWN GATE in this task's instructions already ran the command below and kept its JSON: use that JSON and do not run it again. It is described here so its result is read the same way.
 Run `python3 backup_planner.pyz gates --task @@TASK_ID@@` (Mac: `python3 -m scripts.backup_planner gates --task @@TASK_ID@@`). It reads the real clock, converts it to America/New_York, applies the rules below, and prints one JSON document. Never pass --now; never take the date or time from recollection. @@SLOT_RESOLUTION@@ Market day: today must be a weekday that is not in the Closed list; on an early-close day a fire at or after @@EARLY_TIME@@ ET also counts as closed.
 - status PROCEED: continue. Its slot and latest_placement_et are this run's slot and latest placement time (rule 9).
 - status skipped_market_closed or skipped_outside_window: stop with exactly that status.
@@ -72,6 +73,7 @@ Do not classify these orders by hand: the planner's classify command does it in 
 PUBLISHED PLAN-FIRST SET. Then read the plan-first recommendation the Mac publishes for cloud readers: the primary's own {ticker, usd, ref_id} list per slot, the same one the Claude slot places. It is an INPUT (rule 7). Read @@PUBLISHED_CHANNELS@@ Save the text untouched to published.json; never retype, reorder, or edit it. If no channel can be read or the text is not JSON, continue without published.json: that is not an error, the run falls back to the other plan sources.
 
 STEP 3 - MAC-FIRST (replaces the 2026-09-23 rule never to check the Mac; operator directive 2026-10-06)
+The STAND-DOWN GATE already did (a) and, when the Mac was online, the status command of (c): reuse the mac_status and local_status the STAND-DOWN GATE recorded, and do not call list_devices or the status command again (only the LATE-START GUARD recheck repeats it), and the 3 minute Mac budget started at the gate's list_devices.
 a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error. Set mac_path_abandoned to false. If this session has no device-listing tool at all (the 2026-10-12 15:45 run found none), that is mac_status not_found: the Mac is out of reach, not an error, and the rule below applies.
 b. The whole Mac path has a budget of 3 minutes, counted from the start of (a). When it is spent at any point, abandon the Mac path: set mac_path_abandoned to true, ignore its partial output, run no further Mac command, and continue with the sandbox parts of (d) and (e); a plan computed after that is plan_source cloud_compute. Once mac_path_abandoned is true it never goes back to false, and every Mac command below (3c, 3e, 3f, 5, 6, 7) requires it to be false, whatever mac_status still says.
 c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only when it has failed. Decide local_status:
