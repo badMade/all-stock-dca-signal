@@ -664,6 +664,73 @@ def test_launcher_rescues_the_tickers_of_a_chunk_that_died_on_both_attempts(tmp_
     assert set(json.loads(out.read_text())["sources"]["robinhood"]) == set(plan["tickers"])
 
 
+# -- a chunk that replied but left tickers out (2026-10-26 13:30 refusal) -----------------------------------------------
+# Eight tickers came back "no data returned for this ticker" (coverage 83/91 < 95%) although Robinhood served every one
+# of them minutes later: their chunks replied, so the dead-chunk rescue never ran and run_chunk's whole-chunk retry had
+# not recovered them. They are now re-asked for alone.
+
+#: Stub ``codex``: valid data for every requested ticker, except that a request for a whole LOSSY chunk loses its first
+#: ticker (omitted, or answered with a per-ticker error when MODE=error). LOSS_ALWAYS=1 also loses it in a small request.
+_PARTIAL_STUB = """#!{python}
+import json, re, sys
+out = sys.argv[sys.argv.index("-o") + 1]
+tickers = re.search(r"Tickers: (.*)", sys.stdin.read()).group(1).split(", ")
+bar = lambda ts: dict(timestamp=ts, open=10.0, high=10.2, low=9.9, close=10.1, volume=100)
+reply = {{t: dict(previous_close_bar=bar("2026-10-19T00:00:00Z"), intraday_bars=[bar("2026-10-20T13:30:00Z")],
+              quote=dict(price=10.1, as_of="2026-10-20T13:36:00Z")) for t in tickers}}
+for chunk in json.loads({lossy!r}):
+    if {always!r} and chunk[0] in tickers or set(tickers) == set(chunk):
+        if {mode!r} == "error":
+            reply[chunk[0]] = {{"error": "no data"}}
+        else:
+            del reply[chunk[0]]
+open(out, "w").write(json.dumps(reply))
+"""
+
+
+def _run_with_lossy_chunks(tmp_path, mode, *, always=False):
+    import sys
+
+    plan = _plan_0935(tmp_path)
+    lossy = [plan["chunks"][i] for i in _DEAD]
+    stub = _PARTIAL_STUB.format(python=sys.executable, lossy=json.dumps(lossy), mode=mode, always=always)
+    done, _ = _run_launcher(tmp_path, fake_script=stub)
+    return done, plan, lossy
+
+
+@pytest.mark.parametrize("mode", ["omitted", "error"])
+def test_launcher_rescues_tickers_a_replying_chunk_left_out_or_errored(tmp_path, mode):
+    from pathlib import Path
+
+    # Two chunks reply, each minus its first ticker (absent, or a per-ticker error). The re-ask for just those tickers
+    # succeeds, so the slot publishes the whole universe instead of 89/91.
+    done, plan, lossy = _run_with_lossy_chunks(tmp_path, mode)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["valid"] == meta["universe"] == len(plan["tickers"]) and meta["failed"] == {}, meta
+    # Only the lossy chunks are rescued, and only for the one ticker each lost: no chunk that replied in full is re-asked.
+    import re
+
+    rescued = re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)
+    assert sorted(rescued) == sorted((str(i), "1") for i in _DEAD), log
+
+
+def test_launcher_rescue_never_makes_a_still_missing_ticker_worse(tmp_path):
+    from pathlib import Path
+
+    # The ticker is lost again in the small request, so it stays failed (one miss is inside the 95% floor, so the
+    # payload still publishes) and the rest of its chunk keeps the data the first reply gave it.
+    done, plan, lossy = _run_with_lossy_chunks(tmp_path, "omitted", always=True)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert set(meta["failed"]) == {chunk[0] for chunk in lossy}, meta
+    assert set(json.loads(out.read_text())["sources"]["robinhood"]) == set(plan["tickers"]) - set(meta["failed"])
+
+
 def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
     from pathlib import Path
 
@@ -691,7 +758,9 @@ def test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk(tmp_path):
     done, chunks = _run_launcher(tmp_path)
     log = done.stdout + done.stderr
     assert "deadline chunk=" not in log and re.search(r"timing total .* deadline=0\b", log), log
-    assert len(re.findall(r"timing chunk=", log)) == chunks, log
+    # Whole chunks only (2026-10-26): the stub's empty replies now also trigger rescue requests, which log
+    # `timing chunk=<i>.r<k>`; those are rescue parts, not first-pass chunks, so they must not count here.
+    assert len(re.findall(r"timing chunk=\d+ attempt=", log)) == chunks, log
 
 
 def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):

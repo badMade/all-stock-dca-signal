@@ -147,14 +147,30 @@ wait
 # Rescue pass (2026-10-26). The 95% floor tolerates 4 misses in a 91-ticker universe, but the unit that fails is a whole
 # 8-ticker chunk: at 09:35 chunks 4 and 10 died on both attempts, 16 tickers went missing, and the slot aborted although
 # every other chunk validated. A chunk with no reply at all is asked for again in requests of RESCUE_SIZE tickers (each
-# with run_chunk's own retry and deadline), so one dead worker no longer costs the slot. Only a dead chunk is rescued: a
-# chunk that replied with per-ticker errors already had its retry. A rescue part is named chunk_<i>.r<k>.json and folded
-# back into chunk_<i>.json before the merge, so the merge's chunk ownership is unchanged.
-dead=()
-for ((i = 0; i < idx; i++)); do [ -s "$WORK/chunk_$i.json" ] || dead+=("$i"); done
+# with run_chunk's own retry and deadline), so one dead worker no longer costs the slot. A rescue part is named
+# chunk_<i>.r<k>.json and folded back into chunk_<i>.json before the merge, so the merge's chunk ownership is unchanged.
+# Extended the same day (13:30 refusal: 8 tickers, "no data returned", coverage 83/91): a chunk that DID reply but left
+# tickers out, or answered them with a per-ticker error, only got run_chunk's whole-chunk retry, which keeps the better
+# attempt and can still lose the same tickers twice. Those tickers are now re-asked for alone, in the same small
+# requests. Only absent or "error" tickers are rescued; a ticker that replied with data is never re-fetched, and a
+# rescue reply that is again missing or an error leaves the original entry in place for the merge to report.
+targets=()
+for ((i = 0; i < idx; i++)); do
+  # A crash here only means this chunk is not rescued (set -e must not end the launcher before the merge).
+  need="$("$PY" -c '
+import sys
+from scripts.robinhood_payload import _load_chunk
+try:
+    reply = _load_chunk(sys.argv[1])
+except (OSError, ValueError):  # no file, or one that holds no usable object: every ticker of the chunk is missing
+    reply = {}
+print(",".join(t for t in sys.argv[2].split(",") if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))))
+' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
+  if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
+done
 rescued=0
-for i in ${dead[@]+"${dead[@]}"}; do
-  IFS=, read -r -a members <<<"$(sed -n "$((i + 1))p" "$WORK/chunks.txt")"
+for i in ${targets[@]+"${targets[@]}"}; do
+  IFS=, read -r -a members <<<"$(cat "$WORK/need_$i.txt")"
   echo "robinhood_payload: rescue chunk=$i tickers=${#members[@]} size=$RESCUE_SIZE" >&2
   for ((k = 0; k * RESCUE_SIZE < ${#members[@]}; k++)); do
     group="$(IFS=,; echo "${members[*]:k*RESCUE_SIZE:RESCUE_SIZE}")"
@@ -165,31 +181,42 @@ for i in ${dead[@]+"${dead[@]}"}; do
   done
 done
 wait
-for i in ${dead[@]+"${dead[@]}"}; do
+for i in ${targets[@]+"${targets[@]}"}; do
   specs=()
   for t in "$WORK"/rescue_"$i".r*.tickers; do
     part="${t%.tickers}"; part="${part##*/rescue_}"
     specs+=("$WORK/chunk_$part.json=$(cat "$t")")
   done
   # Each part counts only for its own group, as each chunk does in the merge: a key a part was not asked for is dropped.
+  # The chunk's own reply (if any) is the base; a part overrides it only with an entry that carries no error, so a
+  # rescue can never make a ticker worse than it was.
   "$PY" -c '
 import json, sys
 from scripts.robinhood_payload import _load_chunk
-merged = {}
+try:
+    merged = _load_chunk(sys.argv[1])
+except (OSError, ValueError):
+    merged = {}
+changed = False
 for spec in sys.argv[2:]:
     path, group = spec.rsplit("=", 1)
     try:
         reply = _load_chunk(path)
     except (OSError, ValueError):  # a dead part leaves its tickers to the merge report, as a dead chunk does
         continue
-    merged.update({t: reply[t] for t in group.split(",") if t in reply})
-if merged:
+    for t in group.split(","):
+        if t in reply and not (isinstance(reply[t], dict) and reply[t].get("error")):
+            merged[t] = reply[t]
+            changed = True
+        elif t in reply and t not in merged:
+            merged[t] = reply[t]  # keep the error text for the merge report when there was nothing before it
+            changed = True
+if changed:
     with open(sys.argv[1], "w", encoding="utf-8") as handle:
         json.dump(merged, handle)
-' "$WORK/chunk_$i.json" "${specs[@]}" \
-    || echo "robinhood_payload: rescue chunk=$i could not fold its parts back; its tickers go to the merge report" >&2
+' "$WORK/chunk_$i.json" "${specs[@]}"     || echo "robinhood_payload: rescue chunk=$i could not fold its parts back; its tickers go to the merge report" >&2
   # Under set -e a crash above would have ended the launcher before the merge (no refusal marker, no log line), so
-  # every failure here only leaves the chunk without a reply, exactly as before the rescue existed.
+  # every failure here only leaves the chunk as it was before the rescue.
   rm -f "$WORK"/chunk_"$i".r*.json
   # Tickers carried by the folded reply, per-ticker errors included; the merge decides which of them validate.
   echo "robinhood_payload: rescue chunk=$i replied=$("$PY" -c 'import json,sys
