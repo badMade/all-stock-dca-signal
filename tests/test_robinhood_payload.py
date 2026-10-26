@@ -758,7 +758,9 @@ def test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk(tmp_path):
     done, chunks = _run_launcher(tmp_path)
     log = done.stdout + done.stderr
     assert "deadline chunk=" not in log and re.search(r"timing total .* deadline=0\b", log), log
-    assert len(re.findall(r"timing chunk=", log)) == chunks, log
+    # Whole chunks only (2026-10-26): the stub's empty replies now also trigger rescue requests, which log
+    # `timing chunk=<i>.r<k>`; those are rescue parts, not first-pass chunks, so they must not count here.
+    assert len(re.findall(r"timing chunk=\d+ attempt=", log)) == chunks, log
 
 
 def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):
