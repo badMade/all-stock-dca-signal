@@ -46,6 +46,15 @@ It then reads `ticker_errors.robinhood` (2026-10-23, to match the 95% floor from
 evidence, and the generator scores each one `NO_DATA` (reported as `provider_error_tickers`, never a BUY). The existing
 zero-candidates rule still applies: with any `provider_error_count` above 0 a run that places nothing alerts instead of ending silently.
 
+**Refusal marker.** When `merge` refuses to publish (coverage below the floor, or built before the decision
+anchor) it writes `<payload>.refused.json` beside the would-be payload: slot, day, time, reason, valid/universe
+counts and each not-valid ticker with its reason. `check` on a missing payload reads it and prints
+`publisher ran and refused at HH:MM ET: coverage 89/90 ... [not valid: DXYZ (...)]`; with no marker it prints
+`no record that the publisher ran for this slot`. The live prompts already put `check`'s stderr in the Gate 9
+alert, so the alert now says which of the two happened. (2026-10-21: three slots aborted on a refusal while the
+13:30 alert guessed the Mac was asleep.) A marker for another slot or day, or an unreadable one, is ignored; a
+successful publish deletes the slot's marker.
+
 **Install.** Copy `deploy/launchd/com.all-stock-dca.robinhood-payload.plist.template` to
 `~/Library/LaunchAgents/`, replace the three `REPLACE_WITH_*` values, and `launchctl load` it. The Mac must be on
 ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`. Timing (2026-10-22): each chunk attempt logs
