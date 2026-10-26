@@ -48,6 +48,37 @@ Recommendations live under `<cron root>/recommendations/<day>/`: `rec_*.json` is
   the future, or one older than 10 minutes, and stamps everything with `planned_at` rather
   than the ingest clock. A late ingest therefore cannot make old data look fresh.
 
+## Publishing to the `recommendations` branch (Mac launchd)
+
+The Perplexity backups' cloud fallback reads the `recommendations` branch (`plan --source published_rec`,
+`classify --published`). On 2026-10-26 that branch was a 404. Its only writer was the courier's own `ingest`, and the
+courier runs in a scheduled Claude session, which holds no GitHub credentials (`docs/schedule_verification.md`,
+confirmed 2026-10-21). The push failed every cycle, and the only trace was one `"ok": false` row in an exit-0 report.
+
+The push now runs on the Mac under your own git login: `python -m scripts.snapshot_cycle publish --notify`, every
+5 minutes from `deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template`. It publishes today's newest
+set per slot, whatever its age. `classify` needs today's set to recognise an order Claude placed from an older file,
+and `published_rec` applies its own freshness rule. `ingest` no longer pushes the branch, so it is never written by
+two jobs with different content.
+
+| Exit | Status | Meaning |
+| --- | --- | --- |
+| 0 | `OK` | Every enabled channel published |
+| 0 | `UNCHANGED` | The same sets were already published; nothing pushed |
+| 3 | `NONE` | No set for today yet, or no channel enabled in `config/recommendations.json` |
+| 2 | `ERROR` | A channel failed. `--notify` raises a macOS notification; the next run retries |
+
+Install it with the same root the courier writes the store under:
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$DCA_CRON_TRACKING_ROOT|g" \
+  deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.recommendations-publish.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.recommendations-publish.plist
+tail -n 5 /tmp/dca-recommendations-publish.log      # expect OK, UNCHANGED or NONE; never ERROR
+git ls-remote origin refs/heads/recommendations     # one line once the first set of the day is published
+```
+
 ## Rollout and limits
 
 Run in shadow mode for at least five trading days, comparing recommendations with live slot buys. Then the operator repastes the seven reader prompts. Spread is checked at compute time, not placement time; decision time may move up to 15 minutes; rollover reserve is not read (treated as 0, the conservative choice). Gate 9's budget record comes from the program-only `ExpectedPriceSet.budget` (the tier and caps the engine actually used), which `finish` forwards as `--budget-json`. `filter` re-checks the daily, weekly and order-count caps against the fresh order history the agent just saved and places nothing if the set no longer fits. Gate 6.5 binds logged decision prices only for buys made through this path; a repeat after a legacy-slot buy gets the gate's conservative $0 until the legacy slots are retired.

@@ -51,7 +51,7 @@ set is the primary's own `{ticker, usd, ref_id}` list, which these backups now r
 | Command | Where | Output |
 | --- | --- | --- |
 | `plan --source mac_rec --trading-day D --slot S --now T` | Mac | The slot's set from the local store, by the reader's freshness rule (`config/recommendations.json` `max_age_minutes`), as a `plan_first` plan |
-| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set) |
+| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set). The Mac's `snapshot_cycle publish` launchd job pushes that branch (`docs/plan_first_recommendations.md`) |
 | `executor-ids --trading-day D --slot S` | Mac | The broker order ids Claude saved for the slot: the reader's `placements/<slot>/<TICKER>.json` and the live prompt's `place_<TICKER>.json` in the slot's run directory, with a per-source file count in `sources` |
 | `classify --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]` | sandbox | `CLEAR` or `UNRECOGNIZED` for every order inside this slot's window |
 
