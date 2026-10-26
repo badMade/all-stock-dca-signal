@@ -3,6 +3,11 @@
 ``publish`` is the one subcommand that does NOT run in the courier session: the Mac's launchd job
 (``deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template``) runs it under the operator's own
 git login, because a scheduled Claude session holds no GitHub credentials (see :func:`_publish`).
+
+DEPRECATED (2026-10-26): the 5-minute Claude courier is retired; Robinhood bars and quotes now come from one
+program, the payload launcher (``scripts/robinhood_payload.py`` + ``deploy/launchd/robinhood_payload.sh``,
+docs/robinhood_payload.md). Nothing is scheduled against this module. The payload does not fetch order pages or
+buying power, so ``ingest`` and ``status`` stay as the reference for that raw-file contract. Do not add new callers.
 """
 
 from __future__ import annotations
