@@ -114,6 +114,12 @@ RETIRED_YFINANCE_MARKERS = ("PREFETCHED YFINANCE FALLBACK", "PREFETCH-FIRST")
 # generator and are never recomputed by hand. A live body without this sentence lets a failed data path end in
 # hand-written signal logic instead of a not_submitted_error abort.
 NO_HAND_SIGNALS_RULE = "Never recompute signals, sizes or candidates by hand"
+# 2026-10-22 11:30 (ref_id_format_rejected): the per-order placement sentence still named the text key
+# dca-runner-<slot>-<date>-<TICKER> right after "DETERMINISTIC ref_id", with the UUID override ~110 lines
+# earlier in the NATIVE ORDER-ID RULE. One session in five sent the text key, place_equity_order rejected
+# it (UUID only) and the slot placed nothing. The reworded mirrors put only the validate_native_placement
+# UUID in the ref_id position; a live body still carrying this phrase needs a repaste.
+TEXT_KEY_REF_ID_WORDING = "DETERMINISTIC ref_id with every order (sent as the UUID"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -250,6 +256,14 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
                 "code": "missing_no_hand_signals_rule",
                 "detail": f'Gate 5 lacks the rule "{NO_HAND_SIGNALS_RULE}": a failed data path could end in '
                 "hand-replicated signal logic instead of a not_submitted_error abort (hand_reimplemented)",
+            }
+        )
+    if TEXT_KEY_REF_ID_WORDING in live_text:
+        findings.append(
+            {
+                "code": "ref_id_names_text_key",
+                "detail": "the placement sentence names the dca-runner text key as the ref_id; a session that sends "
+                "it is rejected by place_equity_order (UUID only) and places nothing (2026-10-22 11:30)",
             }
         )
     if window_end_date:
