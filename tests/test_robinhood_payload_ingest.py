@@ -1,17 +1,14 @@
 """The plan-first half of scripts/robinhood_payload.py (2026-10-26): bid/ask, the broker worker's prompt and reply, ingest,
 and the launcher step that runs them after the payload merge. Replaces the retired Claude courier's duties."""
 
-import json
 import os
-import subprocess
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from test_robinhood_payload import DAY, good_ticker, kw, plan_for, write_chunk
 
 from scripts import robinhood_payload as rp
-from test_robinhood_payload import DAY, good_ticker, kw, plan_for, write_chunk
 
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO / "deploy/launchd/robinhood_payload.sh"
@@ -126,6 +123,7 @@ def test_ingest_exits_3_when_another_ingest_holds_the_lease(tmp_path, monkeypatc
     monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "ct"))
     import importlib
+
     import dca_paths
 
     importlib.reload(dca_paths)
