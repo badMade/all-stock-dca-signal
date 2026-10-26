@@ -534,10 +534,11 @@ def test_refusal_before_the_anchor_is_recorded_too(tmp_path):
 LAUNCHER = "deploy/launchd/robinhood_payload.sh"
 
 
-def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None):
+def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_script=None):
     """Run the real launcher for a past trading day with a stub `codex` (default: answers every chunk with `{}`).
 
     The merge then publishes nothing (no data for any ticker), which is fine: this exercises the fetch loop's logging only.
+    ``fake_script`` replaces the whole stub when a test needs one that reads the prompt (``_RESCUE_STUB``).
     """
     import os
     import subprocess
@@ -547,7 +548,8 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None):
     repo = Path(__file__).resolve().parents[1]
     fake = tmp_path / "fake_codex"
     fake.write_text(
-        f'#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n{reply}\n'
+        fake_script
+        or f'#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n{reply}\n'
     )
     fake.chmod(0o755)
     env = {
@@ -596,6 +598,88 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     assert sorted(seen) == sorted(
         [(str(i), "1", "1") for i in range(chunks)] + [(str(i), "2", "0") for i in range(chunks)]
     ), log
+
+
+# -- a whole dead chunk (2026-10-26 09:35 abort) -----------------------------------------------------------------------
+# Chunks 4 and 10 of the 0935 plan each failed both attempts, so 16 of 91 tickers (two whole chunks) went missing and
+# the 95% floor refused the payload. The floor tolerates 4 misses but the unit that fails is an 8-ticker chunk, so one
+# dead chunk alone was enough to cost the slot; and the launcher's cleanup deleted the workers' logs, so nobody could
+# say afterwards why those two workers died. The incident's plan is replayed here (2026-10-20 has the same universe).
+
+#: Stub ``codex``: answers each requested ticker with valid 0935 data for 2026-10-20, except that it dies (stderr line,
+#: no reply, exit 1) on a request for a DEAD_CHUNKS chunk: with DEAD_MODE=whole only when the request is that whole
+#: chunk, with DEAD_MODE=always whenever the request names any of its tickers.
+_RESCUE_STUB = """#!{python}
+import json, re, sys
+out = sys.argv[sys.argv.index("-o") + 1]
+tickers = re.search(r"Tickers: (.*)", sys.stdin.read()).group(1).split(", ")
+dead = [set(c) for c in json.loads({dead!r})]
+if any(set(tickers) == c if {mode!r} == "whole" else set(tickers) & c for c in dead):
+    print("stub codex: simulated worker death for " + ",".join(tickers), file=sys.stderr)
+    sys.exit(1)
+bar = lambda ts: dict(timestamp=ts, open=10.0, high=10.2, low=9.9, close=10.1, volume=100)
+reply = {{t: dict(previous_close_bar=bar("2026-10-19T00:00:00Z"), intraday_bars=[bar("2026-10-20T13:30:00Z")],
+              quote=dict(price=10.1, as_of="2026-10-20T13:36:00Z")) for t in tickers}}
+open(out, "w").write(json.dumps(reply))
+"""
+
+_DEAD = (4, 10)  # the two chunks lost on 2026-10-26
+
+
+def _run_with_dead_chunks(tmp_path, mode):
+    import sys
+
+    plan = _plan_0935(tmp_path)
+    dead = [plan["chunks"][i] for i in _DEAD]
+    stub = _RESCUE_STUB.format(python=sys.executable, dead=json.dumps(dead), mode=mode)
+    done, _ = _run_launcher(tmp_path, fake_script=stub)
+    return done, plan, dead
+
+
+def _plan_0935(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {**os.environ, "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct")}
+    plan = subprocess.run(
+        [sys.executable, "-m", "scripts.robinhood_payload", "plan", "--slot", "0935", "--day", "2026-10-20"],
+        env=env, capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1], check=True,
+    )
+    return json.loads(plan.stdout)
+
+
+def test_launcher_rescues_the_tickers_of_a_chunk_that_died_on_both_attempts(tmp_path):
+    from pathlib import Path
+
+    # The dead chunks' tickers are fine; only the 8-ticker request that carries them dies. Re-asking for them in
+    # smaller requests must recover them, so the slot publishes its whole universe instead of aborting at Gate 5.
+    done, plan, dead = _run_with_dead_chunks(tmp_path, "whole")
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["valid"] == meta["universe"] == len(plan["tickers"]) and meta["failed"] == {}, meta
+    assert set(json.loads(out.read_text())["sources"]["robinhood"]) == set(plan["tickers"])
+
+
+def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
+    from pathlib import Path
+
+    # The dead chunks' tickers fail however they are asked for, so the slot still refuses (the floor is unchanged);
+    # but the workers' own output must survive the launcher's cleanup next to the refusal marker, or the next
+    # incident is as undiagnosable as this one. Healthy chunks leave nothing behind.
+    done, plan, dead = _run_with_dead_chunks(tmp_path, "always")
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 2 and out.with_suffix(".refused.json").exists() and not out.exists(), log
+    kept = [p for p in out.parent.rglob("*") if p.is_file() and ".log" in p.name]
+    assert kept, f"no worker log kept under {out.parent}: {sorted(p.name for p in out.parent.rglob('*'))}"
+    texts = [p.read_text() for p in kept]
+    assert all("simulated worker death" in t for t in texts), kept  # only the dead requests' logs are kept
+    for chunk in dead:
+        assert any(f"simulated worker death for {','.join(chunk)}" in t for t in texts), (chunk, kept)
 
 
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
