@@ -218,7 +218,10 @@ class MarketHistoryStore:
         # (tests/test_config_invariants.py) wherever a fixture or doc spells one out.
         run_dir = (self.raw_dir / "incoming" / now_et.strftime("%Hh%Mm%Ss")).resolve()
         symbols = list(dict.fromkeys(universe))
+        # get_equity_quotes takes up to 25 symbols per call; get_equity_historicals rejects anything over 10
+        # ("too many symbols ... max 10", 2026-10-26), so the two tools need separate chunk sizes.
         chunks = [symbols[index:index + 25] for index in range(0, len(symbols), 25)]
+        history_chunks = [symbols[index:index + 10] for index in range(0, len(symbols), 10)]
         stored_bars = self._read_merged_bars()
         latest: datetime | None = None
         for row in stored_bars.values():
@@ -241,14 +244,14 @@ class MarketHistoryStore:
         calls = []
         for index, chunk in enumerate(chunks):
             calls.append({"tool": "get_equity_quotes", "args": {"symbols": chunk}, "save_as": f"quotes_{index}.json", "paginate": False})
-        for index, chunk in enumerate(chunks):
+        for index, chunk in enumerate(history_chunks):
             calls.append({"tool": "get_equity_historicals", "args": {
                 "symbols": chunk, "start_time": start.isoformat(), "end_time": now_et.isoformat(),
                 "interval": "5minute", "bounds": "regular", "adjustment_type": "none",
             }, "save_as": f"bars5m_{index}.json", "paginate": False})
         if not (self.raw_dir / "daily.json").exists():
             daily_start = datetime.combine(trading_day - timedelta(days=14), time.min, ET)
-            for index, chunk in enumerate(chunks):
+            for index, chunk in enumerate(history_chunks):
                 calls.append({"tool": "get_equity_historicals", "args": {
                     "symbols": chunk, "start_time": daily_start.isoformat(), "end_time": now_et.isoformat(),
                     "interval": "day", "bounds": "regular", "adjustment_type": "none",
