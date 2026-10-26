@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-26, after #1937): commit `830d2340`. Nothing below is live until
+State of `main` when this was last updated (2026-10-26, after #1956): commit `b6e2b9ec`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -29,8 +29,8 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1906 | `810d2564` | This note. |
 | #1907 | `30d5a8ff` | Rebuilt the committed `backup_planner.pyz` (stamp `41fc5fa0`) after it had drifted from its sources, and added two tests that fail CI if the file or the prompts ever disagree again. |
 | #1894 | `b0030620` | Changed `near_close_dca.py` (a bundled file), so the planner stamp moved to `b106fea3` (since superseded). Prompts and file were regenerated in the same PR. |
-| #1911 | `147c4faf` | Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
-| #1914 | `b396c8e3` | Unrelated Sentinel fix. It also deleted this note by accident; #1925 restored it. Changed a bundled file, so it moved the planner stamp. |
+| #1911 | `147c4faf` | **Rolled back by #1914 and NOT on `main` today** (open: #1957, failing test only). Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
+| #1914 | `b396c8e3` | Duplicate-JSON-key rejection in `dca_console.py` (kept). Built on the 10-19 base, so it also rolled back other merged work: see "What #1914 rolled back" below. Moved the planner stamp. |
 | #1916 | `16639526d` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
 | #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Moved the planner stamp to `07c79aa9` (since superseded). |
 | #1922, #1923 | `297430ac`, `4e8aa8dc` | Changed bundled files (titles: "Rebase pr 1893", "Perf opt path resolve"), so the planner stamp moved to `61cbe8ec`. Prompts and file were regenerated. Not reviewed here. |
@@ -42,6 +42,9 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1933 | `c6d6632b` | CI: every push to `main` gets its own concurrency group. |
 | #1935 | `5aa6653f` | Console routes test module stubs the architecture scan for every test (autouse fixture), and the gate-order test asserts the untrusted-host request never reaches it. |
 | #1937 | `830d2340` | Payload refusal marker change in `scripts/robinhood_payload.py` (see `docs/robinhood_payload.md`). Not reviewed here. |
+| #1949, #1950, #1951 | `447d9cac`, `15a6d8c4`, `86039cd4` | Titles: `scripts.sync_live_prompts` (live task bodies up to their mirrors), Perplexity backups stand down before the broker pull, `ref_id_format_rejected` names only the UUID. Not reviewed here. The stamp moved to `6ca697a4` after these; which one moved it was not checked. |
+| #1954 | `0503586a` | Re-added the account-loading step to the bridge-shell drafts and the three `cloud-clone-*` drafts on purpose (this restores #1913's content that #1914 had rolled back). |
+| #1956 | `b6e2b9ec` | Restored #1907's two drift guards and #1915's CRLF fold that #1914 had rolled back. No prompt changes. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
 
 ## Do these in order
@@ -51,7 +54,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
    `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
    (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
-   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `830d2340` both carry `61cbe8ec` (read the stamp from the prompt you paste, not from this note). Two tests in
+   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `b6e2b9ec` both carry `6ca697a4` (read the stamp from the prompt you paste, not from this note). Two tests in
    `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
    Before pasting, on a current `main`, confirm it still holds:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
@@ -79,12 +82,18 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 ## Not verified
 
-- That `main` stayed green after #1937. The last run I read was green on #1935's own head.
+- That `main` stayed green after #1956. The last run I read was green on #1956's own head.
 
 - That the scheduled tasks hold the same Gate 5 sentence as the repo.
 - The new `ticker_errors` rule and the 95% floor live. The 10-22 slots were all 90/90.
 - Whether the QTOP and DXYZ aborts were quiet tickers. Only TOPT could have been checked, and the result was not seen.
 - A core CI job on Python 3.11. None appeared in any run that was read.
+
+## Held on purpose
+
+#1957 and #1958 hold the two fixes #1914 rolled back that change a bundled file. Each fix changes the planner hash, which
+changes the six Perplexity prompts (only the expected `content_sha256` in step 0). Land both together, rebuild
+`backup_planner.pyz` once, regenerate the prompts once and repaste once. The live-mirror prompts do not change.
 
 ## Known fragile points
 
@@ -96,12 +105,23 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
   CI coverage tracing starving the request. #1880 stubbed the scan in that test; #1914 silently reverted the stub with
   unrelated files; #1935 restored it for the whole module and added a guard test. One green run does not prove it is gone
   and the link is inferred, not reproduced. If it times out again, treat it as a real problem.
-- Two PRs overwrote files unrelated to their own fix: #1914 (deleted this note, reverted #1880's stub) and #1911 (dropped
-  the `triage_reconcile` change, fixed in #1930). #1914 also deleted the three `cloud-clone-*` drafts and changed
-  `dca_console.py`, `dca_inverse_martingale.py` and `config/scheduled_tasks.json`; those were not audited.
+- What #1914 rolled back (it was built on the 10-19 base; squash-merged on 10-23):
+
+  | Rolled back | State on `main` today |
+  | --- | --- |
+  | #1911 boolean-trap fix (`near_close_dca.py`) | **Missing.** #1911's own test passed with or without the fix. Open: #1957 (stronger failing test only). Changes the planner stamp when fixed. |
+  | #1912 `_is_finite_scalar` (`dca_inverse_martingale.py`) | **Missing.** Open: #1958 (failing tests only). Changes the planner stamp when fixed. Opt-in mode, off by default. |
+  | #1907 drift guards and #1915 CRLF fold | Restored by #1956. |
+  | #1880 payload refusal marker and console scan stub | Restored by #1937 and #1935. |
+  | #1913 account-loading step and `cloud-clone-*` drafts | Restored on purpose by #1954. (An earlier audit wrongly called #1914's deletion of the drafts correct.) |
+  | #1917 no-folder failure form in `0915ET-bridge-health-check.draft.txt` | **Missing.** Draft only. |
+  | #1892 wording of the 1530ET `reason` in `config/scheduled_tasks.json` | Missing; wording only. |
+  | #1906 and this note | Restored by #1925. |
+
+  Kept from #1914: duplicate-key rejection in `dca_console.py` POSTs, with its test.
 - Line endings: a planner rebuilt on Windows used to stamp `f4bbe2f9` instead of CI's `675d66b7` (the hash of the same
-  sources with CRLF endings), which failed three guard tests on #1911. #1915 fixed the build, so a rebuild on either OS
-  should now match. If a guard test still reports a mismatch, check for an older checkout of `build_backup_planner.py`.
+  sources with CRLF endings), which failed three guard tests on #1911. #1915 fixed the build, #1914 rolled it back and #1956
+  restored it, so a rebuild on either OS should now match. If a guard test still reports a mismatch, check for an older checkout of `build_backup_planner.py`.
 - Write commit hashes in this note with at least one letter (use 9 or more characters). A hash made only of digits, such as
   the 8-character one that broke `main` after #1925, fails the account-number scan.
 - Whenever `main` changes the planner or the backup procedure, the Perplexity prompt stamps change and need
