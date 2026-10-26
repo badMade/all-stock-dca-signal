@@ -14,8 +14,10 @@ including scheduling. Then delete the courier branch. Not "deprecate and leave";
   do not open a new PR. Any new PR must be a draft.
 - Branch pushed so far holds ONLY the deprecation notes (courier.draft.txt, snapshot_cycle.py docstring,
   docs/plan_first_recommendations.md, docs/README.md). No runtime code changed.
-- The unfinished port lives in commit `ec070d05` on `origin/claude/rescue-no-data-tickers` (the "courier branch").
-  Do NOT delete that branch until the port is on the PR branch.
+- The unfinished port is commit `ec070d05` (full id `ec070d05bb93d97d27ed68f78507ef658f26671a`). Its original branch,
+  `origin/claude/rescue-no-data-tickers`, was already deleted from GitHub by 2026-10-26 23:30 UTC, leaving the commit
+  unreachable. It is now pinned on `origin/rescue/courier-port` (session_01V6XG5FEYM3QS6oqKHh8VEu). Do NOT delete that
+  branch until the port is on the PR branch.
 - `/Users/geoffreyplymale/all-stock-dca-courier` was named by the operator; the cloud session could not see it.
   Check it: `git status` and `git log origin/<branch>..HEAD`. If it holds unpushed work, push it to a branch first.
 
@@ -23,6 +25,7 @@ including scheduling. Then delete the courier branch. Not "deprecate and leave";
 ```bash
 git fetch origin
 git checkout badmade/funny-noether-aankvh
+git rev-parse --verify ec070d05^{commit}   # present after the fetch (rescue/courier-port)
 git checkout ec070d05 -- dca_market_history.py scripts/robinhood_payload.py
 ```
 Verified: main has not touched those two files since ec070d05's base, so a whole-file checkout loses nothing.
@@ -55,7 +58,16 @@ all pass (cloud run, 2026-10-26). If they fail on the Mac, suspect the environme
    `python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`.
 6. Real-run check on the Mac (cannot be done in the cloud): install the launchd job, run one slot with
    `DCA_TRADING_DAY` and `DCA_PAYLOAD_NOW_ET` set, confirm a payload and its ingest output appear.
-7. Only after 1-6 and the PR merges: delete `origin/claude/rescue-no-data-tickers`.
+7. Only after 1-6 and the PR merges: delete `origin/rescue/courier-port` (the courier branch itself is already gone).
+
+## Keep ONE writer for the `recommendations` branch
+The ported `ingest` (`scripts/robinhood_payload.py`, `publish_all(publishers_from_settings(...))`) publishes to every
+enabled channel, `github_branch` included, and only the slot it just computed. On the Mac that push succeeds, and it
+would overwrite the whole-day document that the `snapshot_cycle publish` launchd job (PR #1964, installed on the Mac
+2026-10-26) pushes every 5 minutes, so the backups' `classify --published` would lose earlier slots' sets. Filter the
+branch out exactly as the courier's ingest does: use `scripts.snapshot_cycle._courier_publishers(settings.publish,
+repo_dir=...)` instead of `publishers_from_settings(...)`, and add a test that the ported `ingest` never calls the
+`github_branch` publisher. The publish job then picks up the new `rec_*.json` within 5 minutes.
 
 ## Risks
 - The broker worker must copy every order page back verbatim in one reply. The assembler fails closed on an incomplete
@@ -69,4 +81,6 @@ PR #1968 (docstring-only plus rebuilt `backup_planner.pyz` and six regenerated P
 ## Prompt to paste into the local Claude Code session
 > Read HANDOFF_courier_merge.md on branch badmade/funny-noether-aankvh and continue PR 1970. Restore the port from
 > ec070d05, write the tests first and show them to me before implementing, then do the launcher step, scheduling and
-> docs so the payload program is the single Robinhood data program. Do not delete the courier branch until I say so.
+> docs so the payload program is the single Robinhood data program. The port is pinned on origin/rescue/courier-port;
+> do not delete it until I say so. The ported ingest must not push the recommendations branch: use
+> snapshot_cycle._courier_publishers, since the Mac's `snapshot_cycle publish` launchd job is its only writer.
