@@ -16,8 +16,13 @@ on:
 
 # A rapid series of pushes to the same branch should leave one running build,
 # not N. Never cancel on main -- those runs are the record of what landed.
+# cancel-in-progress: false is not enough on its own: GitHub still drops an older
+# run that is merely PENDING in a group when a newer one queues, which left merges
+# such as #1901 with a cancelled run, no jobs, and no 3.11 record. So every push to
+# main gets its own group (keyed by commit) and runs; other refs keep one group per
+# ref so a PR's older runs are still cancelled by its newer pushes.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Read-only by default; no job here needs to write to the repository.
