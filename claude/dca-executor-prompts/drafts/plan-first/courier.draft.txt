@@ -1,4 +1,4 @@
-DEPRECATED (2026-10-26): do not schedule this task. The 5-minute Claude courier is being folded into the single payload program (`scripts/robinhood_payload.py` + `deploy/launchd/robinhood_payload.sh`, see docs/robinhood_payload.md). Kept only as a reference for the raw-file contract until the order-page and buying-power fetch moves over.
+DEPRECATED (2026-10-26): do not schedule this task. Robinhood data fetching lives in one program, the payload launcher (`scripts/robinhood_payload.py` + `deploy/launchd/robinhood_payload.sh`, see docs/robinhood_payload.md). Kept only as a reference for the plan-first raw-file contract. The courier's order-history and buying-power fetch has NOT been ported: plan-first is shadow-only, and porting it is deferred until plan-first goes live.
 
 PLAN-FIRST DATA COURIER — every 5 minutes
 

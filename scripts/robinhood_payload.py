@@ -12,9 +12,6 @@ that already holds Robinhood MCP access -- the Codex CLI on the operator's Mac, 
 * ``prompt``  -- the fixed instruction text handed to ``codex exec`` for one small chunk of tickers.
 * ``merge``   -- validate the per-chunk JSON the agent returned and publish ONE payload in the shape
   ``scripts/stream_candidates.py`` documents (``sources.robinhood`` only; there is still no second source).
-* ``broker-prompt`` / ``ingest`` -- the plan-first half (2026-10-26, replaces the retired Claude courier): the prompt for the
-  one worker that reads order history and buying power, and the step that turns the published payload plus that reply
-  into recommendation files.
 * ``check``   -- re-validate a published payload for a slot (used by the live prompts' Gate 5).
 
 The agent is an LLM copying numbers, so nothing it returns is trusted: every bar is range- and
@@ -209,19 +206,10 @@ def validate_ticker(
         raise PayloadError(f"quote as_of {as_of.isoformat()} is in the future")
     if abs(price - closes[-1]) / closes[-1] > MAX_QUOTE_VS_LAST_CLOSE:
         raise PayloadError(f"quote {price} disagrees with the last bar close {closes[-1]}")
-    normalized_quote: dict[str, Any] = {"price": price, "as_of": as_of.isoformat()}
-    # Optional two-sided quote (2026-10-26): plan-first Gate 6.7 needs both sides to prove the spread, and a quote without
-    # them drops every order as ``spread_unavailable``. Absent keys leave the entry exactly as before, so the live prompts'
-    # Gate 5 is unaffected; a PRESENT but doubtful pair fails the ticker rather than being quietly dropped.
-    if "bid_price" in quote or "ask_price" in quote:
-        bid, ask = _num(quote.get("bid_price"), "quote.bid_price"), _num(quote.get("ask_price"), "quote.ask_price")
-        if ask < bid:
-            raise PayloadError(f"quote ask {ask} is below its bid {bid}")
-        normalized_quote.update(bid_price=bid, ask_price=ask)
     return {
         "previous_close_bar": prev,
         "intraday_bars": bars,
-        "quote": normalized_quote,
+        "quote": {"price": price, "as_of": as_of.isoformat()},
     }
 
 
@@ -334,10 +322,10 @@ For EACH ticker fetch:
    {plan['bar_start_et']} ET and strictly before {plan['decision_time_et']} ET (omit the still-open bar).
 2. The previous completed regular session's daily bar (historicals, interval day, span week -- request ONLY
    the last few sessions, never a long history, so the reply is not truncated; use the newest completed session).
-3. A current quote, with its best bid and best ask.
+3. A current quote.
 
 Reply with ONE JSON object and nothing else (no prose, no code fence). Keys are the tickers above:
-{{"TICKER": {{"previous_close_bar": BAR, "intraday_bars": [BAR, ...], "quote": {{"price": number, "as_of": "<iso with offset>", "bid_price": number, "ask_price": number}}}}}}
+{{"TICKER": {{"previous_close_bar": BAR, "intraday_bars": [BAR, ...], "quote": {{"price": number, "as_of": "<iso with offset>"}}}}}}
 where BAR is {{"timestamp": "<iso with offset>", "open": n, "high": n, "low": n, "close": n, "volume": n}}.
 
 Rules: copy every number and timestamp exactly as the tool returned it; never estimate, round, interpolate or
@@ -345,151 +333,6 @@ fill a gap. Never convert a timestamp between time zones and never attach an off
 if the tool gives a UTC time ("Z" or +00:00), write it back with that same UTC offset. A quote "as_of" is the tool's
 own timestamp for that quote, copied verbatim. If a ticker's data cannot be fetched, give {{"error": "<short reason>"}} for that ticker and keep going.
 Every requested ticker must appear exactly once. Do not write files; your final message is the whole output."""
-
-
-# --------------------------------------------------------------------------- broker state (plan-first)
-
-
-def _account_number() -> str:
-    """The configured brokerage account, resolved from ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (never from a file here)."""
-    import dca_config
-
-    configured = dca_config.expand_config_env("${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", source="robinhood payload")
-    return dca_config.resolve_broker_account(configured, source="robinhood payload")
-
-
-def build_broker_prompt(plan: dict[str, Any], account_number: str) -> str:
-    """The instruction text for the one worker that reads order history and buying power (read tools only).
-
-    Replaces the retired Claude courier's ``get_equity_orders`` and ``get_portfolio`` calls (2026-10-26). The account
-    number is part of the tool arguments, exactly as the live prompts already pass it; this text goes to the worker's
-    stdin and is never written to disk by this program.
-    """
-    from dca_market_history import orders_window_start
-
-    since = orders_window_start(date.fromisoformat(plan["trading_day"])).isoformat()
-    return f"""You are a data-retrieval worker. Use ONLY these two read tools: get_equity_orders and get_portfolio.
-Never call any order, cancel, watchlist or alert tool.
-
-1. get_equity_orders with account_number "{account_number}" and created_at_gte "{since}". Follow the pagination cursor
-   until the tool reports no further page. Keep EVERY page, in the order received, exactly as the tool returned it.
-2. get_portfolio with account_number "{account_number}". Keep the response exactly as returned.
-
-Reply with ONE JSON object and nothing else (no prose, no code fence):
-{{"order_pages": [PAGE_0, PAGE_1, ...], "portfolio": PORTFOLIO}}
-where each PAGE and PORTFOLIO is the tool's full response, copied verbatim. Never summarize, drop, reorder, round or
-retype a field. If a page is too large to copy in full, or a tool errors, reply {{"error": "<short reason>"}} instead."""
-
-
-def load_broker_reply(path: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """``(order_pages, portfolio)`` from the broker worker's reply, each normalised like a saved courier response."""
-    from dca_market_history import MarketHistoryStore
-
-    reply = _load_chunk(path)
-    if reply.get("error"):
-        raise PayloadError(f"broker worker reported: {str(reply['error'])[:200]}")
-    pages = reply.get("order_pages")
-    if not isinstance(pages, list) or not pages:
-        raise PayloadError("broker reply carries no order pages")
-    portfolio = reply.get("portfolio")
-    normalize = MarketHistoryStore.normalize_response
-    return [normalize(page) for page in pages], normalize(portfolio) if isinstance(portfolio, dict) else {}
-
-
-#: Longest an ingest may trail the payload's own build, and a broker reply may sit from the ingest. The recommendation
-#: file is stamped with the payload's build time, so a late ingest must not make old data look fresh (same bound as the
-#: retired courier's ``MAX_RUN_AGE_SECONDS``).
-MAX_INGEST_AGE = timedelta(minutes=10)
-
-
-def _quote_sides(entries: dict[str, Any]) -> dict[str, list[float] | None]:
-    sides: dict[str, list[float] | None] = {}
-    for ticker, entry in entries.items():
-        quote = entry.get("quote", {})
-        bid, ask = quote.get("bid_price"), quote.get("ask_price")
-        sides[ticker.upper()] = [bid, ask] if bid is not None and ask is not None else None
-    return sides
-
-
-def ingest(
-    plan: dict[str, Any],
-    broker_reply: str,
-    *,
-    now: datetime | None = None,
-    min_coverage: float = DEFAULT_MIN_COVERAGE,
-    max_age_minutes: int = DEFAULT_MAX_AGE_MINUTES,
-    config_dir: Path | None = None,
-) -> int:
-    """Turn this slot's published payload plus the broker reply into plan-first recommendation files.
-
-    Exit 0 stored, 2 refused or unusable input, 3 another ingest holds the lease, 6 the payload is stale. Nothing here
-    places an order. Everything downstream is stamped with the payload's build time, never the (later) ingest clock.
-    """
-    import dca_config
-    import dca_paths
-    from dca_fill_compare import FillComparator
-    from dca_market_history import MarketHistoryStore
-    from dca_market_sources import SourceUnavailable
-    from dca_rec_models import MarketSnapshot
-    from dca_rec_publish import build_document, publish_all, publishers_from_settings
-    from dca_rec_store import RecommendationStore, load_settings
-    from dca_recommender import RecommendationEngine
-    from scripts.assemble_order_pages import _order_rows
-    from scripts.scheduler_lease import SchedulerLease, window_key
-
-    now = (now or datetime.now(ET)).astimezone(ET)
-    status = check(plan, min_coverage=min_coverage, now=now, max_age_minutes=max_age_minutes)
-    if status:
-        return status
-    out = Path(plan["out"])
-    day, slot = date.fromisoformat(plan["trading_day"]), plan["slot"]
-    try:
-        meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
-        generated = datetime.fromisoformat(meta["generated_at_et"])
-        reply_at = datetime.fromtimestamp(Path(broker_reply).stat().st_mtime, ET)
-        if now - generated > MAX_INGEST_AGE:
-            raise PayloadError(f"payload built {generated:%H:%M:%S} ET is too old to ingest")
-        if abs(now - reply_at) > MAX_INGEST_AGE:
-            raise PayloadError(f"broker reply written {reply_at:%H:%M:%S} ET is not within {MAX_INGEST_AGE} of now")
-        payload = json.loads(out.read_text(encoding="utf-8"))
-        account = _account_number()
-        config_dir = config_dir or dca_config.get_config_dir()
-        pages, portfolio = load_broker_reply(broker_reply)
-        broker = MarketHistoryStore.broker_state(pages, portfolio, trading_day=day, now=generated, account_number=account)
-        snapshot = MarketSnapshot(
-            day, generated, "robinhood_agent_fetch", payload, _quote_sides(payload["sources"]["robinhood"])
-        )
-        settings = load_settings(config_dir)
-    except (PayloadError, SourceUnavailable, ValueError, OSError, KeyError, TypeError) as exc:
-        print(f"robinhood_payload: ingest refused: {exc.__class__.__name__}: {exc}", file=sys.stderr)
-        return 2
-    store = RecommendationStore()
-    lease = SchedulerLease(
-        Path(dca_paths.cron_tracking_root()) / "scheduler_leases", window_key(day.isoformat(), "plan_first", "ingest")
-    )
-    holder = f"payload-{os.getpid()}-{generated.timestamp()}"
-    acquired = lease.acquire(holder)
-    if not getattr(acquired, "acquired", acquired):
-        print("robinhood_payload: another ingest holds the lease", file=sys.stderr)
-        return 3
-    try:
-        result = RecommendationEngine(config_dir=config_dir).compute(snapshot, broker, generated, slot=slot)
-        if result.status == "OK" and result.recommendations and result.expected:
-            store.write(result.recommendations, result.expected)
-            publish_results = publish_all(
-                publishers_from_settings(settings.publish, repo_dir=Path(__file__).resolve().parents[1]),
-                build_document({slot: result.recommendations}, generated_at=generated),
-            )
-            for item in publish_results:
-                print(f"robinhood_payload: publish {item.channel} ok={item.ok} {item.detail}", file=sys.stderr)
-        comparator = FillComparator(store)
-        rows = [row for page in pages for row in _order_rows(page)]
-        comparator.write_report(day, comparator.compare(day, rows), generated_at=generated)
-        orders = len(result.recommendations.items) if result.recommendations else 0
-        print(json.dumps({"status": result.status, "slot": slot, "reasons": list(result.reasons), "orders": orders}))
-        return 0 if result.status == "OK" else 2
-    finally:
-        lease.release(holder)
 
 
 # --------------------------------------------------------------------------- merge / publish
@@ -726,7 +569,9 @@ def publish(
     meta["payload_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
     fd, tmp = tempfile.mkstemp(prefix=out.name + ".", dir=out.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # newline="": write the exact bytes the sidecar's SHA-256 was taken over. Text mode turns "\n" into "\r\n" on
+        # Windows, so `check` read back a different file than `publish` hashed (a no-op on the Mac).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(body)
         # ln-style no-overwrite publish: a concurrent run that finished first wins, nobody sees a partial file.
         try:
@@ -841,16 +686,6 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
     p_merge.add_argument("chunks", nargs="*")
 
-    p_broker = sub.add_parser("broker-prompt", help="print the prompt for the order-history and buying-power worker")
-    p_broker.add_argument("--plan", required=True)
-
-    p_ingest = sub.add_parser("ingest", help="compute plan-first recommendations from the payload and a broker reply")
-    p_ingest.add_argument("--plan", required=True)
-    p_ingest.add_argument("--broker-reply", required=True)
-    p_ingest.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
-    p_ingest.add_argument("--max-age-minutes", type=int, default=DEFAULT_MAX_AGE_MINUTES)
-    p_ingest.add_argument("--now", default=None, help="ISO tz-aware clock override (tests and replays only)")
-
     p_check = sub.add_parser("check", help="validate a published payload")
     p_check.add_argument("--plan", required=True)
     p_check.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
@@ -877,13 +712,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "prompt":
         print(build_prompt(plan, [t for t in args.tickers.split(",") if t]))
         return 0
-    if args.cmd == "broker-prompt":
-        print(build_broker_prompt(plan, _account_number()))
-        return 0
-    if args.cmd == "ingest":
-        ingest_now = datetime.fromisoformat(args.now).astimezone(ET) if args.now else None
-        return ingest(plan, args.broker_reply, now=ingest_now, min_coverage=args.min_coverage,
-                      max_age_minutes=args.max_age_minutes)
     if args.cmd == "merge":
         try:
             payload, failed = assemble(plan, args.chunks)

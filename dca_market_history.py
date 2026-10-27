@@ -46,13 +46,9 @@ class MarketHistoryStore:
         )
 
     @classmethod
-    def normalize_response(cls, value: Any) -> dict[str, Any]:
-        """One verbatim MCP tool response (raw, ``content`` text block or ``structuredContent``) as a plain object.
-
-        Shared by the courier's saved files and the payload program's in-memory broker reply, so both reject the
-        same malformed shapes. Raises :class:`SourceUnavailable` on anything that is not a strict-JSON object.
-        """
+    def _load_response(cls, path: Path) -> dict[str, Any]:
         try:
+            value = cls._strict_json(path.read_text(encoding="utf-8"))
             if isinstance(value, dict) and "content" in value and "structuredContent" not in value:
                 blocks = value.get("content")
                 text_blocks = [block for block in blocks if isinstance(block, dict) and block.get("type") == "text"]
@@ -64,16 +60,8 @@ class MarketHistoryStore:
             # Structured MCP content has already been decoded, so validate it again as strict JSON.
             json.dumps(response, allow_nan=False)
             return response
-        except (UnicodeError, ValueError, TypeError):
-            raise SourceUnavailable("courier response is unavailable or invalid") from None
-
-    @classmethod
-    def _load_response(cls, path: Path) -> dict[str, Any]:
-        try:
-            value = cls._strict_json(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError, TypeError):
             raise SourceUnavailable("courier response is unavailable or invalid") from None
-        return cls.normalize_response(value)
 
     @staticmethod
     def _indexed(run_dir: Path, prefix: str, *, required: bool = True) -> list[Path]:
@@ -175,35 +163,6 @@ class MarketHistoryStore:
                 return float(value)
         return None
 
-    @classmethod
-    def broker_state(
-        cls, order_pages: list[dict[str, Any]], portfolio: dict[str, Any], *,
-        trading_day: date, now: datetime, account_number: str,
-    ) -> BrokerState:
-        """Assemble the proven-complete order history plus buying power into a :class:`BrokerState`.
-
-        An incomplete or inconsistent page chain is ``SourceUnavailable("order history incomplete")``; a portfolio
-        with no unambiguous buying-power field only leaves ``buying_power_usd`` unset (``None``).
-        """
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise ValueError("now must be timezone-aware")
-        if not isinstance(account_number, str) or not account_number.strip():
-            raise ValueError("account_number is required")
-        with tempfile.TemporaryDirectory(prefix="dca-market-orders-") as temp_dir:
-            page_files = []
-            for index, page in enumerate(order_pages):
-                path = Path(temp_dir) / f"page-{index}.json"
-                atomic_write_text(path, json.dumps(page, allow_nan=False))
-                page_files.append(str(path))
-            try:
-                envelope, _ = assemble_order_pages.assemble(
-                    page_files, account_number=account_number, trading_day=trading_day.isoformat(),
-                    snapshot_at=now.isoformat(),
-                )
-            except (ValueError, assemble_order_pages.AssemblyRefused):
-                raise SourceUnavailable("order history incomplete") from None
-        return BrokerState(trading_day, now, account_number, envelope, cls._buying_power(portfolio))
-
     def ingest_run(
         self, run_dir: Path, *, trading_day: date, now: datetime, universe: list[str], account_number: str,
     ) -> tuple[MarketSnapshot, BrokerState]:
@@ -225,13 +184,24 @@ class MarketHistoryStore:
 
         order_paths = self._indexed(run_dir, "orders")
         order_pages = [self._load_response(path) for path in order_paths]
+        with tempfile.TemporaryDirectory(prefix="dca-market-orders-") as temp_dir:
+            page_files = []
+            for index, page in enumerate(order_pages):
+                path = Path(temp_dir) / f"page-{index}.json"
+                atomic_write_text(path, json.dumps(page, allow_nan=False))
+                page_files.append(str(path))
+            try:
+                envelope, _ = assemble_order_pages.assemble(
+                    page_files, account_number=account_number, trading_day=trading_day.isoformat(),
+                    snapshot_at=now.isoformat(),
+                )
+            except (ValueError, assemble_order_pages.AssemblyRefused):
+                raise SourceUnavailable("order history incomplete") from None
         try:
             portfolio = self._load_response(run_dir / "portfolio.json")
         except SourceUnavailable:
             portfolio = {}
-        broker = self.broker_state(
-            order_pages, portfolio, trading_day=trading_day, now=now, account_number=account_number,
-        )
+        broker = BrokerState(trading_day, now, account_number, envelope, self._buying_power(portfolio))
         snapshot = MarketSnapshot(trading_day, now, "robinhood_agent_fetch", payload, _quote_sides(quotes))
         return snapshot, broker
 
