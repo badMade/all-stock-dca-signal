@@ -87,7 +87,9 @@ would forge evidence of something the Claude reader did not do, so none were wri
 ## Open items
 
 1. **Manual early start (answered).** The operator started the 9:46 run by hand. The run passed its gates
-   because the backup's window opens at the slot's 09:35 start, so nothing stopped an early manual run.
+   because `scripts/backup_gates.py` lets a single-fire backup start from ten minutes before its fire time
+   (09:45 for a 09:55 fire), pinned by `scripts/tests/test_backup_gates.py`. 09:46 was inside that tolerance
+   by one minute. An earlier version of this note wrongly said the window opened at the slot's 09:35 start.
    Record the reason next time, since the run's transcript shows no trigger.
 2. **Misattribution.** Two agents reached "Claude placed these" from an empty `executor-ids` alone. Treat an
    empty list as "not recorded by the Claude reader", not as "placed by Claude", in future write-ups.
