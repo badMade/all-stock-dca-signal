@@ -97,9 +97,6 @@ fi
 
 # --- 1. inputs -------------------------------------------------------------------------------------------------------
 [ -f "$TEMPLATE" ] || die "template missing: $TEMPLATE"
-if [ "$DRY_RUN" = 0 ] && [ "$PY" != "$REPO/.venv/bin/python" ]; then
-  die "DCA_PUBLISH_PYTHON is supported only with --dry-run; the agent requires $REPO/.venv/bin/python"
-fi
 [ -x "$PY" ] || die "python not found at $PY (create the venv: python3 -m venv .venv && .venv/bin/pip install -e '.[dev]')"
 # The agent runs this SAME interpreter (rendered into the plist below), so what the checks prove is what launchd
 # starts. The template's fixed .venv path used to ignore DCA_PUBLISH_PYTHON: an install could pass every check and
