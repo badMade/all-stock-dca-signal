@@ -8,7 +8,7 @@ listed at the end.
 
 The Claude 09:35 ET slot on 2026-10-26 had no usable payload and finalized at 09:40 with no orders. A run
 of the Perplexity "9:55 AM ET DCA backup pass" (task `4412c3c4`) started at 09:46 ET, nine minutes before its
-scheduled time. It could not reach the Mac and found no published recommendation set, so it computed its own
+scheduled time. The operator confirmed they started it by hand. It could not reach the Mac and found no published recommendation set, so it computed its own
 plan in the cloud (`plan_source cloud_compute`) and placed 25 orders between 09:48:56 and 09:50:40 ET. That
 is the backup's designed behavior when both the Mac and the published set are absent, not a gap in the
 Claude slot.
@@ -55,7 +55,8 @@ Reported by the operator, not independently verified:
    deployed prompt still used the older five-minute payload wait. The repo's prompt waits up to 12
    minutes. Not verified.
 2. With no Claude orders and no published set, the backup's classification was CLEAR and it computed its
-   own plan. It started early for a reason not yet known.
+   own plan. It started early because the operator started it by hand (confirmed in chat; the reason and the
+   method were not recorded).
 3. The classifier (`scripts/backup_planner.py`, `_classify_row`) accepts an order as the Claude reader's
    only through a placement-file order id, a `dca-runner-<slot>-` reference, the derived native reference,
    or a published-set match. A cloud-computed backup order matches none of these. Inference: a later run
@@ -85,13 +86,14 @@ would forge evidence of something the Claude reader did not do, so none were wri
 
 ## Open items
 
-1. **Why did the backup start at 09:46?** Its schedule is 09:55. It may have been a manual run, a retry or
-   a scheduler quirk. Check the task's run history and trigger. The 9:57 thread shows the operator talking to
-   that task later in the morning, so ask whether the 9:46 run was started by hand.
+1. **Manual early start (answered).** The operator started the 9:46 run by hand. The run passed its gates
+   because the backup's window opens at the slot's 09:35 start, so nothing stopped an early manual run.
+   Record the reason next time, since the run's transcript shows no trigger.
 2. **Misattribution.** Two agents reached "Claude placed these" from an empty `executor-ids` alone. Treat an
    empty list as "not recorded by the Claude reader", not as "placed by Claude", in future write-ups.
-3. **Duplicate-buy risk.** A backup that fires early could buy while the Claude slot is still waiting for
-   its payload. Decide whether the backup's start time needs a lower bound.
+3. **Duplicate-buy risk.** A backup started early, by hand or otherwise, can buy while the Claude slot is
+   still waiting for its payload. Here the Claude run had already finalized at 09:40, so there was no
+   double buy. Decide whether the backup's start time needs a lower bound.
 4. **Verify the deployed 0935 Claude prompt** matches `claude/dca-executor-prompts/live-mirror/` (12-minute
    wait). Repaste if not.
 5. The Perplexity run warned that the market-open config's `live_task.broker_account` could not be
