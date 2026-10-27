@@ -2,7 +2,7 @@
 
 Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; `--check` exits 1 when this copy is stale and `--impact <module>` lists everything that depends on a module. A workflow refreshes this file on every push to `main`.
 
-169 core modules, 506 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
+167 core modules, 506 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
 
 ## Most depended-on modules (change these with care)
 
@@ -38,8 +38,6 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `find_issues` | 16 | 0 |
 | `from` | 30 | 3 |
 | `guardrails` | 25 | 0 |
-| `patch_finbert_cache` | 21 | 0 |
-| `patch_template` | 21 | 0 |
 | `run_benchmark` | 56 | 0 |
 | `run_market_open_signals` | 110 | 0 |
 | `scripts` | 0 | 234 |
@@ -74,7 +72,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.read_recommendation` | 95 | 0 |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 |
 | `scripts.refresh_market_open_candidates` | 158 | 0 |
-| `scripts.robinhood_payload` | 668 | 17 |
+| `scripts.robinhood_payload` | 725 | 17 |
 | `scripts.run_90day_prediction_experiment` | 422 | 0 |
 | `scripts.run_ledger` | 305 | 0 |
 | `scripts.run_phase4_backtest` | 10 | 0 |
@@ -124,7 +122,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_console_tickers` | 245 | 2 | 1 | 0 | `dca_console_reader`, `dca_ticker_paths` |
 | `dca_console_training` | 355 | 1 | 1 | 0 | `dca_console_reader` |
 | `dca_cost_tracker` | 413 | 3 | 2 | 0 | `dca_common`, `dca_fileio`, `scripts.run_classification` |
-| `dca_cumulative` | 1549 | 3 | 2 | 0 | `dca_fileio`, `dca_paths`, `scripts.file_lock` |
+| `dca_cumulative` | 1555 | 3 | 2 | 0 | `dca_fileio`, `dca_paths`, `scripts.file_lock` |
 | `dca_env` | 157 | 0 | 3 | 0 |  |
 | `dca_execution_router` | 328 | 2 | 1 | 1 | `dca_order_plan`, `dca_paths` |
 | `dca_fileio` | 392 | 0 | 40 | 0 |  |
@@ -165,8 +163,6 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `midday_dca` | 525 | 4 | 4 | 9 | `dca_config`, `dca_paths`, `morning_dca`, `near_close_dca` |
 | `morning_dca` | 9824 | 16 | 8 | 51 | `dca_alerts`, `dca_common`, `dca_config`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_paths`, `dca_risk`, +8 more |
 | `near_close_dca` | 41712 | 17 | 32 | 26 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
-| `patch_finbert_cache` | 21 | 0 | 0 | 0 |  |
-| `patch_template` | 21 | 0 | 0 | 0 |  |
 | `run_benchmark` | 56 | 0 | 0 | 0 |  |
 | `run_dca` | 4719 | 17 | 1 | 26 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
 | `run_market_open_signals` | 110 | 2 | 0 | 0 | `market_open_dca`, `near_close_dca` |
@@ -231,7 +227,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.reason_codes` | 224 | 0 | 4 | 1 |  |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 | 0 | 1 | `dca_ticker_paths` |
 | `scripts.refresh_market_open_candidates` | 158 | 3 | 0 | 0 | `market_open_dca`, `near_close_dca`, `scripts.stream_candidates` |
-| `scripts.robinhood_payload` | 668 | 9 | 0 | 17 | `dca_config`, `dca_paths`, `dca_runner`, `scripts.generate_buy_candidates`, `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, +1 more |
+| `scripts.robinhood_payload` | 725 | 9 | 0 | 17 | `dca_config`, `dca_paths`, `dca_runner`, `scripts.generate_buy_candidates`, `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, +1 more |
 | `scripts.run_90day_prediction_experiment` | 422 | 1 | 0 | 0 | `scripts.sequestered_truth_comparator` |
 | `scripts.run_classification` | 4499 | 4 | 12 | 28 | `dca_fileio`, `dca_paths`, `scripts.broker_reconciliation`, `scripts.same_day_pointer` |
 | `scripts.run_ledger` | 305 | 1 | 0 | 0 | `scripts.file_lock` |
