@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-26, after #1968): commit `8c219fe9`. Nothing below is live until
+State of `main` when this was last updated (2026-10-27, after #1977): commit `f7ae93a9`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -55,23 +55,32 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1967 | `b86c4e4e` | Payload launcher re-fetches tickers a replying chunk left out or errored; documents the no-data rescue (commits `6998a1cf`, `9eb674f6`). The Mac must pull `main`. Not reviewed here. |
 | #1968 | `cef94205` | Reused my branch name `restore-isfinite`; other sessions' commits. Merged with no net change to `main`. |
 | (direct) | `9bf2f9e7` | `dca_market_history.py`: chunk `get_equity_historicals` calls to 10 symbols max, with a test. Not reviewed here. |
+| #1974 | `c8c089f1` | Title: removes the cloud-clone drafts again. Not reviewed here. |
+| #1976 | `5618d5e6` | Title: courier payload fold. Not reviewed here. |
+| #1977 | `f7ae93a9` | Previous refresh of this note. |
 | #1961 | `5eafd4b6` | Titles: payload launcher rescues a dead chunk in small requests and keeps dead workers' logs (`deploy/launchd/robinhood_payload.sh`, `docs/robinhood_payload.md`, `tests/test_robinhood_payload.py`). Not reviewed here. The Mac must pull `main` to get it. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
+
+Stamps named in the merged-PR table above were current when those PRs merged. None of them is the current stamp.
 
 ## Do these in order
 
 1. **Repaste the six live-mirror prompts** from `claude/dca-executor-prompts/live-mirror/` into the scheduled tasks.
    This brings in the 12-minute wait and the new `ticker_errors` rule together.
 2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
-   `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
-   (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
-   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `8c219fe9` both carry `71083a20`. The stamp moved from `98d1a5a9` (set by #1958) because a docstring-only change to `dca_inverse_martingale.py`, which is bundled, reached `main` with #1966. **A set of prompts pasted with `98d1a5a9` is stale: repaste.** Read the stamp from the prompt you paste, not from this note (read the stamp from the prompt you paste, not from this note). Two tests in
-   `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
-   Before pasting, on a current `main`, confirm it still holds:
+   `backup_planner.pyz` from the same `main` commit. **This note does not name the current planner stamp on purpose.**
+   It changed four times on 2026-10-26 (other merged PRs change bundled files), so any value written here is stale within
+   hours. The stamp is the 64-character `content_sha256` that step 0 of each prompt requires the attached file to match;
+   a mismatch makes the backup stand down and do nothing. On the exact `main` commit you paste from, run these checks and
+   paste only if all three pass:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
-   - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`).
-   If `main` has changed the planner since, the stamp changes: read it from the prompt you are about to paste and make
-   sure the attached file's hash equals it. Never reuse a `backup_planner.pyz` from an older checkout.
+   - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`);
+   - `python3 backup_planner.pyz --build-info`: its `content_sha256` must begin with the 12 characters that
+     `grep -o "must equal [0-9a-f]\{12\}" claude/dca-executor-prompts/perplexity/0955ET-935-backup.txt` prints.
+   If `main` moves after you paste, repeat the checks on the new commit; a prompt set pasted from an older commit may be
+   stale. Never reuse a `backup_planner.pyz` from an older checkout. Two tests in
+   `scripts/tests/test_build_backup_planner.py` fail CI if the committed file stops matching its sources or the prompts
+   (they were lost in #1914 and restored in #1956).
 3. **Check the scheduled tasks' current Gate 5 text** against the repo copy. This was not visible when the
    changes were made. If the sentence "the launcher publishes only a complete universe" is not what a task holds,
    tell the engineer before pasting.
