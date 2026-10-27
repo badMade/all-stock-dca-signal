@@ -179,9 +179,9 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.auto_resume_walkforward` | 179 | 0 | 0 | 0 |  |
 | `scripts.backfill_afternoon_evidence` | 325 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `scripts.finalize_run_evidence` |
 | `scripts.backfill_intraday_archive` | 215 | 2 | 0 | 0 | `dca_intraday_archive`, `dca_paths` |
-| `scripts.backup_gates` | 81 | 2 | 1 | 1 | `dca_order_plan`, `scripts.backup_procedure` |
+| `scripts.backup_gates` | 86 | 2 | 1 | 1 | `dca_order_plan`, `scripts.backup_procedure` |
 | `scripts.backup_planner` | 1321 | 19 | 5 | 22 | `dca_config`, `dca_number_check`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_runner`, `near_close_dca`, +11 more |
-| `scripts.backup_procedure` | 332 | 6 | 3 | 1 | `dca_config`, `dca_order_plan`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.backup_planner` |
+| `scripts.backup_procedure` | 330 | 6 | 3 | 1 | `dca_config`, `dca_order_plan`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.backup_planner` |
 | `scripts.backup_strategy` | 732 | 0 | 0 | 0 |  |
 | `scripts.backup_stream_specs` | 36 | 5 | 2 | 1 | `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, `scripts.stream_candidates` |
 | `scripts.broker_reconciliation` | 1036 | 2 | 7 | 0 | `scripts.reason_codes`, `scripts.run_classification` |
