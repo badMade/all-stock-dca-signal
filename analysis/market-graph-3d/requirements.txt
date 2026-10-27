@@ -12,3 +12,4 @@ pillow>=13.0.0
 
 # MP4 output additionally needs an ffmpeg binary on PATH. Without one, pass
 # --format gif (Pillow, which matplotlib already depends on) or --format png.
+msgpack>=1.2.3
