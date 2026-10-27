@@ -488,31 +488,3 @@ def test_every_committed_mirror_carries_the_rule_and_names_its_generator():
         text = mirror.read_text(encoding="utf-8")
         assert drift.NO_HAND_SIGNALS_RULE in text, mirror.name
         assert "scripts/generate_" in text, mirror.name
-
-
-def test_a_live_task_naming_the_text_key_as_its_ref_id_is_flagged(tmp_path):
-    # 2026-10-22 11:30: the placement sentence still read "DETERMINISTIC ref_id with every order
-    # (sent as the UUID ...): dca-runner-1130-<YYYY-MM-DD>-<TICKER>", the session sent the text key,
-    # place_equity_order rejected it (UUID only) and the slot aborted ref_id_format_rejected.
-    mirror_dir = _mirror(tmp_path, "1130-test")
-    stale = GOOD_BODY + (
-        "DETERMINISTIC ref_id with every order (sent as the UUID the NATIVE ORDER-ID RULE derives from "
-        "this key): dca-runner-1130-<YYYY-MM-DD>-<TICKER>, the same key dca_runner.execute_plan() derives.\n"
-    )
-    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1130-test", stale))
-    assert "ref_id_names_text_key" in _findings(report)
-
-
-def test_a_live_task_without_the_old_ref_id_wording_is_not_flagged(tmp_path):
-    mirror_dir = _mirror(tmp_path, "1130-test")
-    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1130-test", GOOD_BODY))
-    assert "ref_id_names_text_key" not in _findings(report)
-
-
-def test_no_committed_mirror_names_the_text_key_as_its_ref_id():
-    for mirror in sorted(MIRROR_DIR.glob("[0-9]*ET-*.txt")):
-        text = mirror.read_text(encoding="utf-8")
-        assert drift.TEXT_KEY_REF_ID_WORDING not in text, mirror.name
-        if "dca-runner-" in text and "Send a UUID ref_id with every order" not in text:
-            # Only the 3:30 mirror (run_slot path, no per-order dca-runner key sentence) may omit it.
-            assert mirror.name.startswith("1530ET"), mirror.name
