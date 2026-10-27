@@ -153,6 +153,52 @@ def test_commit_url_comes_from_the_matching_commit() -> None:
     assert ev.commit_url == f"{REPO_URL}/commit/{'a' * 40}"
 
 
+def _commit(char: str, message: str) -> dict[str, object]:
+    return {"sha": char * 40, "url": f"{REPO_URL}/commit/{char * 40}", "message": message}
+
+
+def test_commit_citing_the_key_only_in_its_body_does_not_match() -> None:
+    # Regression (2026-10-26 digest): the squash commit of #1930, a triage-tool change whose body discussed five
+    # Keys, was matched as the Commit URL for all five rows. Commits now follow the PR title rule via the subject.
+    tool_change = _commit("b", f"triage_reconcile: restore handling (#1930)\n\nRows like {KEY} regressed.")
+    fix = _commit("a", f"Fix {KEY} fallback (#1704)")
+    assert _match(commits=[tool_change, fix]).commit_url == f"{REPO_URL}/commit/{'a' * 40}"
+    assert _match(commits=[tool_change]).commit_url is None
+
+
+def test_commit_listing_key_as_not_changed_does_not_match() -> None:
+    commit = _commit("c", f"Docs (#1642)\n\nNot changed, on purpose: {KEY}.")
+    assert _match(commits=[commit]).commit_url is None
+
+
+def test_recorded_commit_cited_only_in_body_keeps_counting_and_beats_newer_match() -> None:
+    recorded = _commit("a", f"Finalizer fix (#1519)\n\nCovers {KEY}.")
+    newer = _commit("d", f"Mention {KEY} in docs (#1950)")
+    url = f"{REPO_URL}/commit/{'a' * 40}"
+    assert _match(commits=[newer, recorded], recorded_commit_url=url).commit_url == url
+    # A recorded commit that no longer cites the Key does not pin the row.
+    unrelated = _commit("a", "Unrelated change")
+    assert _match(commits=[newer, unrelated], recorded_commit_url=url).commit_url == f"{REPO_URL}/commit/{'d' * 40}"
+
+
+def test_recorded_commit_url_must_be_a_string() -> None:
+    with pytest.raises(tr.EvidenceError):
+        _match(recorded_commit_url=123)
+
+
+def test_recorded_pr_that_never_cites_the_key_is_flagged_not_lowered() -> None:
+    # Regression (2026-10-26 digest): run_states_unclassifiable records PR #1514, whose body never cites the Key.
+    # The reconciler returned "No work" with no signal; the caller must skip the row instead of overwriting it.
+    unrelated = _pr(1514, head_ref="feat/x", title="Unrelated", body="", state="closed", merged=True)
+    ev = _match(prs=[unrelated], recorded_pr_number=1514)
+    assert ev.pr is None and ev.recorded_pr_unconfirmed is True
+
+
+def test_recorded_pr_flag_is_clear_when_evidence_is_found_or_nothing_was_recorded() -> None:
+    assert _match(prs=[_pr(101)], recorded_pr_number=99).recorded_pr_unconfirmed is False
+    assert _match().recorded_pr_unconfirmed is False
+
+
 def test_github_issue_matches_by_key_in_title_and_records_link() -> None:
     ev = _match(issues=[_issue(7)])
     assert ev.issue is not None

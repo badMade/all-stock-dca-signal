@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-26, after #1956): commit `b6e2b9ec`. Nothing below is live until
+State of `main` when this was last updated (2026-10-26, after #1958 and #1961): commit `91ee6f22`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -29,7 +29,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1906 | `810d2564` | This note. |
 | #1907 | `30d5a8ff` | Rebuilt the committed `backup_planner.pyz` (stamp `41fc5fa0`) after it had drifted from its sources, and added two tests that fail CI if the file or the prompts ever disagree again. |
 | #1894 | `b0030620` | Changed `near_close_dca.py` (a bundled file), so the planner stamp moved to `b106fea3` (since superseded). Prompts and file were regenerated in the same PR. |
-| #1911 | `147c4faf` | **Rolled back by #1914 and NOT on `main` today** (open: #1957, failing test only). Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
+| #1911 | `147c4faf` | Rolled back by #1914, restored by #1957 with a stronger test. Jules fix: `bool` values no longer pass the numeric checks in `_unrepresented_prior_candidate_part` (`near_close_dca.py`). Planner file and prompts were rebuilt in the PR (stamp `5b0c20bd`). |
 | #1914 | `b396c8e3` | Duplicate-JSON-key rejection in `dca_console.py` (kept). Built on the 10-19 base, so it also rolled back other merged work: see "What #1914 rolled back" below. Moved the planner stamp. |
 | #1916 | `16639526d` | Added CCI to the active universe: 91 tickers, not 90. Moved the planner stamp. |
 | #1921 | `d37adcc4` | Plan refs use the broker's native UUID. Moved the planner stamp to `07c79aa9` (since superseded). |
@@ -45,6 +45,10 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1949, #1950, #1951 | `447d9cac`, `15a6d8c4`, `86039cd4` | Titles: `scripts.sync_live_prompts` (live task bodies up to their mirrors), Perplexity backups stand down before the broker pull, `ref_id_format_rejected` names only the UUID. Not reviewed here. The stamp moved to `6ca697a4` after these; which one moved it was not checked. |
 | #1954 | `0503586a` | Re-added the account-loading step to the bridge-shell drafts and the three `cloud-clone-*` drafts on purpose (this restores #1913's content that #1914 had rolled back). |
 | #1956 | `b6e2b9ec` | Restored #1907's two drift guards and #1915's CRLF fold that #1914 had rolled back. No prompt changes. |
+| #1957 | `d69c8e23` | Restored the #1911 boolean-trap guards in `near_close_dca.py` with a stronger test (#1911's own test passed without the fix). Changed a bundled file, so the stamp moved (to `123248510381...`, since superseded). |
+| #1958 | `91ee6f22` | Restored the #1912 `_is_finite_scalar` in `dca_inverse_martingale.py` and its tests. Merged on top of #1957, so the one rebuild covers both: the stamp is `98d1a5a9`. Six Perplexity prompts change (only the expected hash in step 0). Live-mirror prompts unchanged. |
+| #1960 | `6924e5d6` | Previous refresh of this note. |
+| #1961 | `5eafd4b6` | Titles: payload launcher rescues a dead chunk in small requests and keeps dead workers' logs (`deploy/launchd/robinhood_payload.sh`, `docs/robinhood_payload.md`, `tests/test_robinhood_payload.py`). Not reviewed here. The Mac must pull `main` to get it. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
 
 ## Do these in order
@@ -54,7 +58,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
    `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
    (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
-   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `b6e2b9ec` both carry `6ca697a4` (read the stamp from the prompt you paste, not from this note). Two tests in
+   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `91ee6f22` both carry `98d1a5a9` (#1957 and #1958 changed bundled files, so the stamp moved from `6ca697a4`; repaste the six Perplexity prompts once, now that both have landed) (read the stamp from the prompt you paste, not from this note). Two tests in
    `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
    Before pasting, on a current `main`, confirm it still holds:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
@@ -64,7 +68,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 3. **Check the scheduled tasks' current Gate 5 text** against the repo copy. This was not visible when the
    changes were made. If the sentence "the launcher publishes only a complete universe" is not what a task holds,
    tell the engineer before pasting.
-4. **Keep the Mac on current `main`.** It already logs timing lines, so it has #1883.
+4. **Keep the Mac on current `main`.** It already logs timing lines, so it has #1883. #1961 changed `deploy/launchd/robinhood_payload.sh` (dead-chunk rescue), so pull `main` on the Mac again.
 5. **After the next trading day, read `/tmp/dca-robinhood-payload.log`** on the Mac and check:
    - `timing total seconds=` per slot (expect about 2 to 4 minutes);
    - any `coverage X/90 ... publishing nothing` line, and which tickers it names;
@@ -82,18 +86,12 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 ## Not verified
 
-- That `main` stayed green after #1956. The last run I read was green on #1956's own head.
+- That `main` stayed green after #1958 and #1961. The last run I read was green on #1958's own head.
 
 - That the scheduled tasks hold the same Gate 5 sentence as the repo.
 - The new `ticker_errors` rule and the 95% floor live. The 10-22 slots were all 90/90.
 - Whether the QTOP and DXYZ aborts were quiet tickers. Only TOPT could have been checked, and the result was not seen.
 - A core CI job on Python 3.11. None appeared in any run that was read.
-
-## Held on purpose
-
-#1957 and #1958 hold the two fixes #1914 rolled back that change a bundled file. Each fix changes the planner hash, which
-changes the six Perplexity prompts (only the expected `content_sha256` in step 0). Land both together, rebuild
-`backup_planner.pyz` once, regenerate the prompts once and repaste once. The live-mirror prompts do not change.
 
 ## Known fragile points
 
@@ -109,8 +107,8 @@ changes the six Perplexity prompts (only the expected `content_sha256` in step 0
 
   | Rolled back | State on `main` today |
   | --- | --- |
-  | #1911 boolean-trap fix (`near_close_dca.py`) | **Missing.** #1911's own test passed with or without the fix. Open: #1957 (stronger failing test only). Changes the planner stamp when fixed. |
-  | #1912 `_is_finite_scalar` (`dca_inverse_martingale.py`) | **Missing.** Open: #1958 (failing tests only). Changes the planner stamp when fixed. Opt-in mode, off by default. |
+  | #1911 boolean-trap fix (`near_close_dca.py`) | Restored by #1957 (with a stronger test; #1911's own test passed with or without the fix). |
+  | #1912 `_is_finite_scalar` (`dca_inverse_martingale.py`) | Restored by #1958. Opt-in mode, off by default. |
   | #1907 drift guards and #1915 CRLF fold | Restored by #1956. |
   | #1880 payload refusal marker and console scan stub | Restored by #1937 and #1935. |
   | #1913 account-loading step and `cloud-clone-*` drafts | Restored on purpose by #1954. (An earlier audit wrongly called #1914's deletion of the drafts correct.) |

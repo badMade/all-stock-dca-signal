@@ -1,13 +1,25 @@
-"""Run or inspect one Robinhood data-courier cycle without placing orders."""
+"""Run or inspect one Robinhood data-courier cycle without placing orders.
+
+``publish`` is the one subcommand that does NOT run in the courier session: the Mac's launchd job
+(``deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template``) runs it under the operator's own
+git login, because a scheduled Claude session holds no GitHub credentials (see :func:`_publish`).
+
+DEPRECATED (2026-10-26): the 5-minute Claude courier is retired; Robinhood bars and quotes now come from one
+program, the payload launcher (``scripts/robinhood_payload.py`` + ``deploy/launchd/robinhood_payload.sh``,
+docs/robinhood_payload.md). Nothing is scheduled against this module. The payload does not fetch order pages or
+buying power, so ``ingest`` and ``status`` stay as the reference for that raw-file contract. Do not add new callers.
+"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -23,6 +35,7 @@ from dca_rec_publish import build_document, publish_all, publishers_from_setting
 from dca_rec_store import RecommendationStore, load_settings
 from dca_recommender import RecommendationEngine, slots_for
 from scripts.assemble_order_pages import _order_rows
+from scripts.schedule_watchdog import notify_macos
 from scripts.scheduler_lease import SchedulerLease, window_key
 
 
@@ -182,7 +195,7 @@ def _ingest(run_dir: Path, now: datetime, config_dir: Path) -> int:
                 staged = history.raw_dir / name
                 if staged.is_file():
                     atomic_write_text(target_raw / name, staged.read_text(encoding="utf-8"))
-        publishers = publishers_from_settings(settings.publish, repo_dir=_root())
+        publishers = _courier_publishers(settings.publish, repo_dir=_root())
         publish_sets = {slot: pair[0] for slot, pair in computed.items()}
         publish_results = publish_all(publishers, build_document(publish_sets, generated_at=now)) if computed else []
         comparator = FillComparator(store)
@@ -197,6 +210,74 @@ def _ingest(run_dir: Path, now: datetime, config_dir: Path) -> int:
         return 2
     finally:
         lease.release(holder)
+
+
+def _courier_publishers(publish: dict, *, repo_dir: Path) -> list:
+    """The channels the courier's own ingest publishes to: every enabled one except the GitHub branch.
+
+    The branch belongs to ``publish`` on the Mac. The courier runs in a scheduled session with no GitHub
+    credentials, so its push failed every cycle (2026-10-26: the branch was a 404 all day), and were it ever to
+    succeed it would overwrite the Mac's whole-day document with only this cycle's slots.
+    """
+    return [item for item in publishers_from_settings(publish, repo_dir=repo_dir)
+            if getattr(item, "channel", None) != "github_branch"]
+
+
+# Today's newest set per slot, whatever its age: the backup's classify needs TODAY's set to recognise an order
+# Claude placed from an older file, and the published_rec reader applies its own freshness rule
+# (backup_planner._freshness_reason). select_for still refuses another day's file and a future-stamped one.
+_WHOLE_DAY = timedelta(days=1)
+PUBLISHED_MARKER = "published.sha256"
+
+
+def _publish(now: datetime, config_dir: Path, *, notify: bool) -> int:
+    """Mirror today's newest set per slot to every enabled channel (Mac only, under the operator's git login).
+
+    Exit 0 published (or ``UNCHANGED``: the same sets were already pushed, so a 5-minute launchd interval does not
+    force-push a new commit every time), 3 nothing to publish, 2 a channel failed. A failure is loud on purpose:
+    the courier's old push failed as one ``ok: false`` row in an exit-0 report, and nobody saw it until a backup
+    found the branch missing. The digest is written only after every channel succeeds, so a failed push is retried.
+    """
+    settings = load_settings(config_dir)
+    store = RecommendationStore()
+    day = now.astimezone(ET).date()
+    sets = {}
+    for slot in SLOT_IDS:
+        selected = store.select_for(slot, now, _WHOLE_DAY)
+        if selected.status == "OK" and selected.recommendation is not None:
+            sets[slot] = selected.recommendation
+    if not sets:
+        _emit({"status": "NONE", "reason": "no_recommendation_today"})
+        return 3
+    publishers = publishers_from_settings(settings.publish, repo_dir=_root())
+    if not publishers:
+        _emit({"status": "NONE", "reason": "no_publisher_enabled"})
+        return 3
+    payload = json.dumps({slot: rec.to_json() for slot, rec in sets.items()}, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    marker = store.day_dir(day) / PUBLISHED_MARKER
+    try:
+        unchanged = marker.read_text(encoding="utf-8").strip() == digest
+    except OSError:
+        unchanged = False
+    if unchanged:
+        _emit({"status": "UNCHANGED", "slots": sorted(sets)})
+        return 0
+    results = publish_all(publishers, build_document(sets, generated_at=now))
+    ok = all(item.ok for item in results)
+    if ok:
+        atomic_write_text(marker, digest + "\n")
+    elif notify:
+        try:
+            notify_macos("DCA recommendations publish",
+                         "Publishing to the recommendations branch failed; the backups' cloud fallback cannot "
+                         "see today's sets. Check the launchd log.")
+        except (OSError, subprocess.SubprocessError):
+            pass  # the exit code and the log still carry the failure
+    _emit({"status": "OK" if ok else "ERROR", "slots": sorted(sets), "publish": [
+        {"channel": item.channel, "ok": item.ok, "detail": item.detail} for item in results
+    ]})
+    return 0 if ok else 2
 
 
 def _status(now: datetime, config_dir: Path) -> int:
@@ -227,6 +308,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     ingest.add_argument("--now")
     status = sub.add_parser("status")
     status.add_argument("--now")
+    publish = sub.add_parser("publish", help="Mac only: mirror today's sets to the enabled channels.")
+    publish.add_argument("--now")
+    publish.add_argument("--notify", action="store_true", help="raise a macOS notification when a channel fails")
     args = parser.parse_args(argv)
     try:
         now = _now(args.now)
@@ -235,6 +319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _fetch_plan(now, config_dir)
         if args.command == "ingest":
             return _ingest(args.run_dir, now, config_dir)
+        if args.command == "publish":
+            return _publish(now, config_dir, notify=args.notify)
         return _status(now, config_dir)
     except (ValueError, OSError, SourceUnavailable):
         _emit({"status": "ERROR", "reason": "configuration_unavailable"})
