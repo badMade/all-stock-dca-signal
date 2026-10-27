@@ -26,6 +26,12 @@ operator, the Perplexity run transcript, and this repository:
 - That run reports: gates passed at 09:46 ET; Mac not reachable (empty device list); the `recommendations`
   branch returned 404; both evidence polls classified CLEAR (it saw no earlier orders in the window); skipped
   GFUZ and RVI (spread), ABT (quote not below prior close at finalize) and GFS (per-order gate).
+- The 9:57 run of the same task (a second thread) passed its gates at 09:57:22 ET, found the Mac reachable but
+  `executor-ids` empty and no published set, classified the 25 orders as UNRECOGNIZED, placed nothing and sent
+  a push notification (`stood_down_unrecognized_order`). Its own assessment said the 25 orders "look like the
+  primary Claude slot running late". That was an inference from the empty ids. It did not know the earlier run
+  of its own task had placed them. The operator's incident summary repeated that attribution, and the first
+  version of this note inherited it.
 - Claude's 0935 run folder (`market_open_dca/20261026_0935ET`) holds `payload_plan_0935.json` (09:38) and
   header-only `submitted_orders.csv` and `market_open_signals.csv`. All state files were written by 09:40.
   There is no `market_data_*` and no `candidates_*` file, so no buy list was built.
@@ -53,8 +59,8 @@ Reported by the operator, not independently verified:
 3. The classifier (`scripts/backup_planner.py`, `_classify_row`) accepts an order as the Claude reader's
    only through a placement-file order id, a `dca-runner-<slot>-` reference, the derived native reference,
    or a published-set match. A cloud-computed backup order matches none of these. Inference: a later run
-   in the same window would read these 25 orders as unrecognized and stand down. This is consistent with
-   the 9:57 run on the same task, which was not read.
+   in the same window would read these 25 orders as unrecognized and stand down. Confirmed by the 9:57
+   run, which did exactly that (see Facts). A backup therefore cannot recognise its own sibling run's orders.
 
 ## Impact
 
@@ -80,8 +86,10 @@ would forge evidence of something the Claude reader did not do, so none were wri
 ## Open items
 
 1. **Why did the backup start at 09:46?** Its schedule is 09:55. It may have been a manual run, a retry or
-   a scheduler quirk. Check the task's run history and trigger.
-2. **Read the 9:57 run** of the same task to confirm it stood down on the 25 orders as inference 3 says.
+   a scheduler quirk. Check the task's run history and trigger. The 9:57 thread shows the operator talking to
+   that task later in the morning, so ask whether the 9:46 run was started by hand.
+2. **Misattribution.** Two agents reached "Claude placed these" from an empty `executor-ids` alone. Treat an
+   empty list as "not recorded by the Claude reader", not as "placed by Claude", in future write-ups.
 3. **Duplicate-buy risk.** A backup that fires early could buy while the Claude slot is still waiting for
    its payload. Decide whether the backup's start time needs a lower bound.
 4. **Verify the deployed 0935 Claude prompt** matches `claude/dca-executor-prompts/live-mirror/` (12-minute
