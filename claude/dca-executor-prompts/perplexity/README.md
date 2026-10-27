@@ -66,12 +66,17 @@ recognises executor orders by the order ids `executor-ids` prints, by a legacy `
 native UUID if the broker ever echoes it, and, with the Mac out of reach, by a buy matching the published set's
 symbol and dollar amount to the cent. Any other order is UNRECOGNIZED, and the backup stands down.
 
-**2026-10-26 09:35 stand-down.** `executor-ids` used to read only the reader's `placements/<slot>/`. The reader
-prompts (`drafts/plan-first/`) were never pasted live, so every Claude slot still runs the gate-sequence prompt in
-`live-mirror/`, which saves each response as `$ROOT/place_<TICKER>.json` in the slot's run directory
-(`market_open_dca/<YYYYMMDD>_0935ET/` for 09:35). No `placements/` directory existed (`begin` creates it before any
-order, so its absence means the reader never ran, not that a write failed), the list came back empty, and 25 of
-Claude's own orders read as UNRECOGNIZED. `executor-ids` now reads both. Check after any Claude slot that bought:
+**2026-10-26 09:35 stand-down.** The 25 orders that read as UNRECOGNIZED were not Claude's: Claude's 09:35 run
+finalized at 09:40 with no orders, and a manual 09:46 run of this slot's own backup (task `4412c3c4`) placed them
+on a cloud-computed plan; the 9:57 scheduled run then stood down on them. See
+`docs/incident_2026-10-26_0935_unrecognized_orders.md`. The empty `executor-ids` list was correct for that day.
+It did expose a real gap, fixed since: `executor-ids` used to read only the reader's `placements/<slot>/`. The
+reader prompts (`drafts/plan-first/`) were never pasted live, so every Claude slot still runs the gate-sequence
+prompt in `live-mirror/`, which saves each response as `$ROOT/place_<TICKER>.json` in the slot's run directory
+(`market_open_dca/<YYYYMMDD>_0935ET/` for 09:35). No `placements/` directory exists in that case (`begin` creates
+it before any order, so its absence means the reader never ran, not that a write failed), so Claude's own orders
+would have read as UNRECOGNIZED on a day it did buy. `executor-ids` now reads both. Check after any Claude slot
+that bought:
 `sources.live_prompt_placements` plus `sources.plan_first_placements` should equal the number of orders placed. Zero
 for a slot that bought means the recognition chain is broken, and the backup will stand down (fail closed).
 
