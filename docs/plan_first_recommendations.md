@@ -1,12 +1,12 @@
 # Plan-first recommendations
 
-> **Deprecation (2026-10-26).** The 5-minute Claude courier (`claude/dca-executor-prompts/drafts/plan-first/courier.draft.txt`, `scripts/snapshot_cycle.py fetch-plan`) is deprecated and must not be scheduled. Bars and quotes come from the payload launcher (`scripts/robinhood_payload.py`, [robinhood_payload.md](robinhood_payload.md)). The courier also saved `get_equity_orders` pages and the `get_portfolio` buying power, which the payload does not fetch; `snapshot_cycle ingest` stays as the reference for that raw-file contract. The recommender, store, reader and fill-comparison below are unchanged.
+> **Folded into the payload program (2026-10-26).** The 5-minute Claude courier and its schedule are retired. `deploy/launchd/robinhood_payload.sh` now fetches bars and quotes (with bid/ask), then, when `DCA_PLAN_FIRST_INGEST=1`, reads order history and buying power with a second read-only `codex exec` (`scripts.robinhood_payload broker-prompt`) and runs `scripts.robinhood_payload ingest`. See [robinhood_payload.md](robinhood_payload.md). `courier.draft.txt` and `scripts/snapshot_cycle.py fetch-plan` are reference only and must not be scheduled.
 
 Plan-first separates computation from the buying agent. The engine computes the recommendation and private expected-price evidence; the reader receives only ticker, dollar amount and reference ID. The buying agent does no sizing math and fetches no prices.
 
 ## Data flow
 
-Courier → ingest → recommendation engine → store/publish → slot reader → placement → fill comparison. The courier saves raw read-tool responses; ingest validates and normalizes them. The engine writes an agent set and a private expected-price set. The reader selects a fresh set, the operator-run prompt places its listed dollar orders, and `dca_fill_compare.py` later compares saved placement responses with fills.
+Payload launcher (fetch + broker worker) → ingest → recommendation engine → store/publish → slot reader → placement → fill comparison. The launcher saves the validated payload and the broker worker's reply; `ingest` normalizes them. The engine writes an agent set and a private expected-price set. The reader selects a fresh set, the operator-run prompt places its listed dollar orders, and `dca_fill_compare.py` later compares saved placement responses with fills.
 
 ## Freshness and slot tiers
 
@@ -57,35 +57,16 @@ The Perplexity backups' cloud fallback reads the `recommendations` branch (`plan
 courier runs in a scheduled Claude session, which holds no GitHub credentials (`docs/schedule_verification.md`,
 confirmed 2026-10-21). The push failed every cycle, and the only trace was one `"ok": false` row in an exit-0 report.
 
-The push now runs on the Mac under your own git login: `python -m scripts.snapshot_cycle publish --notify`, every
-5 minutes from `deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template`. It publishes today's newest
-set per slot, whatever its age. `classify` needs today's set to recognise an order Claude placed from an older file,
-and `published_rec` applies its own freshness rule. `ingest` no longer pushes the branch, so it is never written by
-two jobs with different content.
-
-| Exit | Status | Meaning |
-| --- | --- | --- |
-| 0 | `OK` | Every enabled channel published |
-| 0 | `UNCHANGED` | The same sets were already published; nothing pushed |
-| 3 | `NONE` | No set for today yet, or no channel enabled in `config/recommendations.json` |
-| 2 | `ERROR` | A channel failed. `--notify` raises a macOS notification; the next run retries |
-
-Install it with `deploy/launchd/install_recommendations_publish.sh` from the checkout on the Mac. It resolves the
-cron root the way every stream does (`$DCA_CRON_TRACKING_ROOT`, else `.env`, else `<checkout>/cron_tracking`;
-`--cron-root DIR` overrides), refuses a root with no `recommendations/` store, checks that git can push from your
-login (`git push --dry-run`), runs one `publish` by hand, then validates, unloads any old copy and loads the agent.
-Re-run it to change the root; `--uninstall` removes it; `--dry-run` renders and checks without loading anything.
-
-The same steps by hand, with the same root the courier writes the store under:
+The push now happens inside `scripts.robinhood_payload ingest`, which the payload launcher runs on the Mac under your own git
+login (`publish_all` with the channels enabled in `config/recommendations.json`). The separate 5-minute
+`recommendations-publish` launchd job was removed. Check after the first real run:
 
 ```bash
-sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$DCA_CRON_TRACKING_ROOT|g" \
-  deploy/launchd/com.all-stock-dca.recommendations-publish.plist.template \
-  > ~/Library/LaunchAgents/com.all-stock-dca.recommendations-publish.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.recommendations-publish.plist
-tail -n 5 /tmp/dca-recommendations-publish.log      # expect OK, UNCHANGED or NONE; never ERROR
 git ls-remote origin refs/heads/recommendations     # one line once the first set of the day is published
 ```
+
+Unverified: `ingest` publishes the slot it just computed, whereas the removed job republished every slot's newest set for
+the day. Confirm on the first real run that earlier slots' files are still on the branch.
 
 ## Rollout and limits
 

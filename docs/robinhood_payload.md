@@ -89,6 +89,17 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
 
+## Plan-first ingest (2026-10-26)
+
+This program now does everything the retired 5-minute Claude courier did. After the merge, when `DCA_PLAN_FIRST_INGEST=1`,
+`robinhood_payload.sh` runs a second read-only `codex exec` with `broker-prompt` (only `get_equity_orders`, paginated, and
+`get_portfolio`; the account number comes from `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`), then `ingest`. `ingest` refuses a
+payload older than the freshness bound (exit 6) or a payload or broker reply more than 10 minutes from now (exit 2), takes
+the `plan_first/ingest` lease (exit 3 if held), and writes the recommendation files stamped with the payload's build time.
+It is best-effort: a failure is logged and never changes the launcher's exit status, so Gate 5 does not depend on it.
+Quotes now carry optional `bid_price`/`ask_price` (ask below bid fails the ticker). Default off; one launchd job per slot does
+both steps, and there is no separate courier or publish schedule.
+
 ## Quote freshness
 
 "Same calendar day" is not fresh (Codex adversarial review of #1704). `validate_ticker` rejects a quote whose `as_of`
