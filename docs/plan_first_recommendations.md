@@ -1,10 +1,12 @@
 # Plan-first recommendations
 
+> **Folded into the payload program (2026-10-26).** The 5-minute Claude courier and its schedule are retired. `deploy/launchd/robinhood_payload.sh` now fetches bars and quotes (with bid/ask), then, when `DCA_PLAN_FIRST_INGEST=1`, reads order history and buying power with a second read-only `codex exec` (`scripts.robinhood_payload broker-prompt`) and runs `scripts.robinhood_payload ingest`. See [robinhood_payload.md](robinhood_payload.md). `courier.draft.txt` and `scripts/snapshot_cycle.py fetch-plan` are reference only and must not be scheduled.
+
 Plan-first separates computation from the buying agent. The engine computes the recommendation and private expected-price evidence; the reader receives only ticker, dollar amount and reference ID. The buying agent does no sizing math and fetches no prices.
 
 ## Data flow
 
-Courier → ingest → recommendation engine → store/publish → slot reader → placement → fill comparison. The courier saves raw read-tool responses; ingest validates and normalizes them. The engine writes an agent set and a private expected-price set. The reader selects a fresh set, the operator-run prompt places its listed dollar orders, and `dca_fill_compare.py` later compares saved placement responses with fills.
+Payload launcher (fetch + broker worker) → ingest → recommendation engine → store/publish → slot reader → placement → fill comparison. The launcher saves the validated payload and the broker worker's reply; `ingest` normalizes them. The engine writes an agent set and a private expected-price set. The reader selects a fresh set, the operator-run prompt places its listed dollar orders, and `dca_fill_compare.py` later compares saved placement responses with fills.
 
 ## Freshness and slot tiers
 
@@ -47,6 +49,24 @@ Recommendations live under `<cron root>/recommendations/<day>/`: `rec_*.json` is
   each run directory. `ingest` refuses a run with no marker, a marker from another day or
   the future, or one older than 10 minutes, and stamps everything with `planned_at` rather
   than the ingest clock. A late ingest therefore cannot make old data look fresh.
+
+## Publishing to the `recommendations` branch (Mac launchd)
+
+The Perplexity backups' cloud fallback reads the `recommendations` branch (`plan --source published_rec`,
+`classify --published`). On 2026-10-26 that branch was a 404. Its only writer was the courier's own `ingest`, and the
+courier runs in a scheduled Claude session, which holds no GitHub credentials (`docs/schedule_verification.md`,
+confirmed 2026-10-21). The push failed every cycle, and the only trace was one `"ok": false` row in an exit-0 report.
+
+The push now happens inside `scripts.robinhood_payload ingest`, which the payload launcher runs on the Mac under your own git
+login (`publish_all` with the channels enabled in `config/recommendations.json`). The separate 5-minute
+`recommendations-publish` launchd job was removed. Check after the first real run:
+
+```bash
+git ls-remote origin refs/heads/recommendations     # one line once the first set of the day is published
+```
+
+Unverified: `ingest` publishes the slot it just computed, whereas the removed job republished every slot's newest set for
+the day. Confirm on the first real run that earlier slots' files are still on the branch.
 
 ## Rollout and limits
 
