@@ -1491,8 +1491,14 @@ def _normalized_order_id(value: Any) -> Optional[str]:
     """Return the canonical form of a usable string or numeric broker order ID."""
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return None
-    if isinstance(value, (int, float)) and (value == 0 or not math.isfinite(value)):
-        return None
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return None
+        try:
+            if not math.isfinite(value):
+                return None
+        except OverflowError:
+            return None
     return str(value).strip() or None
 
 
