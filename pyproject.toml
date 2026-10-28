@@ -75,6 +75,7 @@ strategies = [
     "yfinance",
     "vectorbt",
     "alpaca-py",
+    "msgpack>=1.2.3",
     "transformers",
     "torch",
 ]

@@ -54,6 +54,7 @@ selfheal = [
 strategies = [
     { name = "alpaca-py" },
     { name = "jinja2" },
+    { name = "msgpack" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
@@ -71,6 +72,7 @@ requires-dist = [
     { name = "alpaca-py", marker = "extra == 'strategies'" },
     { name = "jinja2", marker = "extra == 'strategies'" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = "==4.26.0" },
+    { name = "msgpack", marker = "extra == 'strategies'", specifier = ">=1.2.3" },
     { name = "numpy", marker = "extra == 'strategies'" },
     { name = "pandas", marker = "extra == 'strategies'" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = "==2.10.1" },
