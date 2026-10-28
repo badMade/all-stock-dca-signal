@@ -114,10 +114,12 @@ Verified from the operator's Mac (2026-10-28):
   MSFT $1.53, MRK $1.36, RVI $1.29, CHE $1.28 ($19.16 in all). 21 other candidates were dropped at the refresh
   because their price had recovered above the Gate 5 decision price. The alert named the remedy: grant
   classifier permission, or place the listed buys by hand. The 09:35 window closes at 10:00 ET.
-- **The 09:52 to 09:54 batch is that same list.** The ten broker orders match the alert's amounts exactly,
-  SYY through CHE, minus MRK $1.36 (total $17.80). So those ten buys did not come from the 09:35 Claude run.
-  Someone placed them after the refusal: the operator by hand, or the 09:55 Perplexity backup started early.
-  The broker cannot say which. Not yet answered.
+- **The 09:52 to 09:54 batch is that same list, placed by the operator.** The ten broker orders match the
+  alert's amounts exactly, SYY through CHE, minus MRK $1.36 (total $17.80). The operator confirmed in chat that
+  they placed this batch by hand, following the alert's remedy. The orders show `placed_agent: agentic`, so
+  they went through an agent session, not the Robinhood app. Reported by the operator, not independently
+  verified. It means the Perplexity backup was not involved and there was no double buy. Why MRK was left out
+  was not recorded.
 - `scripts.check_slot_fills` fails for 09:35, 10:30 and 12:30 because `gate9_report` lacks `eligible_count`
   and the three `dropped` counts, and for 13:30 because `run_state.json` lacks the `counts` and `gate9_report`
   objects. Only 09:35 also fails on the refusal marker. 10:30 and 12:30 therefore show no classifier text in
@@ -126,7 +128,7 @@ Verified from the operator's Mac (2026-10-28):
   tells the slot to supply them (`docs/schedule_verification.md`, "Post-slot submission check"). Not
   verified against the live task text; `scripts/check_live_prompt_drift.py` on the Mac would confirm it.
 
-Not known: who placed the 09:52 batch, why 10:30 placed nothing, what the 13:30 `market_data_unavailable` and
+Not known: why MRK was left out of the hand-placed batch, why 10:30 placed nothing, what the 13:30 `market_data_unavailable` and
 14:30 zero-buy statuses mean for the 13:59 and 14:58 orders, and whether the 13:01 batch was a 12:30 retry.
 
 Likely cause of the 09:35 stop: the Cowork task's classifier permission for `place_equity_order`.
