@@ -106,19 +106,32 @@ Verified from the operator's Mac (2026-10-28):
 - Run folders exist for 09:35, 10:30, 11:30, 12:30, 13:30 and 14:30. The 15:30 folder was not listed by the
   command used.
 - `grep -ril "PLATFORM REFUSAL" cron_tracking/*/20261027_*` matched one file only:
-  `market_open_dca/20261027_0935ET/alert_text.txt`. The 09:35 slot hit an auto-mode classifier refusal of
-  `place_equity_order`. The ten buys at 09:52 to 09:54 fit a partial batch (as on 2026-10-07), but the
-  eligible-versus-submitted counts were not read, so that is unconfirmed.
-- No other folder holds that text. The refusals recorded earlier for 10:30 and 12:30 are therefore not
-  confirmed by the marker and rest on the slot status alone.
-- `scripts.check_slot_fills` did not run (`python` is not on the Mac's PATH; use `python3`).
+  `market_open_dca/20261027_0935ET/alert_text.txt`.
+- **09:35 placed nothing.** Its alert says Gate 7 failed: the auto-mode classifier (`[Real-World Transactions]`)
+  refused `place_equity_order` twice (the first call plus one retry, on SYY at $2.46) before the broker saw
+  it. The batch stopped, no order was placed, and no placement attempt was consumed. Gates 0 to 6.7 had passed
+  with this resolved list: SYY $2.46, KVUE $2.36, SJM $2.13, MCK $1.78, IBM $1.78, MA $1.64, NFLX $1.55,
+  MSFT $1.53, MRK $1.36, RVI $1.29, CHE $1.28 ($19.16 in all). 21 other candidates were dropped at the refresh
+  because their price had recovered above the Gate 5 decision price. The alert named the remedy: grant
+  classifier permission, or place the listed buys by hand. The 09:35 window closes at 10:00 ET.
+- **The 09:52 to 09:54 batch is that same list.** The ten broker orders match the alert's amounts exactly,
+  SYY through CHE, minus MRK $1.36 (total $17.80). So those ten buys did not come from the 09:35 Claude run.
+  Someone placed them after the refusal: the operator by hand, or the 09:55 Perplexity backup started early.
+  The broker cannot say which. Not yet answered.
+- `scripts.check_slot_fills` fails for 09:35, 10:30 and 12:30 because `gate9_report` lacks `eligible_count`
+  and the three `dropped` counts, and for 13:30 because `run_state.json` lacks the `counts` and `gate9_report`
+  objects. Only 09:35 also fails on the refusal marker. 10:30 and 12:30 therefore show no classifier text in
+  their reports, so their cause is still unknown.
+- Inference: the missing counts match a live prompt that predates the mirrors, whose `--report-json` bullet
+  tells the slot to supply them (`docs/schedule_verification.md`, "Post-slot submission check"). Not
+  verified against the live task text; `scripts/check_live_prompt_drift.py` on the Mac would confirm it.
 
-Not known: why 10:30 placed nothing, what the 13:30 `market_data_unavailable` and 14:30 zero-buy statuses
-mean for the 13:59 and 14:58 orders, and whether the 13:01 batch was a 12:30 retry.
+Not known: who placed the 09:52 batch, why 10:30 placed nothing, what the 13:30 `market_data_unavailable` and
+14:30 zero-buy statuses mean for the 13:59 and 14:58 orders, and whether the 13:01 batch was a 12:30 retry.
 
-Likely cause, inference: the classifier refuses `place_equity_order` in the Cowork tasks. `.claude/settings.json`
-allows the tool, but it governs sessions in this repo, not the live tasks, so the Cowork permission setting is
-what counts. Prior instances: 2026-09-04 and 2026-10-07 (`docs/schedule_verification.md`).
+Likely cause of the 09:35 stop: the Cowork task's classifier permission for `place_equity_order`.
+`.claude/settings.json` allows the tool, but it governs sessions in this repo, not the live tasks. Prior
+instances: 2026-09-04 and 2026-10-07.
 
 ## Open items
 
