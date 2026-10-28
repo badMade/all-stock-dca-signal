@@ -27,14 +27,16 @@ STEP 2: Read GitHub (read-only, via the GitHub connector)
 - If a Key's matching PR or commit may lie beyond the last 50 commits or 100 PRs, page further back for that Key before settling on an existing Commit URL.
 
 STEP 3: Read Notion
-- Query all DCA Issues rows. For each row you need Key, Name, Class, Severity, Status, Fix state, Approval, and the tracking columns GitHub issue, Branch, Commit URL, PR number, Progress, Proposed plan.
+- Query all DCA Issues rows. For each row you need Key, Name, Class, Severity, Status, Fix state, Approval, and the tracking columns GitHub issue, Branch, Commit URL, PR number, Progress, Proposed plan, plus each page's last_edited_time (HARD RULE 6). If the query does not return last_edited_time, fetch the page itself before writing to it; if you still cannot read it, do not write that row and list it under "Skipped items".
 
 STEP 4: Reconcile
 - Do not skim or sample. Run tr.match_git_evidence for EVERY Key, and fetch each matched PR directly for its real merged state and check status. If you could not do that for a Key, list the Key under "Skipped items" and leave its row untouched; never report an unchecked Key as unchanged.
-- For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=...); progress = tr.derive_progress(evidence).
+- For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=..., recorded_pr_number=<the row's PR number as an int, or None>, recorded_commit_url=<the row's Commit URL, or None>); progress = tr.derive_progress(evidence). Always pass the row's recorded values: they keep a real fix that cites its Key only in the body from being lowered or displaced.
+- If evidence.recorded_pr_unconfirmed is True, the row's recorded PR was neither matched nor found citing the Key. Do not write that row; list it under "Skipped items" with the recorded PR number so the operator can confirm or correct it.
+- A commit matches only when its SUBJECT line names the Key (tr enforces this). Do not hand-pick a commit tr did not return as evidence.commit_url.
 - If tr raises EvidenceError, do not write that Key. Put the error text in the digest.
 - New candidate with no row: create a row with Key, Name, Fix state = New, Approval = Proposed.
-- Existing row: update only Progress (a text column; write the label exactly as tr.derive_progress returns it), GitHub issue, Branch, Commit URL and PR number, and only when the value changed. Never change Status, Class, Severity or Fix state.
+- Existing row: update only Progress (a text column; write the label exactly as tr.derive_progress returns it), GitHub issue, Branch, Commit URL and PR number, and only when the value changed. Never clear GitHub issue, Branch, Commit URL or PR number because tr found nothing (a merged selfheal/<key> branch is usually deleted); only replace them with a new non-empty value. Never change Status, Class, Severity or Fix state.
 - Approval: the only value you may ever write is "Proposed", and only on a row you created or on a row whose Approval is empty. Never write "Approved" or "Rejected", and never change a row that already has any Approval value. An empty Approval counts as NOT approved.
 
 STEP 5: Propose plans (text only)
