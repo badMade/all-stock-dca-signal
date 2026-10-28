@@ -102,3 +102,8 @@ def test_any_source_may_support_a_price():
     payload = _payload(price=500.0)
     payload["sources"]["finance"] = {"MSFT": {"quote": {"price": 100.0}, "previous_close_bar": {"close": 101.0, "low": 100.5}}}
     assert nc.plan_grounding_errors(_plan(_order()), payload) == []
+
+def test_source_values_catches_type_error():
+    payload = {"sources": {"robinhood": {"MSFT": {"quote": None}}}}
+    # lambda x: x["quote"]["price"] will raise TypeError when x["quote"] is None
+    assert nc._source_values(payload, "MSFT", nc._quote_price) == []
