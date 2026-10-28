@@ -757,7 +757,9 @@ def publish(
     meta["payload_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
     fd, tmp = tempfile.mkstemp(prefix=out.name + ".", dir=out.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # newline="": write the exact bytes the sidecar's SHA-256 was taken over. Text mode turns "\n" into "\r\n" on
+        # Windows, so `check` read back a different file than `publish` hashed (a no-op on the Mac).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(body)
         # ln-style no-overwrite publish: a concurrent run that finished first wins, nobody sees a partial file.
         try:

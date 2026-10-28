@@ -1,5 +1,6 @@
 """scripts/robinhood_payload.py: the validation that stands between an LLM-copied fetch and a live slot."""
 
+import hashlib
 import json
 from datetime import date, time
 
@@ -367,6 +368,23 @@ def test_publish_refuses_before_the_decision_anchor(tmp_path):
     early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
     assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
     assert not (tmp_path / "out" / "payload.json").exists()
+
+
+def test_published_bytes_match_the_sidecar_checksum_even_with_windows_newlines(tmp_path, monkeypatch):
+    # Text mode turns "\n" into "\r\n" on Windows, so publish hashed one file and wrote another and `check` failed with
+    # "payload does not match its sidecar checksum". Simulate that translation here so the regression shows on any OS.
+    real_fdopen = rp.os.fdopen
+
+    def windows_fdopen(fd, mode="r", *args, newline=None, **kwargs):
+        return real_fdopen(fd, mode, *args, newline="\r\n" if newline is None else newline, **kwargs)
+
+    monkeypatch.setattr(rp.os, "fdopen", windows_fdopen)
+    plan = _published(tmp_path)
+    out = tmp_path / "out"
+    written = (out / "payload.json").read_bytes()
+    assert b"\r" not in written
+    assert hashlib.sha256(written).hexdigest() == json.loads((out / "payload.meta.json").read_text())["payload_sha256"]
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=5)) == 0
 
 
 def test_missing_or_mismatched_sidecar_fails_closed(tmp_path):
