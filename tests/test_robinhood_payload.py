@@ -783,7 +783,11 @@ def test_eight_quiet_tickers_of_ninety_still_publish(tmp_path):
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
     assert not (tmp_path / "out" / "payload.refused.json").exists()
     published = json.loads((tmp_path / "out" / "payload.json").read_text())
-    assert published["ticker_errors"]["quiet"] == sorted(tickers[:8])
+    # generate_buy_candidates rejects unknown ticker_errors keys and scores errored names NO_DATA (never a BUY),
+    # so a quiet name stays under "robinhood" in the file; the sidecar says which of those did not trade.
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:8])}
+    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
+    assert meta["quiet"] == sorted(tickers[:8])
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0  # re-validation must not read them as misses
 
 
@@ -810,8 +814,8 @@ def test_real_failures_within_the_floor_publish_beside_quiet_tickers(tmp_path):
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
     published = json.loads((tmp_path / "out" / "payload.json").read_text())
-    assert published["ticker_errors"]["quiet"] == sorted(tickers[:4])
-    assert published["ticker_errors"]["robinhood"] == sorted(tickers[4:8])
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:8])}
+    assert json.loads((tmp_path / "out" / "payload.meta.json").read_text())["quiet"] == sorted(tickers[:4])
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
 
 
@@ -822,3 +826,24 @@ def test_a_stale_newest_bar_still_counts_against_the_floor(tmp_path):
     payload, failed = rp.assemble(plan, [chunk])
     assert payload["ticker_errors"]["robinhood"] == [tickers[8]]
     assert payload["ticker_errors"]["quiet"] == sorted(tickers[:8])
+
+
+def test_a_published_payload_with_quiet_tickers_is_accepted_by_the_candidate_generator(tmp_path):
+    # generate_buy_candidates rejects ticker_errors keys that are not source names; the file must stay valid.
+    from scripts.generate_buy_candidates import _VALID_SOURCE_NAMES
+
+    plan, _, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert set(published["ticker_errors"]) <= set(_VALID_SOURCE_NAMES)
+
+
+def test_live_mirror_prompts_leave_quiet_tickers_out_of_the_errored_count():
+    from pathlib import Path
+
+    mirror = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "live-mirror"
+    for slot in rp.SLOTS:
+        (path,) = mirror.glob(f"{slot}ET-*.txt")
+        _, rule = _errored_ticker_rule(path)
+        assert '"quiet"' in rule and ".meta.json" in rule, path.name
