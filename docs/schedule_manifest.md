@@ -843,11 +843,11 @@ Desktop tasks take their cron in the Mac's local time and are unaffected.
 
 Verifier and watchdog prompts follow the same rule: **derive the slot window from the ET
 boundaries at run time, never hardcode a Z value.** Use, e.g. for the 9:35 slot (window
-09:30 to 10:00 ET):
+09:30 to 10:20 ET, widened from 10:00 on 2026-10-28 after the scheduler fired the slot 18 minutes late):
 
 ```
 W_START=$(TZ=America/New_York date -u -d "today 09:30" +%Y-%m-%dT%H:%M:%SZ)
-W_END=$(TZ=America/New_York date -u -d "today 10:00" +%Y-%m-%dT%H:%M:%SZ)
+W_END=$(TZ=America/New_York date -u -d "today 10:20" +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 (BSD/macOS `date` has no `-d`; use `gdate` or Python `zoneinfo` there.) Check:

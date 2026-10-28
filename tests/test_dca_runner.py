@@ -2906,7 +2906,7 @@ def test_gate1_jittered_fire_time_still_passes():
     [
         datetime(2026, 7, 28, 9, 30, tzinfo=ET),      # the old window start
         datetime(2026, 7, 28, 9, 34, 59, tzinfo=ET),  # a second before 9:35: never fires early
-        datetime(2026, 7, 28, 10, 0, 1, tzinfo=ET),   # a second late
+        datetime(2026, 7, 28, 10, 20, 1, tzinfo=ET),  # a second after the 10:20 close
         datetime(2026, 7, 28, 15, 30, tzinfo=ET),     # another slot's window
     ],
 )
@@ -3084,7 +3084,7 @@ def test_gate4_matches_on_created_at_not_fill_time():
     "created",
     [
         _utc(2026, 7, 28, 13, 29, 59),  # one second before 13:30 UTC
-        _utc(2026, 7, 28, 14, 0, 1),    # one second after 14:00 UTC
+        _utc(2026, 7, 28, 14, 20, 1),   # one second after the 10:20 ET (14:20 UTC) close
     ],
 )
 def test_gate4_orders_just_outside_boundary_do_not_trip(created):
@@ -7515,7 +7515,7 @@ def test_execute_plan_allows_a_ticker_not_bought_today_alongside_unrelated_histo
         account_number=TEST_ACCOUNT_NUMBER,
     )
     # Afternoon, same calendar day but well outside the 0935 slot's own
-    # 9:35-10:00 ET window, so this exercises only the bought-today dedup
+    # 9:35-10:20 ET window, so this exercises only the bought-today dedup
     # check below, not the (separately tested) sole-executor interlock.
     earlier = [_order("MSFT", 2.0, _utc(2026, 7, 28, 18, 0))]
     plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)])
@@ -10570,13 +10570,13 @@ def test_execute_plan_recheck_the_clock_halts_the_remainder_when_the_window_clos
         snapshot=snapshot,
         tier=tier,
     )
-    # The 0935 slot's window is 09:35-10:00 ET (see SLOTS); the first two
+    # The 0935 slot's window is 09:35-10:20 ET (see SLOTS); the first two
     # now_fn calls (the one-time freshness check, then before AAPL) are still
     # inside it, the third (before MSFT) is not.
     clock_readings = iter([
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
-        datetime(2026, 7, 28, 10, 5, tzinfo=ET),
+        datetime(2026, 7, 28, 10, 25, tzinfo=ET),
     ])
     result = dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
