@@ -1556,3 +1556,7 @@ def test_cumulative_credit_edge_cases(tmp_path):
     assert zero_dec.order_amount_usd == 0.0
     assert zero_dec.pending_after_usd == 0.0
 
+
+def test_normalized_order_id_overflows():
+    from dca_cumulative import _normalized_order_id
+    assert _normalized_order_id(10**1000) is None

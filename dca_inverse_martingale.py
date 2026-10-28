@@ -48,23 +48,6 @@ STATUS_DIPPING = "dipping"
 STATUS_FIRING = "firing"
 
 
-def _is_finite_scalar(val: object) -> bool:
-    """True only for a real, finite int/float; never raises.
-
-    bool is rejected because it is an int subclass that carries no amount. The OverflowError guard
-    exists because json.loads() parses an arbitrarily large JSON integer into an unbounded Python int,
-    which passes isinstance() but makes math.isfinite() RAISE rather than return False; uncaught, that
-    escaped the per-ticker CorruptedLedgerStateError boundary and aborted the whole scheduled run
-    (#1912, restored after #1914 rolled it back).
-    """
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
-        return False
-    try:
-        return math.isfinite(val)
-    except (OverflowError, TypeError):
-        return False
-
-
 class CorruptedLedgerStateError(RuntimeError):
     """A ticker's persisted tracker.json exists but cannot be trusted.
 
@@ -523,9 +506,9 @@ def _parse_positive_finite(raw_value: Optional[str]) -> Optional[float]:
         return None
     try:
         candidate = float(raw_value)
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, TypeError):
         return None
-    return candidate if _is_finite_scalar(candidate) and candidate > 0 else None
+    return candidate if math.isfinite(candidate) and candidate > 0 else None
 
 
 def _parse_corporate_action_cell(raw_value: Optional[str]) -> tuple[bool, Optional[float]]:
@@ -548,9 +531,9 @@ def _parse_corporate_action_cell(raw_value: Optional[str]) -> tuple[bool, Option
         return False, None
     try:
         candidate = float(raw_value)
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, TypeError):
         return False, None
-    if not _is_finite_scalar(candidate) or candidate < 0:
+    if not math.isfinite(candidate) or candidate < 0:
         return False, None
     if candidate == 0.0:
         return True, None
@@ -1032,7 +1015,7 @@ def archived_split_factor(
         return None
     if latest_row_date < since:
         return None
-    if not _is_finite_scalar(factor) or factor <= 0:
+    if not math.isfinite(factor) or factor <= 0:
         return None
     return factor, latest_row_date
 
@@ -1494,9 +1477,9 @@ def evaluate_inverse_martingale_step(
     # Non-Finite / Non-Positive decision_price"; mirrors the identical,
     # already-fixed risk at the reconciliation layer -- see that function's
     # own "Reject non-finite reconciled prices" comment).
-    if not _is_finite_scalar(decision_price) or decision_price <= 0:
+    if not math.isfinite(decision_price) or decision_price <= 0:
         return _unchanged(tracker_state, status_before, accumulated_before, "invalid_decision_price")
-    if not _is_finite_scalar(previous_close) or previous_close <= 0:
+    if not math.isfinite(previous_close) or previous_close <= 0:
         return _unchanged(tracker_state, status_before, accumulated_before, "invalid_previous_close")
 
     # A multi-day cycle's drop must be measured against the price frozen at
@@ -1508,13 +1491,10 @@ def evaluate_inverse_martingale_step(
     # recovery-offset comparison (Codex review: "Measure a cycle against its
     # snapshotted reference close"). Only a brand-new cycle (status "none")
     # has no snapshot yet, so it uses the caller's freshly supplied value.
-    raw_ref = tracker_state.get("cycle_reference_close", previous_close) if status_before != STATUS_NONE else previous_close
-    try:
-        reference_close = float(raw_ref)
-    except (TypeError, ValueError, OverflowError):
-        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_reference_close")
-
-    if not _is_finite_scalar(reference_close) or reference_close <= 0:
+    reference_close = (
+        previous_close if status_before == STATUS_NONE else float(tracker_state.get("cycle_reference_close", previous_close))
+    )
+    if not math.isfinite(reference_close) or reference_close <= 0:
         return _unchanged(tracker_state, status_before, accumulated_before, "invalid_reference_close")
     drop_pct = (reference_close - decision_price) / reference_close
     if basis == BASIS_STDDEV:
@@ -1545,7 +1525,7 @@ def evaluate_inverse_martingale_step(
         # reference_close) already getting an explicit isfinite() check.
         if (
             not effective_stddev_reference
-            or not _is_finite_scalar(effective_stddev_reference)
+            or not math.isfinite(effective_stddev_reference)
             or effective_stddev_reference <= 0
         ):
             return _unchanged(tracker_state, status_before, accumulated_before, "stddev_unavailable")
@@ -1568,7 +1548,7 @@ def evaluate_inverse_martingale_step(
     # derived drop metrics"). Fail closed exactly like the reference_close/
     # stddev_reference checks just above -- no reset, no tier credit, just
     # skip this evaluation.
-    if not _is_finite_scalar(drop_metric):
+    if not math.isfinite(drop_metric):
         return _unchanged(tracker_state, status_before, accumulated_before, "invalid_drop_metric")
 
     new_state = dict(tracker_state)
@@ -1948,7 +1928,7 @@ def evaluate_inverse_martingale_step(
         #    re-arming and re-crediting an already-paid-for price level
         #    (Codex review: "Compare the rearm floor in the same price
         #    frame").
-        if fired_floor_price is not None and _is_finite_scalar(fired_floor_price) and fired_floor_price > 0:
+        if fired_floor_price is not None and math.isfinite(fired_floor_price) and fired_floor_price > 0:
             floor_not_yet_broken = decision_price >= fired_floor_price
         elif same_day_fire_floor is not None:
             floor_not_yet_broken = drop_metric <= same_day_fire_floor
@@ -1999,7 +1979,7 @@ def evaluate_inverse_martingale_step(
                 # persistable balance.
                 tier_credit = 0.01
             accumulated = round(accumulated + tier_credit, 2)
-            if not _is_finite_scalar(accumulated):
+            if not math.isfinite(accumulated):
                 # A schema-valid but extreme unit_usd/units combination
                 # (e.g. unit_usd=1e200 with a units=1e200 tier) can produce
                 # a `units * unit_usd` product that overflows to `inf`
@@ -2325,7 +2305,11 @@ def _validate_settlement_fields(
         # oversized JSON integer raises out of math.isfinite() rather than
         # returning False, and an uncaught OverflowError escapes the
         # per-ticker CorruptedLedgerStateError boundary entirely.
-        if not _is_finite_scalar(claimed_usd) or claimed_usd < 0:
+        try:
+            claimed_finite = math.isfinite(claimed_usd)
+        except OverflowError:
+            raise _corrupted("settlement_claimed_usd", claimed_usd) from None
+        if not claimed_finite or claimed_usd < 0:
             raise _corrupted("settlement_claimed_usd", claimed_usd)
         target_state = data.get("settlement_target_state")
         if not isinstance(target_state, dict):
@@ -2472,7 +2456,11 @@ def _validate_numeric_fields(
             # site never catches it and the WHOLE scheduled run aborts over
             # one ticker's damaged tracker (Codex review: "Treat oversized
             # ledger integers as corruption").
-            if not _is_finite_scalar(value):
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                raise _corrupted(field, value) from None
+            if not finite:
                 raise _corrupted(field, value)
 
     # cycle_reference_close specifically must also be POSITIVE, not merely
@@ -2586,7 +2574,10 @@ def _validate_numeric_fields(
             # at near_close_dca.py's injection site never caught it and one
             # damaged tracker aborted the whole scheduled run (Codex review:
             # "Convert oversized fire-floor prices into ledger corruption").
-            fired_floor_price_invalid = not _is_finite_scalar(fired_floor_price) or fired_floor_price <= 0
+            try:
+                fired_floor_price_invalid = not math.isfinite(fired_floor_price) or fired_floor_price <= 0
+            except OverflowError:
+                fired_floor_price_invalid = True
         if fired_floor_price_invalid:
             raise _corrupted("fired_floor_price", fired_floor_price)
 
@@ -2739,7 +2730,29 @@ def _validate_tier_crossing_fields(
     data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
 ) -> None:
     def _is_finite_number(value: Any) -> bool:
-        return _is_finite_scalar(value)
+        """True only for a real, finite int/float.
+
+        math.isfinite() alongside the type check: NaN/inf ARE real int/float
+        instances in Python, so the type check alone lets them through --
+        inconsistent with every other numeric field validated just above, which
+        all reject non-finite values explicitly (Antigravity review: "Non-Finite
+        Floats in _validate_tracker_payload() Tier Thresholds").
+
+        The OverflowError guard is the same one the generic numeric loop uses:
+        json.loads() parses an arbitrarily large JSON integer into an unbounded
+        Python int, which passes isinstance() but makes math.isfinite() RAISE
+        rather than return False. Uncaught, that escaped this function instead
+        of becoming CorruptedLedgerStateError, so the per-ticker recovery
+        boundary at near_close_dca.py's injection site never caught it and one
+        damaged tracker aborted the WHOLE scheduled run (Codex review: "Convert
+        oversized crossed tiers into ledger corruption").
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
 
     crossed = data.get("crossed_tier_thresholds")
     if crossed is not None and (
@@ -2896,7 +2909,7 @@ def _validate_fingerprint_and_identity_fields(
     tier_config_fingerprint = data.get("tier_config_fingerprint")
     if tier_config_fingerprint is not None:
         def _positive_finite(value: Any) -> bool:
-            return _is_finite_scalar(value) and value > 0
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
         valid_fingerprint_shape = (
             isinstance(tier_config_fingerprint, list)
