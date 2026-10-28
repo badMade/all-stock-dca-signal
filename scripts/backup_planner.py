@@ -660,9 +660,11 @@ def _cmd_executor_ids(args: argparse.Namespace, trading_day: date) -> int:
     * the gate-sequence live prompt every slot still runs (``claude/dca-executor-prompts/live-mirror/``), as
       ``$ROOT/place_<TICKER>.json`` in the slot's run directory (:func:`_live_prompt_placements`).
 
-    Reading only the first was the 2026-10-26 09:35 stand-down: the reader prompts were never pasted live, so
-    no ``placements/`` directory existed, the list came back empty, and 25 of Claude's own orders read as
-    UNRECOGNIZED. Neither directory existing means no placements (an empty list). A response that cannot be read is a
+    Reading only the first was a gap found in the 2026-10-26 09:35 stand-down (the 25 orders there were a manual
+    backup run's own, not Claude's: docs/incident_2026-10-26_0935_unrecognized_orders.md): the reader prompts were
+    never pasted live, so on a day a live-prompt slot buys no ``placements/`` directory exists, the list comes back
+    empty, and Claude's own orders would read as UNRECOGNIZED. Neither directory existing means no placements (an
+    empty list). A response that cannot be read is a
     refusal: a recognition list with a hole in it would turn Claude's own order into an unrecognized one, and the
     prompt fails closed on that, but silently is worse. ``sources`` counts the files each writer contributed, so a
     slot that bought with both counts at zero is visible in the saved output, not only in the stand-down.

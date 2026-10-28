@@ -628,3 +628,10 @@ def test_builders_never_take_a_cross_process_lock_or_a_state_transaction(roots, 
     results = every_builder(roots)
     assert len(results) == 8 and all("warnings" in result for result in results)
     assert results[0]["status"] == "available" and results[0]["lock_file_present"] is True
+
+
+def test_finite_handles_oversized_integer_without_overflow():
+    from dca_console_state import _finite
+    oversized = 10**400
+    assert _finite(oversized) is None
+    assert _finite(-oversized) is None

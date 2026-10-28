@@ -2467,7 +2467,10 @@ def test_market_open_live_mirror_fail_closes_reviewed_placement_boundaries():
     assert "immediately before calling place_equity_order" in gate_7
     assert "pre-fetch clock result is never placement authorization" in gate_7
     assert "same fail-closed checks as dca_runner._placement_failure_reason" in gate_7
-    assert "symbol, side, dollar amount, account number, or client reference" in gate_7
+    # 2026-10-27: the returned ref_id is no longer part of this check (the broker echoes its own, never the one
+    # sent, which halted the 15:30 batch after one order); validate_native_placement is the identity check.
+    assert "symbol, side, dollar amount, or account number that does not match this exact request" in gate_7
+    assert "the `ref_id` is NOT compared" in gate_7
     assert "only AFTER all of these checks pass" in gate_7
     assert "logged_reference_bound is true" in text
     assert "reference_source is logged" in text
