@@ -852,8 +852,9 @@ W_END=$(TZ=America/New_York date -u -d "today 10:00" +%Y-%m-%dT%H:%M:%SZ)
 
 (BSD/macOS `date` has no `-d`; use `gdate` or Python `zoneinfo` there.) Check:
 `TZ=America/New_York date -u -d "2026-11-02 09:30"` must print `14:30:00 UTC`. Pass
-`W_START` as the broker query's `created_at_gte`. The other slot windows are 10:25-10:55,
-11:25-11:55, 12:25-12:55, 1:25-1:55, 2:25-2:55 and 3:25-3:55 ET.
+`W_START` as the broker query's `created_at_gte`. The other slot windows are 10:25-11:00,
+11:25-12:00, 12:30-1:00, 1:25-2:00, 2:25-3:00 and 3:25-3:55 ET (the live prompts' Gate 1 bounds;
+the four :25 slots close where `dca_runner.SLOTS` does, and 3:30 keeps 3:55, before the 4:00 close).
 `tests/test_schedule_dst_guard.py` fails if a repo prompt hardcodes a UTC window.
 
 ### Expired temporary live scheduler overrides (historical record)

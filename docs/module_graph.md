@@ -111,7 +111,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_console_docs` | 144 | 1 | 1 | 0 | `dca_console_reader` |
 | `dca_console_env` | 223 | 4 | 1 | 0 | `dca_console`, `dca_console_jobs`, `dca_console_reader`, `dca_console_release` |
 | `dca_console_jobs` | 507 | 3 | 8 | 0 | `dca_console_routes`, `dca_fileio`, `near_close_dca` |
-| `dca_console_launch` | 626 | 6 | 3 | 0 | `dca_console`, `dca_console_reader`, `dca_console_state`, `dca_fileio`, `dca_paths`, `dca_risk` |
+| `dca_console_launch` | 628 | 6 | 3 | 0 | `dca_console`, `dca_console_reader`, `dca_console_state`, `dca_fileio`, `dca_paths`, `dca_risk` |
 | `dca_console_octopus` | 411 | 2 | 1 | 0 | `dca_config`, `dca_console_reader` |
 | `dca_console_reader` | 190 | 0 | 16 | 0 |  |
 | `dca_console_release` | 59 | 0 | 4 | 0 |  |
@@ -120,7 +120,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_console_routes` | 653 | 17 | 2 | 0 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_diagnostics`, `dca_console_docs`, `dca_console_env`, `dca_console_jobs`, `dca_console_launch`, +9 more |
 | `dca_console_runs` | 790 | 13 | 2 | 0 | `dca_config`, `dca_console_data`, `dca_console_jobs`, `dca_console_reader`, `dca_paths`, `dca_reporting`, `dca_risk`, `scripts.close_window_signal`, +5 more |
 | `dca_console_schedule` | 739 | 11 | 1 | 0 | `dca_console_data`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, +3 more |
-| `dca_console_state` | 903 | 6 | 2 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_risk`, `dca_runner`, `scripts.purchase_history` |
+| `dca_console_state` | 906 | 6 | 2 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_risk`, `dca_runner`, `scripts.purchase_history` |
 | `dca_console_tickers` | 245 | 2 | 1 | 0 | `dca_console_reader`, `dca_ticker_paths` |
 | `dca_console_training` | 355 | 1 | 1 | 0 | `dca_console_reader` |
 | `dca_cost_tracker` | 413 | 3 | 2 | 0 | `dca_common`, `dca_fileio`, `scripts.run_classification` |
