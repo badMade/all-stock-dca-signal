@@ -103,7 +103,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.sequestered_truth_comparator", "run_benchmark",
     )),
     ("utilities", "Dev tools & utilities", (
-        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues", "patch_finbert_cache", "patch_template",
+        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues",
         "snap", "scripts.__init__", "scripts.agent_entry_points", "scripts.compute_schedule",
         "scripts.fill_perplexity_backup_prompts", "scripts.github_mcp_login", "scripts.healthcheck",
         "scripts.self_heal", "scripts.verify_perplexity_pair", "scripts.workflow_policy", "scripts.promote_console",

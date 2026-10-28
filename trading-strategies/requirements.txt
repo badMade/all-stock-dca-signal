@@ -15,3 +15,4 @@ torch
 # Patched minimums for torch's transitive dependencies (research audit).
 filelock>=4.2.1
 setuptools>=84.1.0
+msgpack>=1.2.3
