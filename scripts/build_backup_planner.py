@@ -224,16 +224,6 @@ def _bootstrap(min_python: tuple[int, int]) -> bytes:
     return (_BOOTSTRAP % {"min_python": tuple(min_python)}).encode()
 
 
-def _read_bundled(root: Path, name: str) -> bytes:
-    """Read a bundled file with CRLF folded to LF.
-
-    Every bundled file is ``.py`` or ``.json`` text. A Windows checkout with autocrlf holds the same git
-    content with CRLF endings, which would change the hash and the zip for identical sources (PR #1911:
-    f4bbe2f9 against CI's 675d66b7). Folding here makes the build the same on every OS.
-    """
-    return (root / name).read_bytes().replace(b"\r\n", b"\n")
-
-
 def _digest(bootstrap: bytes, files: list[str], payload: dict[str, bytes]) -> str:
     # The bootstrap is executable behaviour (version check, config isolation, dispatch) and embeds min_python,
     # so hashing its bytes covers the build parameter as well; a file with a different startup path cannot
@@ -254,13 +244,13 @@ def content_sha256(repo_root: Path = REPO, min_python: tuple[int, int] = DEFAULT
     """
     root = Path(repo_root)
     files = collect_files(root)
-    return _digest(_bootstrap(min_python), files, {name: _read_bundled(root, name) for name in files})
+    return _digest(_bootstrap(min_python), files, {name: (root / name).read_bytes() for name in files})
 
 
 def _render(root: Path, source_commit: str, min_python: tuple[int, int]) -> tuple[bytes, dict]:
     commit = _resolve_commit(root, source_commit)
     files = collect_files(root)
-    payload = {name: _read_bundled(root, name) for name in files}
+    payload = {name: (root / name).read_bytes() for name in files}
     info = {
         "schema_version": 1,
         "tool": "scripts/build_backup_planner.py",

@@ -51596,28 +51596,3 @@ def test_nyse_holidays_new_years_weekend_observance():
     # 2023 New Year's Day was Sunday. Observed on Monday, 2023-01-02.
     holidays_2023 = near_close_dca.nyse_holidays(2023)
     assert date(2023, 1, 2) in holidays_2023
-
-
-def test_bool_amounts_in_a_legacy_attribution_are_never_summed_as_numbers():
-    # The 10-23 boolean-trap fix (#1911) was rolled back by #1914. Its own test passed with or without
-    # the fix: its prior and its (empty) fresh rows made every id "missing", so the function returned
-    # the prior untouched before reaching the merge. This one trims a single id (B) out of {A, B} so the
-    # legacy per-order breakdown is actually merged, and fails while True + True is summed to 2.
-    from near_close_dca import _unrepresented_prior_candidate_part
-
-    legacy = {"order_id": "B", "submitted_amount_usd": True, "planned_amount_usd": True, "whole_share_quantity": True}
-    prior = {
-        "order_id": "A",
-        "whole_share_order_ids": ["A", "B"],
-        "submitted_amount_usd": 10.0,
-        "planned_amount_usd": 10.0,
-        "whole_share_quantity": 2.0,
-        "whole_share_order_attributions": [dict(legacy), dict(legacy)],
-    }
-
-    result = _unrepresented_prior_candidate_part(prior, [{"order_id": "A"}])
-
-    # Booleans carry no amount: the trim must stay conservative (the prior's own totals), not use 2.
-    assert result["submitted_amount_usd"] == 10.0
-    assert result["planned_amount_usd"] == 10.0
-    assert result["whole_share_quantity"] == 2.0

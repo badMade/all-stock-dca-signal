@@ -36,13 +36,9 @@ PARALLEL="${DCA_CODEX_PARALLEL:-3}"
 # so a late build fails fast at Gate 5 instead of arriving too late to be read.
 BUILD_DEADLINE_SECONDS="${DCA_BUILD_DEADLINE_SECONDS:-0}"
 MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
-# Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
-# costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).
-RESCUE_SIZE="${DCA_RESCUE_CHUNK_SIZE:-2}"
-case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL$RESCUE_SIZE" in
-  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS, DCA_CODEX_PARALLEL and DCA_RESCUE_CHUNK_SIZE must be whole numbers" >&2; exit 2 ;;
+case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL" in
+  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS and DCA_CODEX_PARALLEL must be whole numbers" >&2; exit 2 ;;
 esac
-[ "$RESCUE_SIZE" -gt 0 ] || { echo "robinhood_payload: DCA_RESCUE_CHUNK_SIZE must be at least 1" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dca-rhpayload.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -63,10 +59,6 @@ case "$PLAN_STATUS" in
 esac
 
 OUT="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["out"])' "$WORK/plan.json")"
-# Where a dead worker's own output is kept (2026-10-26): $WORK, and every chunk_<i>.log in it, is deleted on exit, so the
-# 09:35 refusal (chunks 4 and 10 dead on both attempts) left nothing to say why. Only attempts that returned no reply
-# are kept, so a healthy build writes nothing here. Gitignored like the rest of the cron tree.
-KEEP_LOGS="${OUT%.json}.chunk_logs"
 if [ -e "$OUT" ]; then
   # Reuse only a payload that is provably fresh for THIS slot (built after the decision time, within the age
   # bound, matching its sidecar checksum). A leftover from an earlier attempt is set aside, never overwritten
@@ -116,9 +108,6 @@ run_chunk() {
       || echo "robinhood_payload: chunk $idx attempt $attempt failed or timed out" >&2
     if [ ! -s "$out" ]; then
       echo "robinhood_payload: timing chunk=$idx attempt=$attempt seconds=$(( $(date +%s) - started )) errors=n/a" >&2
-      # Best-effort: a log that cannot be kept must never change the build's outcome.
-      { mkdir -p "$KEEP_LOGS" && cp "$WORK/chunk_$idx.log" "$KEEP_LOGS/chunk_$idx.attempt$attempt.$BUILD_STARTED.log"; } 2>/dev/null \
-        || echo "robinhood_payload: could not keep the log of chunk $idx attempt $attempt" >&2
     else
       # grep -o exits 1 when a clean reply has no "error"; under set -e + pipefail that silently ended this worker
       # (the reply file survived only because nothing had deleted it yet), so a clean reply is counted as 0 here.
@@ -134,116 +123,18 @@ run_chunk() {
 }
 
 BUILD_STARTED="$(date +%s)"
-"$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json" >"$WORK/chunks.txt"
 idx=0
 while IFS= read -r tickers; do
   run_chunk "$idx" "$tickers" &
   idx=$((idx + 1))
   # Bound concurrency without bash 4's wait -n (macOS ships bash 3.2).
   if [ $((idx % PARALLEL)) -eq 0 ]; then wait; fi
-done <"$WORK/chunks.txt"
+done < <("$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json")
 wait
-
-# Rescue pass (2026-10-26). The 95% floor tolerates 4 misses in a 91-ticker universe, but the unit that fails is a whole
-# 8-ticker chunk: at 09:35 chunks 4 and 10 died on both attempts, 16 tickers went missing, and the slot aborted although
-# every other chunk validated. A chunk with no reply at all is asked for again in requests of RESCUE_SIZE tickers (each
-# with run_chunk's own retry and deadline), so one dead worker no longer costs the slot. A rescue part is named
-# chunk_<i>.r<k>.json and folded back into chunk_<i>.json before the merge, so the merge's chunk ownership is unchanged.
-# Extended the same day (13:30 refusal: 8 tickers, "no data returned", coverage 83/91): a chunk that DID reply but left
-# tickers out, or answered them with a per-ticker error, only got run_chunk's whole-chunk retry, which keeps the better
-# attempt and can still lose the same tickers twice. Those tickers are now re-asked for alone, in the same small
-# requests. Only absent or "error" tickers are rescued; a ticker that replied with data is never re-fetched, and a
-# rescue reply that is again missing or an error leaves the original entry in place for the merge to report.
-targets=()
-for ((i = 0; i < idx; i++)); do
-  # A crash here only means this chunk is not rescued (set -e must not end the launcher before the merge).
-  need="$("$PY" -c '
-import sys
-from scripts.robinhood_payload import _load_chunk
-try:
-    reply = _load_chunk(sys.argv[1])
-except (OSError, ValueError):  # no file, or one that holds no usable object: every ticker of the chunk is missing
-    reply = {}
-print(",".join(t for t in sys.argv[2].split(",") if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))))
-' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
-  if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
-done
-rescued=0
-for i in ${targets[@]+"${targets[@]}"}; do
-  IFS=, read -r -a members <<<"$(cat "$WORK/need_$i.txt")"
-  echo "robinhood_payload: rescue chunk=$i tickers=${#members[@]} size=$RESCUE_SIZE" >&2
-  for ((k = 0; k * RESCUE_SIZE < ${#members[@]}; k++)); do
-    group="$(IFS=,; echo "${members[*]:k*RESCUE_SIZE:RESCUE_SIZE}")"
-    echo "$group" >"$WORK/rescue_$i.r$k.tickers"
-    run_chunk "$i.r$k" "$group" &
-    rescued=$((rescued + 1))
-    if [ $((rescued % PARALLEL)) -eq 0 ]; then wait; fi
-  done
-done
-wait
-for i in ${targets[@]+"${targets[@]}"}; do
-  specs=()
-  for t in "$WORK"/rescue_"$i".r*.tickers; do
-    part="${t%.tickers}"; part="${part##*/rescue_}"
-    specs+=("$WORK/chunk_$part.json=$(cat "$t")")
-  done
-  # Each part counts only for its own group, as each chunk does in the merge: a key a part was not asked for is dropped.
-  # The chunk's own reply (if any) is the base; a part overrides it only with an entry that carries no error, so a
-  # rescue can never make a ticker worse than it was.
-  "$PY" -c '
-import json, sys
-from scripts.robinhood_payload import _load_chunk
-try:
-    merged = _load_chunk(sys.argv[1])
-except (OSError, ValueError):
-    merged = {}
-changed = False
-for spec in sys.argv[2:]:
-    path, group = spec.rsplit("=", 1)
-    try:
-        reply = _load_chunk(path)
-    except (OSError, ValueError):  # a dead part leaves its tickers to the merge report, as a dead chunk does
-        continue
-    for t in group.split(","):
-        if t in reply and not (isinstance(reply[t], dict) and reply[t].get("error")):
-            merged[t] = reply[t]
-            changed = True
-        elif t in reply and t not in merged:
-            merged[t] = reply[t]  # keep the error text for the merge report when there was nothing before it
-            changed = True
-if changed:
-    with open(sys.argv[1], "w", encoding="utf-8") as handle:
-        json.dump(merged, handle)
-' "$WORK/chunk_$i.json" "${specs[@]}"     || echo "robinhood_payload: rescue chunk=$i could not fold its parts back; its tickers go to the merge report" >&2
-  # Under set -e a crash above would have ended the launcher before the merge (no refusal marker, no log line), so
-  # every failure here only leaves the chunk as it was before the rescue.
-  rm -f "$WORK"/chunk_"$i".r*.json
-  # Tickers carried by the folded reply, per-ticker errors included; the merge decides which of them validate.
-  echo "robinhood_payload: rescue chunk=$i replied=$("$PY" -c 'import json,sys
-try: print(len(json.load(open(sys.argv[1]))))
-except (OSError, ValueError): print(0)' "$WORK/chunk_$i.json" || echo 0)" >&2
-done
 
 shopt -s nullglob
 # The total covers the fetch and the merge; the merge's exit status still decides the launcher's.
 MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
 echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS" >&2
-
-# Plan-first half (2026-10-26): the retired 5-minute Claude courier's order-history and buying-power read, now a second
-# `codex exec` after the payload is published, followed by `ingest`, which writes the recommendation files. Opt-in
-# (DCA_PLAN_FIRST_INGEST=1) so the six Gate 5 slots are unchanged until the operator has seen one real run. Strictly
-# best-effort: Gate 5 reads the payload only, so a broker or ingest failure is logged and never changes the exit status.
-if [ "${DCA_PLAN_FIRST_INGEST:-0}" = "1" ] && [ "$MERGE_STATUS" -eq 0 ]; then
-  BROKER_REPLY="$WORK/broker_reply.json"
-  INGEST_STATUS=0
-  {
-    "$PY" -m scripts.robinhood_payload broker-prompt --plan "$WORK/plan.json" >"$WORK/broker_prompt.txt" \
-      && perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
-        -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' --skip-git-repo-check -o "$BROKER_REPLY" - \
-        <"$WORK/broker_prompt.txt" >"$WORK/broker.log" 2>&1 \
-      && "$PY" -m scripts.robinhood_payload ingest --plan "$WORK/plan.json" --broker-reply "$BROKER_REPLY"
-  } || INGEST_STATUS=$?
-  [ "$INGEST_STATUS" -eq 0 ] || echo "robinhood_payload: plan-first ingest did not complete (status $INGEST_STATUS); the payload is unaffected" >&2
-fi
 exit "$MERGE_STATUS"

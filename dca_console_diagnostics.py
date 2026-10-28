@@ -86,7 +86,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
         "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
         "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
-        "scripts.sync_live_prompts", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
+        "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
         "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.slot_attribution",
     )),
     ("broker_market", "Broker, orders & market data", (
@@ -103,7 +103,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.sequestered_truth_comparator", "run_benchmark",
     )),
     ("utilities", "Dev tools & utilities", (
-        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues", "patch_finbert_cache", "patch_template",
+        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues",
         "snap", "scripts.__init__", "scripts.agent_entry_points", "scripts.compute_schedule",
         "scripts.fill_perplexity_backup_prompts", "scripts.github_mcp_login", "scripts.healthcheck",
         "scripts.self_heal", "scripts.verify_perplexity_pair", "scripts.workflow_policy", "scripts.promote_console",
