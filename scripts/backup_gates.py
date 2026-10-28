@@ -9,7 +9,8 @@ agent to act on. The rules are not new:
   1330 or 1430 from fixed ET ranges);
 * market day: a weekday that is not a listed holiday; on an early-close day a fire at or after the early-close
   time stops too (``skipped_market_closed``);
-* time: inside the slot's range, else ``skipped_outside_window``;
+* time: inside the slot's range (a single-fire task starts at its fire time, not before), else
+  ``skipped_outside_window``;
 * market-closed is decided before the window, as in the step 1 text (b before c).
 
 Fail closed: a naive clock value, an unknown task, or a date the calendar does not cover is an error (the
@@ -20,7 +21,7 @@ Standard library only; the calendar is passed in so the tests (and the zipapp's 
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,7 +29,7 @@ import dca_order_plan
 from scripts import backup_procedure
 
 ET = ZoneInfo("America/New_York")
-# The two-fire task has no "ten minutes before the fire" rule: its two ET ranges are fixed in the step 1 text.
+# The two-fire task's two ET ranges are fixed in the step 1 text (they start ten minutes before each fire; left as is).
 _TWO_FIRE_RANGES = {"1330": (time(13, 40), time(14, 20)), "1430": (time(14, 40), time(15, 20))}
 
 
@@ -38,10 +39,14 @@ def _hhmm(text: str) -> time:
 
 
 def _single_fire_range(backup: Any) -> tuple[str, time, time, bool]:
-    """(slot, start, end, end_inclusive): from ten minutes before the fire up to the latest placement time."""
+    """(slot, start, end, end_inclusive): from the fire time up to the latest placement time.
+
+    The fire time is the earliest start, never earlier: a backup is a delayed second chance, and a run that began
+    before it (a manual one at 09:46 on 2026-10-26, inside the old ten-minutes-early allowance) bought 25 orders
+    before Claude's slot could be judged to have failed. Scheduled runs start at or after their fire time.
+    """
     slot = backup.slots[0]
-    fire = datetime.combine(datetime(2000, 1, 1), _hhmm(backup.fires[0]))
-    return slot, (fire - timedelta(minutes=10)).time(), _hhmm(dca_order_plan.LATEST_PLACEMENT_ET[slot]), False
+    return slot, _hhmm(backup.fires[0]), _hhmm(dca_order_plan.LATEST_PLACEMENT_ET[slot]), False
 
 
 def _covered(calendar: dict, day: str) -> None:

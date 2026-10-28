@@ -277,6 +277,14 @@ ET** to summarize the day's automation usage in proxy bands, with a separate
 section for every recovery, retry, escalation, and repair run. Analytics only,
 no trading. See [credit_usage_proxy_report.md](credit_usage_proxy_report.md).
 
+### Perplexity backup target band
+
+Operator target (2026-10-25): the seven Perplexity backup fires (09:55, 10:50, 11:50, 12:50, 13:50, 14:50, 15:45
+ET) should use **at most 1,000 Perplexity credits per trading day** in total, about 140 per fire on average. This is
+a ceiling the operator reads off Perplexity's own usage page. It is not a figure the repo measures or estimates, so
+the proxy-band rule above still holds and no report may claim a credit count against it. The lever is the early
+stand-down gate in `docs/adr-plan-first-backup-executor.md` ("Amendment: stand down before the broker pull").
+
 ## Levers
 
 - Prefer compact Notion "Latest Run" updates daily; full dashboard only weekly/monthly.

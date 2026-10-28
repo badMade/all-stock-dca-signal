@@ -8,11 +8,11 @@ requests
 jinja2
 yfinance
 vectorbt
-msgpack>=1.2.3
 alpaca-py
 # Sentiment monitor only; large ML stack.
 transformers
 torch
-# Patched minimums for torch's transitive dependencies (research audit).
+# Patched minimums for vulnerable transitive dependencies (research audit).
 filelock>=4.2.1
 setuptools>=84.1.0
+msgpack>=1.2.3

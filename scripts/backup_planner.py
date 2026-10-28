@@ -11,7 +11,7 @@ Three subcommands, each printing ONE JSON document and exiting 0 when the result
     finalize  --trading-day D --slot S --plan F --orders-pages F --fresh-quotes F
               --fresh-spreads F --buying-power USD [--fresh-prior-closes F] [--now T]
     classify  --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]
-    executor-ids --trading-day D --slot S          (Mac only)
+    executor-ids --trading-day D --slot S [--rec-root R] [--cron-root C]   (Mac only)
     check-placement --trading-day D --slot S --response F --symbol T --amount USD --sent-ref-id R
               --submitted-after T --prior-orders-pages F [--placed-responses F ...]
 
@@ -87,6 +87,7 @@ import dca_config  # noqa: E402  (every project import must follow the version g
 import dca_order_plan as dop  # noqa: E402
 from dca_number_check import plan_grounding_errors  # noqa: E402
 from dca_order_plan import PlanError, PlanResult  # noqa: E402
+from dca_paths import cron_tracking_root  # noqa: E402
 from dca_rec_models import RecommendationSet  # noqa: E402
 from dca_rec_store import RecommendationStore, load_settings  # noqa: E402
 from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError  # noqa: E402
@@ -103,6 +104,7 @@ from scripts.broker_reconciliation import _has_continuation, _unwrap  # noqa: E4
 from scripts.reason_codes import UNSUPPORTED_NUMBER  # noqa: E402
 from scripts.same_day_top_up_gate import _bind_saved_pages  # noqa: E402
 from scripts.validate_native_placement import native_ref_id, validate_native_placement  # noqa: E402
+from scripts.verify_schedule import slot_run_dir_relative  # noqa: E402
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
@@ -649,23 +651,57 @@ def _placement_order_id(document: Any) -> str | None:
 
 
 def _cmd_executor_ids(args: argparse.Namespace, trading_day: date) -> int:
-    """The broker order ids the Claude plan-first reader saved for this slot today (Mac only).
+    """The broker order ids Claude's slot saved for this slot today, from either writer (Mac only).
 
-    Robinhood echoes its OWN ref_id, never the UUID the reader sent (scripts/validate_native_placement.py), so the
-    order id in each saved response under ``<cron root>/recommendations/<day>/placements/<slot>/<TICKER>.json`` is
-    the one exact link between a broker row and Claude's reader. No directory means no placements (an empty list).
-    A response that cannot be read is a refusal: a recognition list with a hole in it would turn Claude's own order
-    into an unrecognized one, and the prompt fails closed on that, but silently is worse.
+    Robinhood echoes its OWN ref_id, never the UUID that was sent (scripts/validate_native_placement.py), so the
+    order id in each saved response is the one exact link between a broker row and Claude. Two writers save them:
+
+    * the plan-first reader, under ``<cron root>/recommendations/<day>/placements/<slot>/<TICKER>.json``;
+    * the gate-sequence live prompt every slot still runs (``claude/dca-executor-prompts/live-mirror/``), as
+      ``$ROOT/place_<TICKER>.json`` in the slot's run directory (:func:`_live_prompt_placements`).
+
+    Reading only the first was the 2026-10-26 09:35 stand-down: the reader prompts were never pasted live, so
+    no ``placements/`` directory existed, the list came back empty, and 25 of Claude's own orders read as
+    UNRECOGNIZED. Neither directory existing means no placements (an empty list). A response that cannot be read is a
+    refusal: a recognition list with a hole in it would turn Claude's own order into an unrecognized one, and the
+    prompt fails closed on that, but silently is worse. ``sources`` counts the files each writer contributed, so a
+    slot that bought with both counts at zero is visible in the saved output, not only in the stand-down.
     """
     store = RecommendationStore(args.rec_root)
-    directory = store.placements_dir(trading_day, args.slot)
+    plan_first = sorted(store._placed_tickers(store.placements_dir(trading_day, args.slot)))
+    cron_root = Path(args.cron_root) if args.cron_root is not None else Path(cron_tracking_root())
+    live_prompt = _live_prompt_placements(cron_root, trading_day, args.slot)
     ids: set[str] = set()
-    for path in sorted(store._placed_tickers(directory)):
+    for path in plan_first + live_prompt:
         order_id = _placement_order_id(_read_json(path, missing="placement_missing", corrupt="placement_corrupt"))
         if order_id:
             ids.add(order_id)  # a refused placement saved no order id; there is nothing at the broker to recognise
     return _emit({"status": "OK", "trading_day": trading_day.isoformat(), "slot": args.slot,
-                  "order_ids": sorted(ids), "errors": []}, 0)
+                  "order_ids": sorted(ids),
+                  "sources": {"plan_first_placements": len(plan_first), "live_prompt_placements": len(live_prompt)},
+                  "errors": []}, 0)
+
+
+# The live prompt's `--redacted-response $ROOT/place_<TICKER>.json`; the ticker shape is dca_rec_store's own.
+_LIVE_PROMPT_PLACEMENT = re.compile(r"^place_[A-Z][A-Z0-9.\-]{0,9}\.json$")
+
+
+def _live_prompt_placements(cron_root: Path, trading_day: date, slot: str) -> list[Path]:
+    """The ``place_<TICKER>.json`` responses the live prompt saved in this slot's run directory today.
+
+    The directory is Gate 9's (``verify_schedule.slot_run_dir_relative``: ``<stream>/<YYYYMMDD>_<slot>ET``) plus
+    the dashed ``<YYYY-MM-DD>_<slot>ET`` beside it, because the 15:30 prompt resolves its $ROOT with the dashed date
+    (1530ET-330-final-buying-run.txt, Gate 6). The redacted copy is written whether or not the native check passed,
+    and that is wanted: any order id in it is an order Claude created, so it is executor traffic either way.
+    """
+    relative = slot_run_dir_relative(slot, trading_day)
+    folders = {relative.name, f"{trading_day.isoformat()}_{slot}ET"}
+    paths: list[Path] = []
+    for folder in sorted(folders):
+        directory = cron_root / relative.parent / folder
+        if directory.is_dir():
+            paths.extend(path for path in directory.iterdir() if _LIVE_PROMPT_PLACEMENT.match(path.name))
+    return sorted(paths)
 
 
 def _load_executor_ids(path: Path, trading_day: date, slot: str) -> set[str]:
@@ -1182,9 +1218,12 @@ def _build_parser() -> argparse.ArgumentParser:
     classify.add_argument("--orders-pages", required=True, type=Path)
     classify.add_argument("--executor-ids", type=Path, default=None, help="The Mac's executor-ids output, saved untouched.")
     classify.add_argument("--published", type=Path, default=None, help="The published recommendations payload, if saved.")
-    executor_ids = sub.add_parser("executor-ids", help="Mac only: order ids the plan-first reader saved for this slot.")
+    executor_ids = sub.add_parser("executor-ids", help="Mac only: order ids Claude's slot saved for this slot.")
     common(executor_ids)
     executor_ids.add_argument("--rec-root", default=None, help="Recommendation store root (default: the cron root's).")
+    executor_ids.add_argument("--cron-root", default=None,
+                              help="Cron-tracking root holding the live prompt's run directories (default: "
+                                   "$DCA_CRON_TRACKING_ROOT, as dca_paths resolves it).")
     check = sub.add_parser("check-placement", help="Step 7e: validate one saved placement response (native ref_id rule).")
     common(check)
     check.add_argument("--response", required=True, type=Path, help="The raw placement response, saved untouched.")

@@ -115,6 +115,10 @@ class GitEvidence:
     issue: IssueRef | None = None
     #: The newest PR that cites the Key only in its body. Recorded for the operator, never counted as a fix.
     mentioned_in: PullRequestRef | None = None
+    #: True when the row already records a PR that this evidence neither matched nor found citing the Key. The
+    #: caller must leave the row alone rather than lower it: the 2026-10-26 run could not confirm
+    #: ``run_states_unclassifiable``'s recorded PR #1514 and would otherwise have overwritten it with "No work".
+    recorded_pr_unconfirmed: bool = False
 
 
 def _check_key(key: object) -> str:
@@ -175,9 +179,7 @@ def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str, str
     url = _own_url(record, f"{repo_url}/pull/{number}", "pull request")
     # A line saying "Not changed" names keys the PR deliberately left alone (PR #1642 listed eight), so
     # a mention there is evidence against a fix, not for one.
-    body = "\n".join(
-        line for line in _text(record, "body", "pull request").splitlines() if not _NOT_CHANGED.search(line)
-    )
+    body = _without_not_changed(_text(record, "body", "pull request"))
     title = _text(record, "title", "pull request")
     searchable = f"{title}\n{body}"
     ref = PullRequestRef(number=number, url=url, state=state, merged=merged, checks=checks, docs_only=docs_only)
@@ -194,13 +196,20 @@ def _parse_issue(raw: object, repo_url: str) -> tuple[IssueRef, str]:
     return IssueRef(number=number, url=url, state=state), _text(record, "title", "issue")
 
 
-def _parse_commit(raw: object, repo_url: str) -> tuple[str, str]:
+def _without_not_changed(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not _NOT_CHANGED.search(line))
+
+
+def _parse_commit(raw: object, repo_url: str) -> tuple[str, str, str]:
+    """Return the commit URL, its subject line and its whole message minus "Not changed" lines."""
     record = _mapping(raw, "commit")
     sha = _text(record, "sha", "commit", required=True)
     if not _SHA_PATTERN.fullmatch(sha):
         raise EvidenceError(f"commit sha {sha!r} is not a full lower-case 40-character SHA")
     url = _own_url(record, f"{repo_url}/commit/{sha}", "commit")
-    return url, _text(record, "message", "commit")
+    message = _text(record, "message", "commit")
+    subject = message.splitlines()[0] if message else ""
+    return url, subject, _without_not_changed(message)
 
 
 def match_git_evidence(
@@ -212,6 +221,7 @@ def match_git_evidence(
     commits: Iterable[Mapping[str, object]],
     issues: Iterable[Mapping[str, object]],
     recorded_pr_number: int | None = None,
+    recorded_commit_url: str | None = None,
 ) -> GitEvidence:
     """Match already-fetched git records to one DCA Issues Key.
 
@@ -219,8 +229,9 @@ def match_git_evidence(
     by that head ref, or by the key appearing as a whole token in its title; the
     newest (highest number) match wins. A pull request that cites the key only
     in its body is not a fix: it is returned as ``mentioned_in`` and never
-    reaches :func:`derive_progress`. The first matching commit in
-    the order given wins, so the caller passes them newest first. An issue
+    reaches :func:`derive_progress`. A commit matches the same way, by the key
+    in its subject line (a squash merge's subject is the PR title); the first
+    match in the order given wins, so the caller passes them newest first. An issue
     matches by the key in its title, newest first. Every record is validated,
     matching or not, so one bad record refuses the batch.
 
@@ -239,7 +250,13 @@ def match_git_evidence(
         recorded_pr_number: The PR number already on the Notion row, if any. A
             body-only citation of that exact PR keeps counting, so tightening
             the matcher never regresses a link the operator already holds
-            (the 2026-10-22 run sent five merged rows to "No work").
+            (the 2026-10-22 run sent five merged rows to "No work"). When no PR
+            is found at all, ``recorded_pr_unconfirmed`` is set instead of
+            silently lowering the row.
+        recorded_commit_url: The Commit URL already on the Notion row, if any.
+            When it is among ``commits`` and its message still cites the key,
+            it wins over any other match, so a newer commit that merely
+            discusses the key never displaces the real fix commit.
 
     Returns:
         The frozen :class:`GitEvidence`; unmatched fields are ``None``.
@@ -278,15 +295,28 @@ def match_git_evidence(
             cited = [ref for ref in cited if ref.number != recorded_pr_number]
     mentioned_in = max(cited, key=lambda ref: ref.number, default=None)
 
+    if recorded_commit_url is not None and not isinstance(recorded_commit_url, str):
+        raise EvidenceError("recorded_commit_url must be a string")
+    # Same rule as PRs. Matching anywhere in the message let the squash commit of #1930 (205ae99e), a triage-tool
+    # change whose body only discussed five Keys, claim all five rows, four of which already held their real fix
+    # commit (2026-10-26 digest). The subject line is the squash's PR title, so this mirrors the title rule.
+    parsed_commits = [_parse_commit(raw, repo_url) for raw in commits]
     commit_url = next(
-        (url for url, message in (_parse_commit(raw, repo_url) for raw in commits) if _mentions(key, message)),
+        (url for url, _subject, message in parsed_commits if url == recorded_commit_url and _mentions(key, message)),
         None,
-    )
+    ) or next((url for url, subject, _message in parsed_commits if _mentions(key, subject)), None)
 
     matching_issues = [ref for ref, title in (_parse_issue(raw, repo_url) for raw in issues) if _mentions(key, title)]
     issue = max(matching_issues, key=lambda ref: ref.number, default=None)
 
-    return GitEvidence(branch=branch, pr=pr, commit_url=commit_url, issue=issue, mentioned_in=mentioned_in)
+    return GitEvidence(
+        branch=branch,
+        pr=pr,
+        commit_url=commit_url,
+        issue=issue,
+        mentioned_in=mentioned_in,
+        recorded_pr_unconfirmed=pr is None and recorded_pr_number is not None,
+    )
 
 
 def derive_progress(evidence: GitEvidence) -> str:
