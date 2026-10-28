@@ -725,3 +725,100 @@ def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())
+
+
+# -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
+# The same eight thinly traded names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between
+# 12:30 and 13:30, so 82/90 (91%) refused the slot on both days. A name that did not trade is not a failed fetch:
+# it is reported as "quiet" (Gate 5 scores it NO_DATA, never a BUY), kept out of the coverage denominator, and
+# capped so a real feed outage, which also yields empty series, still refuses.
+
+
+def quiet_ticker():
+    raw = good_ticker()
+    raw["intraday_bars"] = []
+    return raw
+
+
+def stale_ticker():
+    # FLKR 2026-10-27: it traded, but its newest bar is far before the anchor, so this stays a real failure.
+    return good_ticker(minutes=range(30, 40, 5)) | {"intraday_bars": [bar("2026-10-15T17:30:00Z")]}
+
+
+def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, total=90):
+    tickers = [f"T{i}" for i in range(total)]
+    plan = plan_for(tmp_path, tickers)
+    replies = {t: good_ticker() for t in tickers}
+    cursor = 0
+    for count, make in ((quiet, quiet_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"})):
+        for t in tickers[cursor : cursor + count]:
+            replies[t] = make()
+        cursor += count
+    chunk = write_chunk(tmp_path, "chunk_0.json", replies)
+    return plan, tickers, chunk
+
+
+def test_a_ticker_with_no_bars_in_the_window_is_a_quiet_ticker_error():
+    with pytest.raises(rp.QuietTickerError):
+        rp.validate_ticker(quiet_ticker(), **kw())
+
+
+def test_a_stale_newest_bar_is_a_plain_failure_not_a_quiet_ticker():
+    with pytest.raises(rp.PayloadError) as excinfo:
+        rp.validate_ticker(stale_ticker(), **kw())
+    assert not isinstance(excinfo.value, rp.QuietTickerError)
+
+
+def test_quiet_tickers_are_reported_apart_from_failed_fetches(tmp_path):
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"] == {"robinhood": [], "quiet": sorted(tickers[:8])}
+    assert sorted(payload["sources"]["robinhood"]) == sorted(tickers[8:])
+    assert set(failed) == set(tickers[:8])  # the reason is still recorded for the log and the sidecar
+
+
+def test_eight_quiet_tickers_of_ninety_still_publish(tmp_path):
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    assert not (tmp_path / "out" / "payload.refused.json").exists()
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert published["ticker_errors"]["quiet"] == sorted(tickers[:8])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0  # re-validation must not read them as misses
+
+
+def test_more_quiet_tickers_than_the_cap_still_refuse(tmp_path):
+    # An outage that returns empty series looks the same as a quiet market; the cap keeps it a refusal.
+    plan, _, chunk = universe_plan(tmp_path, quiet=10)
+    assert rp.MAX_QUIET_SHARE == 0.10
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+    assert not (tmp_path / "out" / "payload.json").exists()
+    assert (tmp_path / "out" / "payload.refused.json").is_file()
+
+
+def test_the_floor_applies_to_the_non_quiet_tickers(tmp_path):
+    # 4 quiet leaves 86; 5 real failures give 81/86 = 94.2%, under the floor.
+    plan, _, chunk = universe_plan(tmp_path, quiet=4, errored=5)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+
+
+def test_real_failures_within_the_floor_publish_beside_quiet_tickers(tmp_path):
+    # 4 quiet leaves 86; 4 real failures give 82/86 = 95.3%, at or over the floor.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=4, errored=4)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert published["ticker_errors"]["quiet"] == sorted(tickers[:4])
+    assert published["ticker_errors"]["robinhood"] == sorted(tickers[4:8])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+def test_a_stale_newest_bar_still_counts_against_the_floor(tmp_path):
+    # 2026-10-27 FLKR: 8 quiet plus 1 stale. The stale name stays under ticker_errors.robinhood, where the
+    # live prompts' ">5% errored aborts" rule still sees it; only the quiet names move to their own key.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8, stale=1)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"]["robinhood"] == [tickers[8]]
+    assert payload["ticker_errors"]["quiet"] == sorted(tickers[:8])
