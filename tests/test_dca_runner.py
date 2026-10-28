@@ -2906,13 +2906,44 @@ def test_gate1_jittered_fire_time_still_passes():
     [
         datetime(2026, 7, 28, 9, 30, tzinfo=ET),      # the old window start
         datetime(2026, 7, 28, 9, 34, 59, tzinfo=ET),  # a second before 9:35: never fires early
-        datetime(2026, 7, 28, 10, 0, 1, tzinfo=ET),   # a second late
+        datetime(2026, 7, 28, 10, 20, 1, tzinfo=ET),  # a second after the 10:20 close
         datetime(2026, 7, 28, 15, 30, tzinfo=ET),     # another slot's window
     ],
 )
 def test_gate1_outside_window_fails(when):
     """An off-schedule firing is a scheduler fault, never a late run."""
     assert not dca_runner.gate_time_sanity(when, dca_runner.SLOTS["0935"])
+
+
+def test_gate1_0935_window_closes_at_1020_to_absorb_scheduler_lateness():
+    """2026-10-27: the 9:35 fire started at about 9:53 ET (18 minutes late) and the
+    run aborted with the 10:00 close too close to finish Gates 6 through 7 for 32
+    candidates, so nothing was placed. The close moves to 10:20 ET (operator
+    decision 2026-10-28); the open stays at 9:35 and the end stays exclusive."""
+    spec = dca_runner.SLOTS["0935"]
+    assert spec.window_start_et == (9, 35)
+    assert spec.window_end_et == (10, 20)
+    assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 9, 53, 34, tzinfo=ET), spec)  # the late fire
+    assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 0, 1, tzinfo=ET), spec)  # was a second late
+    assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 19, 59, tzinfo=ET), spec)
+    assert not dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 20, 0, tzinfo=ET), spec)  # exclusive end
+
+
+def test_gate1_0935_window_closes_before_the_1030_slot_opens():
+    """Widening must never let the 9:35 slot overlap the next slot's own window."""
+    closes = dca_runner.SLOTS["0935"].window_end_et
+    next_opens = dca_runner.SLOTS["1030"].window_start_et
+    assert closes < next_opens
+
+
+def test_gate4_0935_interlock_follows_the_widened_window():
+    """Gate 4 reads the same window bounds as Gate 1, so an executor order placed at
+    10:10 ET now falls inside the 9:35 slot's interlock instead of slipping past it."""
+    spec = dca_runner.SLOTS["0935"]
+    inside = _order("AAPL", 2.0, _utc(2026, 10, 27, 14, 10))  # 10:10 ET
+    after = _order("AAPL", 2.0, _utc(2026, 10, 27, 14, 20, 1))  # one second after the 10:20 close
+    assert dca_runner.gate_sole_executor([inside], spec, date(2026, 10, 27))
+    assert dca_runner.gate_sole_executor([after], spec, date(2026, 10, 27)) == []
 
 
 def test_gate1_naive_datetime_is_rejected_rather_than_assumed():
@@ -3053,7 +3084,7 @@ def test_gate4_matches_on_created_at_not_fill_time():
     "created",
     [
         _utc(2026, 7, 28, 13, 29, 59),  # one second before 13:30 UTC
-        _utc(2026, 7, 28, 14, 0, 1),    # one second after 14:00 UTC
+        _utc(2026, 7, 28, 14, 20, 1),   # one second after the 10:20 ET (14:20 UTC) close
     ],
 )
 def test_gate4_orders_just_outside_boundary_do_not_trip(created):
@@ -7484,7 +7515,7 @@ def test_execute_plan_allows_a_ticker_not_bought_today_alongside_unrelated_histo
         account_number=TEST_ACCOUNT_NUMBER,
     )
     # Afternoon, same calendar day but well outside the 0935 slot's own
-    # 9:35-10:00 ET window, so this exercises only the bought-today dedup
+    # 9:35-10:20 ET window, so this exercises only the bought-today dedup
     # check below, not the (separately tested) sole-executor interlock.
     earlier = [_order("MSFT", 2.0, _utc(2026, 7, 28, 18, 0))]
     plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)])
@@ -10539,13 +10570,13 @@ def test_execute_plan_recheck_the_clock_halts_the_remainder_when_the_window_clos
         snapshot=snapshot,
         tier=tier,
     )
-    # The 0935 slot's window is 09:35-10:00 ET (see SLOTS); the first two
+    # The 0935 slot's window is 09:35-10:20 ET (see SLOTS); the first two
     # now_fn calls (the one-time freshness check, then before AAPL) are still
     # inside it, the third (before MSFT) is not.
     clock_readings = iter([
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
-        datetime(2026, 7, 28, 10, 5, tzinfo=ET),
+        datetime(2026, 7, 28, 10, 25, tzinfo=ET),
     ])
     result = dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
