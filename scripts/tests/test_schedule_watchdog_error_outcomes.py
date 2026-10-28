@@ -5,7 +5,8 @@ valid run_state.json and finalized as ``not_submitted_error`` (the classifier re
 2026-10-27, the market_data_unavailable aborts) verifies cleanly, so the day looks green to the one process that
 is supposed to catch what the executor session does not report. Contract pinned here:
 
-* ``verify_day`` rows carry an additive ``error_class`` (None when absent); the audit verdict is unchanged.
+* ``schedule_watchdog.audit_day`` rows carry an additive ``error_class`` (None when absent); the verdict is unchanged
+  (scripts/verify_schedule.py stays untouched: it feeds the Perplexity planner stamp).
 * ``schedule_watchdog.error_outcome_rows`` returns VERIFIED rows whose ``order_submit_status`` is an error status
   (``not_submitted_error``, ``blocked_placement_phase_unreachable``) and nothing else: quiet outcomes
   (no orders, no candidates, budget exhausted, confirmation required) are not errors, and a row that already
@@ -28,7 +29,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import schedule_watchdog  # noqa: E402
-from scripts.verify_schedule import SLOT_EVIDENCE_LAYOUT, slot_run_dir_relative, verify_day  # noqa: E402
+from scripts.verify_schedule import SLOT_EVIDENCE_LAYOUT, slot_run_dir_relative  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 9, 22)
@@ -64,7 +65,7 @@ def error_day(root, slot_id="1330", status="not_submitted_error", error_class="p
     if error_class:
         extra["error_class"] = error_class
     write_complete_day(root, overrides={slot_id: extra})
-    return verify_day(DAY, AFTER_CLOSE, root=root)
+    return schedule_watchdog.audit_day(DAY, AFTER_CLOSE, root=root)
 
 
 def row_for(report, slot_id):
