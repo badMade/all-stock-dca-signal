@@ -55,12 +55,13 @@ def test_a_single_fire_task_proceeds_at_its_fire_time(task, hhmm, slot, latest):
 @pytest.mark.parametrize(
     ("task", "hhmm", "expected"),
     [
-        (T_0935, "09:44", "skipped_outside_window"),  # ten minutes before the fire is the earliest start
-        (T_0935, "09:45", "PROCEED"),
+        (T_0935, "09:46", "skipped_outside_window"),  # 2026-10-26: a manual 09:46 run placed 25 buys before its fire
+        (T_0935, "09:54", "skipped_outside_window"),  # the fire time is the earliest start, so Claude's slot goes first
+        (T_0935, "09:55", "PROCEED"),
         (T_0935, "10:29", "PROCEED"),
         (T_0935, "10:30", "skipped_outside_window"),  # never at or after the latest placement time
-        (T_1530, "15:35", "PROCEED"),
-        (T_1530, "15:34", "skipped_outside_window"),
+        (T_1530, "15:44", "skipped_outside_window"),
+        (T_1530, "15:45", "PROCEED"),
         (T_1530, "16:00", "skipped_outside_window"),
     ],
 )

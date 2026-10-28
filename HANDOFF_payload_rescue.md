@@ -1,31 +1,31 @@
-# Handoff: 13:30 payload refusal and rescue fix (2026-10-26)
+# Handoff: payload rescue for tickers a replying chunk left out or errored
+
+Start Claude Code in this repo and say: "Read HANDOFF_payload_rescue.md and continue." The change below is merged to `main` via PR 1967 (badMade/all-stock-dca). Originating session: https://claude.ai/code/session_01CZmLj4zSQEtD2X3vEuof9d
+
+## Goal
+Stop the Robinhood payload build from refusing a slot when a chunk replies but leaves tickers out or marks them `error`, while live quotes for those tickers are fine.
 
 ## Incident
-- 13:30 ET payload refused at 13:36:02 ET: coverage 83/91 (91%), floor 95% (`DEFAULT_MIN_COVERAGE`, `scripts/robinhood_payload.py`).
-- Failed tickers, all "no data returned for this ticker": DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ.
-- The empty 13:57 plan followed from the refusal. It was not a "nothing dropped 0.1%" result.
-- 09:35 was also refused earlier the same day (chunks 4 and 10 dead on both attempts). 10:30, 11:30 and 12:30 published normally.
+2026-10-26, 13:30 ET build refused at 83/91 (91%, floor 95%). Eight tickers (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) returned `no data returned for this ticker`. Their chunks had replied, so the existing dead-chunk rescue never ran. The empty plan at 13:57 followed from that refusal.
 
-## Ruled out
-- Not the "no orders since Friday's close" theory. Previous close is Friday's price bar from market data (`validate_ticker` checks it against `_previous_trading_day`, which maps Monday to Friday). Order history only feeds caps.
-- Not bad symbols. Live Robinhood quotes for all 8 returned full data (previous close dated 2026-10-23).
+## What changed (merged)
+- `deploy/launchd/robinhood_payload.sh`: the rescue pass now also targets tickers that are absent from a replying chunk or carry a per-ticker `error`. They are re-asked in requests of `DCA_RESCUE_CHUNK_SIZE` (default 2), reusing `run_chunk` (retry and build deadline apply), then folded back into that chunk's reply before the merge. Dead chunks are rescued as before.
+- A ticker that replied with data is never re-fetched. A rescue reply that is again missing or an error leaves the original entry in place, so the rescue cannot make a ticker worse.
+- Logs: `rescue chunk=<i> tickers=<n> size=<s>` and `rescue chunk=<i> replied=<n>`. Rescue parts log timing as `timing chunk=<i>.r<k> ...`.
+- Bash 3.2 compatible for macOS: no `wait -n`, no bash 4 features.
+- `docs/robinhood_payload.md`: new bullet under "Honest limits" describing this rescue.
+- `tests/test_robinhood_payload.py`: `test_launcher_rescues_tickers_a_replying_chunk_left_out_or_errored` (omitted and error modes) and `test_launcher_rescue_never_makes_a_still_missing_ticker_worse`. `test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk` now counts only whole-chunk timing lines (`timing chunk=\d+ attempt=`), because the stub's empty replies trigger rescue for every ticker.
 
-## Why no `chunk_0` log exists
-- `deploy/launchd/robinhood_payload.sh` deletes `$WORK` and every `chunk_<i>.log` on exit.
-- Only attempts that returned no reply are kept, under `<payload path>.chunk_logs/`. That keep-logs code is dated 2026-10-26 and may not have been on the Mac at 13:30.
-- The 13:30 chunks replied, so nothing would have been kept anyway.
+## Verified (cloud session, not local)
+- `tests/test_robinhood_payload.py` green, `ruff check .` clean, full `python -m pytest` green (exit 0).
+- CI check suites on the PR head completed without a failure before the merge.
 
-## Fix
-- Branch `claude/rescue-no-data-tickers`, one commit.
-- The rescue pass now also re-fetches tickers a replying chunk left out or answered with a per-ticker `error`, in `DCA_RESCUE_CHUNK_SIZE` requests (default 2), before the merge. A good entry is never overwritten.
-- Tests added in `tests/test_robinhood_payload.py`: omitted, error, and still-missing-stays-failed.
-- Not yet run anywhere.
+## Not verified
+- No live run. The first real signal is the next scheduled payload build: look for `rescue chunk=` lines in `/tmp/dca-robinhood-payload.log` and whether coverage stays at or above 95%.
+- Whether the 8 ambiguous tickers were a stub-able "no data" reply or a genuine worker truncation is unknown. If rescue requests also return `no data`, the cause is upstream of chunking (worker prompt or MCP quote tool), not the launcher.
 
-## Cloud session (task_f46c38bd)
-Runs `pytest tests/test_robinhood_payload.py`, `ruff check .`, and the full suite. It fixes failures, updates the rescue paragraph in `docs/robinhood_payload.md`, and opens a DRAFT PR.
-
-## Still open
-- Merge the PR, then pull on the Mac so the launchd job picks it up.
-- Confirm the Mac has the keep-logs code, or the next failure leaves no log.
-- Not covered by the fix: a ticker that replies with data but fails validation (stale quote, bad bar).
-- Not checked: whether the 14:30 payload passed, and whether the same 8 tickers failed at 09:35 (`robinhood_payload_2026-10-26_0935.refused.json`, Mac repo folder).
+## Open items
+1. Watch the next few builds for `rescue chunk=` frequency. Frequent rescues mean first-pass chunks are lossy and chunk size or the worker prompt needs work.
+2. The coverage floor (95%) is unchanged by design. Do not lower it to absorb misses.
+3. Rescue adds worker calls on a bad build (up to ceil(missing/2) extra requests per affected chunk, parallel by `DCA_CODEX_PARALLEL`). Check total build time against the sessions' 12-minute wait using the `timing total` line.
+4. Housekeeping: a worker's own log is kept beside the refusal marker only for requests that returned no reply. Replies that were present but incomplete leave no log, so a diagnosis of "why did the worker omit these" needs a rerun.

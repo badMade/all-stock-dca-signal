@@ -1,6 +1,6 @@
 # Handoff: 9:35 payload abort and backup-prompt fixes (2026-10-21 to 2026-10-23)
 
-State of `main` when this was last updated (2026-10-26, after #1958 and #1961): commit `91ee6f22`. Nothing below is live until
+State of `main` when this was last updated (2026-10-27, after #1977): commit `f7ae93a9`. Nothing below is live until
 the prompts are repasted (steps 1 and 2). This is a one-time handoff, not a standing reference: for the payload itself see
 [robinhood_payload.md](robinhood_payload.md).
 
@@ -47,28 +47,44 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 | #1956 | `b6e2b9ec` | Restored #1907's two drift guards and #1915's CRLF fold that #1914 had rolled back. No prompt changes. |
 | #1957 | `d69c8e23` | Restored the #1911 boolean-trap guards in `near_close_dca.py` with a stronger test (#1911's own test passed without the fix). Changed a bundled file, so the stamp moved (to `123248510381...`, since superseded). |
 | #1958 | `91ee6f22` | Restored the #1912 `_is_finite_scalar` in `dca_inverse_martingale.py` and its tests. Merged on top of #1957, so the one rebuild covers both: the stamp is `98d1a5a9`. Six Perplexity prompts change (only the expected hash in step 0). Live-mirror prompts unchanged. |
-| #1960 | `6924e5d6` | Previous refresh of this note. |
+| #1960, #1963 | `6924e5d6`, `b058d02d` | Previous refreshes of this note. |
+| #1959 | `e42f31bd` | Automated refresh of `docs/module_graph.md` (generated file). |
+| #1962, #1964 | `7fcdc8fd`, `4635db9c` | Merged from one branch (titles only). Not reviewed here. |
+| #1965 | `a382c284` | Titles: bridge health check draft, 08:50 wording. With `90db3649` it restores the no-folder failure form that #1914 rolled back (item #1917 below). |
+| #1966 | `54d03c31` | First merge after a docstring-only change to `_is_finite_scalar`; that file is bundled, so the stamp moved to `71083a20`. Not reviewed beyond that. |
+| #1967 | `b86c4e4e` | Payload launcher re-fetches tickers a replying chunk left out or errored; documents the no-data rescue (commits `6998a1cf`, `9eb674f6`). The Mac must pull `main`. Not reviewed here. |
+| #1968 | `cef94205` | Reused my branch name `restore-isfinite`; other sessions' commits. Merged with no net change to `main`. |
+| (direct) | `9bf2f9e7` | `dca_market_history.py`: chunk `get_equity_historicals` calls to 10 symbols max, with a test. Not reviewed here. |
+| #1974 | `c8c089f1` | Title: removes the cloud-clone drafts again. Not reviewed here. |
+| #1976 | `5618d5e6` | Title: courier payload fold. Not reviewed here. |
+| #1977 | `f7ae93a9` | Previous refresh of this note. |
 | #1961 | `5eafd4b6` | Titles: payload launcher rescues a dead chunk in small requests and keeps dead workers' logs (`deploy/launchd/robinhood_payload.sh`, `docs/robinhood_payload.md`, `tests/test_robinhood_payload.py`). Not reviewed here. The Mac must pull `main` to get it. |
 | #1915 | `93f8aaeb` | `build_backup_planner` folds CRLF to LF when it reads bundled files, so a Windows rebuild gives the same hash and bytes as Linux. The committed file and prompts did not change. |
+
+Stamps named in the merged-PR table above were current when those PRs merged. None of them is the current stamp.
 
 ## Do these in order
 
 1. **Repaste the six live-mirror prompts** from `claude/dca-executor-prompts/live-mirror/` into the scheduled tasks.
    This brings in the 12-minute wait and the new `ticker_errors` rule together.
 2. **Repaste the six Perplexity backup prompts** from `claude/dca-executor-prompts/perplexity/`, and attach the
-   `backup_planner.pyz` from the same `main` commit. Until #1907 the committed file had drifted from its sources
-   (stamp `f1fc9f5c` against `41fc5fa0`), which would have made every backup stand down at step 0. It is fixed on
-   `main` at `30d5a8ff`: the prompts and the committed file agree. On `main` at `91ee6f22` both carry `98d1a5a9` (#1957 and #1958 changed bundled files, so the stamp moved from `6ca697a4`; repaste the six Perplexity prompts once, now that both have landed) (read the stamp from the prompt you paste, not from this note). Two tests in
-   `scripts/tests/test_build_backup_planner.py` now fail CI if the file stops matching its sources or the prompts.
-   Before pasting, on a current `main`, confirm it still holds:
+   `backup_planner.pyz` from the same `main` commit. **This note does not name the current planner stamp on purpose.**
+   It changed four times on 2026-10-26 (other merged PRs change bundled files), so any value written here is stale within
+   hours. The stamp is the 64-character `content_sha256` that step 0 of each prompt requires the attached file to match;
+   a mismatch makes the backup stand down and do nothing. On the exact `main` commit you paste from, run these checks and
+   paste only if all three pass:
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
-   - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`).
-   If `main` has changed the planner since, the stamp changes: read it from the prompt you are about to paste and make
-   sure the attached file's hash equals it. Never reuse a `backup_planner.pyz` from an older checkout.
+   - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`);
+   - `python3 backup_planner.pyz --build-info`: its `content_sha256` must begin with the 12 characters that
+     `grep -o "must equal [0-9a-f]\{12\}" claude/dca-executor-prompts/perplexity/0955ET-935-backup.txt` prints.
+   If `main` moves after you paste, repeat the checks on the new commit; a prompt set pasted from an older commit may be
+   stale. Never reuse a `backup_planner.pyz` from an older checkout. Two tests in
+   `scripts/tests/test_build_backup_planner.py` fail CI if the committed file stops matching its sources or the prompts
+   (they were lost in #1914 and restored in #1956).
 3. **Check the scheduled tasks' current Gate 5 text** against the repo copy. This was not visible when the
    changes were made. If the sentence "the launcher publishes only a complete universe" is not what a task holds,
    tell the engineer before pasting.
-4. **Keep the Mac on current `main`.** It already logs timing lines, so it has #1883. #1961 changed `deploy/launchd/robinhood_payload.sh` (dead-chunk rescue), so pull `main` on the Mac again.
+4. **Keep the Mac on current `main`.** It already logs timing lines, so it has #1883. #1961 and #1967 changed the payload launcher (dead-chunk rescue and re-fetching tickers a chunk left out), so pull `main` on the Mac again.
 5. **After the next trading day, read `/tmp/dca-robinhood-payload.log`** on the Mac and check:
    - `timing total seconds=` per slot (expect about 2 to 4 minutes);
    - any `coverage X/90 ... publishing nothing` line, and which tickers it names;
@@ -86,7 +102,7 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 ## Not verified
 
-- That `main` stayed green after #1958 and #1961. The last run I read was green on #1958's own head.
+- Nothing red was seen on `main`: all 12 newest push runs, up to `8c219fe9`, are success. Docs-only pushes (such as the note refreshes) do not trigger CI.
 
 - That the scheduled tasks hold the same Gate 5 sentence as the repo.
 - The new `ticker_errors` rule and the 95% floor live. The 10-22 slots were all 90/90.
@@ -112,11 +128,12 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
   | #1907 drift guards and #1915 CRLF fold | Restored by #1956. |
   | #1880 payload refusal marker and console scan stub | Restored by #1937 and #1935. |
   | #1913 account-loading step and `cloud-clone-*` drafts | Restored on purpose by #1954. (An earlier audit wrongly called #1914's deletion of the drafts correct.) |
-  | #1917 no-folder failure form in `0915ET-bridge-health-check.draft.txt` | **Missing.** Draft only. |
+  | #1917 no-folder failure form in `0915ET-bridge-health-check.draft.txt` | Restored (the draft has the NO-FOLDER form again; see #1965 and `90db3649`). |
   | #1892 wording of the 1530ET `reason` in `config/scheduled_tasks.json` | Missing; wording only. |
   | #1906 and this note | Restored by #1925. |
 
   Kept from #1914: duplicate-key rejection in `dca_console.py` POSTs, with its test.
+- Do not reuse a branch name across sessions: #1968 reused `restore-isfinite` after #1958 had merged, and carried other sessions' commits (net no change, but it moved nothing useful and confused the history).
 - Line endings: a planner rebuilt on Windows used to stamp `f4bbe2f9` instead of CI's `675d66b7` (the hash of the same
   sources with CRLF endings), which failed three guard tests on #1911. #1915 fixed the build, #1914 rolled it back and #1956
   restored it, so a rebuild on either OS should now match. If a guard test still reports a mismatch, check for an older checkout of `build_backup_planner.py`.

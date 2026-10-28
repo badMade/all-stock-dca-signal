@@ -16,7 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 selfheal = [
     "pytest==9.1.1",
-    "ruff==0.17.0",
+    "ruff==0.17.2",
     "pyright==1.1.414",
     "pytest-cov==7.1.0",
     "pip-audit==2.10.1",
@@ -36,7 +36,7 @@ selfheal = [
 # at all (Codex review, PR #219).
 dev = [
     "pytest==9.1.1",
-    "ruff==0.17.0",
+    "ruff==0.17.2",
     "jsonschema==4.26.0",
     "referencing==0.37.0",
     "pytest-cov==7.1.0",
@@ -53,7 +53,7 @@ dev = [
     "scipy-stubs==1.18.1.0; python_version >= '3.12'",
     "pip-audit==2.10.1",
     "pyright==1.1.414",
-    "uv==0.13.4",
+    "uv==0.13.5",
 ]
 # Yahoo Finance client for the NON-BUYING scheduled tasks only (the daily ticker-history
 # archive refresh, the ^TICK breadth fetch, ticker-advisor, ml-forecaster research). Owner
@@ -75,6 +75,7 @@ strategies = [
     "yfinance",
     "vectorbt",
     "alpaca-py",
+    "msgpack>=1.2.3",
     "transformers",
     "torch",
 ]

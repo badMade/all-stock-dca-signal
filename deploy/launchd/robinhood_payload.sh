@@ -229,4 +229,21 @@ shopt -s nullglob
 MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
 echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS" >&2
+
+# Plan-first half (2026-10-26): the retired 5-minute Claude courier's order-history and buying-power read, now a second
+# `codex exec` after the payload is published, followed by `ingest`, which writes the recommendation files. Opt-in
+# (DCA_PLAN_FIRST_INGEST=1) so the six Gate 5 slots are unchanged until the operator has seen one real run. Strictly
+# best-effort: Gate 5 reads the payload only, so a broker or ingest failure is logged and never changes the exit status.
+if [ "${DCA_PLAN_FIRST_INGEST:-0}" = "1" ] && [ "$MERGE_STATUS" -eq 0 ]; then
+  BROKER_REPLY="$WORK/broker_reply.json"
+  INGEST_STATUS=0
+  {
+    "$PY" -m scripts.robinhood_payload broker-prompt --plan "$WORK/plan.json" >"$WORK/broker_prompt.txt" \
+      && perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
+        -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' --skip-git-repo-check -o "$BROKER_REPLY" - \
+        <"$WORK/broker_prompt.txt" >"$WORK/broker.log" 2>&1 \
+      && "$PY" -m scripts.robinhood_payload ingest --plan "$WORK/plan.json" --broker-reply "$BROKER_REPLY"
+  } || INGEST_STATUS=$?
+  [ "$INGEST_STATUS" -eq 0 ] || echo "robinhood_payload: plan-first ingest did not complete (status $INGEST_STATUS); the payload is unaffected" >&2
+fi
 exit "$MERGE_STATUS"

@@ -505,10 +505,11 @@ def test_executor_ids_refuses_an_unreadable_placement(tmp_path, capsys):
     assert (code, report["status"], [e["code"] for e in report["errors"]]) == (2, "FAILED", ["placement_corrupt"])
 
 
-# 2026-10-26: the 09:35 backup stood down on UNRECOGNIZED for 25 of Claude's own orders. The live slots still run the
-# gate-sequence prompt (claude/dca-executor-prompts/live-mirror/), which saves each response as
-# `$ROOT/place_<TICKER>.json` in the slot's run directory, never under recommendations/<day>/placements/<slot>/, so
-# executor-ids printed an empty list. These pin that the live prompt's own responses are read too.
+# 2026-10-26: the 09:35 stand-down (on 25 orders a manual backup run placed, not Claude's: see
+# docs/incident_2026-10-26_0935_unrecognized_orders.md) exposed a gap. The live slots still run the gate-sequence
+# prompt (claude/dca-executor-prompts/live-mirror/), which saves each response as `$ROOT/place_<TICKER>.json` in the
+# slot's run directory, never under recommendations/<day>/placements/<slot>/, so executor-ids would print an empty
+# list for a day Claude did buy. These pin that the live prompt's own responses are read too.
 
 def _legacy_run_dir(cron_root, *, slot=SLOT, folder=None):
     from scripts.verify_schedule import slot_run_dir_relative

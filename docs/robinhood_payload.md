@@ -24,6 +24,13 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is F
    `NO_DATA` and never a BUY. More misses than that publish nothing and the slot aborts at Gate 5. The old 100% floor
    guarded against Gate 6 handing a missing high-priority ticker's cap headroom to lower-priority names; in the
    recorded runs the daily cap peaked near 42% and the weekly cap near 13%, so that reshuffle had no room to occur.
+   **Quiet tickers (2026-10-28).** A ticker that printed no bar at all in the slot window did not trade; it is not a failed
+   fetch (2026-10-26 and 10-27 13:30: the same eight thin names refused the slot at 82/90). `publish` leaves it in
+   `ticker_errors.robinhood` (NO_DATA, never a BUY; omitting it would read as "not covered" and allow a single-source BUY),
+   lists it under `quiet` in the `.meta.json` sidecar, and takes it out of the coverage denominator. More than
+   `MAX_QUIET_SHARE` (10%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
+   traded but whose newest bar is far before the anchor stays a real failure. The prompts leave the sidecar's quiet names
+   out of their ">5% errored" count.
    Each worker's reply counts only for the tickers its own chunk was assigned (`chunk_<i>.json` is
    `plan["chunks"][i]`): any other key is dropped and reported, a ticker two replies carry fails, and a plan
    whose chunks do not partition its universe publishes nothing.
@@ -88,6 +95,17 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
 - `~/.codex/config.toml`'s default model is used. Pin one with `DCA_CODEX_MODEL` only if needed (model names
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
+
+## Plan-first ingest (2026-10-26)
+
+This program now does everything the retired 5-minute Claude courier did. After the merge, when `DCA_PLAN_FIRST_INGEST=1`,
+`robinhood_payload.sh` runs a second read-only `codex exec` with `broker-prompt` (only `get_equity_orders`, paginated, and
+`get_portfolio`; the account number comes from `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`), then `ingest`. `ingest` refuses a
+payload older than the freshness bound (exit 6) or a payload or broker reply more than 10 minutes from now (exit 2), takes
+the `plan_first/ingest` lease (exit 3 if held), and writes the recommendation files stamped with the payload's build time.
+It is best-effort: a failure is logged and never changes the launcher's exit status, so Gate 5 does not depend on it.
+Quotes now carry optional `bid_price`/`ask_price` (ask below bid fails the ticker). Default off; one launchd job per slot does
+both steps, and there is no separate courier or publish schedule.
 
 ## Quote freshness
 

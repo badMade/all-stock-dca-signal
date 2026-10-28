@@ -193,9 +193,7 @@ KNOWN LIMITATION (accepted 2026-10-06): the Mac-first check can use time that th
 
 def _slot_resolution(backup: Backup) -> str:
     if len(backup.fires) == 1:
-        slot, fire = backup.slots[0], backup.fires[0]
-        hh, mm = int(fire[:2]), int(fire[3:])
-        start = f"{hh:02d}:{mm - 10:02d}" if mm >= 10 else f"{hh - 1:02d}:{mm + 50:02d}"
+        slot, start = backup.slots[0], backup.fires[0]  # the fire time is the earliest start (2026-10-26 incident)
         return (f"This fire backs up slot {slot} ({_SLOT_LABEL[slot]}). The ET time must be from {start} up to the "
                 f"latest placement time {_NEXT_SLOT_START[slot]}.")
     # The two-fire task (13:50 and 14:50): the clock decides which slot this run backs up.
