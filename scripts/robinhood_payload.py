@@ -76,6 +76,12 @@ DEFAULT_CHUNK_SIZE = 8
 #: happen. A failed ticker stays in ticker_errors.robinhood, so Gate 5 still scores it NO_DATA (never a BUY).
 #: At 90 tickers this tolerates 4 misses; a stale-feed slot (2026-10-20 13:30: 8 of 90) still publishes nothing.
 DEFAULT_MIN_COVERAGE = 0.95
+#: Share of the universe that may be "quiet" (no bar in the slot window) before the payload is refused anyway.
+#: 2026-10-26 and 2026-10-27 13:30: the same eight thin names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed
+#: nothing between 12:30 and 13:30, so 82/90 refused the slot although the fetch worked. A quiet name is reported under
+#: ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the coverage denominator. A feed outage
+#: also returns empty series, so more than this share still refuses.
+MAX_QUIET_SHARE = 0.10
 #: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
 #: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
 #: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
@@ -104,6 +110,10 @@ EXIT_NO_SLOT_DUE = 5
 
 class PayloadError(ValueError):
     """A ticker's data failed validation; the message becomes the ticker's recorded provider error."""
+
+
+class QuietTickerError(PayloadError):
+    """A ticker printed no bar at all in the slot window: it did not trade, which is not a failed fetch."""
 
 
 # --------------------------------------------------------------------------- validation
@@ -180,7 +190,7 @@ def validate_ticker(
                 raise PayloadError(f"duplicate intraday timestamp {stamp.isoformat()}")
             by_stamp[stamp] = bar
     if not by_stamp:
-        raise PayloadError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
+        raise QuietTickerError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
     if min(by_stamp) > start + timedelta(minutes=interval):
         raise PayloadError(f"intraday bars do not cover the {bar_start:%H:%M} trend-window start")
     bars = [by_stamp[k] for k in sorted(by_stamp)]
@@ -609,6 +619,7 @@ def _validate_entries(
     duplicated = duplicated or {}
     good: dict[str, Any] = {}
     failed: dict[str, str] = {}
+    quiet: set[str] = set()
     for ticker in plan["tickers"]:
         try:
             if ticker in duplicated:
@@ -618,15 +629,30 @@ def _validate_entries(
             good[ticker] = validate_ticker(
                 merged[ticker], day=day, bar_start=bar_start, decision=decision, interval=interval
             )
+        except QuietTickerError as exc:
+            failed[ticker] = str(exc)
+            quiet.add(ticker)
         except PayloadError as exc:
             failed[ticker] = str(exc)
     good = _require_fresh_fetch(good, failed, day=day, decision=decision, interval=interval)
-    payload = {
-        "sources": {"robinhood": good},
-        "source_errors": [],
-        "ticker_errors": {"robinhood": sorted(failed)},
-    }
+    ticker_errors: dict[str, list[str]] = {"robinhood": sorted(set(failed) - quiet)}
+    # Internal to build/publish: ``publish`` folds these back into ``robinhood`` before writing, because
+    # generate_buy_candidates rejects any ticker_errors key that is not a source name.
+    if quiet:
+        ticker_errors["quiet"] = sorted(quiet)
+    payload = {"sources": {"robinhood": good}, "source_errors": [], "ticker_errors": ticker_errors}
     return payload, failed
+
+
+def _coverage_problem(ok: int, universe: int, quiet: int, min_coverage: float) -> str | None:
+    """Why ``ok`` valid tickers of ``universe`` (``quiet`` of them did not trade) cannot be published, or None."""
+    if quiet / universe > MAX_QUIET_SHARE:
+        return f"{quiet}/{universe} tickers printed no bar in the window, over the {MAX_QUIET_SHARE:.0%} quiet cap"
+    traded = universe - quiet
+    coverage = ok / traded
+    if coverage < min_coverage:
+        return f"coverage {ok}/{traded} ({coverage:.0%}) is below {min_coverage:.0%}"
+    return None
 
 
 def _refusal_path(out: Path) -> Path:
@@ -699,16 +725,20 @@ def publish(
         return 2
     universe = len(plan["tickers"])
     ok = len(payload["sources"]["robinhood"])
-    coverage = ok / universe
+    quiet = payload["ticker_errors"].get("quiet", [])
     for ticker, reason in sorted(failed.items()):
         print(f"robinhood_payload: {ticker}: {reason}", file=sys.stderr)
-    if coverage < min_coverage:
-        reason = f"coverage {ok}/{universe} ({coverage:.0%}) is below {min_coverage:.0%}"
+    reason = _coverage_problem(ok, universe, len(quiet), min_coverage)
+    if reason:
         print(f"robinhood_payload: {reason}; publishing nothing so the slot aborts at Gate 5", file=sys.stderr)
         _record_refusal(plan, reason, ok=ok, universe=universe, failed=failed, min_coverage=min_coverage, now=now)
         return 2
     out = Path(plan["out"])
     out.parent.mkdir(parents=True, exist_ok=True)
+    # A quiet name must stay in ticker_errors.robinhood: omitting it would read as "Robinhood does not cover it",
+    # which lets reconcile_signals allow a single-source BUY, while an errored name is scored NO_DATA, never a BUY.
+    # The sidecar's "quiet" list is how the prompts and ``check`` tell these names from failed fetches.
+    payload = {**payload, "ticker_errors": {"robinhood": sorted(failed)}}
     if out.exists():
         print(f"robinhood_payload: {out} already exists; leaving the published payload in place")
         return 0
@@ -719,6 +749,7 @@ def publish(
         "fetched_by": "codex exec via robinhood-trading MCP (scripts/robinhood_payload.py)",
         "universe": universe,
         "valid": ok,
+        "quiet": quiet,
         "failed": failed,
     }
     body = json.dumps(payload, indent=1)
@@ -741,6 +772,7 @@ def publish(
     _refusal_path(out).unlink(missing_ok=True)
     # A partial payload is allowed above the floor; say which tickers it leaves to ticker_errors so the log shows it.
     skipped = f"; ticker_errors: {', '.join(sorted(failed))}" if failed else ""
+    skipped += f" ({len(quiet)} quiet)" if quiet else ""
     print(f"robinhood_payload: wrote {out} ({ok}/{universe} tickers{skipped})")
     return 0
 
@@ -773,6 +805,12 @@ def _freshness_problem(plan: dict[str, Any], out: Path, now: datetime, max_age_m
     if age > timedelta(minutes=max_age_minutes):
         return f"built {int(age.total_seconds() // 60)} minutes ago, older than the {max_age_minutes}-minute bound"
     return None
+
+
+def _sidecar_quiet(out: Path) -> list[str]:
+    """The quiet tickers ``publish`` recorded beside ``out`` (already bound to the payload by the checksum)."""
+    meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    return list(meta.get("quiet", []))
 
 
 def check(
@@ -808,8 +846,10 @@ def check(
             print(f"robinhood_payload: {ticker}: {reason}", file=sys.stderr)
         return 2
     ok = len(rebuilt["sources"]["robinhood"])
-    if ok / len(plan["tickers"]) < min_coverage:
-        print(f"robinhood_payload: only {ok}/{len(plan['tickers'])} tickers validate", file=sys.stderr)
+    quiet = _sidecar_quiet(out)
+    problem = _coverage_problem(ok, len(plan["tickers"]), len(quiet), min_coverage)
+    if problem:
+        print(f"robinhood_payload: only {ok}/{len(plan['tickers'])} tickers validate: {problem}", file=sys.stderr)
         return 2
     print(f"robinhood_payload: OK {out} ({ok}/{len(plan['tickers'])})")
     return 0
