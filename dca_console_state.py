@@ -198,7 +198,10 @@ def _finite(value: Any) -> float | None:
     """A finite number, or None; bools are not numbers here."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 def _jsonable(value: Any, depth: int = 0) -> Any:

@@ -370,3 +370,9 @@ def test_replayable_source_keys_match_the_generators_source_names():
     from near_close_dca import SourceName
 
     assert REPLAYABLE_SOURCE_KEYS == {member.value for member in SourceName}
+
+
+def test_finite_rejects_boolean_values():
+    from dca_console_launch import _finite
+    assert _finite(True) is None
+    assert _finite(False) is None
