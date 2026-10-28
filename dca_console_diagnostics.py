@@ -86,7 +86,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
         "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
         "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
-        "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
+        "scripts.sync_live_prompts", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
         "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.slot_attribution",
     )),
     ("broker_market", "Broker, orders & market data", (

@@ -2,5 +2,5 @@
 # stdlib-only core. Pinned so a new upstream release cannot change behaviour without a
 # deliberate commit (docs/adr-price-source-massive-alpaca.md).
 requests==2.34.2
-duckdb==1.5.6
+duckdb==2.0.0
 pytest==9.1.1
