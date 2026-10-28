@@ -66,12 +66,39 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
 - A transient miss on one ticker costs the slot. The launcher retries a chunk once (2026-10-19: the 10:30 run
   covered 52/68 tickers, 9 daily-bar replies truncated and 8 quotes stamped with a wrong offset, so nothing was
   published) and keeps the attempt with fewer per-ticker errors. The coverage floor is 95% (see above).
+- A chunk that returns no reply on both attempts is rescued (2026-10-26: the 09:35 run lost chunks 4 and 10 whole,
+  16 of 91 tickers, and refused at 75/91 although every other chunk validated). The floor tolerates 4 misses but a
+  chunk holds 8, so one dead worker used to cost the slot. Its tickers are now asked for again in requests of
+  `DCA_RESCUE_CHUNK_SIZE` (default 2), each with the usual retry and build deadline, and folded back into that
+  chunk's reply before the merge, so chunk ownership is unchanged. Logs: `rescue chunk=<i> tickers=<n> size=<s>`
+  and `rescue chunk=<i> replied=<n>` (tickers in the folded reply, per-ticker errors included). The floor itself is unchanged.
+- A chunk that replies but leaves tickers out, or answers them with a per-ticker `error`, is rescued the same way
+  (2026-10-26: the 13:30 run refused at 83/91 because DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM and DXYZ came back
+  `no data returned for this ticker` while their live quotes were fine; their chunks had replied, so the dead-chunk
+  rescue never ran). Only the absent or errored tickers are re-asked, in the same `DCA_RESCUE_CHUNK_SIZE` requests,
+  logged as `rescue chunk=<i> tickers=<n> size=<s>`. A ticker that replied with data is never re-fetched, and a rescue
+  reply that is again missing or an error leaves the original entry in place, so the rescue cannot make a ticker worse.
+- Every attempt that returns no reply keeps its worker output in
+  `robinhood_payload_<day>_<slot>.chunk_logs/chunk_<i>.attempt<k>.<build epoch>.log` beside the payload (the
+  launcher's temp folder, and every log in it, is deleted on exit). A healthy build writes nothing there. Read
+  these first when a refusal names whole chunks of tickers.
 - An LLM copies the numbers. The validation catches malformed, inconsistent and outlier data; it cannot prove a
   plausible-looking bar is exact. Treat this as the trade-off for having any Robinhood path off-session.
 - Needs the Mac awake and Codex logged in. A failure leaves the slot to abort, as before.
 - `~/.codex/config.toml`'s default model is used. Pin one with `DCA_CODEX_MODEL` only if needed (model names
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
+
+## Plan-first ingest (2026-10-26)
+
+This program now does everything the retired 5-minute Claude courier did. After the merge, when `DCA_PLAN_FIRST_INGEST=1`,
+`robinhood_payload.sh` runs a second read-only `codex exec` with `broker-prompt` (only `get_equity_orders`, paginated, and
+`get_portfolio`; the account number comes from `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`), then `ingest`. `ingest` refuses a
+payload older than the freshness bound (exit 6) or a payload or broker reply more than 10 minutes from now (exit 2), takes
+the `plan_first/ingest` lease (exit 3 if held), and writes the recommendation files stamped with the payload's build time.
+It is best-effort: a failure is logged and never changes the launcher's exit status, so Gate 5 does not depend on it.
+Quotes now carry optional `bid_price`/`ask_price` (ask below bid fails the ticker). Default off; one launchd job per slot does
+both steps, and there is no separate courier or publish schedule.
 
 ## Quote freshness
 

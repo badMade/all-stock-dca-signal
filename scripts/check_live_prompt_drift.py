@@ -114,6 +114,12 @@ RETIRED_YFINANCE_MARKERS = ("PREFETCHED YFINANCE FALLBACK", "PREFETCH-FIRST")
 # generator and are never recomputed by hand. A live body without this sentence lets a failed data path end in
 # hand-written signal logic instead of a not_submitted_error abort.
 NO_HAND_SIGNALS_RULE = "Never recompute signals, sizes or candidates by hand"
+# 2026-10-22 11:30 (ref_id_format_rejected): the per-order placement sentence still named the text key
+# dca-runner-<slot>-<date>-<TICKER> right after "DETERMINISTIC ref_id", with the UUID override ~110 lines
+# earlier in the NATIVE ORDER-ID RULE. One session in five sent the text key, place_equity_order rejected
+# it (UUID only) and the slot placed nothing. The reworded mirrors put only the validate_native_placement
+# UUID in the ref_id position; a live body still carrying this phrase needs a repaste.
+TEXT_KEY_REF_ID_WORDING = "DETERMINISTIC ref_id with every order (sent as the UUID"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -128,8 +134,11 @@ _DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)\b")
 _END_DATE_CONTEXT_CHARS = 80
 _END_DATE_PHRASE_RE = re.compile(r"end[_ ]date|window end|trading window ends?", re.IGNORECASE)
 _LONG_DIGITS_RE = re.compile(r"\d{6,}")
-# A whole 6+ digit run (not a slice of a longer one) -- an account candidate.
-_ACCOUNT_CANDIDATE_RE = re.compile(r"(?<!\d)\d{6,}(?!\d)")
+_ACCOUNT_REFERENCE_RE = re.compile(
+    r"(?:--account(?:\s*=\s*|\s+)|[\"']account_number[\"']\s*:\s*[\"']?|"
+    r"\baccount(?:_number|\s+number)?\s*(?:[:=]\s*|\s+(?:is\s+)?)[\"']?)(\d{6,})(?!\d)",
+    re.IGNORECASE,
+)
 
 
 def default_scheduled_dir() -> Path:
@@ -252,6 +261,14 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
                 "hand-replicated signal logic instead of a not_submitted_error abort (hand_reimplemented)",
             }
         )
+    if TEXT_KEY_REF_ID_WORDING in live_text:
+        findings.append(
+            {
+                "code": "ref_id_names_text_key",
+                "detail": "the placement sentence names the dca-runner text key as the ref_id; a session that sends "
+                "it is rejected by place_equity_order (UUID only) and places nothing (2026-10-22 11:30)",
+            }
+        )
     if window_end_date:
         stale = _stale_window_dates(live_text, window_end_date)
         if stale:
@@ -349,27 +366,32 @@ def check(
 
 
 def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
-    """The one account-shaped value every live slot carries, when the env var is unset.
+    """The one account referenced by every live slot, when the env var is unset.
 
     Without ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` the literal-vs-placeholder
     lines were never normalized, so the plain command reported every slot as
     ``differs`` right after a faithful repaste (2026-09-22: 13 false changed
-    lines per slot). The live bodies already hold the account, so use it --
-    but only when exactly ONE 6+ digit value is common to every live slot.
-    Anything else (a slot missing, two candidates, a slot on a different
-    account) returns None and the comparison stays strict, so a live task
-    pointed at the wrong account still reads as drift. Never printed.
+    lines per slot). The live bodies already hold the account in account-specific
+    references, so use it only when each slot references exactly one account and
+    every slot agrees. Unrelated numbers are ignored. Anything else (a slot
+    missing or carrying multiple/different account references) returns None.
+    Never printed.
     """
-    common: Optional[set] = None
+    shared: Optional[str] = None
     for mirror in sorted(Path(mirror_dir).glob("*.txt")):
         if mirror.name.startswith("."):
             continue
         live = Path(scheduled_dir) / str(task_id_for(mirror)) / "SKILL.md"
         if not live.is_file():
             return None
-        values = set(_ACCOUNT_CANDIDATE_RE.findall(live.read_text(encoding="utf-8")))
-        common = values if common is None else common & values
-    return next(iter(common)) if common and len(common) == 1 else None
+        references = set(_ACCOUNT_REFERENCE_RE.findall(live.read_text(encoding="utf-8")))
+        if len(references) != 1:
+            return None
+        account = next(iter(references))
+        if shared is not None and account != shared:
+            return None
+        shared = account
+    return shared
 
 
 def mirror_set_problem(mirror_dir: Path) -> Optional[str]:

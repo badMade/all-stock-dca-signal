@@ -61,6 +61,7 @@ BACKUPS = (
 
 PROCEDURE_TEMPLATE = """\
 STEP 1 - GATES
+The STAND-DOWN GATE in this task's instructions already ran the command below and kept its JSON: use that JSON and do not run it again. It is described here so its result is read the same way.
 Run `python3 backup_planner.pyz gates --task @@TASK_ID@@` (Mac: `python3 -m scripts.backup_planner gates --task @@TASK_ID@@`). It reads the real clock, converts it to America/New_York, applies the rules below, and prints one JSON document. Never pass --now; never take the date or time from recollection. @@SLOT_RESOLUTION@@ Market day: today must be a weekday that is not in the Closed list; on an early-close day a fire at or after @@EARLY_TIME@@ ET also counts as closed.
 - status PROCEED: continue. Its slot and latest_placement_et are this run's slot and latest placement time (rule 9).
 - status skipped_market_closed or skipped_outside_window: stop with exactly that status.
@@ -72,6 +73,7 @@ Do not classify these orders by hand: the planner's classify command does it in 
 PUBLISHED PLAN-FIRST SET. Then read the plan-first recommendation the Mac publishes for cloud readers: the primary's own {ticker, usd, ref_id} list per slot, the same one the Claude slot places. It is an INPUT (rule 7). Read @@PUBLISHED_CHANNELS@@ Save the text untouched to published.json; never retype, reorder, or edit it. If no channel can be read or the text is not JSON, continue without published.json: that is not an error, the run falls back to the other plan sources.
 
 STEP 3 - MAC-FIRST (replaces the 2026-09-23 rule never to check the Mac; operator directive 2026-10-06)
+The STAND-DOWN GATE already did (a) and, when the Mac was online, the status command of (c): reuse the mac_status and local_status the STAND-DOWN GATE recorded, and do not call list_devices or the status command again (only the LATE-START GUARD recheck repeats it), and the 3 minute Mac budget started at the gate's list_devices.
 a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error. Set mac_path_abandoned to false. If this session has no device-listing tool at all (the 2026-10-12 15:45 run found none), that is mac_status not_found: the Mac is out of reach, not an error, and the rule below applies.
 b. The whole Mac path has a budget of 3 minutes, counted from the start of (a). When it is spent at any point, abandon the Mac path: set mac_path_abandoned to true, ignore its partial output, run no further Mac command, and continue with the sandbox parts of (d) and (e); a plan computed after that is plan_source cloud_compute. Once mac_path_abandoned is true it never goes back to false, and every Mac command below (3c, 3e, 3f, 5, 6, 7) requires it to be false, whatever mac_status still says.
 c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only when it has failed. Decide local_status:
@@ -84,7 +86,7 @@ c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only
    Never buy when local_status is reachable, in_progress, succeeded, or unknown. A cloud run places nothing by itself; only this task's step 7 may place a fallback order, and only when finalize returns PROCEED (operator directive 2026-10-13: a backup that cannot reach the Mac places its own computed plan).
 d. EXECUTOR RECOGNITION. Claude's plan-first slot sends a UUID ref_id and the broker answers with its own, so Claude's orders carry no dca-runner- reference at the broker and are recognized by order id instead. If mac_status is online and mac_path_abandoned is false, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
    python3 -m scripts.backup_planner executor-ids --trading-day <YYYY-MM-DD> --slot <slot>
-   It prints {"status", "trading_day", "slot", "order_ids", "errors"}: the broker order ids Claude's reader saved for this slot. Save that output untouched to executor_ids.json. A status other than OK, or a non-zero exit: place nothing, status failed_unexpected_error, notify. Then, in this sandbox, run:
+   It prints {"status", "trading_day", "slot", "order_ids", "sources", "errors"}: the broker order ids Claude saved for this slot, from the plan-first reader's placements and the live prompt's place_<TICKER>.json responses alike. Save that output untouched to executor_ids.json. A status other than OK, or a non-zero exit: place nothing, status failed_unexpected_error, notify. Then, in this sandbox, run:
    python3 backup_planner.pyz classify --trading-day <YYYY-MM-DD> --slot <slot> --orders-pages orders_pages_poll1.json --executor-ids executor_ids.json --published published.json
    leaving out --executor-ids when there is no executor_ids.json and --published when there is no published.json. It classifies EVERY order created inside this slot's window as the user's own activity (placed_agent user, recurring, or drip; noted, never blocking), expected executor traffic (an order id in executor_ids.json, a dca-runner-<slot>- reference, or a buy of a symbol the published set for this slot lists for exactly its dollar amount), or UNRECOGNIZED. Status CLEAR (exit 0): continue. Status UNRECOGNIZED: place nothing, record stood_down_unrecognized_order, and notify. Any other status or output: place nothing, status failed_unexpected_error, notify. Expected executor traffic is not a reason to stop: tickers already ordered are excluded later by the planner, so a partly finished Claude batch is completed, not abandoned. Keep its executor_orders for the state record.
 e. PLAN-FIRST SET FIRST. If mac_status is online and mac_path_abandoned is false, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
@@ -191,9 +193,7 @@ KNOWN LIMITATION (accepted 2026-10-06): the Mac-first check can use time that th
 
 def _slot_resolution(backup: Backup) -> str:
     if len(backup.fires) == 1:
-        slot, fire = backup.slots[0], backup.fires[0]
-        hh, mm = int(fire[:2]), int(fire[3:])
-        start = f"{hh:02d}:{mm - 10:02d}" if mm >= 10 else f"{hh - 1:02d}:{mm + 50:02d}"
+        slot, start = backup.slots[0], backup.fires[0]  # the fire time is the earliest start (2026-10-26 incident)
         return (f"This fire backs up slot {slot} ({_SLOT_LABEL[slot]}). The ET time must be from {start} up to the "
                 f"latest placement time {_NEXT_SLOT_START[slot]}.")
     # The two-fire task (13:50 and 14:50): the clock decides which slot this run backs up.
