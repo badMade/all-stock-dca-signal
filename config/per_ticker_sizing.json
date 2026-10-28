@@ -5,8 +5,31 @@
   "method": "Per ticker, the 5th..100th percentiles (96 tiers) of the last 90 days of adjusted prior-close-to-low drops map to a log-scaled 1.00x..10.00x curve (8.00x at the 95th, 10.00x at the 100th = the window's largest drop).",
   "lookback_days": 90,
   "minimum_order_usd": 1.0,
-  "fallback_tickers": [],
+  "fallback_tickers": ["CCI"],
   "tickers": {
+    "CCI": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {"min_drop_pct": 0.1, "multiplier": 1.0},
+        {"min_drop_pct": 0.5, "multiplier": 1.5},
+        {"min_drop_pct": 1.0, "multiplier": 2.0},
+        {"min_drop_pct": 1.5, "multiplier": 2.5},
+        {"min_drop_pct": 2.0, "multiplier": 3.0},
+        {"min_drop_pct": 2.75, "multiplier": 3.5},
+        {"min_drop_pct": 3.5, "multiplier": 4.0},
+        {"min_drop_pct": 4.5, "multiplier": 4.5},
+        {"min_drop_pct": 5.5, "multiplier": 5.0},
+        {"min_drop_pct": 7.0, "multiplier": 5.5},
+        {"min_drop_pct": 8.5, "multiplier": 6.0},
+        {"min_drop_pct": 10.5, "multiplier": 6.5},
+        {"min_drop_pct": 12.5, "multiplier": 7.0},
+        {"min_drop_pct": 14.5, "multiplier": 7.5},
+        {"min_drop_pct": 16.0, "multiplier": 8.0}
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
     "DFTX": {
       "base_amount_usd": 1.0,
       "base_amount_below_close_usd": 1.0,

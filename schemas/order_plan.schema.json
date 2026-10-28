@@ -104,8 +104,8 @@
           },
           "ref_id": {
             "type": "string",
-            "pattern": "^dca-runner-(0935|1030|1130|1230|1330|1430|1530)-[0-9]{4}-[0-9]{2}-[0-9]{2}-[A-Z][A-Z0-9.]{0,9}$",
-            "description": "dca-runner-<slot_id>-<trading_day>-<TICKER>, the same derivation dca_runner.execute_plan uses. Reuse is NOT assumed to give broker-side idempotency (ADR decision D6); reconciliation depends on a fresh order pull."
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "Deterministic UUIDv5 of dca-runner-<slot_id>-<trading_day>-<TICKER> (scripts.validate_native_placement.native_ref_id): the only form the broker's place_equity_order tool accepts. Reuse is NOT assumed to give broker-side idempotency (ADR decision D6); reconciliation depends on a fresh order pull."
           }
         }
       }

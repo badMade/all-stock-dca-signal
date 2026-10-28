@@ -379,6 +379,15 @@ ACTIVE_TICKERS = [
     "MCK",
     "CHD",
     "CL",
+    # OCT 23 2026 (user-requested): CCI (Crown Castle Inc.). A read-only Robinhood
+    # instrument search resolved CCI as Crown Castle Inc. (state active, prior
+    # close $78.83 on 2026-10-22). Fractional tradability was NOT verified (that
+    # check needs the account number), so the run-time is_tradable_for_fractional_buy
+    # gate admits or blocks CCI fail-closed. CCI is already in tickers.txt (the
+    # history-fetch symbol list) but has no calibrated config/per_ticker_sizing.json
+    # entry yet, so its sizing waits on scripts/generate_per_ticker_sizing.py
+    # being re-run against the ticker_data archive. See config/tickers.json's notes.
+    "CCI",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it
@@ -1147,21 +1156,21 @@ class StrategyConfig:
     # which now require only a 2.0% drop (was 6% after the 2026-08-02 rescale), so
     # tier escalation is correspondingly MORE frequent for the same market conditions.
     sizing_tiers: tuple[tuple[float, float], ...] = (
-        (0.001, 1.0),   # 0.1% to <0.5%
-        (0.005, 1.5),   # 0.5% to <1.0%
-        (0.010, 2.0),   # 1.0% to <1.5%
-        (0.015, 2.5),   # 1.5% to <2.0%
-        (0.020, 3.0),   # 2.0% to <2.75%
+        (0.001, 1.0),  # 0.1% to <0.5%
+        (0.005, 1.5),  # 0.5% to <1.0%
+        (0.010, 2.0),  # 1.0% to <1.5%
+        (0.015, 2.5),  # 1.5% to <2.0%
+        (0.020, 3.0),  # 2.0% to <2.75%
         (0.0275, 3.5),  # 2.75% to <3.5%
-        (0.035, 4.0),   # 3.5% to <4.5%
-        (0.045, 4.5),   # 4.5% to <5.5%
-        (0.055, 5.0),   # 5.5% to <7.0%
-        (0.070, 5.5),   # 7.0% to <8.5%
-        (0.085, 6.0),   # 8.5% to <10.5%
-        (0.105, 6.5),   # 10.5% to <12.5%
-        (0.125, 7.0),   # 12.5% to <14.5%
-        (0.145, 7.5),   # 14.5% to <16.0%
-        (0.160, 8.0),   # 16.0% or more (no upper cutoff)
+        (0.035, 4.0),  # 3.5% to <4.5%
+        (0.045, 4.5),  # 4.5% to <5.5%
+        (0.055, 5.0),  # 5.5% to <7.0%
+        (0.070, 5.5),  # 7.0% to <8.5%
+        (0.085, 6.0),  # 8.5% to <10.5%
+        (0.105, 6.5),  # 10.5% to <12.5%
+        (0.125, 7.0),  # 12.5% to <14.5%
+        (0.145, 7.5),  # 14.5% to <16.0%
+        (0.160, 8.0),  # 16.0% or more (no upper cutoff)
     )
     # Optional symbol-specific historical calibration loaded from
     # config/per_ticker_sizing.json. Each value supplies ``tiers`` as
@@ -18923,9 +18932,7 @@ def _whole_share_dry_run_preview(
             "whole_share_planned_notional_usd": preview_order_notional,
             **spread_fields,
         }
-        _record_block_reason(
-            ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping"
-        )
+        _record_block_reason(ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping")
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     # A dry-run preview must not claim success for a broker that cannot
@@ -19034,7 +19041,6 @@ def _whole_share_dry_run_preview(
     if ctx.run_result is not None:
         _log_execution(ctx.run_result, decision, order_id, ctx.broker, notional_usd=preview_order_notional)
     return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-
 
 
 def _handle_whole_share_placement_exception(
@@ -19554,9 +19560,7 @@ def _handle_whole_share_placement_exception(
         terminal_order = exc.order
     else:
         try:
-            terminal_order = ctx.broker.same_day_order_with_ref_id_prefix_any_state(
-                ticker, ctx.trading_day, (ref_id,)
-            )
+            terminal_order = ctx.broker.same_day_order_with_ref_id_prefix_any_state(ticker, ctx.trading_day, (ref_id,))
         except Exception as terminal_lookup_exc:  # noqa: BLE001
             # A raised terminal-inclusive lookup establishes NEITHER outcome
             # -- mirrors the live lookup's own failure posture just above
@@ -19745,9 +19749,7 @@ def _handle_whole_share_placement_exception(
             # shortfalls from the cached share price"). See the
             # sibling "if matched_order:" branch above for the full
             # reasoning.
-            settlement_shortfall_usd = round(
-                max(0.0, planned_order_notional - filled_shares * current_share_price), 2
-            )
+            settlement_shortfall_usd = round(max(0.0, planned_order_notional - filled_shares * current_share_price), 2)
             settlement_failed = False
             resolved_by_this_call = False
             try:
@@ -19809,8 +19811,7 @@ def _handle_whole_share_placement_exception(
                 post_fire_pending_usd = ledger.pending_usd(ticker)
             except Exception as read_exc:  # noqa: BLE001
                 logger.warning(
-                    "whole-share accumulation ledger read failed for %s after reconciled "
-                    "partial-fill settlement: %s",
+                    "whole-share accumulation ledger read failed for %s after reconciled partial-fill settlement: %s",
                     ticker,
                     read_exc,
                 )
@@ -20143,7 +20144,6 @@ def _handle_whole_share_placement_exception(
     }
     logger.error("Whole-share placement failed for %s: %s", ticker, exc)
     return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-
 
 
 def _handle_whole_share_placement_success(
@@ -29509,18 +29509,18 @@ def _unrepresented_prior_candidate_part(
             _merged_entry = dict(_existing_entry)
             for _field in ("submitted_amount_usd", "planned_amount_usd", "whole_share_quantity"):
                 _a, _b = _existing_entry.get(_field), _item.get(_field)
-                if isinstance(_a, (int, float)) and isinstance(_b, (int, float)):
+                if isinstance(_a, (int, float)) and not isinstance(_a, bool) and isinstance(_b, (int, float)) and not isinstance(_b, bool):
                     _merged_entry[_field] = _a + _b
-                elif isinstance(_b, (int, float)):
+                elif isinstance(_b, (int, float)) and not isinstance(_b, bool):
                     _merged_entry[_field] = _b
             _legacy_by_id[_key] = _merged_entry
     _matched_legacy = [_legacy_by_id[key] for key in missing_keys if key in _legacy_by_id]
     _legacy_fully_matched = bool(_matched_legacy) and len(_matched_legacy) == len(missing_keys)
     if attribution is not None:
         trimmed_amount = round(sum(float(attribution.get(key) or 0.0) for key in missing_keys), 2)
-        if isinstance(prior.get("submitted_amount_usd"), (int, float)):
+        if isinstance(prior.get("submitted_amount_usd"), (int, float)) and not isinstance(prior.get("submitted_amount_usd"), bool):
             trimmed["submitted_amount_usd"] = trimmed_amount
-        if isinstance(prior.get("planned_amount_usd"), (int, float)):
+        if isinstance(prior.get("planned_amount_usd"), (int, float)) and not isinstance(prior.get("planned_amount_usd"), bool):
             trimmed["planned_amount_usd"] = trimmed_amount
         trimmed["_order_amount_usd_by_id"] = {key: attribution[key] for key in missing_keys if key in attribution}
         # `_order_failure_kind_by_id` is a per-id map too (see
@@ -29546,8 +29546,8 @@ def _unrepresented_prior_candidate_part(
             if not isinstance(prior.get(field), (int, float)):
                 continue
             _values = [_item.get(field) for _item in _matched_legacy]
-            if all(isinstance(_v, (int, float)) for _v in _values):
-                trimmed[field] = round(sum(float(_v) for _v in _values if isinstance(_v, (int, float))), 2)
+            if all(isinstance(_v, (int, float)) and not isinstance(_v, bool) for _v in _values):
+                trimmed[field] = round(sum(float(_v) for _v in _values if isinstance(_v, (int, float)) and not isinstance(_v, bool)), 2)
         # Restricted to just the still-represented ids, not the prior
         # aggregate's full list (inherited unchanged via `dict(prior)`
         # above): a later `_merge_whole_share_submission_outcomes` call on
@@ -29704,11 +29704,11 @@ def _unrepresented_prior_candidate_part(
     # started as `dict(prior)`, so its submitted/planned amounts already
     # hold that conservative total unless one of the branches above just
     # replaced them with an exact figure.
-    if isinstance(prior.get("whole_share_quantity"), (int, float)):
+    if isinstance(prior.get("whole_share_quantity"), (int, float)) and not isinstance(prior.get("whole_share_quantity"), bool):
         if _legacy_fully_matched:
             _qty_values = [_item.get("whole_share_quantity") for _item in _matched_legacy]
-            if all(isinstance(_v, (int, float)) for _v in _qty_values):
-                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values if isinstance(_v, (int, float)))
+            if all(isinstance(_v, (int, float)) and not isinstance(_v, bool) for _v in _qty_values):
+                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values if isinstance(_v, (int, float)) and not isinstance(_v, bool))
         # else: no exact per-order quantity available -- preserve the
         # prior's full quantity (already in `trimmed` via `dict(prior)`)
         # rather than subtract a fresh sibling's own quantity from a total

@@ -191,6 +191,9 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   `build_afternoon_live_run_classification` for 15:30.
 - It writes `run_state.json` and `run_summary.json`, plus header-only CSVs
   where missing, then checks them with `validate_run_artifacts`.
+- For states it builds, `generated_at` and `finalized_at` record the artifact
+  write time. Risk consumers use `dca_risk.run_timestamp_et`, which reads the
+  classification's actual start and floors it at the trading day's nominal slot.
 - It refreshes the pointer through `same_day_pointer.refresh_latest_pointer`,
   or `update_latest_scheduled_run_pointer` for 15:30, then re-validates the
   pointer and the slot. It exits 0 only when both verify.
@@ -281,6 +284,13 @@ For every slot whose status is not `verified`/`not_due`/`awaiting_evidence`/
   parses. `SCHEDULE_WATCHDOG` is registered in that module's `_REASON_CODES`
   so `detect_gate_evidence` recognizes it and buckets it separately from a
   gate an executor reported on itself, rather than loading as `gate=None`;
+* **Error outcomes (2026-10-28).** A slot that ran and wrote valid evidence but finalized as
+  `not_submitted_error` or `blocked_placement_phase_unreachable` (classifier refusals, `market_data_unavailable`
+  aborts) verifies cleanly, so it used to read green. `error_outcome_rows` now flags those verified slots too: same
+  alert file name (a slot cannot both lack evidence and have an outcome), a body that says "error outcome" with the
+  status and `error_class`, exit code 1, and `error_slots` in the `--json` report. The desktop banner and Slack text
+  name slot ids only. Quiet outcomes (no orders, no candidates, budget exhausted, confirmation required) are not
+  errors and do not alert;
 * re-running it for a still-unresolved (day, slot) overwrites that same file
   rather than creating a numbered duplicate, so `alert_digest`'s per-slot
   counts and streaks reflect one unresolved incident, not one per invocation;

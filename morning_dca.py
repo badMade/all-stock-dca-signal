@@ -449,9 +449,7 @@ def _dated_manual_override_cap_seed_roots() -> tuple[str, ...]:
     """
     try:
         parent = Path(cron_tracking_root())
-        return tuple(
-            str(p) for p in sorted(parent.glob("perplexity_primary_*/manual_override_*")) if p.is_dir()
-        )
+        return tuple(str(p) for p in sorted(parent.glob("perplexity_primary_*/manual_override_*")) if p.is_dir())
     except OSError:
         return ()
 
@@ -995,13 +993,11 @@ def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
         max_order = float(raw_val)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"budgets.json circuit_breakers.max_per_order_usd must be a finite "
-            f"positive number, got {raw_val!r}"
+            f"budgets.json circuit_breakers.max_per_order_usd must be a finite positive number, got {raw_val!r}"
         ) from exc
     if not (math.isfinite(max_order) and max_order > 0):
         raise ValueError(
-            f"budgets.json circuit_breakers.max_per_order_usd must be a finite "
-            f"positive number, got {raw_val!r}"
+            f"budgets.json circuit_breakers.max_per_order_usd must be a finite positive number, got {raw_val!r}"
         )
     return max_order
 
@@ -1042,8 +1038,7 @@ def load_max_orders_per_day(config_dir_path: Path) -> Optional[int]:
     raw_val = cb["max_orders_per_day"]
     if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val <= 0:
         raise ValueError(
-            f"budgets.json circuit_breakers.max_orders_per_day must be a positive "
-            f"integer, got {raw_val!r}"
+            f"budgets.json circuit_breakers.max_orders_per_day must be a positive integer, got {raw_val!r}"
         )
     return raw_val
 
@@ -1088,9 +1083,7 @@ def load_max_consecutive_placement_failures(config_dir_path: Path) -> Optional[i
         # than the afternoon path got from the SAME file (Codex review,
         # PR #786: "Reject duplicate placement-breaker keys"). ValueError is
         # what the hook raises and is caught below alongside the parse errors.
-        budgets_raw = json.loads(
-            budgets_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys
-        )
+        budgets_raw = json.loads(budgets_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError(
             f"budgets.json exists but could not be read or parsed; "
@@ -1325,9 +1318,7 @@ def resolved_count_breakers(config_dir_path: Path) -> dict:
         resolved["max_orders_per_day"] = DEFAULT_MAX_ORDERS_PER_DAY
     # Unlike the optional order cap above, this required breaker resolves to
     # the shared safe default even when the entire budgets file is absent.
-    resolved["max_consecutive_placement_failures"] = (
-        load_max_consecutive_placement_failures(config_dir_path)
-    )
+    resolved["max_consecutive_placement_failures"] = load_max_consecutive_placement_failures(config_dir_path)
     return resolved
 
 
@@ -1379,9 +1370,7 @@ def load_morning_config(
 
     cfg_path = config_dir_path / "morning_dca.json"
     if not cfg_path.exists():
-        logger.warning(
-            "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
-        )
+        logger.warning("morning_dca.json not found at %s; using MorningConfig defaults", cfg_path)
         approved_dates = _load_approved_dates_fail_closed(config_dir_path)
         # morning_run_state_root deliberately stays
         # None here rather than being resolved via stream_root() at load
@@ -1476,10 +1465,7 @@ def load_morning_config(
     if "no_buy_below_pct" in sizing:
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
-        tiers = tuple(
-            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"]))
-            for t in sizing["tiers"]
-        )
+        tiers = tuple((float(t["min_drop_pct"]) / 100.0, float(t["multiplier"])) for t in sizing["tiers"])
         kwargs["sizing_tiers"] = tiers
 
     budget = raw.get("budget_ledger", {})
@@ -1523,9 +1509,7 @@ def load_morning_config(
     if "broker_account" in account_task:
         source = f"{mode} {account_task_key}.broker_account"
         try:
-            kwargs["target_account_number"] = resolve_broker_account(
-                account_task["broker_account"], source=source
-            )
+            kwargs["target_account_number"] = resolve_broker_account(account_task["broker_account"], source=source)
         except (MissingConfigEnvError, InvalidAccountNumberError):
             if not allow_unpinned_account:
                 raise
@@ -1571,9 +1555,7 @@ def load_morning_config(
         # config sets one) does not silently bypass that visibility (Codex
         # review, PR #656 follow-up on discussion_r3839652545: "Add
         # override roots to configured cap seeds").
-        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
-            tuple(str(r) for r in cap_roots)
-        )
+        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(tuple(str(r) for r in cap_roots))
     # model_usage_log_root (see scripts/model_usage_log.py, config/scheduled_tasks.json
     # -> model_usage_log): defaults to stream_root("model_usage"), resolved when
     # this loader RUNS rather than at import, so the audit
@@ -1720,8 +1702,7 @@ def load_stream_config(
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
         kwargs["sizing_tiers"] = tuple(
-            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"]))
-            for t in sizing["tiers"]
+            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"])) for t in sizing["tiers"]
         )
 
     budget = raw.get("budget_ledger", {})
@@ -1740,9 +1721,7 @@ def load_stream_config(
         # and writes durable blocked evidence.
         source = f"{source_label} live_task.broker_account"
         try:
-            kwargs["target_account_number"] = resolve_broker_account(
-                live_task["broker_account"], source=source
-            )
+            kwargs["target_account_number"] = resolve_broker_account(live_task["broker_account"], source=source)
         except (MissingConfigEnvError, InvalidAccountNumberError):
             if not allow_unpinned_account:
                 raise
@@ -1770,9 +1749,7 @@ def load_stream_config(
         # cap_seed_roots list too (Codex review, PR #656 follow-up on
         # discussion_r3839652545: "Add override roots to configured cap
         # seeds").
-        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
-            tuple(str(r) for r in cap_roots)
-        )
+        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(tuple(str(r) for r in cap_roots))
 
     if "model_usage_log_root" in artifact_paths:
         configured_log_root = artifact_paths["model_usage_log_root"]
@@ -2369,7 +2346,9 @@ class _PersistingMarketDataProvider:
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 self._raw_connector_invocations += 1
                 symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
-                key = "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
+                key = (
+                    "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
+                )
                 try:
                     payload = _connector(*args, **kwargs)
                     persisted = self._recorder.persist(_kind, key, payload)
@@ -2418,14 +2397,10 @@ class _PersistingMarketDataProvider:
             self._recorder.record_connector_error("prior_close", ticker, exc)
             raise
 
-    def get_intraday_bars(
-        self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int
-    ) -> Sequence[Bar]:
+    def get_intraday_bars(self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int) -> Sequence[Bar]:
         try:
             invocations_before = self._raw_connector_invocations
-            bars = self._inner.get_intraday_bars(
-                ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
-            )
+            bars = self._inner.get_intraday_bars(ticker=ticker, start=start, end=end, interval_minutes=interval_minutes)
             if self._raw_connector_invocations != invocations_before:
                 return bars
             persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
@@ -2696,9 +2671,7 @@ class _PersistingBrokerAdapter:
 
     def review_market_buy(self, ticker: str, notional_usd: float):
         result = self._inner.review_market_buy(ticker, notional_usd)
-        self._recorder.persist(
-            "order_review", ticker, {"notional_usd": notional_usd, "result": result}
-        )
+        self._recorder.persist("order_review", ticker, {"notional_usd": notional_usd, "result": result})
         return result
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
@@ -2730,13 +2703,15 @@ class _PersistingBrokerAdapter:
             self._placement_responses.extend(response for response in responses if isinstance(response, dict))
             for response in responses:
                 self._recorder.persist(
-                    "order_response", ticker,
+                    "order_response",
+                    ticker,
                     {"notional_usd": notional_usd, "ref_id": ref_id, "response": response},
                 )
             return
         if order_id is not None:
             self._recorder.persist(
-                "order_response", ticker,
+                "order_response",
+                ticker,
                 {"notional_usd": notional_usd, "ref_id": ref_id, "order_id": order_id},
             )
 
@@ -2763,45 +2738,47 @@ class _PersistingBrokerAdapter:
         return getattr(self._inner, name)
 
 
-_RESERVED_ARTIFACT_FILENAMES = frozenset({
-    "",
-    ".",
-    "..",
-    "raw",
-    "manual_runs",
-    "manual_reruns",
-    "manual_recovery",
-    "scheduled_runs",
-    "run_state.json",
-    "run_summary.json",
-    "latest_run_summary.json",
-    "morning_signals.csv",
-    "midday_signals.csv",
-    "market_open_signals.csv",
-    "intraday_signals.csv",
-    "signals.csv",
-    "submitted_orders.csv",
-    "filled_orders.csv",
-    "orders.csv",
-    "buy_candidates.csv",
-    "validation.csv",
-    "observations.csv",
-    "slippage_ranked.csv",
-    "missing_fills_report.csv",
-    "drift_report.json",
-    "drift_report.md",
-    "slippage_and_coverage_report.md",
-    "weekly_performance_dashboard.md",
-    "notion_latest_run_compact.md",
-    "notion_latest_run_payload.json",
-    "latest_morning_run.json",
-    "latest_scheduled_run.json",
-    "latest_midday_run.json",
-    "latest_market_open_run.json",
-    "latest_intraday_run.json",
-    "latest_dca_run.json",
-    "latest_trade_run.json",
-})
+_RESERVED_ARTIFACT_FILENAMES = frozenset(
+    {
+        "",
+        ".",
+        "..",
+        "raw",
+        "manual_runs",
+        "manual_reruns",
+        "manual_recovery",
+        "scheduled_runs",
+        "run_state.json",
+        "run_summary.json",
+        "latest_run_summary.json",
+        "morning_signals.csv",
+        "midday_signals.csv",
+        "market_open_signals.csv",
+        "intraday_signals.csv",
+        "signals.csv",
+        "submitted_orders.csv",
+        "filled_orders.csv",
+        "orders.csv",
+        "buy_candidates.csv",
+        "validation.csv",
+        "observations.csv",
+        "slippage_ranked.csv",
+        "missing_fills_report.csv",
+        "drift_report.json",
+        "drift_report.md",
+        "slippage_and_coverage_report.md",
+        "weekly_performance_dashboard.md",
+        "notion_latest_run_compact.md",
+        "notion_latest_run_payload.json",
+        "latest_morning_run.json",
+        "latest_scheduled_run.json",
+        "latest_midday_run.json",
+        "latest_market_open_run.json",
+        "latest_intraday_run.json",
+        "latest_dca_run.json",
+        "latest_trade_run.json",
+    }
+)
 
 
 def _sanitize_budget_ledger_filename(raw_filename: Optional[str]) -> str:
@@ -2943,9 +2920,7 @@ class MorningDCAExecutor(DCAExecutor):
         # a stream whose config didn't itself set morning_run_state_root
         # (Codex review, PR #219). See load_morning_config's config-missing
         # fallback for why that resolution can't happen there instead.
-        self.state_root = self.config.morning_run_state_root or stream_root(
-            self.profile["state_root_stream"]
-        )
+        self.state_root = self.config.morning_run_state_root or stream_root(self.profile["state_root_stream"])
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
         # run_ids already folded into self.ledger by _seed_ledger_from_prior_runs
         # -- including this instance's OWN completed runs (added in run() right
@@ -3023,9 +2998,7 @@ class MorningDCAExecutor(DCAExecutor):
         modes keep the strict behavior -- nothing downstream of them can produce
         block evidence, so a raise is the clearest failure they have.
         """
-        return load_morning_config(
-            config_dir, mode=mode, allow_unpinned_account=mode == MORNING_LIVE_MODE
-        )
+        return load_morning_config(config_dir, mode=mode, allow_unpinned_account=mode == MORNING_LIVE_MODE)
 
     def _idempotency_stream(self) -> str:
         """Namespace for the broker idempotency ref id / duplicate check.
@@ -3084,24 +3057,16 @@ class MorningDCAExecutor(DCAExecutor):
             self._cap_seed_scan_incomplete = True
             self._cap_seed_scan_incomplete_paths = [str(p) for p in cap_skip_sink]
             self._cap_seed_poison_day_sources.setdefault(trading_day, set()).add("cap_roots")
-            day_poison_delta = max(
-                0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
-            )
+            day_poison_delta = max(0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day))
             if day_poison_delta > 0:
-                self.ledger.planned_by_day[trading_day] = (
-                    self.ledger.day_planned(trading_day) + day_poison_delta
-                )
+                self.ledger.planned_by_day[trading_day] = self.ledger.day_planned(trading_day) + day_poison_delta
                 self._cap_seed_poison_day[trading_day] = (
                     self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
                 )
             self._cap_seed_poison_week_sources.setdefault(this_week, set()).add("cap_roots")
-            week_poison_delta = max(
-                0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
-            )
+            week_poison_delta = max(0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day))
             if week_poison_delta > 0:
-                self.ledger.planned_by_week[this_week] = (
-                    self.ledger.week_planned(trading_day) + week_poison_delta
-                )
+                self.ledger.planned_by_week[this_week] = self.ledger.week_planned(trading_day) + week_poison_delta
                 self._cap_seed_poison_week[this_week] = (
                     self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
                 )
@@ -3137,15 +3102,9 @@ class MorningDCAExecutor(DCAExecutor):
                 sum(a.attempt_count for a in cap_allocations.values()),
             )
             manual_root = str(Path(self.state_root) / self.manual_run_subdir)
-            own_manual_in_scan = any(
-                Path(manual_root).is_relative_to(Path(r)) for r in cap_roots
-            )
-            own_scheduled_in_scan = any(
-                Path(self.state_root).is_relative_to(Path(r)) for r in cap_roots
-            )
-            own_amount = (
-                self._own_recorded_manual.get(trading_day, 0.0) if own_manual_in_scan else 0.0
-            ) + (
+            own_manual_in_scan = any(Path(manual_root).is_relative_to(Path(r)) for r in cap_roots)
+            own_scheduled_in_scan = any(Path(self.state_root).is_relative_to(Path(r)) for r in cap_roots)
+            own_amount = (self._own_recorded_manual.get(trading_day, 0.0) if own_manual_in_scan else 0.0) + (
                 self._own_recorded_scheduled.get(trading_day, 0.0) if own_scheduled_in_scan else 0.0
             )
             prev_total = self._cap_seeded_amounts.get(seed_key, 0.0) + own_amount
@@ -3156,7 +3115,11 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
-        self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False,
+        self,
+        now: datetime,
+        signals: Sequence["MorningSignal"],
+        *,
+        manual: bool = False,
         broker: Optional[BrokerAdapter] = None,
         same_stream_orders: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, TopUpOutcome]:
@@ -3208,9 +3171,7 @@ class MorningDCAExecutor(DCAExecutor):
         # hardcoded production default) rather than pointing it at a specific,
         # narrower tree -- e.g. an isolated replay/staging config (Codex review:
         # "Honor explicit prior-allocation roots in shared executors").
-        uses_default_prior_allocation_roots = (
-            raw_roots is None or tuple(raw_roots) == default_prior_allocation_roots()
-        )
+        uses_default_prior_allocation_roots = raw_roots is None or tuple(raw_roots) == default_prior_allocation_roots()
         # Append the manual_runs subtree of self.state_root only for the morning
         # stream. Midday manual reruns are prior context for the afternoon guard,
         # not for the midday scheduled run; skip to avoid scanning
@@ -3221,9 +3182,7 @@ class MorningDCAExecutor(DCAExecutor):
         morning_only = self.stream == MORNING_STREAM
         roots = []
         if not explicit_disable:
-            already_covered = any(
-                Path(manual_root).resolve().is_relative_to(Path(r).resolve()) for r in configured
-            )
+            already_covered = any(Path(manual_root).resolve().is_relative_to(Path(r).resolve()) for r in configured)
             if morning_only and not already_covered:
                 roots = list(dict.fromkeys([*configured, manual_root]))
             else:
@@ -3303,13 +3262,9 @@ class MorningDCAExecutor(DCAExecutor):
             ticker = signal.ticker
             slot_key = self._credit_idempotency_key(now, manual=manual)
             try:
-                cached_decision = self.credit_ledger.recorded_decision(
-                    ticker, trading_day.isoformat(), slot_key
-                )
+                cached_decision = self.credit_ledger.recorded_decision(ticker, trading_day.isoformat(), slot_key)
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"cumulative credit ledger idempotency read failed for {ticker}"
-                ) from exc
+                raise RuntimeError(f"cumulative credit ledger idempotency read failed for {ticker}") from exc
             if cached_decision is not None:
                 # THIS slot's own earlier attempt already durably recorded a
                 # stays-pending decline for this ticker (the only record()
@@ -3360,17 +3315,13 @@ class MorningDCAExecutor(DCAExecutor):
                 # stale pending balance with newer provenance and recreate
                 # credit that has already been paid (PR #1051 -- see
                 # CumulativeCreditLedger.provenance_snapshot's docstring).
-                credit_snapshot = self.credit_ledger.provenance_snapshot(
-                    ticker, trading_day.isoformat(), slot_key
-                )
+                credit_snapshot = self.credit_ledger.provenance_snapshot(ticker, trading_day.isoformat(), slot_key)
             except Exception as exc:  # noqa: BLE001
                 # This is an operational failure, not a genuine no-incremental
                 # decision.  Raising routes scheduled runs through the durable
                 # startup-failure artifact writer and prevents a healthy
                 # completed-no-orders classification from masking the outage.
-                raise RuntimeError(
-                    f"cumulative credit ledger balance read failed for {ticker}"
-                ) from exc
+                raise RuntimeError(f"cumulative credit ledger balance read failed for {ticker}") from exc
             # Snapshot of the ticker's TOTAL shared pending balance at
             # the moment the order-vs-stays-pending decision below is
             # about to be made from it -- passed through to
@@ -3629,9 +3580,7 @@ class MorningDCAExecutor(DCAExecutor):
                         pending_baseline_usd=existing_pending_credit_usd,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    _log.warning(
-                        "cumulative credit ledger record failed for %s: %s", ticker, exc
-                    )
+                    _log.warning("cumulative credit ledger record failed for %s: %s", ticker, exc)
             outcomes[ticker] = outcome
         return outcomes
 
@@ -3747,9 +3696,7 @@ class MorningDCAExecutor(DCAExecutor):
         ladder_incremental = desired - round(prior.amount_usd, 2)
         if ladder_incremental < 0:
             return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
-        price_step_incremental = cumulative_price_step_amount_usd(
-            prior.reference_price, price, self.sizing_config
-        )
+        price_step_incremental = cumulative_price_step_amount_usd(prior.reference_price, price, self.sizing_config)
         if ladder_incremental < 1.0:
             # A ladder/price-step floor below $1 must never be submitted as a
             # raw broker order (Robinhood's $1 minimum) nor silently dropped
@@ -3776,16 +3723,17 @@ class MorningDCAExecutor(DCAExecutor):
             # decline_usd are computed purely from prices and never reflect
             # any settlement, so they always need it subtracted directly.
             ladder_floor = round(
-                max(0.0, ladder_incremental - (0.0 if settled_credit_reflected_in_prior else settled_credit_for_slot_usd)),
+                max(
+                    0.0,
+                    ladder_incremental - (0.0 if settled_credit_reflected_in_prior else settled_credit_for_slot_usd),
+                ),
                 2,
             )
             non_ladder_floor = round(
                 max(0.0, max(price_step_incremental, decline_usd) - settled_credit_for_slot_usd), 2
             )
             credit_amount_usd = max(ladder_floor, non_ladder_floor)
-            decision = apply_cumulative_credit(
-                existing_pending_credit_usd, credit_amount_usd, final_session=False
-            )
+            decision = apply_cumulative_credit(existing_pending_credit_usd, credit_amount_usd, final_session=False)
             incremental = decision.order_amount_usd
             if incremental <= 0:
                 return _outcome(
@@ -3822,9 +3770,7 @@ class MorningDCAExecutor(DCAExecutor):
             # sub-dollar branch above uses instead (Codex review, PR #656
             # follow-up on discussion_r3837494241: "Route post-settlement
             # sub-dollar amounts through credit handling").
-            decision = apply_cumulative_credit(
-                existing_pending_credit_usd, incremental, final_session=False
-            )
+            decision = apply_cumulative_credit(existing_pending_credit_usd, incremental, final_session=False)
             sub_dollar_incremental = decision.order_amount_usd
             # ``incremental`` is already this retry's freshly recomputed net
             # outstanding decline (ladder_incremental - settled credit).  Do
@@ -3918,9 +3864,7 @@ class MorningDCAExecutor(DCAExecutor):
         if outcome.cumulative_credit_decline_usd is not None:
             row["cumulative_credit_decline_usd"] = outcome.cumulative_credit_decline_usd
 
-    def _augment_artifacts(
-        self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]
-    ) -> None:
+    def _augment_artifacts(self, artifacts: Dict[str, Any], top_up_outcomes: Optional[Dict[str, Any]]) -> None:
         """Attach top-up summary fields to the run artifact when the guard ran."""
         if not top_up_outcomes:
             return
@@ -3933,12 +3877,10 @@ class MorningDCAExecutor(DCAExecutor):
         existing_manual_review = set(artifacts.get("manual_review_tickers", []))
         new_top_up_manual = [t for t in top_up_manual_reviews if t not in existing_manual_review]
         if new_top_up_manual:
-            artifacts["counts"]["manual_review_candidates"] = (
-                artifacts["counts"].get("manual_review_candidates", 0) + len(new_top_up_manual)
-            )
-            artifacts["manual_review_tickers"] = (
-                artifacts.get("manual_review_tickers", []) + new_top_up_manual
-            )
+            artifacts["counts"]["manual_review_candidates"] = artifacts["counts"].get(
+                "manual_review_candidates", 0
+            ) + len(new_top_up_manual)
+            artifacts["manual_review_tickers"] = artifacts.get("manual_review_tickers", []) + new_top_up_manual
             # Also add the full row dicts (not a re-derived minimal dict) so
             # downstream readers of manual_review_candidates see top-up
             # missing-price cases with the same shape as trend-unvalidated
@@ -3949,10 +3891,7 @@ class MorningDCAExecutor(DCAExecutor):
             # morning_decision_price, incremental_order_amount,
             # top_up_guard_result, top_up_skipped, top_up_manual_review).
             new_set = set(new_top_up_manual)
-            extra_rows = [
-                row for row in artifacts.get("buy_candidates", [])
-                if row.get("ticker") in new_set
-            ]
+            extra_rows = [row for row in artifacts.get("buy_candidates", []) if row.get("ticker") in new_set]
             if extra_rows:
                 manual_rows = list(artifacts.get("manual_review_candidates", []))
                 by_ticker = {r.get("ticker"): r for r in manual_rows if r.get("ticker")}
@@ -4045,9 +3984,7 @@ class MorningDCAExecutor(DCAExecutor):
             if not math.isfinite(value):
                 raise ValueError(f"{label} must be finite, got {value!r}")
         if deployed_last_7d_usd < 0:
-            raise ValueError(
-                f"deployed_last_7d_usd must be non-negative, got {deployed_last_7d_usd!r}"
-            )
+            raise ValueError(f"deployed_last_7d_usd must be non-negative, got {deployed_last_7d_usd!r}")
         # Zero stays legal (the documented unset escape hatch); below zero does
         # not. See the docstring: a negative allocation takes kill_switch_engaged's
         # `allocation <= 0` branch and disables the guard exactly as zero does,
@@ -4060,8 +3997,7 @@ class MorningDCAExecutor(DCAExecutor):
             )
         if not 0 <= kill_switch_7d_deploy_fraction <= 1:
             raise ValueError(
-                "kill_switch_7d_deploy_fraction must be within [0, 1], got "
-                f"{kill_switch_7d_deploy_fraction!r}"
+                f"kill_switch_7d_deploy_fraction must be within [0, 1], got {kill_switch_7d_deploy_fraction!r}"
             )
         self._sizing_config = replace(
             self._sizing_config,
@@ -4201,9 +4137,7 @@ class MorningDCAExecutor(DCAExecutor):
         # The sole consumer (generate_credit_usage_proxy_report's
         # _account_number_from) falls back to the run_state value when absent.
         account_number = getattr(self.config, "target_account_number", None)
-        pinnable = isinstance(account_number, str) and ACCOUNT_NUMBER_SHAPE.fullmatch(
-            account_number
-        )
+        pinnable = isinstance(account_number, str) and ACCOUNT_NUMBER_SHAPE.fullmatch(account_number)
         # profile["trades"] gates BOTH branches, not just the failure marker:
         # target_account_number's dataclass default is the import-time
         # ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env constant, and a watchlist/
@@ -4301,12 +4235,8 @@ class MorningDCAExecutor(DCAExecutor):
         provenance: Dict[str, Any] = dict(session_stats(completed_bars))
         if prev_bar is not None:
             provenance["previous_close_as_of"] = prev_bar.timestamp
-        current_price = self._current_price(
-            data, ticker, decision_dt, bars, warnings, provenance
-        )
-        observation = PriceObservation(
-            **{k: v for k, v in provenance.items() if k in PriceObservation._ROW_FIELDS}
-        )
+        current_price = self._current_price(data, ticker, decision_dt, bars, warnings, provenance)
+        observation = PriceObservation(**{k: v for k, v in provenance.items() if k in PriceObservation._ROW_FIELDS})
 
         if previous_close is None or not previous_close or current_price is None:
             return MorningSignal(
@@ -4348,10 +4278,7 @@ class MorningDCAExecutor(DCAExecutor):
             if _ticker_sizing(ticker, self.sizing_config)
             else self.sizing_config.minimum_drop_vs_previous_close
         )
-        if (
-            drop_fraction < _effective_minimum_drop
-            or multiplier <= 0
-        ):
+        if drop_fraction < _effective_minimum_drop or multiplier <= 0:
             # Keyed on multiplier <= 0 as well as the configured minimum drop:
             # a customized config can set minimum_drop_vs_previous_close below
             # the first positive sizing tier, so a drop can clear the minimum
@@ -4434,9 +4361,7 @@ class MorningDCAExecutor(DCAExecutor):
             observation=observation,
         )
 
-    def _trend_validated(
-        self, bars: Sequence[Bar], decision_dt: datetime, warnings: List[str]
-    ) -> bool:
+    def _trend_validated(self, bars: Sequence[Bar], decision_dt: datetime, warnings: List[str]) -> bool:
         """Return True when the intraday trend over the window can be validated.
 
         The 10:30 live run exists to observe a true ~60-minute trend window
@@ -4469,9 +4394,7 @@ class MorningDCAExecutor(DCAExecutor):
             )
             return False
         if sorted_bars[-1].close >= sorted_bars[0].close:
-            warnings.append(
-                "intraday trend flat or rising: price is at or above open; skipping auto-buy"
-            )
+            warnings.append("intraday trend flat or rising: price is at or above open; skipping auto-buy")
             return False
         return True
 
@@ -4545,13 +4468,9 @@ class MorningDCAExecutor(DCAExecutor):
                         if quote_price > 0:
                             _record(price_source="quote", price_as_of=quote_time)
                             return quote_price
-                        warnings.append(
-                            f"quote price {quote_price!r} is not positive; falling back to completed bar"
-                        )
+                        warnings.append(f"quote price {quote_price!r} is not positive; falling back to completed bar")
                     elif quote_time is None:
-                        warnings.append(
-                            "quote has no usable timestamp; falling back to completed bar"
-                        )
+                        warnings.append("quote has no usable timestamp; falling back to completed bar")
                     elif quote_time > decision_dt:
                         warnings.append(
                             f"quote timestamp {quote_time!r} is after the {self.profile['scheduled_for_et']} ET "
@@ -4662,13 +4581,9 @@ class MorningDCAExecutor(DCAExecutor):
             amt = self._effective_buy_amount(candidate, top_up_outcomes, broker_outcomes)
             self.ledger.record_hypothetical(trading_day, amt)
             if _track_own == "manual":
-                self._own_recorded_manual[trading_day] = (
-                    self._own_recorded_manual.get(trading_day, 0.0) + amt
-                )
+                self._own_recorded_manual[trading_day] = self._own_recorded_manual.get(trading_day, 0.0) + amt
             elif _track_own == "scheduled":
-                self._own_recorded_scheduled[trading_day] = (
-                    self._own_recorded_scheduled.get(trading_day, 0.0) + amt
-                )
+                self._own_recorded_scheduled[trading_day] = self._own_recorded_scheduled.get(trading_day, 0.0) + amt
 
     # -- Artifacts -----------------------------------------------------------
     def build_artifacts(
@@ -4695,9 +4610,7 @@ class MorningDCAExecutor(DCAExecutor):
 
         signal_rows = [s.to_row() for s in signals]
         buy_candidates = self._buy_candidates(signals)
-        manual_review = [
-            c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
-        ]
+        manual_review = [c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE]
         spend_candidates = [c for c in buy_candidates if c.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE]
 
         hypothetical_spend = round(
@@ -4797,15 +4710,11 @@ class MorningDCAExecutor(DCAExecutor):
         # shadow run (evaluated fully, deliberately placed nothing) apart from a
         # live run that genuinely found no candidates. Both leave
         # order_submit_status=no_orders, which alone is ambiguous.
-        artifacts["live_execution_enabled"] = getattr(
-            self.config, "live_execution_enabled", True
-        )
+        artifacts["live_execution_enabled"] = getattr(self.config, "live_execution_enabled", True)
         self._augment_artifacts(artifacts, top_up_outcomes)
         return artifacts
 
-    def _complete_signal_rows_for_output(
-        self, rows: Sequence[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _complete_signal_rows_for_output(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Return CSV rows containing every configured active ticker exactly once.
 
         This is an artifact-contract guard only. Evaluation and order selection
@@ -4816,15 +4725,9 @@ class MorningDCAExecutor(DCAExecutor):
         Any extra/unknown or duplicate rows from the input are preserved after
         the configured set.
         """
-        configured = [
-            ticker
-            for ticker in self.config.tickers
-            if ticker not in self.config.excluded_tickers
-        ]
+        configured = [ticker for ticker in self.config.tickers if ticker not in self.config.excluded_tickers]
         ticker_key = "ticker"
-        if rows and any("symbol" in row for row in rows) and not any(
-            "ticker" in row for row in rows
-        ):
+        if rows and any("symbol" in row for row in rows) and not any("ticker" in row for row in rows):
             ticker_key = "symbol"
         row_by_ticker: Dict[str, Dict[str, Any]] = {}
         extras: List[Dict[str, Any]] = []
@@ -4951,9 +4854,7 @@ class MorningDCAExecutor(DCAExecutor):
         atomic_write_text(run_state_path, json.dumps(artifacts, indent=2, sort_keys=True))
 
         signals_path = out / self.signals_csv_name
-        output_signal_rows = self._complete_signal_rows_for_output(
-            artifacts["signal_rows"]
-        )
+        output_signal_rows = self._complete_signal_rows_for_output(artifacts["signal_rows"])
         _write_csv(signals_path, output_signal_rows)
 
         paths = {"run_state": str(run_state_path), "signals": str(signals_path)}
@@ -4965,13 +4866,9 @@ class MorningDCAExecutor(DCAExecutor):
         # computed into artifacts["budget"], so a missing ledger on disk is
         # bootstrapped rather than treated as an escalation condition.
         if self.mode == MORNING_LIVE_MODE and self.writes_budget_ledger:
-            ledger_filename = _sanitize_budget_ledger_filename(
-                self.config.budget_ledger_filename
-            )
+            ledger_filename = _sanitize_budget_ledger_filename(self.config.budget_ledger_filename)
             ledger_path = out / ledger_filename
-            atomic_write_text(
-                ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
-            )
+            atomic_write_text(ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True))
             paths["budget_ledger"] = str(ledger_path)
 
         # Write submitted_orders.csv so detect_drift() can build submitted_symbols.
@@ -4997,9 +4894,7 @@ class MorningDCAExecutor(DCAExecutor):
         # Plus any submission carried forward from an earlier attempt at this same
         # scheduled slot, so a retry never rewrites the canonical order record
         # without the orders that attempt actually placed (Codex review).
-        submitted_rows.extend(
-            _carried_forward_order_rows(placed_outcomes, artifacts.get("buy_candidates") or [])
-        )
+        submitted_rows.extend(_carried_forward_order_rows(placed_outcomes, artifacts.get("buy_candidates") or []))
         is_live_execution = self.mode == MORNING_LIVE_MODE and self.trades
         if is_live_execution or submitted_rows:
             orders_path = write_submitted_orders_csv(out, submitted_rows)
@@ -5013,15 +4908,11 @@ class MorningDCAExecutor(DCAExecutor):
             # artifact contract's require_summary check and downstream readers had
             # no summary to attribute the run by (Jul 27 2026 12:30 and 1:30).
             summary_path = out / "run_summary.json"
-            summary = build_run_summary(
-                artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")}
-            )
+            summary = build_run_summary(artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")})
             atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True))
             paths["run_summary"] = str(summary_path)
 
-        orders_rows = [
-            c for c in artifacts.get('buy_candidates', []) if c.get('order_id')
-        ]
+        orders_rows = [c for c in artifacts.get("buy_candidates", []) if c.get("order_id")]
         if orders_rows:
             orders_csv_path = out / "orders.csv"
             _write_csv(
@@ -5093,13 +4984,9 @@ class MorningDCAExecutor(DCAExecutor):
                 summary.get("error"),
             )
         try:
-            atomic_write_text(
-                run_state_path, json.dumps(artifacts, indent=2, sort_keys=True)
-            )
+            atomic_write_text(run_state_path, json.dumps(artifacts, indent=2, sort_keys=True))
         except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
-            _log.warning(
-                "could not annotate run_state with intraday archive summary: %s", exc
-            )
+            _log.warning("could not annotate run_state with intraday archive summary: %s", exc)
 
     def _blocked_live_result(
         self,
@@ -5223,9 +5110,7 @@ class MorningDCAExecutor(DCAExecutor):
             # placement" classification for every blocked retry that carries
             # forward prior submitted evidence and passes no explicit
             # error_class of its own.
-            artifacts["error_class"] = (
-                error_class if error_class is not None else ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
-            )
+            artifacts["error_class"] = error_class if error_class is not None else ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
             # raw_input_dir/raw_inputs_saved are the exception: they are NOT
             # unconditionally dropped. The original raw files that justified
             # an already-submitted order are still on disk even when THIS
@@ -5301,18 +5186,14 @@ class MorningDCAExecutor(DCAExecutor):
             ]
             submitted_outcomes = {
                 ticker: outcome
-                for ticker, outcome in (
-                    prior_outcomes.items() if isinstance(prior_outcomes, dict) else []
-                )
+                for ticker, outcome in (prior_outcomes.items() if isinstance(prior_outcomes, dict) else [])
                 if isinstance(outcome, dict)
                 and (
-                    (
-                        isinstance(outcome.get("status"), str)
-                        and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
-                    )
+                    (isinstance(outcome.get("status"), str) and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES)
                     or outcome.get("ambiguous_placement_exception") is True
                 )
             }
+
             # A prior artifact can record its submission ONLY in
             # broker_outcomes, with no matching candidate row --
             # _existing_submitted_run_state() accepts that shape explicitly, on
@@ -5529,11 +5410,7 @@ class MorningDCAExecutor(DCAExecutor):
                 # the same corrupt row reaches this second membership test too
                 # (Codex review: "Validate carried tickers before building a
                 # set"). Require a usable string here as well.
-                carried = {
-                    row.get("ticker")
-                    for row in carried_rows
-                    if isinstance(row.get("ticker"), str)
-                }
+                carried = {row.get("ticker") for row in carried_rows if isinstance(row.get("ticker"), str)}
                 rebuilt = [
                     row
                     for row in artifacts.get("buy_candidates", [])
@@ -5588,18 +5465,15 @@ class MorningDCAExecutor(DCAExecutor):
             # evidence for a later scan to reconstruct, but it is NOT a
             # submitted order, so it must not inflate orders_submitted_count/
             # counts.submitted the way a genuinely order-bearing row does.
-            carried_submitted = (
-                sum(
-                    1
-                    for row in carried_rows
-                    if isinstance(row, dict)
-                    and (
-                        row.get("status") in _ORDER_BEARING_CANDIDATE_STATUSES
-                        or row.get("ambiguous_placement_exception") is True
-                    )
+            carried_submitted = sum(
+                1
+                for row in carried_rows
+                if isinstance(row, dict)
+                and (
+                    row.get("status") in _ORDER_BEARING_CANDIDATE_STATUSES
+                    or row.get("ambiguous_placement_exception") is True
                 )
-                + len(unreconstructable)
-            )
+            ) + len(unreconstructable)
             artifacts["orders_submitted_count"] = carried_submitted
             # The NESTED counts have to move with the top-level ones, never
             # apart from them. They feed different consumers --
@@ -5631,9 +5505,7 @@ class MorningDCAExecutor(DCAExecutor):
                 # specific than the generic post-submission label. The evidence
                 # denial the helper applied also stands: this attempt proved
                 # nothing about the slot executing.
-                artifacts["run_classification_outcome"] = (
-                    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-                )
+                artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
                 artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
         paths = self.write_artifacts(artifacts, now)
         # A blocked scheduled live run may have committed signals but placed no
@@ -5682,8 +5554,7 @@ class MorningDCAExecutor(DCAExecutor):
             existing_artifacts = json.loads(state_path.read_bytes())
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             _log.warning(
-                "existing run_state.json at %s is corrupted or unreadable (%s); "
-                "overwriting with a fresh blocked stub",
+                "existing run_state.json at %s is corrupted or unreadable (%s); overwriting with a fresh blocked stub",
                 state_path,
                 exc,
             )
@@ -5711,10 +5582,7 @@ class MorningDCAExecutor(DCAExecutor):
         # filter, is what stops the two drifting again.
         has_submitted = any(
             isinstance(row, dict)
-            and (
-                _is_deployed_candidate_status(row.get("status"))
-                or row.get("ambiguous_placement_exception") is True
-            )
+            and (_is_deployed_candidate_status(row.get("status")) or row.get("ambiguous_placement_exception") is True)
             for row in buy_candidates
         ) or any(
             isinstance(outcome, dict)
@@ -5728,9 +5596,7 @@ class MorningDCAExecutor(DCAExecutor):
             return None
         return {"artifacts": existing_artifacts, "paths": {"run_state": str(state_path)}}
 
-    def _credit_decline_already_recorded_this_slot(
-        self, now: datetime, ticker: str
-    ) -> bool:
+    def _credit_decline_already_recorded_this_slot(self, now: datetime, ticker: str) -> bool:
         """True if THIS slot's own earlier attempt today already recorded a
         cumulative-credit decline for ``ticker``.
 
@@ -5791,18 +5657,9 @@ class MorningDCAExecutor(DCAExecutor):
         # live runs only). The load-failed sentinel is excluded -- that case
         # already logs its own fail-closed warning and its date.min content
         # would render a nonsense "window ended 0001-01-01" message.
-        if (
-            self.mode == MORNING_LIVE_MODE
-            and not manual
-            and approved
-            and approved != _APPROVED_DATES_LOAD_FAILED
-        ):
+        if self.mode == MORNING_LIVE_MODE and not manual and approved and approved != _APPROVED_DATES_LOAD_FAILED:
             warn_if_window_expiring(approved, trading_day, log=_log)
-        is_outside_window = (
-            self.mode == MORNING_LIVE_MODE
-            and bool(approved)
-            and trading_day not in approved
-        )
+        is_outside_window = self.mode == MORNING_LIVE_MODE and bool(approved) and trading_day not in approved
         # Reject a scheduled live invocation outside its declared
         # window_start_et/window_end_et slot window (Codex review: "Reject
         # scheduled runs outside their slot window"). self.profile carries
@@ -5823,16 +5680,9 @@ class MorningDCAExecutor(DCAExecutor):
             if window_start_et and window_end_et:
                 now_et_time = now.astimezone(EASTERN).time()
                 is_outside_time_window = not (
-                    time.fromisoformat(window_start_et)
-                    <= now_et_time
-                    <= time.fromisoformat(window_end_et)
+                    time.fromisoformat(window_start_et) <= now_et_time <= time.fromisoformat(window_end_et)
                 )
-        if manual or (
-            not is_weekend
-            and not is_holiday
-            and not is_outside_window
-            and not is_outside_time_window
-        ):
+        if manual or (not is_weekend and not is_holiday and not is_outside_window and not is_outside_time_window):
             return None
         if is_weekend:
             block_reason = "weekend"
@@ -5903,21 +5753,15 @@ class MorningDCAExecutor(DCAExecutor):
             _write_csv(signals_path, artifacts.get("signal_rows") or [])
             paths["signals"] = str(signals_path)
             if self.writes_budget_ledger and artifacts.get("budget"):
-                ledger_filename = _sanitize_budget_ledger_filename(
-                    self.config.budget_ledger_filename
-                )
+                ledger_filename = _sanitize_budget_ledger_filename(self.config.budget_ledger_filename)
                 ledger_path = out / ledger_filename
-                atomic_write_text(
-                    ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True)
-                )
+                atomic_write_text(ledger_path, json.dumps(artifacts["budget"], indent=2, sort_keys=True))
                 paths["budget_ledger"] = str(ledger_path)
             summary_path = out / "run_summary.json"
             atomic_write_text(
                 summary_path,
                 json.dumps(
-                    build_run_summary(
-                        artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")}
-                    ),
+                    build_run_summary(artifacts, extra={"stream": self.stream, "mode": artifacts.get("mode")}),
                     indent=2,
                     sort_keys=True,
                 ),
@@ -5930,9 +5774,7 @@ class MorningDCAExecutor(DCAExecutor):
         )
         return {"artifacts": artifacts, "paths": paths}
 
-    def _seed_ledger_from_prior_runs(
-        self, now: datetime, broker: Optional[BrokerAdapter] = None
-    ) -> None:
+    def _seed_ledger_from_prior_runs(self, now: datetime, broker: Optional[BrokerAdapter] = None) -> None:
         """Fold already-submitted same-day/same-week spend into the ledger.
 
         ``MorningLedger`` is in-memory and this executor is normally instantiated
@@ -6134,9 +5976,7 @@ class MorningDCAExecutor(DCAExecutor):
                     continue
                 leaf_trading_day_str = leaf_state.get("trading_day")
                 try:
-                    leaf_trading_day = (
-                        date.fromisoformat(leaf_trading_day_str) if leaf_trading_day_str else None
-                    )
+                    leaf_trading_day = date.fromisoformat(leaf_trading_day_str) if leaf_trading_day_str else None
                 except (TypeError, ValueError):
                     leaf_trading_day = None
                 if leaf_trading_day is None:
@@ -6240,9 +6080,7 @@ class MorningDCAExecutor(DCAExecutor):
                 continue
             file_trading_day_str = state.get("trading_day")
             try:
-                file_trading_day = (
-                    date.fromisoformat(file_trading_day_str) if file_trading_day_str else None
-                )
+                file_trading_day = date.fromisoformat(file_trading_day_str) if file_trading_day_str else None
             except (TypeError, ValueError):
                 file_trading_day = None
             if file_trading_day is None:
@@ -6312,7 +6150,8 @@ class MorningDCAExecutor(DCAExecutor):
                         # discussion_r3920642630: "Carry ambiguous orders
                         # through normal retries").
                         submitted_rows_only = [
-                            c for c in _bcs
+                            c
+                            for c in _bcs
                             if isinstance(c, dict)
                             and isinstance(c.get("status"), str)
                             and c.get("status") in _ORDER_BEARING_CANDIDATE_STATUSES
@@ -6340,12 +6179,8 @@ class MorningDCAExecutor(DCAExecutor):
                 # placement's dollars fall out of the cap total.
                 _candidate_status = candidate.get("status")
                 if (
-                    (
-                        not isinstance(_candidate_status, str)
-                        or _candidate_status not in _ORDER_BEARING_CANDIDATE_STATUSES
-                    )
-                    and candidate.get("ambiguous_placement_exception") is not True
-                ):
+                    not isinstance(_candidate_status, str) or _candidate_status not in _ORDER_BEARING_CANDIDATE_STATUSES
+                ) and candidate.get("ambiguous_placement_exception") is not True:
                     continue
                 candidate_ticker = candidate.get("ticker")
                 if (
@@ -6353,9 +6188,7 @@ class MorningDCAExecutor(DCAExecutor):
                     and candidate_ticker
                     and not candidate.get("whole_share_settlement_adjustment")
                 ):
-                    physical_row_counts[candidate_ticker] = (
-                        physical_row_counts.get(candidate_ticker, 0) + 1
-                    )
+                    physical_row_counts[candidate_ticker] = physical_row_counts.get(candidate_ticker, 0) + 1
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
                     amount = candidate.get("hypothetical_amount_usd")
@@ -6419,8 +6252,7 @@ class MorningDCAExecutor(DCAExecutor):
                     if not isinstance(_candidate_ticker, str):
                         continue
                     if (
-                        isinstance(_candidate_status, str)
-                        and _candidate_status in _ORDER_BEARING_CANDIDATE_STATUSES
+                        isinstance(_candidate_status, str) and _candidate_status in _ORDER_BEARING_CANDIDATE_STATUSES
                     ) or _candidate.get("ambiguous_placement_exception") is True:
                         _physical_rows_by_ticker[_candidate_ticker] = (
                             _physical_rows_by_ticker.get(_candidate_ticker, 0) + 1
@@ -6443,10 +6275,9 @@ class MorningDCAExecutor(DCAExecutor):
                     if not isinstance(row, dict) or not isinstance(row.get("ticker"), str):
                         continue
                     row_status = row.get("status")
-                    if (
-                        isinstance(row_status, str)
-                        and row_status in _ORDER_BEARING_CANDIDATE_STATUSES
-                    ) or row.get("ambiguous_placement_exception") is True:
+                    if (isinstance(row_status, str) and row_status in _ORDER_BEARING_CANDIDATE_STATUSES) or row.get(
+                        "ambiguous_placement_exception"
+                    ) is True:
                         row_ticker = row["ticker"]
                         _physical_rows_by_ticker[row_ticker] = _physical_rows_by_ticker.get(row_ticker, 0) + 1
                 for _unrec_ticker in _unreconstructable:
@@ -6457,10 +6288,7 @@ class MorningDCAExecutor(DCAExecutor):
                     # Count before filtering unusable notionals: otherwise one
                     # known row plus one amountless sibling looks uniquely
                     # resolved and silently reopens the aggregate caps.
-                    if (
-                        _unrec_ticker in _already_represented
-                        and _physical_rows_by_ticker.get(_unrec_ticker) == 1
-                    ):
+                    if _unrec_ticker in _already_represented and _physical_rows_by_ticker.get(_unrec_ticker) == 1:
                         continue
                     # A broker fill may resolve an order-ID-less durable marker,
                     # but uniqueness is judged across EVERY same-ticker row,
@@ -6586,9 +6414,7 @@ class MorningDCAExecutor(DCAExecutor):
             # earlier-weekday sibling paths only, matching this method's
             # other fail-closed handling; today's own-stream scan has its
             # own separate skip_sink handling in _compute_top_up.
-            _csv_skip_sink: Optional[List[Path]] = (
-                [] if path in _earlier_weekday_sibling_paths else None
-            )
+            _csv_skip_sink: Optional[List[Path]] = [] if path in _earlier_weekday_sibling_paths else None
             csv_total = _csv_qualifying_notional_total(
                 filled_orders_csv, blank_status_means_filled=True, skip_sink=_csv_skip_sink
             )
@@ -6637,15 +6463,11 @@ class MorningDCAExecutor(DCAExecutor):
                     else:
                         # Cross-day-in-week seeding only bumps the shared weekly
                         # bucket; the daily bucket stays scoped to trading_day.
-                        self.ledger.planned_by_week[this_week] = (
-                            self.ledger.planned_by_week.get(this_week, 0.0) + total
-                        )
+                        self.ledger.planned_by_week[this_week] = self.ledger.planned_by_week.get(this_week, 0.0) + total
             if is_scheduled_today and submitted_rows:
                 self._prior_same_day_candidate_rows.extend(submitted_rows)
 
-        _ledger_scan_already_poisoned = "ledger_scan" in self._cap_seed_poison_week_sources.get(
-            this_week, set()
-        )
+        _ledger_scan_already_poisoned = "ledger_scan" in self._cap_seed_poison_week_sources.get(this_week, set())
         if _earlier_weekday_sibling_paths or _today_unreconstructable_found or _ledger_scan_already_poisoned:
             if self._cap_seed_scan_incomplete:
                 # FAIL CLOSED: an earlier-weekday sibling artifact that could
@@ -6670,16 +6492,10 @@ class MorningDCAExecutor(DCAExecutor):
                 # failure clears
                 # (Codex review: "Clear prior-week cap poisoning after a
                 # recovered scan").
-                self._cap_seed_poison_week_sources.setdefault(this_week, set()).add(
-                    "ledger_scan"
-                )
-                week_poison_delta = max(
-                    0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
-                )
+                self._cap_seed_poison_week_sources.setdefault(this_week, set()).add("ledger_scan")
+                week_poison_delta = max(0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day))
                 if week_poison_delta > 0:
-                    self.ledger.planned_by_week[this_week] = (
-                        self.ledger.week_planned(trading_day) + week_poison_delta
-                    )
+                    self.ledger.planned_by_week[this_week] = self.ledger.week_planned(trading_day) + week_poison_delta
                     self._cap_seed_poison_week[this_week] = (
                         self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
                     )
@@ -6721,16 +6537,10 @@ class MorningDCAExecutor(DCAExecutor):
         # today's own path is clean.
         if scheduled_path.exists():
             if _today_unreconstructable_found:
-                self._cap_seed_poison_day_sources.setdefault(trading_day, set()).add(
-                    "ledger_scan"
-                )
-                day_poison_delta = max(
-                    0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
-                )
+                self._cap_seed_poison_day_sources.setdefault(trading_day, set()).add("ledger_scan")
+                day_poison_delta = max(0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day))
                 if day_poison_delta > 0:
-                    self.ledger.planned_by_day[trading_day] = (
-                        self.ledger.day_planned(trading_day) + day_poison_delta
-                    )
+                    self.ledger.planned_by_day[trading_day] = self.ledger.day_planned(trading_day) + day_poison_delta
                     self._cap_seed_poison_day[trading_day] = (
                         self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
                     )
@@ -6863,9 +6673,7 @@ class MorningDCAExecutor(DCAExecutor):
         # this ticker, erasing evidence a fresh executor's cap-seeding
         # scan depends on (Codex review, PR #88: "Preserve submitted
         # evidence when a cap-seeded retry is full").
-        has_prior_allocation = (
-            top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
-        )
+        has_prior_allocation = top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
         dup_order: Optional[Dict[str, Any]] = None
         try:
             if has_prior_allocation:
@@ -6874,9 +6682,7 @@ class MorningDCAExecutor(DCAExecutor):
                     if isinstance(dup_order, Exception):
                         raise dup_order
                 else:
-                    dup_order = _same_stream_order_exists(
-                        broker, ticker, trading_day, self._idempotency_stream()
-                    )
+                    dup_order = _same_stream_order_exists(broker, ticker, trading_day, self._idempotency_stream())
                 dup = dup_order is not None
                 duplicate_reason = "same-stream broker order exists"
             else:
@@ -7138,9 +6944,7 @@ class MorningDCAExecutor(DCAExecutor):
                     consecutive_placement_failures,
                     False,
                 )
-            spread_fields = spread_gate_fields(
-                spread_pct=spread_pct, max_spread_pct=max_spread
-            )
+            spread_fields = spread_gate_fields(spread_pct=spread_pct, max_spread_pct=max_spread)
             if spread_pct is None and not manual:
                 # A scheduled run is pre-authorized to place without review, so
                 # the spread breaker is the only thing standing between an
@@ -7152,9 +6956,7 @@ class MorningDCAExecutor(DCAExecutor):
                 # near_close_dca's scheduled spread gate).
                 outcomes[ticker] = {
                     "status": "blocked",
-                    "skip_reason": (
-                        "bid/ask spread unavailable; scheduled runs require spread_ok"
-                    ),
+                    "skip_reason": ("bid/ask spread unavailable; scheduled runs require spread_ok"),
                     "deliberate_skip": True,
                     # The spread gate is what stopped this row. Recorded
                     # explicitly rather than inferred from spread_status,
@@ -7174,9 +6976,7 @@ class MorningDCAExecutor(DCAExecutor):
             if spread_pct is not None and spread_pct > max_spread:
                 outcomes[ticker] = {
                     "status": "blocked",
-                    "skip_reason": (
-                        f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
-                    ),
+                    "skip_reason": (f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"),
                     "deliberate_skip": True,
                     **spread_fields,
                 }
@@ -7190,9 +6990,7 @@ class MorningDCAExecutor(DCAExecutor):
                 )
             spread_by_ticker[ticker] = spread_fields
         else:
-            spread_by_ticker[ticker] = spread_gate_fields(
-                spread_pct=None, max_spread_pct=max_spread, evaluated=False
-            )
+            spread_by_ticker[ticker] = spread_gate_fields(spread_pct=None, max_spread_pct=max_spread, evaluated=False)
         try:
             tradable = broker.is_tradable_for_fractional_buy(ticker)
         except Exception as exc:  # noqa: BLE001
@@ -7219,7 +7017,11 @@ class MorningDCAExecutor(DCAExecutor):
                 False,
             )
         if not tradable:
-            outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": "not tradable for fractional buy",
+                "deliberate_skip": True,
+            }
             return (
                 batch_buying_power,
                 reserved_buying_power,
@@ -7246,7 +7048,11 @@ class MorningDCAExecutor(DCAExecutor):
                 False,
             )
         if batch_buying_power - reserved_buying_power < notional:
-            outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": "insufficient buying power",
+                "deliberate_skip": True,
+            }
             return (
                 batch_buying_power,
                 reserved_buying_power,
@@ -7285,7 +7091,11 @@ class MorningDCAExecutor(DCAExecutor):
                     False,
                 )
             if not review_ok:
-                outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"review blocked: {review_reason}",
+                    "deliberate_skip": True,
+                }
                 return (
                     batch_buying_power,
                     reserved_buying_power,
@@ -7379,12 +7189,9 @@ class MorningDCAExecutor(DCAExecutor):
             consecutive_placement_failures += 1
             if (
                 self.config.max_consecutive_placement_failures is not None
-                and consecutive_placement_failures
-                >= self.config.max_consecutive_placement_failures
+                and consecutive_placement_failures >= self.config.max_consecutive_placement_failures
             ):
-                breaker_skipped = record_breaker_skipped_remainder(
-                    consecutive_placement_failures, ticker
-                )
+                breaker_skipped = record_breaker_skipped_remainder(consecutive_placement_failures, ticker)
                 _log.error(
                     "Halting the batch after %d consecutive placement failures "
                     "(circuit_breakers.max_consecutive_placement_failures); "
@@ -7460,15 +7267,11 @@ class MorningDCAExecutor(DCAExecutor):
             consecutive_placement_failures += 1
             if (
                 self.config.max_consecutive_placement_failures is not None
-                and consecutive_placement_failures
-                >= self.config.max_consecutive_placement_failures
+                and consecutive_placement_failures >= self.config.max_consecutive_placement_failures
             ):
-                breaker_skipped = record_breaker_skipped_remainder(
-                    consecutive_placement_failures, ticker
-                )
+                breaker_skipped = record_breaker_skipped_remainder(consecutive_placement_failures, ticker)
                 _log.error(
-                    "Halting the batch after %d consecutive placement failures; "
-                    "%d candidate(s) never attempted: %s",
+                    "Halting the batch after %d consecutive placement failures; %d candidate(s) never attempted: %s",
                     consecutive_placement_failures,
                     len(breaker_skipped),
                     ", ".join(breaker_skipped) or "none",
@@ -7514,11 +7317,13 @@ class MorningDCAExecutor(DCAExecutor):
             # exception.
             _terminal_raw_responses = getattr(broker, "_raw_placement_responses", None)
             if isinstance(_terminal_raw_responses, list):
-                _terminal_raw_responses.append({
-                    "ticker": ticker,
-                    "order_id": order_id or "",
-                    **terminal_order,
-                })
+                _terminal_raw_responses.append(
+                    {
+                        "ticker": ticker,
+                        "order_id": order_id or "",
+                        **terminal_order,
+                    }
+                )
             if terminal_fill.kind is _TerminalFillKind.RECONCILED:
                 # A terminal state proves only that no LIVE remainder is
                 # left. It does not prove that no capital executed before
@@ -7608,9 +7413,7 @@ class MorningDCAExecutor(DCAExecutor):
                     consecutive_placement_failures,
                     False,
                 )
-            outcomes[ticker]["skip_reason"] = (
-                f"placement rejected with unreconcilable fill evidence: {exc}"
-            )
+            outcomes[ticker]["skip_reason"] = f"placement rejected with unreconcilable fill evidence: {exc}"
             outcomes[ticker]["ambiguous_placement_exception"] = True
             # The broker order exists but its terminal fill cannot be valued.
             # Reserve the full approved notional as ambiguous exposure so no
@@ -7788,9 +7591,7 @@ class MorningDCAExecutor(DCAExecutor):
                     order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001
-                _log.warning(
-                    "cumulative credit ledger settlement failed for %s: %s", ticker, exc
-                )
+                _log.warning("cumulative credit ledger settlement failed for %s: %s", ticker, exc)
         return (
             batch_buying_power,
             reserved_buying_power,
@@ -7911,6 +7712,7 @@ class MorningDCAExecutor(DCAExecutor):
                     "placement_breaker_halted": True,
                 }
             return skipped
+
         # Prior-submitted amounts by ticker from the CURRENT on-disk dated-slot
         # artifact (this stream's own earlier attempt this scheduled slot, if
         # any), read once before this call's outcomes overwrite that file.
@@ -8059,9 +7861,7 @@ class MorningDCAExecutor(DCAExecutor):
             reason = error or getattr(getattr(broker, "_recorder", None), "error", None)
             outcomes[ticker] = {
                 "status": "blocked",
-                "skip_reason": (
-                    f"raw input persistence failed mid-batch: {reason}"
-                ),
+                "skip_reason": (f"raw input persistence failed mid-batch: {reason}"),
                 "deliberate_skip": True,
                 "blocked_by_raw_persistence": True,
                 "raw_persistence_blocked": True,
@@ -8134,11 +7934,7 @@ class MorningDCAExecutor(DCAExecutor):
         for signal in candidates:
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
-            if (
-                top_up is None
-                or top_up.cumulative_credit_decline_usd is None
-                or top_up.incremental_order_amount <= 0
-            ):
+            if top_up is None or top_up.cumulative_credit_decline_usd is None or top_up.incremental_order_amount <= 0:
                 continue
             outcome = outcomes.get(ticker)
             # A candidate the batch never reached at all -- the loop halted
@@ -8237,9 +8033,7 @@ class MorningDCAExecutor(DCAExecutor):
                     idempotency_key=self._credit_idempotency_key(now, manual=manual) if now is not None else None,
                 )
             except Exception as exc:  # noqa: BLE001
-                _log.warning(
-                    "cumulative credit ledger preserve_pending failed for %s: %s", ticker, exc
-                )
+                _log.warning("cumulative credit ledger preserve_pending failed for %s: %s", ticker, exc)
         # Stamp the spread verdict onto every outcome for a ticker that reached the
         # gate but was decided after it (tradability, buying power, review,
         # placement). The rows blocked AT the gate already carry their own verdict
@@ -8379,8 +8173,7 @@ class MorningDCAExecutor(DCAExecutor):
                 self._write_startup_failure_artifacts(now, exc)
             except Exception:  # noqa: BLE001
                 _log.exception(
-                    "failed to write startup-failure artifacts for the %s stream; "
-                    "re-raising the original run failure",
+                    "failed to write startup-failure artifacts for the %s stream; re-raising the original run failure",
                     self.stream,
                 )
 
@@ -8430,6 +8223,7 @@ class MorningDCAExecutor(DCAExecutor):
                     artifact_written_at_failure[0] = freshness_probe[0]()
                     _publish_startup_failure_artifacts(exc)
                     raise
+
         # Clear any in-flight placement state from a PREVIOUS invocation before
         # anything in this run can fail. These attributes live on the executor,
         # which is reused across calls, so a startup failure on a later run (a
@@ -8502,12 +8296,14 @@ class MorningDCAExecutor(DCAExecutor):
                 #     placement failure also read as a healthy run (Codex
                 #     review, PR #688 discussion_r3925372792: "Fail the
                 #     heartbeat for placement failures").
-                result_ok=lambda result: not (
-                    isinstance(result, dict)
-                    and (
-                        (result.get("artifacts") or {}).get("raw_persistence_error")
-                        or (result.get("artifacts") or {}).get("error_class") == "buying_power_lookup_failed"
-                        or (result.get("artifacts") or {}).get("is_trading_failure") is True
+                result_ok=lambda result: (
+                    not (
+                        isinstance(result, dict)
+                        and (
+                            (result.get("artifacts") or {}).get("raw_persistence_error")
+                            or (result.get("artifacts") or {}).get("error_class") == "buying_power_lookup_failed"
+                            or (result.get("artifacts") or {}).get("is_trading_failure") is True
+                        )
                     )
                 ),
             ),
@@ -8567,9 +8363,7 @@ class MorningDCAExecutor(DCAExecutor):
         # preserved in buy_candidates below (Codex review, PR #1300
         # discussion_r3920546920: "Count ambiguous orders in crash-recovery
         # artifacts").
-        submitted = sum(
-            1 for oc in placed.values() if oc.get("status") in ("submitted", "potentially_submitted")
-        )
+        submitted = sum(1 for oc in placed.values() if oc.get("status") in ("submitted", "potentially_submitted"))
         signals_by_ticker = getattr(self, "_in_flight_signals_by_ticker", None) or {}
         buy_candidates = []
         for ticker, outcome in placed.items():
@@ -8662,16 +8456,10 @@ class MorningDCAExecutor(DCAExecutor):
                 # order did submit, so it takes the after-submission outcome and
                 # the submitted status (Codex review).
                 "run_classification_outcome": (
-                    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-                    if submitted
-                    else RUN_CLASSIFICATION_STARTUP_FAILED
+                    RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION if submitted else RUN_CLASSIFICATION_STARTUP_FAILED
                 ),
-                "order_submit_status": (
-                    ORDER_SUBMIT_STATUS_SUBMITTED if submitted else ORDER_SUBMIT_STATUS_ERROR
-                ),
-                "error_class": (
-                    ERROR_CLASS_POST_SUBMISSION_FAILURE if submitted else ERROR_CLASS_STARTUP_FAILURE
-                ),
+                "order_submit_status": (ORDER_SUBMIT_STATUS_SUBMITTED if submitted else ORDER_SUBMIT_STATUS_ERROR),
+                "error_class": (ERROR_CLASS_POST_SUBMISSION_FAILURE if submitted else ERROR_CLASS_STARTUP_FAILURE),
                 "error_detail": f"{type(exc).__name__}: {exc}",
                 "is_trading_failure": True,
                 # Explicit denial the derivation honors. select_same_day_run_state
@@ -8713,22 +8501,14 @@ class MorningDCAExecutor(DCAExecutor):
         raw_candidates = run_state.get("buy_candidates")
         candidates_list: Sequence[Dict[str, Any]] = raw_candidates if isinstance(raw_candidates, list) else []
         order_rows = submitted_order_rows(outcomes_dict)
-        order_rows.extend(
-            _carried_forward_order_rows(
-                outcomes_dict, candidates_list
-            )
-        )
+        order_rows.extend(_carried_forward_order_rows(outcomes_dict, candidates_list))
         # Rewrite whenever the state records an order the CSV may not: a stale
         # file from an earlier attempt would otherwise be advertised as the
         # canonical order record for a state that knows about more (Codex review).
         # order_csv_covers returns True for an empty expected set without ever
         # reading the file, so on a synthesized state that placed nothing a stale
         # CSV would survive untouched.
-        if (
-            state_is_synthesized
-            or not orders_path.exists()
-            or not order_csv_covers(orders_path, order_rows)
-        ):
+        if state_is_synthesized or not orders_path.exists() or not order_csv_covers(orders_path, order_rows):
             write_submitted_orders_csv(out, order_rows)
         paths["submitted_orders"] = str(orders_path)
         summary_path = out / "run_summary.json"
@@ -8740,9 +8520,7 @@ class MorningDCAExecutor(DCAExecutor):
             atomic_write_text(
                 summary_path,
                 json.dumps(
-                    build_run_summary(
-                        run_state, extra={"stream": self.stream, "mode": run_state.get("mode")}
-                    ),
+                    build_run_summary(run_state, extra={"stream": self.stream, "mode": run_state.get("mode")}),
                     indent=2,
                     sort_keys=True,
                 ),
@@ -8788,9 +8566,7 @@ class MorningDCAExecutor(DCAExecutor):
                     valid_scheduled_evidence=False,
                     pointer_status=POINTER_STATUS_PENDING,
                 )
-            self._write_same_day_pointers(
-                self._scheduled_pointer_names(), payload, paths
-            )
+            self._write_same_day_pointers(self._scheduled_pointer_names(), payload, paths)
         except Exception:  # noqa: BLE001 - never mask the original run failure
             _log.exception("failed to refresh the %s same-day pointer", self.stream)
 
@@ -8938,13 +8714,7 @@ class MorningDCAExecutor(DCAExecutor):
         execution_enabled = getattr(self.config, "live_execution_enabled", True)
         if not execution_enabled:
             broker = None
-        if (
-            execution_enabled
-            and self.mode == MORNING_LIVE_MODE
-            and self.trades
-            and not manual
-            and broker is None
-        ):
+        if execution_enabled and self.mode == MORNING_LIVE_MODE and self.trades and not manual and broker is None:
             return self._blocked_live_result(
                 now, "missing broker adapter for scheduled live execution", signals, source
             )
@@ -9033,12 +8803,8 @@ class MorningDCAExecutor(DCAExecutor):
         # namespace and daily/weekly budget, so morning fills must not reduce
         # the midday cap even when prior_cap_seed_roots is configured.
         prior_daily_seeded = self._prior_daily_spend_seeded if self.stream == MORNING_STREAM else 0.0
-        pre_run_remaining_daily = max(
-            0.0, self.ledger.remaining_daily(trading_day) - prior_daily_seeded
-        )
-        pre_run_remaining_weekly = max(
-            0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
-        )
+        pre_run_remaining_daily = max(0.0, self.ledger.remaining_daily(trading_day) - prior_daily_seeded)
+        pre_run_remaining_weekly = max(0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded)
         broker_outcomes: Optional[Dict[str, Any]] = None
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             try:
@@ -9103,9 +8869,7 @@ class MorningDCAExecutor(DCAExecutor):
                 # once here regardless of which branch above already read it.
                 if broker is not None and broker is not _caller_broker:
                     _drained_placement_responses = broker.get_raw_placement_responses()
-                    if _drained_placement_responses and hasattr(
-                        _caller_broker, "_raw_placement_responses"
-                    ):
+                    if _drained_placement_responses and hasattr(_caller_broker, "_raw_placement_responses"):
                         cast(Any, _caller_broker)._raw_placement_responses.extend(_drained_placement_responses)
             # NOTE: a raw persistence failure detected mid-batch does NOT
             # short-circuit here with an empty-stub _blocked_live_result()
@@ -9144,7 +8908,8 @@ class MorningDCAExecutor(DCAExecutor):
             # discussion_r3920344709: "Count ambiguous morning placements as
             # in-flight").
             submitted_candidates = [
-                c for c in auto_buy_candidates
+                c
+                for c in auto_buy_candidates
                 if (
                     broker_outcomes.get(c.ticker, {}).get("status") in ("submitted", "potentially_submitted")
                     or broker_outcomes.get(c.ticker, {}).get("ambiguous_placement_exception") is True
@@ -9190,7 +8955,9 @@ class MorningDCAExecutor(DCAExecutor):
             morning_live_no_broker = self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM
             candidates_to_record = [] if morning_live_no_broker else auto_buy_candidates
             self.record_buy_candidates(trading_day, candidates_to_record, top_up_outcomes, _track_own=None)
-        artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes, broker_outcomes=broker_outcomes)
+        artifacts = self.build_artifacts(
+            now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes, broker_outcomes=broker_outcomes
+        )
         # NOTE: a mid-batch raw persistence failure is NOT stamped onto
         # `artifacts` here. The unconditional `if raw_persistence_error:`
         # block further below -- gated on `raw_persistence_error =
@@ -9250,7 +9017,8 @@ class MorningDCAExecutor(DCAExecutor):
             # "not_submitted_confirmation_required", and "blocked" without
             # deliberate_skip, e.g. spread-quote errors) so drift alerts fire.
             _deliberate_skip_tickers = {
-                t for t, oc in broker_outcomes.items()
+                t
+                for t, oc in broker_outcomes.items()
                 if oc.get("status") in ("skipped", "cap_exceeded", "dry_run")
                 or (oc.get("status") == "blocked" and oc.get("deliberate_skip"))
             }
@@ -9345,8 +9113,7 @@ class MorningDCAExecutor(DCAExecutor):
                 _carried_unreconstructable_tickers = {
                     row.get("ticker")
                     for row in carried_forward
-                    if row.get("synthesized_from_unreconstructable_submission")
-                    and isinstance(row.get("ticker"), str)
+                    if row.get("synthesized_from_unreconstructable_submission") and isinstance(row.get("ticker"), str)
                 }
                 if _carried_unreconstructable_tickers:
                     _existing_urst = artifacts.get("unreconstructable_submitted_tickers")
@@ -9429,9 +9196,7 @@ class MorningDCAExecutor(DCAExecutor):
                 stamp_failure_classification(
                     artifacts,
                     submitted=submitted_count,
-                    error_detail=(
-                        f"raw input persistence failed during placement: {raw_persistence_error}"
-                    ),
+                    error_detail=(f"raw input persistence failed during placement: {raw_persistence_error}"),
                 )
             )
             # Two overrides on top of the shared helper. "blocked" is the status
@@ -9503,12 +9268,8 @@ def _merge_placements_into_state(
         # with no real order evidence is safe to replace outright: nothing
         # is lost, since it never represented an accepted order in the
         # first place.
-        existing_has_real_order = (
-            isinstance(existing_outcome, dict)
-            and (
-                existing_outcome.get("order_id")
-                or _is_deployed_candidate_status(existing_outcome.get("status"))
-            )
+        existing_has_real_order = isinstance(existing_outcome, dict) and (
+            existing_outcome.get("order_id") or _is_deployed_candidate_status(existing_outcome.get("status"))
         )
         if not existing_has_real_order:
             outcomes[ticker] = outcome
@@ -9523,11 +9284,7 @@ def _merge_placements_into_state(
     merged["broker_outcomes"] = outcomes
 
     existing_rows = list(merged.get("buy_candidates") or [])
-    seen = {
-        row.get("order_id") or f"ticker:{row.get('ticker')}"
-        for row in existing_rows
-        if isinstance(row, dict)
-    }
+    seen = {row.get("order_id") or f"ticker:{row.get('ticker')}" for row in existing_rows if isinstance(row, dict)}
     for row in buy_candidates:
         key = row.get("order_id") or f"ticker:{row.get('ticker')}"
         if key not in seen:
@@ -9556,9 +9313,7 @@ def _merge_placements_into_state(
     )
 
 
-def _submitted_keys(
-    broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
-) -> set:
+def _submitted_keys(broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]) -> set:
     """Distinct submissions for this slot, from this call AND earlier attempts.
 
     A scheduled retry overwrites the fixed-path artifact, and _run_impl prepends
@@ -9689,9 +9444,7 @@ def _apply_blocked_before_placement_fields(artifacts: Dict[str, Any]) -> None:
     artifacts.update(deny_scheduled_evidence(artifacts))
 
 
-def _apply_no_order_classification(
-    artifacts: Dict[str, Any], *, scheduled: bool = True
-) -> None:
+def _apply_no_order_classification(artifacts: Dict[str, Any], *, scheduled: bool = True) -> None:
     """Record how a live run that submitted zero orders is classified.
 
     Separates no-order logic from failures per
@@ -9771,9 +9524,7 @@ def _apply_no_order_classification(
     # fixed-path artifact keeps their evidence; counting only the current
     # broker_outcomes would let a retry that places nothing new be recorded as a
     # zero-order run for a slot that did place orders (Codex review).
-    submitted = len(
-        _submitted_keys(outcomes, artifacts.get("buy_candidates") or [])
-    )
+    submitted = len(_submitted_keys(outcomes, artifacts.get("buy_candidates") or []))
     if submitted:
         artifacts["orders_submitted_count"] = submitted
         # build_artifacts does not set this field, so without it even a fully
@@ -9811,18 +9562,14 @@ def _apply_no_order_classification(
         return
 
     reaching_gate = sum(
-        1
-        for outcome in spread_by_ticker.values()
-        if outcome.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+        1 for outcome in spread_by_ticker.values() if outcome.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
     )
     # Only rows the SPREAD GATE itself stopped count here. A manual run does not
     # fail closed on an unproven spread, so a row can carry
     # spread_status='spread_unavailable' and still be stopped later by human
     # review or broker confirmation; counting that as a spread block would record
     # error_class='missing_spread_data' for a non-spread cause (Codex review).
-    blocked_missing_spread = sum(
-        1 for outcome in rows if outcome.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
-    )
+    blocked_missing_spread = sum(1 for outcome in rows if outcome.get("blocked_by") == BLOCKED_BY_SPREAD_GATE)
     # Degraded inputs, from two sources that both leave the run looking empty
     # without being a clean ladder no-op (Codex review):
     #   * a market-data provider that RAISED, which evaluate_signal() catches and
@@ -9833,14 +9580,8 @@ def _apply_no_order_classification(
     #     non-deliberate block. Deliberate safety skips carry deliberate_skip=True
     #     and are NOT errors.
     data_errors = sum(
-        1
-        for row in artifacts.get("signal_rows") or []
-        if "provider error" in str(row.get("warnings") or "")
-    ) + sum(
-        1
-        for row in rows
-        if row.get("status") == "blocked" and not row.get("deliberate_skip")
-    )
+        1 for row in artifacts.get("signal_rows") or [] if "provider error" in str(row.get("warnings") or "")
+    ) + sum(1 for row in rows if row.get("status") == "blocked" and not row.get("deliberate_skip"))
     outcome = classify_no_order_run(
         candidates_reaching_spread_gate=reaching_gate,
         candidates_blocked_missing_spread=blocked_missing_spread,
@@ -9865,9 +9606,7 @@ def _apply_no_order_classification(
         #
         # `placement_attempted_and_failed` is the exact fit: placement ran on
         # qualifying candidates and could not place them.
-        placement_attempted_and_failed=(
-            any(row.get("status") == "failed" for row in rows) or placement_halted
-        ),
+        placement_attempted_and_failed=(any(row.get("status") == "failed" for row in rows) or placement_halted),
         data_errors=data_errors,
         # A manual run never runs the scheduled connector-native recovery policy,
         # so its broker failures must not be recorded under that outcome.
@@ -9979,9 +9718,7 @@ def _same_stream_order_exists(
     """
     checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
     if checker is None:
-        raise RuntimeError(
-            "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
-        )
+        raise RuntimeError("broker does not support same-stream ref-id duplicate checks for guarded top-ups")
     prefixes = same_stream_ref_id_prefixes(stream, trading_day, ticker)
     result = checker(ticker, trading_day, prefixes)
     if not isinstance(result, dict):
@@ -10012,9 +9749,7 @@ def _same_stream_order_exists(
 # smaller) notional. See the comment at the single read site in
 # _place_broker_orders for why pending/unconfirmed belong here (Codex review,
 # PR #1364: "Preserve amounts for pending retry orders").
-_RETRY_PRESERVED_AMOUNT_STATUSES = frozenset(
-    {"submitted", "filled", "potentially_submitted", "pending", "unconfirmed"}
-)
+_RETRY_PRESERVED_AMOUNT_STATUSES = frozenset({"submitted", "filled", "potentially_submitted", "pending", "unconfirmed"})
 
 
 def _stable_broker_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:

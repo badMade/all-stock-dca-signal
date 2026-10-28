@@ -312,6 +312,11 @@ before you apply it:
   Before taking the freshness-sensitive broker and quote snapshots, the prompt
   resolves every configured market-open prior-allocation root and runs
   `python3 -m scripts.prior_reference_bindings --trading-day <day> --root <root> ...`.
+  Every `--root` is fail-closed: a root that is not a directory aborts the scan. A
+  root that legitimately does not exist most days (for example
+  `final_manual_review`) may instead be passed as `--optional-root`: an absent one
+  is listed under `absent_optional_roots` and does not abort, while an optional
+  path that exists but is not a directory still aborts.
   That tested, read-only helper uses the canonical allocation loader and returns
   the logged price together with the broker order ID that owns it; legacy
   evidence without a one-to-one binding remains explicitly unresolved. A logged

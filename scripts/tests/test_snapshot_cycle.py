@@ -316,3 +316,109 @@ def test_fetch_plan_writes_the_run_marker(monkeypatch, tmp_path, capsys):
     assert cycle._fetch_plan(NOW, tmp_path) == 0
     marker = json.loads((run_dir / cycle.RUN_MARKER).read_text(encoding="utf-8"))
     assert datetime.fromisoformat(marker["planned_at"]) == NOW
+
+
+# --- publish: the Mac-side mirror of today's sets to the `recommendations` branch ----------------------------------
+# 2026-10-26: the branch was a 404, so the 09:35 backup's --published fallback had nothing to read. The only writer was
+# the courier's ingest, which runs inside a scheduled Claude session, and a scheduled session holds no GitHub
+# credentials (docs/schedule_verification.md, confirmed 2026-10-21): its push failed every cycle, and the failure was
+# one `ok: false` row in an exit-0 report. These pin the replacement: a command the Mac runs under its own git login.
+
+class _Recorder:
+    channel = "github_branch"
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.documents = []
+
+    def publish(self, document):
+        self.documents.append(document)
+        return SimpleNamespace(channel=self.channel, ok=self.ok, detail="pushed" if self.ok else "git push failed")
+
+
+def _publish_env(monkeypatch, tmp_path, publisher, notified=None):
+    store = RecommendationStore(tmp_path / "recommendations")
+    monkeypatch.setattr(cycle, "RecommendationStore", lambda: store)
+    monkeypatch.setattr(cycle, "load_settings", lambda _: SimpleNamespace(publish={"github_branch": {"enabled": True}}))
+    monkeypatch.setattr(cycle, "publishers_from_settings", lambda *_a, **_k: [publisher] if publisher else [])
+    monkeypatch.setattr(cycle, "_root", lambda: tmp_path)
+    monkeypatch.setattr(cycle, "notify_macos", lambda title, message: (notified if notified is not None else []).append(
+        (title, message)))
+    return store
+
+
+def test_publish_pushes_the_newest_set_per_slot_for_today_even_when_stale(monkeypatch, tmp_path, capsys):
+    """classify needs TODAY's set, not a fresh one (Claude may have bought from an older file), so age is not a filter."""
+    publisher = _Recorder()
+    store = _publish_env(monkeypatch, tmp_path, publisher)
+    store.write(*_pair("0935", NOW - timedelta(hours=2, minutes=40)))  # 09:45: long past max_age at 12:25
+    store.write(*_pair("1230", NOW - timedelta(minutes=10)))
+    store.write(*_pair("1230", NOW - timedelta(minutes=5)))
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert (report["status"], report["slots"]) == ("OK", ["0935", "1230"])
+    assert report["publish"] == [{"channel": "github_branch", "ok": True, "detail": "pushed"}]
+    [document] = publisher.documents
+    assert sorted(document["slots"]) == ["0935", "1230"]
+    assert document["slots"]["1230"]["as_of"] == (NOW - timedelta(minutes=5)).isoformat()
+    assert "price" not in json.dumps(document).lower()
+
+
+def test_publish_skips_the_push_when_nothing_changed(monkeypatch, tmp_path, capsys):
+    publisher = _Recorder()
+    store = _publish_env(monkeypatch, tmp_path, publisher)
+    store.write(*_pair("1230", NOW - timedelta(minutes=5)))
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 0
+    capsys.readouterr()
+    assert cycle.main(["publish", "--now", (NOW + timedelta(minutes=5)).isoformat()]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "UNCHANGED"
+    assert len(publisher.documents) == 1
+    store.write(*_pair("1230", NOW + timedelta(minutes=3)))  # a newer set is a change
+    assert cycle.main(["publish", "--now", (NOW + timedelta(minutes=5)).isoformat()]) == 0
+    assert len(publisher.documents) == 2
+
+
+def test_publish_with_no_set_today_pushes_nothing(monkeypatch, tmp_path, capsys):
+    publisher = _Recorder()
+    store = _publish_env(monkeypatch, tmp_path, publisher)
+    store.write(*_pair("1230", NOW - timedelta(days=1)))  # yesterday's set is not today's
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 3
+    assert json.loads(capsys.readouterr().out) == {"status": "NONE", "reason": "no_recommendation_today"}
+    assert publisher.documents == []
+
+
+def test_publish_with_no_channel_enabled_says_so(monkeypatch, tmp_path, capsys):
+    store = _publish_env(monkeypatch, tmp_path, None)
+    store.write(*_pair("1230", NOW - timedelta(minutes=5)))
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 3
+    assert json.loads(capsys.readouterr().out) == {"status": "NONE", "reason": "no_publisher_enabled"}
+
+
+def test_a_failed_push_fails_loudly_and_is_retried(monkeypatch, tmp_path, capsys):
+    """The old failure was an exit-0 report nobody read. Now: exit 2, a notification, and no 'unchanged' skip next time."""
+    notified = []
+    publisher = _Recorder(ok=False)
+    store = _publish_env(monkeypatch, tmp_path, publisher, notified)
+    store.write(*_pair("1230", NOW - timedelta(minutes=5)))
+    assert cycle.main(["publish", "--now", NOW.isoformat(), "--notify"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ERROR"
+    assert report["publish"] == [{"channel": "github_branch", "ok": False, "detail": "git push failed"}]
+    assert len(notified) == 1 and "recommendations" in notified[0][1]
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 2  # retried, not skipped as unchanged
+    assert len(publisher.documents) == 2
+
+
+def test_publish_without_notify_never_raises_a_notification(monkeypatch, tmp_path, capsys):
+    notified = []
+    store = _publish_env(monkeypatch, tmp_path, _Recorder(ok=False), notified)
+    store.write(*_pair("1230", NOW - timedelta(minutes=5)))
+    assert cycle.main(["publish", "--now", NOW.isoformat()]) == 2
+    assert notified == []
+
+
+def test_ingest_leaves_the_github_branch_to_the_mac_job(monkeypatch, tmp_path):
+    """The courier session cannot push, and a second writer would overwrite the full day with this cycle's slots."""
+    github, other = SimpleNamespace(channel="github_branch"), SimpleNamespace(channel="notion")
+    monkeypatch.setattr(cycle, "publishers_from_settings", lambda *_a, **_k: [github, other])
+    assert cycle._courier_publishers({}, repo_dir=tmp_path) == [other]

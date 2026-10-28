@@ -30,7 +30,7 @@ def test_gfs_has_a_calibrated_sizing_entry():
     assert entry["sample_sessions"] >= 40
 
 
-def test_active_count_is_90_everywhere():
-    assert len(_load("tickers.json")["active"]) == 90
+def test_active_count_is_91_everywhere():
+    assert len(_load("tickers.json")["active"]) == 91
     policy = _load("scheduled_tasks.json")["ticker_universe_policy"]
-    assert policy["active_count"] == 90
+    assert policy["active_count"] == 91

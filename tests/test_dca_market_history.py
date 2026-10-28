@@ -144,6 +144,9 @@ def test_fetch_plan_chunks_calls_and_advances_start_time(tmp_path):
     quotes = [call for call in plan["calls"] if call["tool"] == "get_equity_quotes"]
     hist = [call for call in plan["calls"] if call["tool"] == "get_equity_historicals" and call["args"]["interval"] == "5minute"]
     assert [len(call["args"]["symbols"]) for call in quotes] == [25, 25, 10]
+    # get_equity_historicals rejects more than 10 symbols per call (2026-10-26), so it never gets the 25-symbol quote chunks.
+    assert [len(call["args"]["symbols"]) for call in hist] == [10] * 6
+    assert all(len(call["args"]["symbols"]) <= 10 for call in plan["calls"] if call["tool"] == "get_equity_historicals")
     assert all(call["args"]["start_time"] == "2026-10-07T09:30:00-04:00" for call in hist)
     assert any(call["save_as"].startswith("daily_") for call in plan["calls"])
     _write(store.raw_dir / "daily.json", [])

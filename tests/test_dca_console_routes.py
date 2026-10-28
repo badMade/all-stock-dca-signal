@@ -23,6 +23,16 @@ from dca_console_routes import (
 )
 
 
+@pytest.fixture(autouse=True)
+def architecture_scan(monkeypatch):
+    # Every test here sees a stubbed scan: a real whole-repo AST scan on a background thread, under CI's
+    # coverage tracing, starves the request thread past the 5 s socket timeout (#1897, #1907, #1931). #1880
+    # stubbed it in the gate-order test alone and #1914 reverted that; the diagnostics suite owns the real scan.
+    scan = Mock(return_value={"status": "ready", "modules": [], "edges": [], "stats": {}})
+    monkeypatch.setattr("dca_console_diagnostics.SCAN_CACHE.get", scan)
+    return scan
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
@@ -95,27 +105,20 @@ def test_response_json_defaults_to_the_strict_csp_and_redacts_unless_told_not_to
 
 
 @pytest.mark.parametrize("route", sorted(GET_ROUTES) + sorted(ASSETS))
-def test_every_get_route_sits_behind_trust_then_basic(app, route, monkeypatch):
-    # Keep this gate-order test independent of the real graph's size and CI
-    # coverage overhead; the diagnostics suite exercises the full repo scan.
-    scan = Mock(return_value={"status": "ready", "modules": [], "edges": [], "stats": {}})
-    monkeypatch.setattr("dca_console_diagnostics.SCAN_CACHE.get", scan)
+def test_every_get_route_sits_behind_trust_then_basic(app, route, architecture_scan):
     access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
     with running_server(app, access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
         status, _, body = request(server, route, headers={"Host": "untrusted.example"})
         assert status == 403, route
         assert json.loads(body)["error"]
-        scan.assert_not_called()
+        architecture_scan.assert_not_called()
         status, headers, body = request(server, route)
         if route in CREDENTIAL_FREE_ROUTES:
             assert status == 200, route
         else:
             assert status == 401, route
             assert headers["WWW-Authenticate"].startswith('Basic realm="DCA console"')
-        scan.assert_not_called()
         status, headers, _ = request(server, route, headers=auth_headers())
-        if route == "/api/diagnostics/architecture":
-            scan.assert_called_once_with(dca_console.REPO, refresh=False)
         # A route that requires parameters answers 400 to a bare request; it
         # still sits behind the same two gates and carries the same headers.
         assert status in {200, 400, 404}, route
@@ -206,3 +209,16 @@ def test_jobs_cancel_route_requires_the_token_and_a_closed_body(app):
             assert app.jobs.snapshot()[0]["status"] == "cancelled"
         finally:
             dca_console_jobs.subprocess.Popen = previous
+
+
+def test_this_module_never_runs_the_real_architecture_scan():
+    # The gate-order test above only checks status codes and headers. A real whole-repo AST scan on a
+    # background thread, under CI's coverage tracing, starves the request thread past the 5 s socket
+    # timeout (TimeoutError on [/api/diagnostics/architecture] in #1897, #1907 and #1931). #1880 stubbed
+    # the scan inside the gate-order test, #1914 silently reverted that stub along with unrelated files,
+    # and the timeout came back. The diagnostics suite covers the real scan; this module must not run it.
+    import inspect
+
+    from dca_console_diagnostics import SCAN_CACHE
+
+    assert not inspect.ismethod(SCAN_CACHE.get), "SCAN_CACHE.get is the real method: stub it for this module"

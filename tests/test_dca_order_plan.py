@@ -38,6 +38,7 @@ import dca_order_plan as dop
 import dca_runner
 import near_close_dca
 from dca_runner import BrokerOrder
+from scripts.validate_native_placement import native_ref_id
 
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 7)  # a Wednesday
@@ -80,7 +81,7 @@ def _order(symbol="MSFT", notional=4.0, multiplier=2.0, drop=1.2, **over):
         "decision_price": 100.0,
         "prior_close": 101.2,
         "prior_low": 100.5,
-        "ref_id": f"dca-runner-{SLOT}-{DAY.isoformat()}-{symbol}",
+        "ref_id": native_ref_id(SLOT, DAY.isoformat(), symbol),
     }
     row.update(over)
     return row
@@ -750,7 +751,7 @@ def test_the_planned_notional_is_the_resolved_buy_usd_not_the_desired_amount(con
     assert order["decision_price"] == 100.0
     assert order["prior_close"] == 101.2
     assert order["prior_low"] == 100.5
-    assert order["ref_id"] == "dca-runner-1130-2026-10-07-MSFT"
+    assert order["ref_id"] == native_ref_id("1130", "2026-10-07", "MSFT")
 
 
 def test_zero_buy_rows_are_dropped_and_an_all_zero_list_is_a_valid_empty_plan(config, ctx):

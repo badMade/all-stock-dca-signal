@@ -122,6 +122,8 @@ def _dedup(items: list[str]) -> list[str]:
 
 
 def _finite(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):

@@ -23,6 +23,7 @@ import dca_config
 import dca_order_plan as dop
 import dca_paths
 from scripts import backup_planner
+from scripts.validate_native_placement import native_ref_id
 
 DAY = "2026-10-07"
 SLOT = "1130"
@@ -273,8 +274,8 @@ def test_finalize_returns_exactly_what_to_place(tmp_path, capsys, two_order_plan
     code, report = _finalize(tmp_path, capsys, two_order_plan)
     assert (code, report["status"]) == (0, "PROCEED")
     assert report["to_place"] == [
-        {"symbol": "MSFT", "notional_usd": 4.0, "ref_id": f"dca-runner-{SLOT}-{DAY}-MSFT"},
-        {"symbol": "AAPL", "notional_usd": 2.0, "ref_id": f"dca-runner-{SLOT}-{DAY}-AAPL"},
+        {"symbol": "MSFT", "notional_usd": 4.0, "ref_id": native_ref_id(SLOT, DAY, "MSFT")},
+        {"symbol": "AAPL", "notional_usd": 2.0, "ref_id": native_ref_id(SLOT, DAY, "AAPL")},
     ]
 
 

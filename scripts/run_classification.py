@@ -48,6 +48,10 @@ from dca_fileio import atomic_write_text
 from dca_paths import cron_tracking_root as _dca_cron_tracking_root
 from dca_paths import stream_root
 
+# ⚡ Bolt optimization: Pre-compile regexes for tight-loop time parsing
+_HH_MM_RE = re.compile(r"(\d{1,2}):(\d{2})")
+_HH_MM_SS_RE = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
+
 # --- Contract constants (mirror config/run_classification.json) --------------
 
 STATE_SCHEMA_VERSION = "run-classification-v1"
@@ -643,7 +647,7 @@ def _et_minutes(value: Any) -> Optional[int]:
             dt = dt.astimezone(_EASTERN)
         return dt.hour * 60 + dt.minute
     # Bare 'HH:MM[:SS]' wall-clock with no date -> treated as ET.
-    match = re.search(r"(\d{1,2}):(\d{2})", str(value))
+    match = _HH_MM_RE.search(str(value))
     if not match:
         return None
     hh, mm = int(match.group(1)), int(match.group(2))
@@ -667,7 +671,7 @@ def _et_seconds(value: Any) -> Optional[int]:
             dt = dt.astimezone(_EASTERN)
         return dt.hour * 3600 + dt.minute * 60 + dt.second
     # Bare 'HH:MM[:SS]' wall-clock with no date -> treated as ET.
-    match = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(value))
+    match = _HH_MM_SS_RE.search(str(value))
     if not match:
         return None
     hh, mm = int(match.group(1)), int(match.group(2))

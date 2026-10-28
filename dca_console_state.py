@@ -52,24 +52,75 @@ SYMBOL = re.compile(r"^[A-Z][A-Z.]{0,5}$")
 LEDGER_KINDS = ("cumulative", "whole_share", "inverse_martingale")
 # Directory names as each ledger module passes them to dca_paths.stream_root;
 # the primary RootSpec IS the cron-tracking root, so they are relative to it.
-LEDGER_DIRS = {"cumulative": "cumulative_dca_credits", "whole_share": "whole_share_accumulation",
-               "inverse_martingale": "inverse_martingale_dca"}
-CUMULATIVE_EVENT_KEYS = ("ticker", "stream", "recorded_at", "final_session", "pending_before_usd",
-                         "incremental_credit_usd", "order_amount_usd", "pending_after_usd", "decision")
-WHOLE_SHARE_EVENT_KEYS = ("trading_day", "stream", "recorded_at", "pending_before_usd", "contribution_usd",
-                          "current_share_price_usd", "shares_to_buy", "order_notional_usd", "pending_after_usd",
-                          "shares_purchased", "submitted_notional_usd", "restored_shortfall_usd",
-                          "shares_purchased_total", "decision")
+LEDGER_DIRS = {
+    "cumulative": "cumulative_dca_credits",
+    "whole_share": "whole_share_accumulation",
+    "inverse_martingale": "inverse_martingale_dca",
+}
+CUMULATIVE_EVENT_KEYS = (
+    "ticker",
+    "stream",
+    "recorded_at",
+    "final_session",
+    "pending_before_usd",
+    "incremental_credit_usd",
+    "order_amount_usd",
+    "pending_after_usd",
+    "decision",
+)
+WHOLE_SHARE_EVENT_KEYS = (
+    "trading_day",
+    "stream",
+    "recorded_at",
+    "pending_before_usd",
+    "contribution_usd",
+    "current_share_price_usd",
+    "shares_to_buy",
+    "order_notional_usd",
+    "pending_after_usd",
+    "shares_purchased",
+    "submitted_notional_usd",
+    "restored_shortfall_usd",
+    "shares_purchased_total",
+    "decision",
+)
 # settlement_ref_id (a broker order id) and settlement_account are deliberately
 # absent from this tracker allowlist.
-TRACKER_KEYS = ("status", "accumulated_usd", "cycle_start_trading_day", "cycle_reference_close", "lowest_drop_seen",
-                "crossed_tier_thresholds", "trading_days_active", "fire_attempts", "last_evaluated_trading_day",
-                "last_evaluated_stream", "last_evaluated_is_real", "settlement_pending", "settlement_trading_day",
-                "settlement_stream", "settlement_live", "settlement_claimed_usd", "settlement_target_state",
-                "stddev_reference", "basis", "fired_floor_price", "fired_floor_drop_metric", "rearm_reference_close",
-                "rearm_last_seen_day")
-TRACKER_EVENT_KEYS = ("status_before", "status_after", "accumulated_usd_before", "accumulated_usd_after",
-                      "newly_crossed_tiers", "fired", "fire_amount_usd", "reason")
+TRACKER_KEYS = (
+    "status",
+    "accumulated_usd",
+    "cycle_start_trading_day",
+    "cycle_reference_close",
+    "lowest_drop_seen",
+    "crossed_tier_thresholds",
+    "trading_days_active",
+    "fire_attempts",
+    "last_evaluated_trading_day",
+    "last_evaluated_stream",
+    "last_evaluated_is_real",
+    "settlement_pending",
+    "settlement_trading_day",
+    "settlement_stream",
+    "settlement_live",
+    "settlement_claimed_usd",
+    "settlement_target_state",
+    "stddev_reference",
+    "basis",
+    "fired_floor_price",
+    "fired_floor_drop_metric",
+    "rearm_reference_close",
+    "rearm_last_seen_day",
+)
+TRACKER_EVENT_KEYS = (
+    "status_before",
+    "status_after",
+    "accumulated_usd_before",
+    "accumulated_usd_after",
+    "newly_crossed_tiers",
+    "fired",
+    "fire_amount_usd",
+    "reason",
+)
 # strategy_state.json keys forwarded verbatim (dca_runner._state_to_json). The
 # order-id, placement-ref and recovered-run-id maps are never forwarded; their
 # names show up under "omitted_keys" so the operator knows the allowlist hid them.
@@ -79,21 +130,57 @@ STATE_DIR, STATE_FILE = "dca_runner", "strategy_state.json"
 STATE_DATED_KEYS = ("submitted_notional_by_day", "submitted_order_count_by_day")
 # Evidence counts the live kill switch requires before it trusts a zero
 # (dca_risk._load_states_with_evidence; plan "Server contract" correction 2).
-EVIDENCE_KEYS = ("state_root_exists", "run_state_files_found", "run_states_loaded", "run_states_unreadable",
-                 "run_states_unclassifiable", "afternoon_states_seen", "afternoon_states_undated",
-                 "afternoon_states_invalid_notional", "unusable_states_outside_window",
-                 "unclassifiable_states_without_deployment")
-EVIDENCE_CHECKS = (("state_root_exists", "is true"), ("run_states_loaded", "> 0"), ("run_states_unreadable", "== 0"),
-                   ("run_states_unclassifiable", "== 0"), ("afternoon_states_seen", "> 0"),
-                   ("afternoon_states_undated", "== 0"), ("afternoon_states_invalid_notional", "== 0"))
+EVIDENCE_KEYS = (
+    "state_root_exists",
+    "run_state_files_found",
+    "run_states_loaded",
+    "run_states_unreadable",
+    "run_states_unclassifiable",
+    "afternoon_states_seen",
+    "afternoon_states_undated",
+    "afternoon_states_invalid_notional",
+    "unusable_states_outside_window",
+    "unclassifiable_states_without_deployment",
+)
+EVIDENCE_CHECKS = (
+    ("state_root_exists", "is true"),
+    ("run_states_loaded", "> 0"),
+    ("run_states_unreadable", "== 0"),
+    ("run_states_unclassifiable", "== 0"),
+    ("afternoon_states_seen", "> 0"),
+    ("afternoon_states_undated", "== 0"),
+    ("afternoon_states_invalid_notional", "== 0"),
+)
 MAINTENANCE = {
     # (directory under the root, scalar allowlist). List-valued keys become
     # ``<key>_count``; ``history_dir`` / ``upstream_ticker_update_event`` /
     # ``output`` hold paths in the real files and are never forwarded.
-    "ticker_history": ("ticker_history_update", ("event_type", "status", "completed_at", "invocations",
-                                                 "updated_total", "remaining", "execution_owner", "version")),
-    "calibration": ("per_ticker_calibration", ("status", "run_at", "completed_at", "calibrated_tickers",
-                                               "trigger_source", "upstream_status", "execution_owner", "version")),
+    "ticker_history": (
+        "ticker_history_update",
+        (
+            "event_type",
+            "status",
+            "completed_at",
+            "invocations",
+            "updated_total",
+            "remaining",
+            "execution_owner",
+            "version",
+        ),
+    ),
+    "calibration": (
+        "per_ticker_calibration",
+        (
+            "status",
+            "run_at",
+            "completed_at",
+            "calibrated_tickers",
+            "trigger_source",
+            "upstream_status",
+            "execution_owner",
+            "version",
+        ),
+    ),
 }
 COUNTED_LIST_KEYS = ("errors", "changed_tickers", "changed_active_tickers", "fallback_tickers", "triggering_tickers")
 # Fields that must be timestamps: forwarded only when they parse as one, else
@@ -111,7 +198,10 @@ def _finite(value: Any) -> float | None:
     """A finite number, or None; bools are not numbers here."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 def _jsonable(value: Any, depth: int = 0) -> Any:
@@ -235,20 +325,29 @@ def _state_fields(raw: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
     weeks = raw.get("submitted_notional_by_week")
     fields["submitted_notional_by_week"] = (
         {_text(key, 20): _finite(value) for key, value in islice(weeks.items(), MAX_ROWS)}
-        if isinstance(weeks, dict) else None)
+        if isinstance(weeks, dict)
+        else None
+    )
     days = raw.get("finalized_budget_days")
     fields["finalized_budget_days"] = (
         sorted({d for day in days for d in (iso_date(day),) if d is not None}, reverse=True)[:MAX_ROWS]
-        if isinstance(days, list) else None)
+        if isinstance(days, list)
+        else None
+    )
     buys = raw.get("buys_by_ticker_by_day")
     fields["buys_by_ticker_by_day"] = None
     if isinstance(buys, dict):
         fields["buys_by_ticker_by_day"], dropped = _symbol_rows(buys, _dated_numbers)
         if dropped:
-            warnings.append(f"{dropped} ticker key(s) in buys_by_ticker_by_day were hidden "
-                            "(not a displayable symbol, or past the row limit); the grid is incomplete.")
-    shown = set(STATE_SCALAR_KEYS) | set(STATE_DATED_KEYS) | {
-        "submitted_notional_by_week", "finalized_budget_days", "buys_by_ticker_by_day"}
+            warnings.append(
+                f"{dropped} ticker key(s) in buys_by_ticker_by_day were hidden "
+                "(not a displayable symbol, or past the row limit); the grid is incomplete."
+            )
+    shown = (
+        set(STATE_SCALAR_KEYS)
+        | set(STATE_DATED_KEYS)
+        | {"submitted_notional_by_week", "finalized_budget_days", "buys_by_ticker_by_day"}
+    )
     fields["omitted_keys"] = sorted(_text(key, 80) for key in raw if key not in shown)[:MAX_ROWS]
     return fields
 
@@ -305,9 +404,14 @@ def strategy_state_view(state_path: Path | None = None, *, roots: Sequence[RootS
         lock_present = path.with_name(path.name + ".lock").exists()
     except OSError:
         lock_present = False
-    return {"status": status, "path_label": root_label(path), "modified": modified,
-            "lock_file_present": lock_present, "fields": _state_fields(raw, warnings) if raw is not None else {},
-            "warnings": _dedup(warnings)}
+    return {
+        "status": status,
+        "path_label": root_label(path),
+        "modified": modified,
+        "lock_file_present": lock_present,
+        "fields": _state_fields(raw, warnings) if raw is not None else {},
+        "warnings": _dedup(warnings),
+    }
 
 
 def _read_object(reader: BoundedReader, relative: Path) -> tuple[str, dict[str, Any] | None]:
@@ -347,15 +451,22 @@ def _events(state: dict[str, Any], keys: Sequence[str], keep, extra=None) -> tup
     if not isinstance(raw, list):
         return [], None
     rows = [event for event in raw if isinstance(event, dict) and keep(event)]
-    return [{**_pick(event, keys), **(extra(event) if extra else {})} for event in reversed(rows[-MAX_ROWS:])], len(rows)
+    return [{**_pick(event, keys), **(extra(event) if extra else {})} for event in reversed(rows[-MAX_ROWS:])], len(
+        rows
+    )
 
 
 def _entry(root: RootSpec, reader: BoundedReader, relative: Path, filename: str) -> tuple[dict[str, Any], dict | None]:
     status, state = _read_object(reader, relative / filename)
     # ledger.json sits beside ledger.lock, tracker.json beside tracker.lock:
     # the lock is reported by existence only and never opened.
-    entry = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
-             "status": status, "lock_file_present": _lock_present(reader, relative / (Path(filename).stem + ".lock"))}
+    entry = {
+        "id": _identity(root, relative),
+        "root_label": root.label,
+        "at_risk": root.kind != "primary",
+        "status": status,
+        "lock_file_present": _lock_present(reader, relative / (Path(filename).stem + ".lock")),
+    }
     if status == "corrupt":
         reader.warn(f"A {root.label} ledger file is corrupt; its balances are unavailable.")
     return entry, state
@@ -364,8 +475,16 @@ def _entry(root: RootSpec, reader: BoundedReader, relative: Path, filename: str)
 def _cumulative_entry(root: RootSpec, reader: BoundedReader, day: str, ticker: str | None) -> dict[str, Any]:
     relative = Path(LEDGER_DIRS["cumulative"]) / day
     entry, state = _entry(root, reader, relative, "ledger.json")
-    entry.update({"day": day, "pending_usd_by_ticker": None, "pending_total_usd": None, "events": [],
-                  "event_count": None, "settled_order_count": None})
+    entry.update(
+        {
+            "day": day,
+            "pending_usd_by_ticker": None,
+            "pending_total_usd": None,
+            "events": [],
+            "event_count": None,
+            "settled_order_count": None,
+        }
+    )
     if state is None:
         return entry
     if state.get("trading_day") != day:
@@ -378,12 +497,15 @@ def _cumulative_entry(root: RootSpec, reader: BoundedReader, day: str, ticker: s
         if dropped:
             # A total over a thinned map is not the day's pending balance;
             # None says "unavailable" where a partial sum would read as $0.00.
-            reader.warn(f"{dropped} pending-credit key(s) in a cumulative ledger were hidden "
-                        "(not a displayable symbol, or past the row limit); its pending total is unavailable.")
+            reader.warn(
+                f"{dropped} pending-credit key(s) in a cumulative ledger were hidden "
+                "(not a displayable symbol, or past the row limit); its pending total is unavailable."
+            )
         elif None not in rows.values():
             entry["pending_total_usd"] = round(sum(rows.values()), 2)
     entry["events"], entry["event_count"] = _events(
-        state, CUMULATIVE_EVENT_KEYS, lambda event: ticker in (None, event.get("ticker")))
+        state, CUMULATIVE_EVENT_KEYS, lambda event: ticker in (None, event.get("ticker"))
+    )
     settled = state.get("settled_order_ids")
     entry["settled_order_count"] = len(settled) if isinstance(settled, dict) else None
     return entry
@@ -392,8 +514,17 @@ def _cumulative_entry(root: RootSpec, reader: BoundedReader, day: str, ticker: s
 def _whole_share_entry(root: RootSpec, reader: BoundedReader, symbol: str, day: str | None) -> dict[str, Any]:
     relative = Path(LEDGER_DIRS["whole_share"]) / symbol
     entry, state = _entry(root, reader, relative, "ledger.json")
-    entry.update({"ticker": symbol, "pending_usd": None, "shares_purchased_total": None, "events": [],
-                  "event_count": None, "claims": [], "unresolved_claim_count": None})
+    entry.update(
+        {
+            "ticker": symbol,
+            "pending_usd": None,
+            "shares_purchased_total": None,
+            "events": [],
+            "event_count": None,
+            "claims": [],
+            "unresolved_claim_count": None,
+        }
+    )
     if state is None:
         return entry
     if state.get("ticker") != symbol:
@@ -402,13 +533,20 @@ def _whole_share_entry(root: RootSpec, reader: BoundedReader, symbol: str, day: 
     entry["pending_usd"] = _finite(state.get("pending_usd"))
     entry["shares_purchased_total"] = _finite(state.get("shares_purchased_total"))
     entry["events"], entry["event_count"] = _events(
-        state, WHOLE_SHARE_EVENT_KEYS, lambda event: day in (None, event.get("trading_day")))
+        state, WHOLE_SHARE_EVENT_KEYS, lambda event: day in (None, event.get("trading_day"))
+    )
     claims = state.get("recorded_idempotency_keys")
     if isinstance(claims, dict):
         # Claim tokens and the slot keys are never forwarded; resolution state is.
-        rows = [{"resolved": claim.get("resolved") is True, "claimed_at": _stamp(claim.get("claimed_at")),
-                 "shares_credited": claim.get("shares_credited") is True}
-                for claim in islice(claims.values(), MAX_ROWS) if isinstance(claim, dict)]
+        rows = [
+            {
+                "resolved": claim.get("resolved") is True,
+                "claimed_at": _stamp(claim.get("claimed_at")),
+                "shares_credited": claim.get("shares_credited") is True,
+            }
+            for claim in islice(claims.values(), MAX_ROWS)
+            if isinstance(claim, dict)
+        ]
         entry["claims"] = rows
         entry["unresolved_claim_count"] = sum(not row["resolved"] for row in rows)
     return entry
@@ -430,13 +568,17 @@ def _tracker_entry(root: RootSpec, reader: BoundedReader, symbol: str) -> dict[s
     # is forwarded, and through _events' hook so a tracker without an "events"
     # list is still "available", not a KeyError (adversarial review round 2).
     entry["events"], entry["event_count"] = _events(
-        state, TRACKER_EVENT_KEYS, lambda event: True,
-        extra=lambda event: {"has_recovery_metadata": "recovery_metadata" in event})
+        state,
+        TRACKER_EVENT_KEYS,
+        lambda event: True,
+        extra=lambda event: {"has_recovery_metadata": "recovery_metadata" in event},
+    )
     return entry
 
 
-def ledger_view(roots: Sequence[RootSpec], kind: str, *, ticker: str | None = None,
-                day: str | None = None) -> dict[str, Any]:
+def ledger_view(
+    roots: Sequence[RootSpec], kind: str, *, ticker: str | None = None, day: str | None = None
+) -> dict[str, Any]:
     """Read one ledger kind's files directly through the bounded reader.
 
     ``kind`` is ``cumulative`` (``cumulative_dca_credits/<day>/ledger.json``),
@@ -456,22 +598,29 @@ def ledger_view(roots: Sequence[RootSpec], kind: str, *, ticker: str | None = No
     if day is not None and iso_date(day) is None:
         raise ValueError("day must be an ISO date")
     warnings: list[str] = []
-    result: dict[str, Any] = {"kind": kind, "directory": LEDGER_DIRS[kind], "entries": [],
-                              "roots": [root.label for root in roots]}
+    result: dict[str, Any] = {
+        "kind": kind,
+        "directory": LEDGER_DIRS[kind],
+        "entries": [],
+        "roots": [root.label for root in roots],
+    }
     listed: set[str] = set()
     for root in roots:
         reader = root.reader(warnings)
         if kind == "cumulative":
             days = sorted(_subdirs(reader, LEDGER_DIRS[kind], iso_date), reverse=True)
             listed.update(days)
-            for chosen in ([day] if day else days[:1]):
+            for chosen in [day] if day else days[:1]:
                 result["entries"].append(_cumulative_entry(root, reader, chosen, ticker))
             continue
         symbols = sorted(_subdirs(reader, LEDGER_DIRS[kind], SYMBOL.match))
         listed.update(symbols)
-        for symbol in ([ticker] if ticker else symbols[:MAX_ROWS]):
-            result["entries"].append(_whole_share_entry(root, reader, symbol, day) if kind == "whole_share"
-                                     else _tracker_entry(root, reader, symbol))
+        for symbol in [ticker] if ticker else symbols[:MAX_ROWS]:
+            result["entries"].append(
+                _whole_share_entry(root, reader, symbol, day)
+                if kind == "whole_share"
+                else _tracker_entry(root, reader, symbol)
+            )
     result["days" if kind == "cumulative" else "tickers"] = sorted(listed, reverse=kind == "cumulative")[:MAX_ROWS]
     if not roots:
         warnings.append("No artifact root is configured; ledgers are unavailable.")
@@ -511,8 +660,10 @@ def purchases_view(roots: Sequence[RootSpec], *, day: str | None = None) -> dict
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {**empty, "warnings": ["Confirmed purchases could not be read; spend remains unverified."]}
     if evidence:
-        warnings.append(f"The purchase-history reader reported {len(evidence)} evidence warning(s); "
-                        "confirmed-fill coverage may be incomplete. Run the purchase-history CLI for details.")
+        warnings.append(
+            f"The purchase-history reader reported {len(evidence)} evidence warning(s); "
+            "confirmed-fill coverage may be incomplete. Run the purchase-history CLI for details."
+        )
     if day is not None:
         records = [record for record in records if record.trading_day == day]
     records.sort(key=lambda record: record.trading_day or "", reverse=True)
@@ -524,27 +675,44 @@ def purchases_view(roots: Sequence[RootSpec], *, day: str | None = None) -> dict
         if record.source_run_dir not in owner_cache:
             owner_cache[record.source_run_dir] = _owning_root(resolved, record.source_run_dir)
         owner = owner_cache[record.source_run_dir]
-        rows.append({"trading_day": iso_date(record.trading_day), "ticker": _text(record.ticker, 12),
-                     "amount_usd": _finite(record.amount_usd), "price": _finite(record.avg_fill_price),
-                     "quantity": _finite(record.quantity), "stream": _jsonable(record.stream),
-                     "origin": _jsonable(record.run_origin), "root_label": owner.label if owner else None,
-                     "at_risk": owner.kind != "primary" if owner else None})
+        rows.append(
+            {
+                "trading_day": iso_date(record.trading_day),
+                "ticker": _text(record.ticker, 12),
+                "amount_usd": _finite(record.amount_usd),
+                "price": _finite(record.avg_fill_price),
+                "quantity": _finite(record.quantity),
+                "stream": _jsonable(record.stream),
+                "origin": _jsonable(record.run_origin),
+                "root_label": owner.label if owner else None,
+                "at_risk": owner.kind != "primary" if owner else None,
+            }
+        )
     if len(records) > MAX_PURCHASES:
         warnings.append(f"Only the newest {MAX_PURCHASES} of {len(records)} purchase records are shown.")
     valid_amounts = [a for record in records if (a := _finite(record.amount_usd)) is not None]
     total = round(sum(valid_amounts), 2) if (len(valid_amounts) == len(records) and records) else None
-    return {"records": rows, "rollup": _jsonable(build_ticker_rollup(records)),
-            "summary": {"record_count": len(records), "total_usd": total,
-                        "last_trading_day": iso_date(records[0].trading_day) if records else None},
-            "warnings": _dedup(warnings)}
+    return {
+        "records": rows,
+        "rollup": _jsonable(build_ticker_rollup(records)),
+        "summary": {
+            "record_count": len(records),
+            "total_usd": total,
+            "last_trading_day": iso_date(records[0].trading_day) if records else None,
+        },
+        "warnings": _dedup(warnings),
+    }
 
 
 def _evidence_checks(evidence: dict[str, Any], warnings: list[str]) -> bool:
     usable = True
     for name, rule in EVIDENCE_CHECKS:
         value = evidence.get(name)
-        passed = (value is True if rule == "is true" else isinstance(value, int) and not isinstance(value, bool)
-                  and (value > 0 if rule == "> 0" else value == 0))
+        passed = (
+            value is True
+            if rule == "is true"
+            else isinstance(value, int) and not isinstance(value, bool) and (value > 0 if rule == "> 0" else value == 0)
+        )
         if not passed:
             usable = False
             warnings.append(f"Risk evidence check failed: {name} {rule} (observed {_jsonable(value)!r}).")
@@ -574,9 +742,16 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
     )
 
     warnings: list[str] = []
-    result: dict[str, Any] = {"usable": False, "evidence": None, "report": None, "scope": {
-        "root_label": roots[0].label if roots else None, "ignored_roots": [root.label for root in roots[1:]],
-        "note": "Computed over the primary root only: that is the tree the live kill switch reads."}}
+    result: dict[str, Any] = {
+        "usable": False,
+        "evidence": None,
+        "report": None,
+        "scope": {
+            "root_label": roots[0].label if roots else None,
+            "ignored_roots": [root.label for root in roots[1:]],
+            "note": "Computed over the primary root only: that is the tree the live kill switch reads.",
+        },
+    }
     if not roots:
         return {**result, "warnings": ["No artifact root is configured; the risk report is unavailable."]}
     try:
@@ -602,19 +777,30 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
     except (ValueError, TypeError, KeyError, OverflowError):
         return {**result, "warnings": _dedup(warnings + ["The risk report could not be computed."])}
     start = day.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
-    report["window_days"] = {"burn": BURN_WINDOW_DAYS, "kill_switch": KILL_SWITCH_WINDOW_DAYS,
-                             "evidence": EVIDENCE_WINDOW_DAYS}
+    report["window_days"] = {
+        "burn": BURN_WINDOW_DAYS,
+        "kill_switch": KILL_SWITCH_WINDOW_DAYS,
+        "evidence": EVIDENCE_WINDOW_DAYS,
+    }
     report["scheduled_deployed_by_day"] = {
-        when.isoformat(): _finite(amount) for when, amount in sorted(by_day.items(), reverse=True)
-        if start <= when.toordinal() <= day.toordinal()}
+        when.isoformat(): _finite(amount)
+        for when, amount in sorted(by_day.items(), reverse=True)
+        if start <= when.toordinal() <= day.toordinal()
+    }
     result["report"] = report
     return {**result, "warnings": _dedup(warnings)}
 
 
 def _maintenance_row(root: RootSpec, reader: BoundedReader, relative: Path, scalars: Sequence[str]) -> dict[str, Any]:
     status, event = _read_object(reader, relative)
-    row: dict[str, Any] = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
-           "day": relative.parent.name, "file": relative.name, "file_status": status}
+    row: dict[str, Any] = {
+        "id": _identity(root, relative),
+        "root_label": root.label,
+        "at_risk": root.kind != "primary",
+        "day": relative.parent.name,
+        "file": relative.name,
+        "file_status": status,
+    }
     if status == "corrupt":
         # _read_object is silent by design (absent is common); a maintenance
         # event that exists but cannot be parsed is not, so name it here.
@@ -656,8 +842,9 @@ def maintenance_events(roots: Sequence[RootSpec], *, days: int = 30) -> dict[str
     return result
 
 
-def build_state_snapshot(roots: Sequence[RootSpec], day: date, *, config_dir: Path,
-                         state_path: Path | None = None) -> dict[str, Any]:
+def build_state_snapshot(
+    roots: Sequence[RootSpec], day: date, *, config_dir: Path, state_path: Path | None = None
+) -> dict[str, Any]:
     """Compose the page's summary without any event list.
 
     ``ledgers`` holds counts per kind (entries, corrupt, lock files, pending

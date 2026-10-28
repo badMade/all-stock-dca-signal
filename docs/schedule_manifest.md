@@ -843,17 +843,18 @@ Desktop tasks take their cron in the Mac's local time and are unaffected.
 
 Verifier and watchdog prompts follow the same rule: **derive the slot window from the ET
 boundaries at run time, never hardcode a Z value.** Use, e.g. for the 9:35 slot (window
-09:30 to 10:00 ET):
+09:30 to 10:20 ET, widened from 10:00 on 2026-10-28 after the scheduler fired the slot 18 minutes late):
 
 ```
 W_START=$(TZ=America/New_York date -u -d "today 09:30" +%Y-%m-%dT%H:%M:%SZ)
-W_END=$(TZ=America/New_York date -u -d "today 10:00" +%Y-%m-%dT%H:%M:%SZ)
+W_END=$(TZ=America/New_York date -u -d "today 10:20" +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 (BSD/macOS `date` has no `-d`; use `gdate` or Python `zoneinfo` there.) Check:
 `TZ=America/New_York date -u -d "2026-11-02 09:30"` must print `14:30:00 UTC`. Pass
-`W_START` as the broker query's `created_at_gte`. The other slot windows are 10:25-10:55,
-11:25-11:55, 12:25-12:55, 1:25-1:55, 2:25-2:55 and 3:25-3:55 ET.
+`W_START` as the broker query's `created_at_gte`. The other slot windows are 10:25-11:00,
+11:25-12:00, 12:30-1:00, 1:25-2:00, 2:25-3:00 and 3:25-3:55 ET (the live prompts' Gate 1 bounds;
+the four :25 slots close where `dca_runner.SLOTS` does, and 3:30 keeps 3:55, before the 4:00 close).
 `tests/test_schedule_dst_guard.py` fails if a repo prompt hardcodes a UTC window.
 
 ### Expired temporary live scheduler overrides (historical record)
