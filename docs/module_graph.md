@@ -148,7 +148,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_recommender` | 315 | 16 | 2 | 0 | `dca_config`, `dca_market_sources`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_risk`, `dca_runner`, +8 more |
 | `dca_reporting` | 1259 | 6 | 2 | 2 | `dca_fileio`, `dca_paths`, `scripts.close_window_signal`, `scripts.foreground_primary`, `scripts.model_usage_log`, `scripts.run_classification` |
 | `dca_risk` | 1669 | 3 | 9 | 1 | `dca_config`, `near_close_dca`, `scripts.run_classification` |
-| `dca_runner` | 9503 | 6 | 23 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
+| `dca_runner` | 9507 | 6 | 23 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
 | `dca_slot_guard` | 62 | 1 | 1 | 0 | `scripts.scheduler_lease` |
 | `dca_ticker_paths` | 33 | 0 | 9 | 0 |  |
 | `dca_weekly_dashboard` | 6476 | 2 | 1 | 12 | `dca_common`, `dca_fileio` |
