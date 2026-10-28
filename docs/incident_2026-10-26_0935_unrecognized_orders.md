@@ -84,6 +84,42 @@ would forge evidence of something the Claude reader did not do, so none were wri
 - Mac Studio checkout pulled with `git pull --ff-only origin main`. Result: already up to date at
   `8c219fe9`, which has `5eafd4b6` as an ancestor.
 
+## Follow-up: 2026-10-27 slots
+
+The day after, the Claude slots did not place nothing. The broker shows 43 agent-initiated buys for $76.23
+(42% of the $180 daily cap) on account ending 7042, so no cap blocked anything. `placed_agent: agentic` is
+shared by Claude and Perplexity, so the broker cannot attribute a batch to a slot. The slot column below is
+an inference from timing.
+
+| Batch (ET) | Orders | Total | Likely slot |
+| --- | --- | --- | --- |
+| 09:52 to 09:54 | 10 | $17.80 | 09:35 |
+| 10:30 to 11:59 | 0 | $0 | 10:30 placed nothing |
+| 12:02 to 12:04 | 9 | $32.36 | 11:30, started about 32 minutes late |
+| 13:01 to 13:02 | 10 | $20.29 | 12:30, after a refusal and retry (inferred) |
+| 13:59 | 2 | $2.91 | 13:30 |
+| 14:58 | 1 | $1.44 | 14:30 |
+| 15:40 | 1 | $1.43 | 15:30 |
+
+Verified from the operator's Mac (2026-10-28):
+
+- Run folders exist for 09:35, 10:30, 11:30, 12:30, 13:30 and 14:30. The 15:30 folder was not listed by the
+  command used.
+- `grep -ril "PLATFORM REFUSAL" cron_tracking/*/20261027_*` matched one file only:
+  `market_open_dca/20261027_0935ET/alert_text.txt`. The 09:35 slot hit an auto-mode classifier refusal of
+  `place_equity_order`. The ten buys at 09:52 to 09:54 fit a partial batch (as on 2026-10-07), but the
+  eligible-versus-submitted counts were not read, so that is unconfirmed.
+- No other folder holds that text. The refusals recorded earlier for 10:30 and 12:30 are therefore not
+  confirmed by the marker and rest on the slot status alone.
+- `scripts.check_slot_fills` did not run (`python` is not on the Mac's PATH; use `python3`).
+
+Not known: why 10:30 placed nothing, what the 13:30 `market_data_unavailable` and 14:30 zero-buy statuses
+mean for the 13:59 and 14:58 orders, and whether the 13:01 batch was a 12:30 retry.
+
+Likely cause, inference: the classifier refuses `place_equity_order` in the Cowork tasks. `.claude/settings.json`
+allows the tool, but it governs sessions in this repo, not the live tasks, so the Cowork permission setting is
+what counts. Prior instances: 2026-09-04 and 2026-10-07 (`docs/schedule_verification.md`).
+
 ## Open items
 
 1. **Manual early start (answered).** The operator started the 9:46 run by hand. The run passed its gates
