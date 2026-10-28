@@ -171,12 +171,15 @@ def _cron_values(field: str, low: int, high: int) -> set[int]:
     return values
 
 
+_TIME_PATTERN = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.I)
+
 def _task_times(task: dict[str, Any]) -> list[time]:
     slots = task.get("et_slots")
     if isinstance(slots, list) and slots:
         return [time.fromisoformat(slot) for slot in slots]
     label = str(task.get("et_equivalent", ""))
-    found = re.search(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", label, re.I)
+    # ⚡ Bolt optimization: Use compiled regex to bypass re._cache lookup overhead
+    found = _TIME_PATTERN.search(label)
     if found:
         hour, minute = int(found[1]) % 12 + (12 if found[3].upper() == "PM" else 0), int(found[2])
         return [time(hour, minute)]
