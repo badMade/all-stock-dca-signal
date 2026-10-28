@@ -2847,6 +2847,60 @@ def test_standing_perplexity_backup_policy_is_mirrored_in_docs():
 _ZONE_DERIVING_MIRROR = "1230ET-1230-pm-midday-buying-run.txt"
 _GATE1_PROSE_MIRRORS = [f for f in _LIVE_MIRROR_FILES if f != _ZONE_DERIVING_MIRROR]
 
+# Live-mirror Gate 1 / Gate 4 interlock windows that open 5 minutes early
+# (:25) and must CLOSE where dca_runner.SLOTS closes them (:00), as the 12:30
+# mirror already did. They used to close at :55: on 2026-10-27 the 11:30 slot
+# fired at 11:48 ET (routine start latency, normally 6-12 minutes past
+# nominal), passed Gates 0-5 with 12 candidates, and aborted at Gate 6.5
+# because per-order revalidation could not finish before 11:55 -- five
+# minutes inside the repo's own 12:00 window end.
+_EARLY_OPEN_MIRROR_WINDOWS = {
+    "1030ET-1030-dca-recurring-buy.txt": ("1030", "10:25-11:00 AM"),
+    "1130ET-1130-mornig-buying-run.txt": ("1130", "11:25 AM-12:00 PM"),
+    "1330ET-130-pm-afternoon-buyiing-run.txt": ("1330", "1:25-2:00 PM"),
+    "1430ET-230-pm-afternoon-buying-run.txt": ("1430", "2:25-3:00 PM"),
+}
+
+
+def test_early_open_mirror_windows_close_where_dca_runner_slots_close():
+    from dca_runner import SLOTS
+
+    for filename, (slot_id, window) in _EARLY_OPEN_MIRROR_WINDOWS.items():
+        end_h, end_m = SLOTS[slot_id].window_end_et
+        assert window.endswith(f"{(end_h - 1) % 12 + 1}:{end_m:02d} {'AM' if end_h < 12 else 'PM'}"), (
+            f"{filename}: expected window {window!r} must end at SLOTS[{slot_id!r}].window_end_et"
+        )
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        assert f"It must fall inside {window} ET" in text, f"{filename}: Gate 1 window must be {window} ET"
+        assert f"interlock window is {window} America/New_York" in text, (
+            f"{filename}: Gate 4 interlock window must match Gate 1's {window}"
+        )
+        assert re.search(r"\b\d{1,2}:25-\d{1,2}:55 [AP]M\b", text) is None, (
+            f"{filename}: a :25-:55 window survives; it closes 5 minutes before dca_runner.SLOTS"
+        )
+
+
+def test_native_ref_id_mirrors_keep_the_uuid_only_sentence():
+    """#1951's ref_id_format_rejected fix must not be reverted by a stale merge.
+
+    f8712235 ("Fix CI drift in prompts and module graph", 2026-10-27) quietly
+    restored the pre-#1951 sentence in six mirrors while the live tasks kept the
+    fix, so check_live_prompt_drift asked for a repaste that would have brought
+    back the 2026-10-22 11:30 failure (the text key sent as ref_id, rejected by
+    place_equity_order, nothing placed). Nothing pinned the sentence until now.
+    The 15:30 mirror carries its own ref_id wording and is outside this check.
+    """
+    for filename in _LIVE_MIRROR_FILES:
+        if filename == "1530ET-330-final-buying-run.txt":
+            continue
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        assert "and ONLY that UUID in the ref_id field" in text, (
+            f"{filename}: the #1951 UUID-only ref_id sentence is missing"
+        )
+        assert "Never put the text key itself in ref_id" in text, (
+            f"{filename}: the #1951 'never send the text key' rule is missing"
+        )
+
 
 def test_gate1_derives_et_by_conversion_not_by_reading_the_host_clock():
     """2026-09-08 1:30 PM: the run sampled 11:31, reported it as "11:31 AM ET",
