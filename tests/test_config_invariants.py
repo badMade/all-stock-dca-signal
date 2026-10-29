@@ -2432,7 +2432,7 @@ def test_market_open_live_mirror_fail_closes_reviewed_placement_boundaries():
     assert "Immediately before EACH sequential placement" in gate_7
     assert "repeat Gate 1's ET wall-clock check" in gate_7
     assert "Gate 4's fully paginated, classify-every-order sole-executor interlock" in gate_7
-    assert "Fetch all pages again before every order" in gate_7
+    assert "Refresh the history under the PER-ORDER INCREMENTAL HISTORY rule before every order" in gate_7
     assert "broker order IDs successfully submitted earlier by THIS run" in gate_7
     assert "in-memory successfully-submitted-ID set" in gate_7
     assert "Do not exclude orders merely because their ticker or deterministic ref_id matches" in gate_7
