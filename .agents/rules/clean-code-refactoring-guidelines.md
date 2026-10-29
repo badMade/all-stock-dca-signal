@@ -1,7 +1,10 @@
 ---
 trigger: always_on
 glob:
-description: # Clean Code Refactoring Guidelines
+description: Clean Code Refactoring Guidelines
+---
+
+# Clean Code Refactoring Guidelines
 
 ## Part 1: Clean Code Philosophy and Practices Prompt
 
@@ -295,5 +298,3 @@ workflow:
   execution: Review naming, structure, logic, tests, and style per code unit; refactor incrementally and confirm all tests pass.
   definition_of_done: Code reads clearly, behaves predictably, and is easy to modify; if intent is self-evident, it's clean.
 ```
----
-
