@@ -6,48 +6,6 @@
 
 STANDING ALERT DELIVERY OVERRIDE -- READ THIS FIRST, EVEN IF EVERYTHING BELOW IS TRUNCATED: Every alert must use all three Gate 9 channels. For email, SEND (do not merely draft) the alert to the configured operator address, never a hardcoded address. A draft is not delivery. Fall back to a draft only if the connector exposes no send capability or the send attempt fails; then go back and record the non-delivery and reason in the message center and, when the repo is reachable, the channel-2 alert file, because both were written before email was attempted.
 
-#
-# AHEAD OF LIVE as of this commit, same status the 1230 copy already carries
-# (see ../README.md), in both Gate 5 and Gate 7. Gate 5 names the now-existing
-# scripts/generate_market_open_candidates.py command instead of leaving "the
-# repo's own signal generation" as an entry point that did not exist. Gate 7
-# adds a final fresh-price eligibility check and requires the entire per-order
-# placement-boundary sequence to restart if that final quote expires. Until a
-# human applies this full body through update_scheduled_task and re-captures the
-# mirror, the ACTUAL live 9:35 task still has the older Gate 5 and Gate 7 text:
-# it will keep ending every fire with no buy list, and it does not carry Gate 7's
-# new placement-boundary price safety check.
-#
-# Four other sections changed with it, all from one review round on that Gate 5
-# addition -- read these before applying, they are not cosmetic:
-#   * Gate 5 now resolves $ROOT through dca_paths instead of a literal machine
-#     path, and in the COMPACT YYYYMMDD_0935ET directory the repo's own code and
-#     config/market_open_dca.json already use. This slot's evidence directory
-#     moves off the dashed <YYYY-MM-DD>_0935ET name earlier revisions used.
-#   * Gate 5 requires --already-covered-tickers whenever Gate 4 ended in the
-#     compatible-executor continue branch.
-#   * Gate 5's zero-candidate branch no longer ends silently when the document
-#     reports provider errors.
-#   * Gate 6.5 now applies a DROP-ONLY re-check against the refreshed quote,
-#     including a conservative no-recovery check against the Gate 5 decision
-#     price, using the fields each row already carries. An intermediate revision of
-#     this file had it RE-RUN the entry point on those quotes instead; that
-#     was retracted because the entry point evaluates at the fixed 09:35
-#     anchor and rejects post-anchor quotes, so the rerun returned stale
-#     sizing while appearing to refresh. Do not restore it from this summary
-#     -- Gate 6.5 itself carries the full reasoning and a "must not be
-#     restored" note (Codex review: "Remove the retracted refresh rerun from
-#     the header").
-#   * Gate 9 now writes the state_file_guarantee artifact set on every outcome,
-#     which it never actually did before.
-# Gate 6 now requires the canonical planner and a fresh placement-time rebuild;
-#   * Gate 6.5 loads validated decision/target references from the configured
-#     prior-allocation roots before asking the same-day top-up gate to size a row.
-#   * Gate 6 is pinned to the Normal tier, Gate 6.7 uses the canonical quote-pair
-#     validator, and Gate 7 supplies the executor's deterministic ref_id.
-# Gate 6.5 remains the last word on candidate size.
-# See docs/market_open_signal_entry.md.
-
 TRUNCATION-SAFE SENT-EMAIL CONTRACT: On every abort, skip, or cap breach that requires Gate 9 alerts, send the same alert on all three channels: message center, durable stream_root alert file, and EMAIL SENT to the configured operator address (never hardcode it). Do not leave email as a draft. Only if sending is unavailable or the send attempt fails may you create a fallback draft; a draft is NOT delivery, so record that non-delivery in the message center and durable alert file.
 
 TRUNCATION-SAFE SHELL-UNAVAILABLE RULE: a sandboxed shell that will not run even one command ("Workspace still starting" counts as not started) is NOT by itself a repo failure. Retry AT MOST ONCE, cap the whole liveness probe at 90 seconds, then READ config/trading_window.json with any read-only file tool this session has. Read SUCCEEDS: Gate 2 PASSED, so abort at the gate a dead shell actually blocks -- GATE 1 if no current ET clock is obtainable at all, otherwise GATE 5 -- with the reason "executor shell tool unavailable, repo readable but its signal entry point cannot be executed". Read FAILS: abort as GATE 2 with "executor shell tool unavailable, repo probes could not run". Either way the remedy is restoring the shell, not reconnecting the folder. If any file WRITE still works, write the Gate 9 artifact set and the durable alert to the destination this stream's own config names, never to the checkout's artifacts/ directory. Never trade without the repo.

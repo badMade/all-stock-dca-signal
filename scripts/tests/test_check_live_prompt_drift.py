@@ -487,7 +487,9 @@ def test_every_committed_mirror_carries_the_rule_and_names_its_generator():
     for mirror in mirrors:
         text = mirror.read_text(encoding="utf-8")
         assert drift.NO_HAND_SIGNALS_RULE in text, mirror.name
-        assert "scripts/generate_" in text, mirror.name
+        # Either spelling names the producer: 0935 runs `python3 -m scripts.generate_market_open_candidates`,
+        # and its only path-form mention was in a '#' reviewer-note block removed 2026-10-29.
+        assert "scripts/generate_" in text or "scripts.generate_" in text, mirror.name
 
 
 def test_a_live_task_naming_the_text_key_as_its_ref_id_is_flagged(tmp_path):
