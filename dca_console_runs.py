@@ -42,6 +42,16 @@ from dca_paths import STREAM_ARTIFACT_DIRS
 from dca_risk import find_run_state_files, run_timestamp_et
 from scripts.run_classification import is_manual_state
 
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
 ET = ZoneInfo("America/New_York")
 RUN_ID_RE = re.compile(r"^run-[0-9a-f]{12}$")
 SLOT_DIR_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})ET$")
@@ -483,7 +493,7 @@ def _post_trade(reader: BoundedReader, relative_dir: str, state: dict[str, Any],
         return {"available": False, "reason": "raw/orders_after_place.json is absent"}
     candidates = [item for item in state.get("buy_candidates") or [] if isinstance(item, dict)]
     try:
-        fills = fills_from_order_history_payload(json.loads(source))
+        fills = fills_from_order_history_payload(json.loads(source, object_pairs_hook=_reject_duplicate_keys))
         slippage = compute_slippage_rows(candidates, fills)
         missing = build_missing_fills(candidates, fills)
         summary = build_latest_run_summary(state, slippage, missing)
@@ -556,7 +566,7 @@ def _parsable_json(reader: BoundedReader, relative: Path) -> bool:
     if source is None:
         return False
     try:
-        json.loads(source)
+        json.loads(source, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, RecursionError):
         return False
     return True
