@@ -646,3 +646,12 @@ def test_finite_handles_oversized_integer_without_overflow():
     oversized = 10**400
     assert _finite(oversized) is None
     assert _finite(-oversized) is None
+
+
+def test_cumulative_pending_total_rejects_bools(roots):
+    ledger = roots[0].path / "cumulative_dca_credits" / "2026-09-08" / "ledger.json"
+    write(ledger, cumulative_payload("2026-09-08", pending_usd_by_ticker={"NVDA": True, "AAPL": False}))
+    view = ledger_view(roots, "cumulative", day="2026-09-08")
+    entry = view["entries"][0]
+    # Bools are not floats, so they should be excluded from valid_pending
+    assert entry["pending_total_usd"] is None

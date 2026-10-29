@@ -874,7 +874,7 @@ def build_state_snapshot(
         ]
         valid_pending: list[float] = []
         for v in pending:
-            if isinstance(v, (int, float)):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
                 try:
                     if math.isfinite(v):
                         valid_pending.append(float(v))
