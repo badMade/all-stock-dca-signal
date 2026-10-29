@@ -173,6 +173,23 @@ def test_verify_day_passes_once_every_slot_is_verified(tmp_path):
     assert report["ok"] is True and {row["status"] for row in report["slots"]} == {"verified"}
 
 
+# 2026-10-28 operator run: `python -m scripts.verify_schedule --json` with no --root crashed with
+# "TypeError: unsupported operand type(s) for /: 'str' and 'str'". dca_paths.cron_tracking_root()
+# returns a str, so the default-root path left `base` a str; `base / slot_run_dir_relative(...)` still
+# worked (Path.__rtruediv__) but `base / "attempt_log"` in _attempt_times did not. Every test above
+# passes root=, which is why none caught it.
+def test_verify_day_default_root_is_a_path_not_a_str(tmp_path, monkeypatch):
+    monkeypatch.delenv("DCA_ATTEMPT_LOG_ROOT", raising=False)
+    monkeypatch.setattr(verify_schedule, "cron_tracking_root", lambda: str(tmp_path))
+    (tmp_path / slot_run_dir_relative("1030", DAY)).mkdir(parents=True)
+
+    report = verify_day(DAY, AFTER_CLOSE)
+
+    statuses = {row["slot_id"]: row["status"] for row in report["slots"]}
+    assert statuses["1030"] == "evidence_incomplete" and statuses["0935"] == "no_evidence"
+    assert verify_schedule.main(["--date", "2026-09-22", "--json"]) == 1
+
+
 # PR #1870 review (Copilot): _attempt_times caught only OSError, but read_text(encoding="utf-8") raises
 # UnicodeDecodeError (a ValueError, not an OSError) on a truncated or non-UTF-8 log, so one corrupt attempt
 # log aborted the whole audit. Its own docstring promises a broken log degrades toward the
