@@ -117,6 +117,7 @@
   "scripts.model_usage_log": "Writes one line per run recording which AI model was used, for the usage audit.",
   "scripts.order_refetch": "Re-reads today's orders from the broker so a second buyer can tell whether the first one already placed them.",
   "scripts.plan_first_slot": "Helper the buying agent uses in the plan-first design to fetch what it may buy.",
+  "scripts.planner_repaste_notice": "Writes the GitHub issue that tells you to repaste the Perplexity prompts and the planner file when a change to main alters the planner. It carries hashes and steps only, never your account details.",
   "scripts.planner_stamp_check": "Warns you when the backup planner file pasted into Perplexity is out of date. A stale planner costs a missed slot, and nothing flagged it before.",
   "scripts.prior_reference_bindings": "Reads back, without changing anything, which earlier buys already used which reference ids.",
   "scripts.promote_console": "Moves a reviewed console release to the stable checkout, only after explicit approval and only once the change is merged. It lives outside the console on purpose, because the console never changes anything itself.",

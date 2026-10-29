@@ -50,6 +50,17 @@ If the first run is blocked by macOS privacy protection, grant the venv Python a
 `~/Documents` as for the robinhood-payload agent. Notifications may need allowing for
 `osascript` under System Settings > Notifications.
 
+## Repaste issue (GitHub)
+
+The Mac check above only helps when the Mac is on, and it cannot see the prompt text pasted into Perplexity (on
+2026-10-28 the prompt said `d5ad2719` while the attached planner was `6e3b2c3b` and main was `f0b3fa93`).
+`.github/workflows/planner-repaste-notice.yml` is the second layer: on every push to `main` that changes
+`backup_planner.pyz` it runs `scripts/planner_repaste_notice.py` and opens, or comments on, ONE issue labelled
+`planner-repaste` with the old and new `content_sha256`, the universe hash and symbol count, and the repaste steps.
+GitHub emails the issue, so it reaches you away from the Mac. The issue holds no private value. Close it once all six
+tasks and the attached planner are repasted. Run the draft by hand with
+`python3 -m scripts.planner_repaste_notice --previous old.pyz --current backup_planner.pyz --commit <sha> --out-dir <dir>`.
+
 ## Stale-planner check (launchd)
 
 `scripts/planner_stamp_check.py` answers one question each weekday morning: is the `backup_planner.pyz` you
