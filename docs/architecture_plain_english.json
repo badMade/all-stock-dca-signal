@@ -62,8 +62,6 @@
   "midday_dca": "The buyer for the 12:30 PM slot. It reuses the morning buyer's machinery with its own names and settings.",
   "morning_dca": "The buyer for the 10:30 AM slot and the base that the other three morning-style buyers extend. It scores tickers, sizes buys, and writes the run record.",
   "near_close_dca": "The heart of the strategy. The 3:30 PM buyer with the signals, the sizing ladder, the budget caps and the safety checks.",
-  "patch_finbert_cache": "A one-time patch script that added result caching to the ticker-advisor's sentiment lookup. Not part of normal operation.",
-  "patch_template": "A one-time patch script that edited the backup-prompt generator. Not part of normal operation.",
   "run_benchmark": "A small speed test comparing two ways of reading the forecast CSV files. A developer tool only.",
   "run_dca": "The main runner. It ties config, data, the buy logic and the reports together. From the command line it only does a safe practice run.",
   "run_market_open_signals": "A one-off helper that runs the real 9:35 signal code on prices fetched a moment ago.",
