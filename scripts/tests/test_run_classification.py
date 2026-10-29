@@ -2258,7 +2258,7 @@ _EASTERN = ZoneInfo("America/New_York")
 def _stamp_mtime_on_trading_day(path: Path, trading_day: str) -> None:
     """Set path's mtime to noon Eastern on trading_day (see _mtime_matches_trading_day)."""
     stamp = datetime.combine(
-        datetime.strptime(trading_day, "%Y-%m-%d").date(), time(12, 0), tzinfo=_EASTERN
+        datetime.fromisoformat(trading_day).date(), time(12, 0), tzinfo=_EASTERN
     ).timestamp()
     os.utime(path, (stamp, stamp))
 
@@ -2480,7 +2480,7 @@ def test_run_classification_missing_target_day():
         # Correctly set the file mtime using os.utime to properly simulate the time bomb fix
         _EASTERN = ZoneInfo("America/New_York")
         stamp = datetime.combine(
-            datetime.strptime(jul22, "%Y-%m-%d").date(), time(12, 0), tzinfo=_EASTERN
+            datetime.fromisoformat(jul22).date(), time(12, 0), tzinfo=_EASTERN
         ).timestamp()
         os.utime(run_state_path, (stamp, stamp))
 
