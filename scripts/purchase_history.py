@@ -78,6 +78,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -1644,7 +1645,7 @@ class _PurchaseCollector:
         # all, and the fixed three-name whitelist above never discovers it
         # (Codex review: "Discover orphan full-report order CSVs").
         _FULL_REPORT_ORPHAN_GLOB = "dca_*_orders.csv"
-
+        _FULL_REPORT_ORPHAN_GLOB_RE = re.compile(r"^dca_.*_orders\.csv$")
 
         orphan_dirs_seen: set = set()
         orphan_full_report_seen: set = set()
@@ -1659,8 +1660,25 @@ class _PurchaseCollector:
             # Canonical per-directory artifacts: exactly one confirmed-fill
             # record per run directory by convention, so directory-level dedup
             # (orphan_dirs_seen) is correct here.
-            canonical_paths = sorted({p for name in order_csv_names for p in scan_root.rglob(name)})
-            for csv_path in canonical_paths:
+            canonical_paths = []
+            full_report_paths = []
+            stack = [scan_root]
+            while stack:
+                current = stack.pop()
+                try:
+                    for entry in os.scandir(current):
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        else:
+                            name = entry.name
+                            if name in order_csv_names:
+                                canonical_paths.append(Path(entry.path))
+                            elif _FULL_REPORT_ORPHAN_GLOB_RE.match(name):
+                                full_report_paths.append(Path(entry.path))
+                except OSError:
+                    pass
+
+            for csv_path in sorted(canonical_paths):
                 run_dir = csv_path.parent
                 if run_dir in self.covered_dirs or run_dir in orphan_dirs_seen or csv_path.resolve() in covered_resolved:
                     continue
@@ -1700,7 +1718,7 @@ class _PurchaseCollector:
             # is re-processing the exact same file twice, which
             # orphan_full_report_seen and self.covered_files (the specific file an
             # externally-referenced run_state already consumed) already prevent.
-            for csv_path in sorted(scan_root.rglob(_FULL_REPORT_ORPHAN_GLOB)):
+            for csv_path in sorted(full_report_paths):
                 if csv_path in orphan_full_report_seen:
                     continue
                 orphan_full_report_seen.add(csv_path)

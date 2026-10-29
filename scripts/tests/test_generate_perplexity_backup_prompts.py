@@ -260,6 +260,44 @@ def test_state_record_and_notification_are_specified(prompts, prefix):
     assert "never a hardcoded address" in text
 
 
+# -- pre-procedure stand-down gate -------------------------------------------------------
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
+    # ADR amendment 2026-10-25: a normal day (Claude succeeded) must stand down before the account lookup, the
+    # 7-day get_equity_orders pull and any procedure fetch, which is where the Perplexity credits went.
+    text = _by_prefix(gen.build_instructions(), prefix)
+    heading = text.find("\nSTAND-DOWN GATE")
+    assert heading != -1, "the pasteable prompt has no STAND-DOWN GATE section"
+    section_end = text.index("PROCEDURE (steps 1-9)")
+    section = text[heading:section_end]
+
+    assert text.index("--build-info") < heading
+    assert text.index("python3 backup_planner.pyz universe") < heading
+    assert heading < text.index("PROCEDURE (steps 1-9)")
+    assert section.index("gates --task ") < section.index("list_devices")
+    assert section.index("list_devices") < section.index("scripts.local_heartbeat status")
+    assert "If local_status is in_progress or succeeded" in section
+    assert "stood_down_local_active" in section
+    assert "no procedure part" in section
+    assert "no get_equity_orders call" in section
+    assert "${PPLX_RUN_STATE_DIR}/run_state_" in section
+    for key in (
+        "trading_day", "slot", "task_id", "account_last4", "fired_at_et", "plan_source", "mac_status",
+        "mac_path_abandoned", "executor_orders", "routing", "mac_elapsed_seconds", "planner_build", "status",
+        "orders_planned", "orders_placed", "skipped", "errors", "universe_hash", "sizing_version", "run_origin",
+    ):
+        assert key in section, key
+    assert "scheduled_backup" in section
+    assert "send no notification" in section
+    assert "Any other result" in section
+    assert "continue with the PROCEDURE below" in section
+    assert text.index("get_equity_orders") > heading
+    assert text.index("procedure --task") > heading
+    assert "@@" not in text
+
+
 # -- hygiene -----------------------------------------------------------------------------
 
 

@@ -147,6 +147,34 @@ Characteristics of this generation:
   the read-only Robinhood calls on the executor side, which no prompt text can
   provide. Same caveat as every bullet here: none of it runs until a human
   applies these bodies and re-captures the mirrors.
+* Gate 7 gained `OPERATOR RETRY AFTER A PLATFORM REFUSAL` on 2026-10-28,
+  after the 9:35 and 10:30 ET runs both stopped on a classifier-refused
+  `place_equity_order`. The Robinhood connector had every tool set to Always
+  allow at the time, so the connector setting was not the cause. At 10:30 the
+  first ticker (CCI) was refused twice, and all seven buys ($13.68) filled only
+  after the operator replied "Try again" in the task session. The new rule
+  keeps the one-automatic-retry cap and adds a documented path for that reply.
+  The push and the alert both name the exact reply. Only the operator's own
+  in-session reply starts the retry. Every unplaced ticker is fully
+  revalidated and never resized. The list expires when the slot window closes,
+  and a second refusal stops the run again. `tests/test_live_prompt_operator_retry.py`
+  pins it. **The lasting fix is outside the prompts.** Claude support
+  confirmed that in Auto mode a connector's Always allow does not skip the
+  classifier for write tools; a `permissions.allow` rule in Claude Code
+  managed settings does. The repo's `.claude/settings.json` already allows
+  the tool, but it only loads for a session started in this repository,
+  which the scheduled tasks are not. On the Mac that runs the tasks, put the
+  rule in `/Library/Application Support/ClaudeCode/managed-settings.json`
+  (needs `sudo`; merge into an existing file instead of overwriting it):
+  `{"parentSettingsBehavior": "merge", "permissions": {"allow":
+  ["mcp__Robinhood__place_equity_order", "mcp__robinhood__place_equity_order"]}}`.
+  Both spellings are listed because the server is named `Robinhood` and
+  matching may be case-sensitive. Then restart Claude Desktop. With that rule
+  in place an unattended run can place equity buys with no classifier review,
+  so set the connector's option, crypto and advanced-order tools to Block and
+  `Cancel equity order` to Needs approval; the prompts already forbid all of
+  them. Same caveat as every bullet here: none of it runs until a human
+  applies these bodies and re-captures the mirrors.
 * Gate 2 also gained a FOURTH repo probe,
   `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
   change. The original three only ever looked under `/sessions/*/mnt/`, which

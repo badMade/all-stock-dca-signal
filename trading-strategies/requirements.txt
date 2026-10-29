@@ -12,6 +12,8 @@ alpaca-py
 # Sentiment monitor only; large ML stack.
 transformers
 torch
-# Patched minimums for torch's transitive dependencies (research audit).
+# Patched minimums for vulnerable transitive dependencies (research audit).
 filelock>=4.2.1
 setuptools>=84.1.0
+# Patched minimum for alpaca-py's transitive dependency (research audit).
+msgpack>=1.2.3
