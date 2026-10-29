@@ -57,7 +57,10 @@ The Mac check above only helps when the Mac is on, and it cannot see the prompt 
 `.github/workflows/planner-repaste-notice.yml` is the second layer: on every push to `main` that changes
 `backup_planner.pyz` it runs `scripts/planner_repaste_notice.py` and opens, or comments on, ONE issue labelled
 `planner-repaste` with the old and new `content_sha256`, the universe hash and symbol count, and the repaste steps.
-GitHub emails the issue, so it reaches you away from the Mac. The issue holds no private value. Close it once all six
+GitHub emails the issue, so it reaches you away from the Mac. The issue lists the bundled files that changed and marks
+a change that only touches comments or docstrings as "Repaste optional" (a pair you already pasted still behaves the
+same); anything else, or an unreadable previous planner, is "Repaste needed". An optional notice never rewrites an
+open "needed" issue. The issue holds no private value and no file contents. Close it once all six
 tasks and the attached planner are repasted. Run the draft by hand with
 `python3 -m scripts.planner_repaste_notice --previous old.pyz --current backup_planner.pyz --commit <sha> --out-dir <dir>`.
 

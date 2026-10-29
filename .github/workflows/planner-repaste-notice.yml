@@ -6,8 +6,9 @@ name: Planner repaste notice
 # GitHub issue labelled planner-repaste, so the operator is emailed wherever they are. The Mac-side
 # scripts/planner_stamp_check.py is the second layer; it only helps when the Mac is on.
 #
-# The body is drafted by scripts/planner_repaste_notice.py and carries hashes, a symbol count and commands only, never a
-# private value.
+# The body is drafted by scripts/planner_repaste_notice.py and carries hashes, a symbol count, the names of the changed
+# bundled files and commands only, never a private value or file contents. A change that only touches comments or
+# docstrings is marked "optional"; it never rewrites an open "needed" issue.
 #
 # TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger, same rule as refresh-generated-docs.yml:
 # `push` runs this file and checks out main, never a dispatch-selected ref, and this job holds `issues: write`.
@@ -73,12 +74,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           title="$(cat "${RUNNER_TEMP}/notice/title.txt")"
+          kind="$(cat "${RUNNER_TEMP}/notice/kind.txt")"
           gh label create planner-repaste --color B60205 \
             --description "Perplexity prompts and attached planner must be repasted" 2>/dev/null || true
           existing="$(gh issue list --label planner-repaste --state open --json number --jq '.[0].number // empty')"
           if [ -n "${existing}" ]; then
-            # A new stamp supersedes the open issue. The comment is what emails the operator; an edit alone does not.
-            gh issue edit "${existing}" --title "${title}" --body-file "${RUNNER_TEMP}/notice/body.md"
+            # A needed notice supersedes the open issue. An optional (comment-only) one must never retitle or rewrite
+            # an open "needed" issue, so it only comments. The comment is what emails the operator; an edit does not.
+            if [ "${kind}" = "needed" ]; then
+              gh issue edit "${existing}" --title "${title}" --body-file "${RUNNER_TEMP}/notice/body.md"
+            fi
             gh issue comment "${existing}" --body-file "${RUNNER_TEMP}/notice/body.md"
           else
             gh issue create --title "${title}" --body-file "${RUNNER_TEMP}/notice/body.md" --label planner-repaste
