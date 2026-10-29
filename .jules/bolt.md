@@ -25,3 +25,7 @@
 ## 2026-10-27 - [Avoid uncompiled re.search in hot paths]
 **Learning:** Calling `re.search` with an inline string pattern repeatedly incurs internal regex cache lookup and locking overhead. In `scripts/run_classification.py`'s `_et_minutes` and `_et_seconds` time parsing logic, replacing inline `re.search` with a module-level pre-compiled `re.compile()` object yielded a ~1.6x speedup while exactly preserving all safety and fallback behavior (including tolerance for unexpected suffixes or decimals).
 **Action:** Always pre-compile regexes at the module level when calling them inside iterative loops or parsing hot paths to maximize performance without sacrificing exact behavioral parity.
+
+## 2026-10-29 - [Avoid Path.resolve() inside comprehension loops]
+**Learning:** Resolving parent directories inside a comprehension loop (e.g., `[path.parent.resolve() for path in paths]`) executes duplicate `stat` syscalls when multiple paths share the same parent directory.
+**Action:** Always deduplicate parent directories via a `set` before calling `.resolve()` to guarantee each unique directory is resolved exactly once, reducing I/O overhead.
