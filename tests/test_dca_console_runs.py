@@ -480,3 +480,17 @@ def test_close_window_grades_with_each_tickers_own_calibration_and_interpolates(
     rows = {r["ticker"]: r for r in window["rows"]}
     assert rows["SMOOTH"]["ladder_multiplier_capped_at_3x"] == 2.0  # blended halfway between 1x and 3x
     assert rows["STEPPED"]["ladder_multiplier_capped_at_3x"] == 1.0  # its own tiers, stepped (global ladder would give 1.5x)
+
+def test_post_trade_rejects_duplicate_keys(tmp_path):
+    from dca_console_reader import BoundedReader
+    from dca_console_runs import RootSpec, _post_trade
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "raw").mkdir()
+    (run_dir / "raw" / "orders_after_place.json").write_text('{"orders": [{"id": 1}], "orders": [{"id": 2}]}')
+
+    reader = BoundedReader(tmp_path, [])
+    res = _post_trade(reader, "run", {}, [RootSpec(tmp_path, "local")])
+    assert res["available"] is False
+    assert res["reason"] == "the persisted order history could not be interpreted"
