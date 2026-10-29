@@ -1,23 +1,26 @@
-💡 **What:** Replaced `datetime.strptime` with native string slicing for fixed clock times (in `scripts/ingest_market_data.py`) and with `datetime.fromisoformat()` for UTC timestamps (in `scripts/model_usage_log.py`, `scripts/generate_credit_usage_proxy_report.py`, `scripts/workspace_probe.py`, and `scripts/tests/test_run_classification.py`).
+### Summary of changes
+- Addressed a Critical JSON Parameter Pollution vulnerability flagged in `.jules/sentinel.md` where `json.loads` calls in `dca_console_state.py` and `dca_console_runs.py` silently allowed duplicate keys (which resolves to the last parsed value by default in Python).
+- Updated the vulnerable `json.loads` calls (`dca_console_state._read_object`, `dca_console_runs._parsable_json`, and `dca_console_runs._post_trade`) to enforce `object_pairs_hook=_reject_duplicate_keys` to ensure duplicate keys safely fail closed and return `"corrupt"` / `False` respectively.
+- Refactored `dca_console_runs.py` and `dca_console_state.py` to use a consistent locally defined `_reject_duplicate_keys` hook to avoid circular imports.
+- Created `test_read_object_rejects_duplicate_keys` and `test_post_trade_rejects_duplicate_keys` tests to strictly enforce duplicate-key rejection behavior.
 
-🎯 **Why:** `datetime.strptime` is remarkably slow in Python because it involves regex parsing and locale lock overhead. When dealing with strict, fixed-width formats inside data ingestion loops or script initializations, we can bypass this bottleneck entirely.
+### Exact test commands run
+- `source .venv/bin/activate && python -m pytest tests/test_dca_console_state.py tests/test_dca_console_runs.py -q`
+- `source .venv/bin/activate && ruff check .`
+- `source .venv/bin/activate && python -m pytest -q`
+- `source .venv/bin/activate && python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`
 
-📊 **Impact & Measurement:**
-Before:
-`old: 1.0338021360000198` (for "%H:%M")
-`old: 1.3935956239999996` (for ISO with 'Z')
-After:
-`new: 0.11754236300001253` (for "%H:%M")
-`new: 0.04945816900001887` (for ISO with 'Z')
-Speedup: ~9x for "%H:%M" via string split, ~28x for ISO format via `fromisoformat`.
+### Known limitations/proposed workflow diffs
+- None.
 
-✅ **Verification:**
-- Ran targeted tests: `.venv/bin/python -m pytest scripts/tests/test_ingest_market_data.py scripts/tests/test_model_usage_log.py scripts/tests/test_generate_credit_usage_proxy_report.py scripts/tests/test_workspace_probe.py scripts/tests/test_run_classification.py -q`
-- Passed linter check: `ruff check .`
-- Smoke test: `.venv/bin/python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`
+### Confirmation of no secrets added
+- No secrets were added.
 
-⚠️ **Known Limitations:** None. Safety boundaries such as `ValueError` for invalid dates and components are natively upheld by `fromisoformat` and integer parsing.
+### Entry-point coverage statement
+- `run_dca.py` tests correctly passed, ensuring safe fallback states inside the console pipelines.
 
-🔒 **Secrets Confirmation:** Confirmed no secrets were added.
-
-🧭 **Entry-Point Coverage:** The changes affect `scripts/` initializations and parsing utilities heavily used during scheduled job artifacts gathering and telemetry generation.
+### Findings Table
+| Severity | File:Line | Issue | Entry Point | Confidence % | Minimal Fix |
+|---|---|---|---|---|---|
+| CRITICAL | `dca_console_state.py:322` | Parameter Pollution via Duplicate JSON Keys allows silent logic override | Console Reader / Runs | 96% | Pass `object_pairs_hook=_reject_duplicate_keys` |
+| HIGH | `dca_console_runs.py:487`, `560` | Parameter Pollution via Duplicate JSON Keys | Console Reader / Runs | 96% | Pass `object_pairs_hook=_reject_duplicate_keys` |

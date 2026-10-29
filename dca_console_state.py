@@ -37,6 +37,20 @@ from zoneinfo import ZoneInfo
 from dca_console_jobs import redact_value
 from dca_console_reader import MAX_BYTES, BoundedReader, RootSpec, iso_date, root_label
 
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # json.loads keeps the LAST duplicate silently; the live loader refuses
+    # such a document (dca_runner._reject_duplicate_keys), so this view must
+    # show it as corrupt rather than as whichever value happened to win.
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+
 ET = ZoneInfo("America/New_York")
 MAX_TEXT = 500
 MAX_ROWS = 200
@@ -246,18 +260,6 @@ def _dedup(warnings: list[str]) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    # json.loads keeps the LAST duplicate silently; the live loader refuses
-    # such a document (dca_runner._reject_duplicate_keys), so this view must
-    # show it as corrupt rather than as whichever value happened to win.
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key {key!r}")
-        result[key] = value
-    return result
-
-
 def _raw_bytes(path: Path) -> bytes | None:
     """Read one file's bytes up to the shared ceiling; None when absent."""
     with path.open("rb") as handle:
@@ -423,7 +425,7 @@ def _read_object(reader: BoundedReader, relative: Path) -> tuple[str, dict[str, 
     if text is None:
         return "corrupt", None
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, RecursionError):
         return "corrupt", None
     return ("available", parsed) if isinstance(parsed, dict) else ("corrupt", None)

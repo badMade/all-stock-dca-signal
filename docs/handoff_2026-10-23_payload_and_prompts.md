@@ -128,7 +128,7 @@ Stamps named in the merged-PR table above were current when those PRs merged. No
   | #1907 drift guards and #1915 CRLF fold | Restored by #1956. |
   | #1880 payload refusal marker and console scan stub | Restored by #1937 and #1935. |
   | #1913 account-loading step and `cloud-clone-*` drafts | Restored on purpose by #1954. (An earlier audit wrongly called #1914's deletion of the drafts correct.) |
-  | #1917 no-folder failure form in `0915ET-bridge-health-check.draft.txt` | Restored (the draft has the NO-FOLDER form again; see #1965 and `90db3649`). |
+  | #1917 no-folder failure form in `0850ET-bridge-health-check.draft.txt` (renamed from `0915ET-…` 2026-10-28) | Restored (the draft has the NO-FOLDER form again; see #1965 and `90db3649`). |
   | #1892 wording of the 1530ET `reason` in `config/scheduled_tasks.json` | Missing; wording only. |
   | #1906 and this note | Restored by #1925. |
 
