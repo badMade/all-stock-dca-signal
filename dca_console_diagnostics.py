@@ -94,7 +94,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.ingest_market_data", "scripts.build_robinhood_market_data", "scripts.order_refetch",
         "scripts.prior_reference_bindings", "scripts.assemble_order_pages", "scripts.adhoc_orders",
         "scripts.emit_order_plan", "scripts.refresh_market_open_candidates", "scripts.backup_gates",
-        "scripts.backup_procedure",
+        "scripts.backup_procedure", "scripts.merge_order_pages", "scripts.check_per_order_record",
     )),
     ("research", "Research & analysis", (
         "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",

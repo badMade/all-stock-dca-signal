@@ -228,7 +228,7 @@ def test_refuses_an_unparseable_page(tmp_path):
     assert not out.exists()
 
 
-@pytest.mark.parametrize("override", [{"account": "999000222"}, {"day": "2026-10-28"}])
+@pytest.mark.parametrize("override", [{"account": "other-account"}, {"day": "2026-10-28"}])
 def test_refuses_an_account_or_trading_day_that_does_not_match_the_base(tmp_path, override):
     base = _base(tmp_path, [_order("o1", "14:00:00")])
     page = _write(tmp_path, "p1.json", {"orders": []})
