@@ -770,6 +770,75 @@ def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
         assert any(f"simulated worker death for {','.join(chunk)}" in t for t in texts), (chunk, kept)
 
 
+# -- a whole chunk that came back with no intraday bars (2026-10-29 15:31 shadow build) ------------------------------
+# Chunk 3 of the 1530 plan (NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW) replied with every ticker's intraday_bars
+# empty, so all eight were filed as "quiet" (no trade in the window) and the payload published 83/91. NVDA, GOOGL, GOOG
+# and AMZN trade every minute of the session: a whole chunk with no bars is a worker that dropped the series, not eight
+# names that all stopped trading at once. A chunk whose every ticker has no bars is re-asked for like a dead chunk; a
+# chunk where only some names are empty (the thin names of 2026-10-26/27 13:30) is left alone, so it costs no rescue.
+
+#: Stub ``codex``: valid data for every requested ticker, except that a request for a whole BLANK chunk answers every
+#: ticker with ``intraday_bars: []``, and a request naming a THIN ticker answers that one ticker with no bars.
+_BLANK_STUB = """#!{python}
+import json, re, sys
+out = sys.argv[sys.argv.index("-o") + 1]
+tickers = re.search(r"Tickers: (.*)", sys.stdin.read()).group(1).split(", ")
+bar = lambda ts: dict(timestamp=ts, open=10.0, high=10.2, low=9.9, close=10.1, volume=100)
+reply = {{t: dict(previous_close_bar=bar("2026-10-19T00:00:00Z"), intraday_bars=[bar("2026-10-20T13:30:00Z")],
+              quote=dict(price=10.1, as_of="2026-10-20T13:36:00Z")) for t in tickers}}
+for chunk in json.loads({blank!r}):
+    if set(tickers) == set(chunk):
+        for t in tickers:
+            reply[t]["intraday_bars"] = []
+for t in json.loads({thin!r}):
+    if t in reply:
+        reply[t]["intraday_bars"] = []
+open(out, "w").write(json.dumps(reply))
+"""
+
+
+def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=()):
+    import sys
+
+    plan = _plan_0935(tmp_path)
+    blank = [plan["chunks"][i] for i in blank_chunks]
+    stub = _BLANK_STUB.format(python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)))
+    done, _ = _run_launcher(tmp_path, fake_script=stub)
+    return done, plan, blank
+
+
+def test_launcher_rescues_a_chunk_whose_every_ticker_came_back_with_no_bars(tmp_path):
+    import re
+    from pathlib import Path
+
+    done, plan, blank = _run_with_blank_chunks(tmp_path)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    # Recovered in the small re-asks: nothing is filed as quiet and nothing fails.
+    assert meta["quiet"] == [] and meta["failed"] == {}, meta
+    assert meta["valid"] == meta["universe"] == len(plan["tickers"]), meta
+    rescued = re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)
+    assert sorted(rescued) == sorted((str(i), str(len(plan["chunks"][i]))) for i in _DEAD), log
+
+
+def test_launcher_leaves_a_genuinely_quiet_name_in_a_replying_chunk_alone(tmp_path):
+    import re
+    from pathlib import Path
+
+    # One thin name in chunk 0 prints no bar, the rest of its chunk did: that is a quiet ticker, not a dead worker,
+    # so no rescue runs for it and it is still reported as quiet (Gate 5 scores it NO_DATA).
+    plan = _plan_0935(tmp_path)
+    thin = plan["chunks"][0][0]
+    done, plan, _ = _run_with_blank_chunks(tmp_path, blank_chunks=(), thin=[thin])
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    assert json.loads(out.with_suffix(".meta.json").read_text())["quiet"] == [thin]
+    assert "0" not in {i for i, _ in re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)}, log
+
+
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
 
 
