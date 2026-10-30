@@ -59,11 +59,11 @@ BAR_START_ET = {
 SLOTS = tuple(BAR_START_ET)
 #: Slots that can be planned and built on demand but are NOT scheduled: ``due_slot`` ignores them, so launchd's
 #: ``auto`` never fires one and no live prompt waits on one. 3:30 only needs the lookback bar (decision anchor minus
-#: ``trend_lookback_minutes`` = 14:30) and the decision bar, because ``scripts/generate_buy_candidates`` bypasses the
+#: ``trend_lookback_minutes``, measured from the completed 15:25 bar = 14:25) and the decision bar, because ``scripts/generate_buy_candidates`` bypasses the
 #: trend filter at 1530ET; the live prompt's "09:30 onward" is wider than the generator's own check and would turn a
 #: 5-minute fetch into 72 bars per ticker for no scoring benefit.
 SHADOW_BAR_START_ET = {
-    "1530": time(14, 30),
+    "1530": time(14, 25),
 }
 PLANNABLE_SLOTS = SLOTS + tuple(SHADOW_BAR_START_ET)
 

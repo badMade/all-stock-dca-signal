@@ -906,7 +906,7 @@ def final_buy_ticker(bars):
 
 
 def final_buy_kw(**over):
-    return kw(bar_start=time(14, 30), decision=time(15, 30), **over)
+    return kw(bar_start=time(14, 25), decision=time(15, 30), **over)
 
 
 def test_1530_is_plannable_but_the_scheduled_slots_stay_the_six_prompt_wired_ones():
@@ -934,7 +934,7 @@ def test_1530_plan_scores_the_universe_and_interval_the_final_buy_generator_uses
     assert plan["tickers"] == [t for t in config.tickers if t not in config.excluded_tickers]
     assert plan["decision_time_et"] == SLOT_SPECS["1530ET"]["decision_time_et"].strftime("%H:%M") == "15:30"
     assert plan["interval_minutes"] == config.robinhood_interval_minutes == 5
-    assert plan["bar_start_et"] == "14:30" and plan["shadow"] is True
+    assert plan["bar_start_et"] == "14:25" and plan["shadow"] is True
     assert plan["out"].endswith("robinhood_payload_2026-10-15_1530.json")
     assert rp.build_plan("1230", DAY)["shadow"] is False
 
@@ -967,14 +967,14 @@ def test_1530_plan_refuses_an_early_close_and_an_unapproved_day(monkeypatch):
 
 
 def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
-    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
-    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:30") and len(ok["intraday_bars"]) == 12
-    # the generator's 60-minutes-back lookback bar (14:30) is missing: bars that start late must not pass
+    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 30)), **final_buy_kw())
+    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:25") and len(ok["intraday_bars"]) == 13
+    # the generator's 60-minutes-back lookback bar (14:25) is missing: bars that start late must not pass
     with pytest.raises(rp.PayloadError, match="do not cover"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
-        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 10)), **final_buy_kw())
 
 
 # -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
