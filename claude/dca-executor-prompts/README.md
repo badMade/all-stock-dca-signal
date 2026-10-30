@@ -263,19 +263,16 @@ Characteristics of this generation:
   `dotenv-loader.draft.md` and then RE-CAPTURES every mirror from the edited live body
   (frontmatter dropped, account masked), so the mirrors end identical to live whatever state
   they started in. Until it has been run with `--write`, these mirrors contain neither the
-  bridge-shell change nor the `.env` edits. `drafts/*.bridge-shell.draft.txt` hold the
-  bridge-shell text and become redundant once the mirrors are re-captured.
-* On 2026-10-29 (Key `bridge_python_alert_channels`) the seven `drafts/*.bridge-shell.draft.txt`
-  moved AHEAD of live: their BRIDGE PROTOCOL opener is now `. scripts/bridge_bootstrap.sh`
-  (one tested script owning the per-user `/tmp/uv-$(id -u)` dirs, a stable `uv-<uid>-alt`
-  fallback when a dir is owned by another user, and the Python 3.11 install), replacing the
-  ~500-character inline opener whose shared `/tmp/uv-cache` caused the 2026-10-28 11:30 and
-  3:30 Gate 2 aborts; and the Gate 2 no-Python and Gate 1 off-window aborts now run
-  `sh scripts/bridge_abort_marker.sh` first, so an abort that never had Python still leaves a
-  durable alert file and a failed-start marker (see `docs/schedule_verification.md`). Nothing
-  changes live until the operator repastes each routine through `update_scheduled_task` and
-  re-captures its mirror; until then the mirrors keep the inline opener, which
-  `scripts/tests/test_bridge_shell_prompt_invariants.py` still pins.
+  bridge-shell change nor the `.env` edits. `drafts/*.bridge-shell.draft.txt` held the
+  bridge-shell text until the mirrors were re-captured; they were removed on 2026-10-30.
+* On 2026-10-29 (Key `bridge_python_alert_channels`) two implementations of the same fix
+  merged: #2048 (`scripts/bridge_bootstrap.sh` + `scripts/bridge_abort_marker.sh`, applied only
+  to the seven `drafts/*.bridge-shell.draft.txt`) and #2052 (`scripts/bridge_python.sh` +
+  `scripts/record_evidence_free_abort.sh`, applied to the live bodies and these mirrors). The
+  operator repasted #2052's text, so on 2026-10-30 `check_live_prompt_drift` reported 7 of 7
+  slots matching, and the #2048 scripts, their tests and the drafts were removed as unused.
+  `scripts/tests/test_bridge_shell_prompt_invariants.py` still pins the per-user uv dirs and
+  the durable abort alert in every mirror.
 
 ## `1-executor-*.txt` … `7-executor-*.txt` — SUPERSEDED. Do not patch these
 
