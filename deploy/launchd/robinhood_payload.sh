@@ -154,6 +154,10 @@ wait
 # attempt and can still lose the same tickers twice. Those tickers are now re-asked for alone, in the same small
 # requests. Only absent or "error" tickers are rescued; a ticker that replied with data is never re-fetched, and a
 # rescue reply that is again missing or an error leaves the original entry in place for the merge to report.
+# Extended 2026-10-30 (10-29 15:31 shadow build): chunk 3 (NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW) replied with
+# every ticker's intraday_bars empty, so all eight were filed "quiet" and published as NO_DATA although NVDA, GOOGL, GOOG
+# and AMZN trade every minute. A whole chunk with no bars is a worker that dropped the series, so it is re-asked like a
+# dead chunk. A chunk where only some names are empty (the thin names of 10-26/27 13:30) is left alone: those are quiet.
 targets=()
 for ((i = 0; i < idx; i++)); do
   # A crash here only means this chunk is not rescued (set -e must not end the launcher before the merge).
@@ -164,7 +168,12 @@ try:
     reply = _load_chunk(sys.argv[1])
 except (OSError, ValueError):  # no file, or one that holds no usable object: every ticker of the chunk is missing
     reply = {}
-print(",".join(t for t in sys.argv[2].split(",") if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))))
+tickers = [t for t in sys.argv[2].split(",") if t]
+need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
+answered = [reply[t] for t in tickers if t not in need]
+if answered and all(isinstance(e, dict) and not e.get("intraday_bars") for e in answered):
+    need = tickers  # every answered ticker came back with no bars: the worker dropped the series
+print(",".join(need))
 ' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
   if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
 done
