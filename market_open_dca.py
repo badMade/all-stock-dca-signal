@@ -105,7 +105,10 @@ MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
 MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
 # Opens AT the 9:35 decision time, never before it (the decision reads the completed 9:30 bar).
 MARKET_OPEN_LIVE_WINDOW_START_ET = "09:35"
-MARKET_OPEN_LIVE_WINDOW_END_ET = "09:50"
+# Closes at 10:20 to match dca_runner.SLOTS["0935"] (operator decision 2026-10-28: the scheduler
+# fired this slot ~18 minutes late on 2026-10-27 and 09:50 left no time to place). The executor's
+# own scheduled-slot-window check in morning_dca reads this profile value, so it must move with the runner.
+MARKET_OPEN_LIVE_WINDOW_END_ET = "10:20"
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 
 # Artifact root: a sibling of, and never nested under, any other stream's root.
