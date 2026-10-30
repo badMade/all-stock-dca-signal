@@ -23,7 +23,7 @@
     "schedule_et": "09:35",
     "schedule_human": "9:35 AM ET weekdays",
     "window_start_et": "09:35",
-    "window_end_et": "10:20",
+    "window_end_et": "09:50",
     "run_type": "market_open_dca_live",
     "state_schema_version": "market-open-live-v1",
     "trades": true,
