@@ -30,6 +30,7 @@ from market_open_dca import (
     DEFAULT_MARKET_OPEN_DAILY_CAP_USD,
     DEFAULT_MARKET_OPEN_WEEKLY_CAP_USD,
     MARKET_OPEN_LIVE_CRON_ID,
+    MARKET_OPEN_PROFILES,
     MARKET_OPEN_SIZING_TIERS,
     MARKET_OPEN_STREAM,
     MarketOpenConfig,
@@ -486,6 +487,35 @@ def test_trend_exempt_buy_is_marked_auto_buy_eligible(tmp_path):
     assert sig.action == Action.BUY
     assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
     assert sig.to_row()["auto_buy_signal"] is True
+
+
+
+# --- 2026-10-30 window-end drift (operator widened 0935 to 10:20 on 2026-10-28) --
+def test_market_open_executor_profile_window_matches_the_live_slot_spec():
+    """dca_runner.SLOTS["0935"] is the authoritative acceptance window the live
+    prompt's Gate 1 enforces; MarketOpenDCAExecutor.run() enforces the profile's
+    own copy (morning_dca's "outside scheduled slot window" check). The operator
+    widened the close to 10:20 on 2026-10-28 and only the runner moved, so a
+    scheduler that fires this slot at 10:11 ET passes Gate 1 but a run() driven
+    by the same fire would block as outside its window. The two must agree."""
+    from dca_runner import SLOTS
+
+    spec = SLOTS["0935"]
+    profile = MARKET_OPEN_PROFILES["live"]
+    assert profile["window_start_et"] == f"{spec.window_start_et[0]:02d}:{spec.window_start_et[1]:02d}"
+    assert profile["window_end_et"] == f"{spec.window_end_et[0]:02d}:{spec.window_end_et[1]:02d}"
+
+
+def test_market_open_config_json_window_matches_the_live_slot_spec():
+    """config/market_open_dca.json's live_task window is the third copy of the
+    same bounds; it is documentation for readers and for the artifact contract,
+    so it must not name a close the runner no longer enforces."""
+    from dca_runner import SLOTS
+
+    spec = SLOTS["0935"]
+    live_task = json.loads((Path(__file__).resolve().parent.parent / "config" / "market_open_dca.json").read_text(encoding="utf-8"))["live_task"]
+    assert live_task["window_start_et"] == f"{spec.window_start_et[0]:02d}:{spec.window_start_et[1]:02d}"
+    assert live_task["window_end_et"] == f"{spec.window_end_et[0]:02d}:{spec.window_end_et[1]:02d}"
 
 
 if __name__ == "__main__":
