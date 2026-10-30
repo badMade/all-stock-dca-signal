@@ -381,10 +381,11 @@ def build_daily_snapshot(
         all_records, fill_warnings = collect_purchase_records(root)
         from collections import defaultdict
 
-        # ⚡ Bolt Optimization: Replace O(N*M) nested path resolution with O(N+M) dictionary lookup
-        # Reduces `build_daily_snapshot` execution time from ~2.35s to ~0.22s (10x speedup)
-        # on days with many purchase records and run states.
-        resolved_state_dirs = {path.parent: str(path.parent.resolve()) for path, _ in states}
+        # ⚡ Bolt Optimization: Deduplicate `path.parent.resolve()` syscalls
+        # Multiple run states often exist in the same run directory (e.g. variants, recoveries).
+        # Deduplicating the parents via a set before resolving eliminates redundant I/O overhead.
+        parents = {path.parent for path, _ in states}
+        resolved_state_dirs = {p: str(p.resolve()) for p in parents}
         excluded = {resolved_state_dirs[path.parent] for path, state in states if _mode(state) in {"dry_run", "demo"}}
         records_by_dir = defaultdict(list)
         records = []
