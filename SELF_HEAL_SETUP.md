@@ -51,6 +51,9 @@ than once, with the fix that ended them. Check here before treating one as new d
 * **Fix in place:** the file is untracked and `/pr_description.*` is in `.gitignore`.
   `AGENTS.md` ("Pull request expectations") tells agents to put the description in the PR
   body instead.
+* **Guard:** `tests/test_config_invariants.py::test_pr_description_scratch_file_is_not_tracked_and_stays_ignored`
+  fails CI (and `scripts/healthcheck.py`, which runs the same pytest) if a root
+  `pr_description.*` is tracked again or the `.gitignore` rule is removed.
 * **If it comes back** (an agent force-adds the file, or an older branch still carries it):
   resolve by deleting the file from that PR, not by picking either side's text:
 
