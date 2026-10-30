@@ -1281,7 +1281,9 @@ def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if not value.endswith("Z"):
+            raise ValueError(value)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
 

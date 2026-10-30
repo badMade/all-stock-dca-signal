@@ -86,15 +86,15 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
         "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
         "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
-        "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
-        "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.slot_attribution",
+        "scripts.sync_live_prompts", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
+        "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.planner_repaste_notice", "scripts.slot_attribution",
     )),
     ("broker_market", "Broker, orders & market data", (
         "dca_live_adapters", "dca_slot_guard", "build_raw_data", "run_market_open_signals",
         "scripts.ingest_market_data", "scripts.build_robinhood_market_data", "scripts.order_refetch",
         "scripts.prior_reference_bindings", "scripts.assemble_order_pages", "scripts.adhoc_orders",
         "scripts.emit_order_plan", "scripts.refresh_market_open_candidates", "scripts.backup_gates",
-        "scripts.backup_procedure",
+        "scripts.backup_procedure", "scripts.merge_order_pages", "scripts.check_per_order_record",
     )),
     ("research", "Research & analysis", (
         "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",
@@ -103,7 +103,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.sequestered_truth_comparator",
     )),
     ("utilities", "Dev tools & utilities", (
-        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues", "patch_finbert_cache", "patch_template",
+        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues",
         "snap", "scripts.__init__", "scripts.agent_entry_points", "scripts.compute_schedule",
         "scripts.fill_perplexity_backup_prompts", "scripts.github_mcp_login", "scripts.healthcheck",
         "scripts.self_heal", "scripts.verify_perplexity_pair", "scripts.workflow_policy", "scripts.promote_console",

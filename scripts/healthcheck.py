@@ -11,7 +11,8 @@ import sys
 import tempfile
 
 
-def run_cmd(cmd):
+def run_cmd(cmd: list[str]) -> bool:
+    """Executes a command and returns True if successful."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, shell=False)  # nosec B603 - explicit shell=False
         if result.returncode != 0:
@@ -27,7 +28,8 @@ def run_cmd(cmd):
         return False
 
 
-def main():
+def main() -> None:
+    """Main entrypoint for the healthcheck gate."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 

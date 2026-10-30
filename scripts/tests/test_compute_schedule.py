@@ -360,3 +360,136 @@ def test_sync_workflow_cron_with_mocked_ruamel_yaml(monkeypatch, tmp_path):
     changed = compute_schedule.sync_workflow_cron(str(workflow_file), "0 4 * * *")
     assert changed is True
     assert workflow_file.read_text() == "dumped: true"
+
+def test_compute_cadence_ci_failure_rate(monkeypatch):
+    def mock_run_cmd(cmd, *args, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "gh run list" in cmd_str and "--workflow=ci" in cmd_str:
+            return '[{"conclusion": "failure"}, {"conclusion": "success"}]'
+        elif "git log" in cmd_str:
+            return "2026-09-01T12:00:00Z\n"
+        return ""
+
+    monkeypatch.setattr(compute_schedule, "run_cmd", mock_run_cmd)
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule
+
+def test_compute_cadence_pr_json_error(monkeypatch):
+    def mock_run_cmd(cmd, *args, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "gh pr list" in cmd_str and "merged:>=" in cmd_str:
+            return 'invalid json'
+        elif "git log" in cmd_str:
+            return "2026-09-01T12:00:00Z\n"
+        return ""
+
+    monkeypatch.setattr(compute_schedule, "run_cmd", mock_run_cmd)
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule
+
+def test_compute_cadence_bad_commit_date(monkeypatch):
+    def mock_run_cmd(cmd, *args, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "git log" in cmd_str:
+            return "bad_date_formatTxx:yy\ninvalid\n"
+        return ""
+
+    monkeypatch.setattr(compute_schedule, "run_cmd", mock_run_cmd)
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule
+
+def test_compute_cadence_reduce_frequency(monkeypatch):
+    def mock_run_cmd(cmd, *args, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "gh run list" in cmd_str and "--workflow=self-heal.yml" in cmd_str:
+            return '[{"createdAt": "2026-10-10T12:00:00Z"}, {"createdAt": "2026-10-10T11:00:00Z"}, {"createdAt": "2026-10-10T10:00:00Z"}]'
+        elif "gh pr list" in cmd_str and "--label self-heal" in cmd_str:
+            return '[{"createdAt": "2026-10-10T09:00:00Z"}]'
+        elif "git log" in cmd_str:
+            return "\n".join(["2026-09-01T12:00:00Z"] * 2) # pr_count = 2, tier 1, reduced by 1 -> tier 0
+        return ""
+
+    monkeypatch.setattr(compute_schedule, "run_cmd", mock_run_cmd)
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 0 1 * *"
+
+def test_compute_cadence_increase_frequency(monkeypatch):
+    def mock_run_cmd(cmd, *args, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "gh pr list" in cmd_str and "--state all" in cmd_str:
+            return '[{"state": "MERGED"}, {"state": "MERGED"}, {"state": "MERGED"}]'
+        elif "git log" in cmd_str:
+            return "\n".join(["2026-09-01T12:00:00Z"] * 2) # pr_count = 2, tier 1, increased by 1 -> tier 2
+        return ""
+
+    monkeypatch.setattr(compute_schedule, "run_cmd", mock_run_cmd)
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 0 */3 * *"
+
+def test_update_schedule_file_no_ruamel(monkeypatch, tmp_path):
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ruamel.yaml":
+            raise ImportError("No ruamel.yaml")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    compute_schedule.update_schedule_file("0 3 * * *", "Test rationale.", str(schedule_file), override=False)
+
+    content = schedule_file.read_text()
+    assert "schedule: '0 3 * * *'" in content
+    assert "rationale: 'Test rationale.'" in content
+    assert "override: false" in content
+    assert "# AUTO-UPDATED" in content
+
+
+def test_update_schedule_file_with_ruamel(monkeypatch, tmp_path):
+    class FakeYAML:
+        def __init__(self):
+            self.preserve_quotes = False
+
+        def load(self, f):
+            return {}
+
+        def dump(self, data, f):
+            import json
+            f.write(json.dumps(data))
+
+    import types
+    fake_mod = types.ModuleType("ruamel.yaml")
+    fake_mod.YAML = FakeYAML  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ruamel", fake_mod)
+    monkeypatch.setitem(sys.modules, "ruamel.yaml", fake_mod)
+
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    # Create the file first so os.path.exists is true
+    schedule_file.write_text("{}")
+
+    compute_schedule.update_schedule_file("0 3 * * *", "Test rationale.", str(schedule_file), override=False)
+
+    content = schedule_file.read_text()
+    assert "0 3 * * *" in content
+    assert "Test rationale." in content
+    assert "# AUTO-UPDATED" in content
+
+def test_sync_workflow_cron_fallback_no_ruamel(monkeypatch, tmp_path):
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ruamel.yaml":
+            raise ImportError("No ruamel.yaml")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    workflow_file = tmp_path / "self-heal.yml"
+    workflow_file.write_text("on:\n  schedule:\n    - cron: '0 1 * * 1' # AUTO-UPDATED\n")
+
+    changed = compute_schedule.sync_workflow_cron(str(workflow_file), "0 3 * * 1")
+    assert changed is True
+    assert "cron: '0 3 * * 1'" in workflow_file.read_text()

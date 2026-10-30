@@ -197,6 +197,12 @@ def resolve_log_path(triggered_at_utc: datetime, *, root: str | Path | None = No
     return Path(root if root is not None else stream_root("model_usage")) / yyyymm / "model_usage.jsonl"
 
 
+def _strict_iso_z_parse(val: str) -> datetime:
+    if not val.endswith("Z"):
+        raise ValueError(val)
+    return datetime.fromisoformat(val.replace("Z", "+00:00"))
+
+
 def append_model_usage_entry(entry: Mapping[str, Any], *, root: str | Path | None = None) -> Path:
     """Append one already-validated entry as a JSONL line. Creates the monthly
     directory if needed. Raises on I/O failure -- use ``log_model_usage`` for
@@ -205,7 +211,7 @@ def append_model_usage_entry(entry: Mapping[str, Any], *, root: str | Path | Non
     triggered = (
         triggered_raw
         if isinstance(triggered_raw, datetime)
-        else datetime.strptime(triggered_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        else _strict_iso_z_parse(triggered_raw)
     )
     path = resolve_log_path(triggered, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +304,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def _main(argv: Optional[list] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     triggered_at_utc = (
-        datetime.strptime(args.triggered_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        _strict_iso_z_parse(args.triggered_at_utc)
         if args.triggered_at_utc
         else None
     )

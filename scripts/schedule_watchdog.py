@@ -89,7 +89,9 @@ from dca_net_utils import (
     sanitize_exception as _sanitize_exception,
 )
 from dca_paths import cron_tracking_root
-from scripts.verify_schedule import OK_STATUSES, verify_day
+from scripts.run_classification import ORDER_SUBMIT_STATUS_ERROR
+from scripts.scheduled_artifacts import ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE
+from scripts.verify_schedule import OK_STATUSES, STATUS_VERIFIED, verify_day
 
 ET = ZoneInfo("America/New_York")
 
@@ -116,14 +118,72 @@ WATCHDOG_GATE_TOKEN = "SCHEDULE_WATCHDOG"
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 
+# order_submit_status values that mean the slot RAN and still could not do its job (market data unavailable,
+# a refused place_equity_order, an unreachable placement phase). Quiet outcomes (no orders, no candidates,
+# budget exhausted, confirmation required) are deliberately absent: they are decisions, not failures.
+ERROR_OUTCOME_STATUSES = frozenset({ORDER_SUBMIT_STATUS_ERROR, ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE})
+
 
 def failing_rows(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The slots in ``report`` (from :func:`verify_day`) that failed the audit."""
     return [row for row in report["slots"] if row["status"] not in OK_STATUSES]
 
 
+def audit_day(day: date, now: datetime, *, root: Optional[Path] = None) -> Dict[str, Any]:
+    """:func:`verify_day` plus each row's ``error_class``, read from that slot's own run_state.json.
+
+    Done here, not in ``verify_day``: scripts/verify_schedule.py is a source of the Perplexity backup planner
+    (its stamp changes with it, which forces a repaste of every backup prompt), and the audit verdict never
+    needs the field.
+    """
+    report = verify_day(day, now, root=root)
+    base = Path(root) if root is not None else Path(cron_tracking_root())
+    for row in report["slots"]:
+        error_class = None
+        try:
+            state = json.loads((base / row["run_dir"] / "run_state.json").read_text(encoding="utf-8"))
+            if isinstance(state, dict) and isinstance(state.get("error_class"), str):
+                error_class = state["error_class"]
+        except (OSError, ValueError):
+            pass
+        row["error_class"] = error_class
+    return report
+
+
+def error_outcome_rows(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Verified slots whose run finalized in an error outcome.
+
+    2026-10-26/27: classifier refusals of place_equity_order and market_data_unavailable aborts wrote complete,
+    valid evidence, so ``failing_rows`` stayed empty and the day read green. Only VERIFIED rows count here: a
+    row that already fails the evidence audit is reported by ``failing_rows``, never twice.
+    """
+    return [row for row in report["slots"]
+            if row["status"] == STATUS_VERIFIED and row.get("order_submit_status") in ERROR_OUTCOME_STATUSES]
+
+
+def flagged_rows(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Every slot the watchdog alerts on: missing or incomplete evidence, then error outcomes."""
+    return failing_rows(report) + error_outcome_rows(report)
+
+
+def _error_alert_body(report: Mapping[str, Any], row: Mapping[str, Any]) -> str:
+    error_class = row.get("error_class") or "none recorded"
+    return (
+        f"Schedule watchdog: slot {row['time_et']} ET ({row['stream']}) ran for {report['date']} "
+        f"but ended in an error outcome.\n"
+        f"Order submit status: {row['order_submit_status']}\n"
+        f"Error class: {error_class}\n"
+        f"Run directory: {row['run_dir']}\n"
+        f"Detected independently of the executor session by "
+        f"scripts.schedule_watchdog at {report['checked_at_et']} -- this "
+        f"fires whether or not that session alerted on its own."
+    )
+
+
 def alert_body(report: Mapping[str, Any], row: Mapping[str, Any]) -> str:
-    """Plain-text Gate-9-style alert body for one failing slot."""
+    """Plain-text Gate-9-style alert body for one flagged slot."""
+    if row["status"] == STATUS_VERIFIED:
+        return _error_alert_body(report, row)
     reasons = "; ".join(row["reasons"]) or "no reason recorded"
     # Additive triage tag: only a slot that never started carries a Key, so the
     # Notion reconciler can tell it from a late or half-finished run.
@@ -172,7 +232,7 @@ def write_watchdog_alert_files(report: Mapping[str, Any], *, root: Optional[Path
     base = Path(root) if root is not None else Path(cron_tracking_root())
     day = date.fromisoformat(report["date"])
     written: List[Path] = []
-    for row in failing_rows(report):
+    for row in flagged_rows(report):
         path = _watchdog_alert_path(base, day, row["slot_id"])
         body = _redacted_diagnostic_text(alert_body(report, row)).rstrip("\n") + "\n"
         try:
@@ -212,7 +272,7 @@ def send_slack_alert(
     scripts.drift_detection.send_slack_alert exactly, since this is the same
     class of opt-in, env-only, no-secrets-in-git webhook path.
     """
-    rows = failing_rows(report)
+    rows = flagged_rows(report)
     if not rows:
         return False
     url = _resolve_slack_webhook(webhook, env_var)
@@ -224,10 +284,14 @@ def send_slack_alert(
     except _UnsafeDestinationError as exc:
         raise urllib.error.URLError(f"Invalid or unsafe webhook destination: {exc}") from exc
 
-    slots = ", ".join(f"{row['time_et']} ET ({row['stream']}: {row['status']})" for row in rows)
+    errors = {row["slot_id"] for row in error_outcome_rows(report)}
+    slots = ", ".join(
+        f"{row['time_et']} ET ({row['stream']}: {'error outcome' if row['slot_id'] in errors else row['status']})"
+        for row in rows
+    )
     text = (
-        f":rotating_light: DCA schedule watchdog: {len(rows)} slot(s) left no "
-        f"valid evidence for {report['date']}\nSlots: {slots}\n"
+        f":rotating_light: DCA schedule watchdog: {len(rows)} slot(s) left no valid evidence or ended in an "
+        f"error outcome for {report['date']}\nSlots: {slots}\n"
         f"Detected independently of the executor sessions -- see the repo "
         f"alert file(s) or run `python -m scripts.schedule_watchdog --date "
         f"{report['date']} --json` for full detail."
@@ -263,13 +327,17 @@ def notify_macos(title: str, message: str) -> None:
 def _render(report: Mapping[str, Any]) -> str:
     lines = [f"Schedule watchdog for {report['date']} (checked {report['checked_at_et']})"]
     rows = failing_rows(report)
-    if not rows:
+    errors = error_outcome_rows(report)
+    if not rows and not errors:
         lines.append("OK -- every due slot verified or was not due")
         return "\n".join(lines)
     for row in rows:
         lines.append(f"  FAILING  {row['time_et']}  {row['stream']:<12} {row['status']:<20} "
                      f"{'; '.join(row['reasons'])}")
-    lines.append(f"{len(rows)} slot(s) failing: {', '.join(r['slot_id'] for r in rows)}")
+    for row in errors:
+        lines.append(f"  ERROR    {row['time_et']}  {row['stream']:<12} {row['order_submit_status']:<20} "
+                     f"error_class={row.get('error_class') or 'none'}")
+    lines.append(f"{len(rows) + len(errors)} slot(s) flagged: {', '.join(r['slot_id'] for r in rows + errors)}")
     return "\n".join(lines)
 
 
@@ -295,8 +363,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     now = datetime.now(ET)
     day = date.fromisoformat(args.date) if args.date else now.date()
     root = Path(args.root) if args.root else None
-    report = verify_day(day, now, root=root)
-    rows = failing_rows(report)
+    report = audit_day(day, now, root=root)
+    rows = flagged_rows(report)
+    report["error_slots"] = [row["slot_id"] for row in error_outcome_rows(report)]
 
     if rows and not args.no_alert_file:
         written = write_watchdog_alert_files(report, root=root)
@@ -306,7 +375,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.notify and rows:
         # Slot ids and the date only: the alert files quote run_state values, a desktop banner must not.
-        message = f"{report['date']}: no verified evidence for slots {', '.join(r['slot_id'] for r in rows)}"
+        failing_ids = [r["slot_id"] for r in failing_rows(report)]
+        parts = []
+        if failing_ids:
+            parts.append(f"no verified evidence for slots {', '.join(failing_ids)}")
+        if report["error_slots"]:
+            parts.append(f"error outcome in slots {', '.join(report['error_slots'])}")
+        message = f"{report['date']}: {'; '.join(parts)}"
         try:
             notify_macos("Schedule watchdog FAILED", message)
         except (OSError, subprocess.SubprocessError) as exc:

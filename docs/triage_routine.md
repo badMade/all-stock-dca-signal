@@ -55,6 +55,17 @@ Anything that is not exactly `Approved` counts as not approved.
 
 ## Matching and Progress
 
+The routine passes each row's recorded `PR number` and `Commit URL` as `recorded_pr_number` and
+`recorded_commit_url`. A recorded PR or commit that cites the Key only in its body keeps counting; any other
+body-only citation does not. When a row records a PR that the evidence neither matched nor found citing the Key,
+`GitEvidence.recorded_pr_unconfirmed` is set and the routine skips the row instead of lowering it to "No work".
+Tracking columns (`GitHub issue`, `Branch`, `Commit URL`, `PR number`) are only ever replaced, never cleared, so a
+deleted `selfheal/<key>` branch leaves its recorded value in place.
+
+A commit matches only by the Key in its subject line (a squash merge's subject is the PR title), mirroring the PR
+title rule; the recorded commit wins over a newer match. Before this, the squash commit of #1930, a triage-tool
+change whose body only discussed five Keys, matched all five rows.
+
 A branch matches only as exactly `selfheal/<key>`. A PR matches by that head ref, or by the Key appearing as a whole
 token in its title, newest wins. A PR that cites the Key only in its body is **not a fix**: it comes back as `mentioned_in`, never reaches `derive_progress` (a Key with only such PRs is "No work"), and the digest lists it separately. The Key is the dedupe token, so name it in the TITLE of every fix PR (or use a `selfheal/<key>` head ref); a batch PR that fixes several Keys must list each Key in its title or be split.
 

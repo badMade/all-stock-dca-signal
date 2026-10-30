@@ -1,30 +1,26 @@
-## Scope
+### Summary of changes
+- Addressed a Critical JSON Parameter Pollution vulnerability flagged in `.jules/sentinel.md` where `json.loads` calls in `dca_console_state.py` and `dca_console_runs.py` silently allowed duplicate keys (which resolves to the last parsed value by default in Python).
+- Updated the vulnerable `json.loads` calls (`dca_console_state._read_object`, `dca_console_runs._parsable_json`, and `dca_console_runs._post_trade`) to enforce `object_pairs_hook=_reject_duplicate_keys` to ensure duplicate keys safely fail closed and return `"corrupt"` / `False` respectively.
+- Refactored `dca_console_runs.py` and `dca_console_state.py` to use a consistent locally defined `_reject_duplicate_keys` hook to avoid circular imports.
+- Created `test_read_object_rejects_duplicate_keys` and `test_post_trade_rejects_duplicate_keys` tests to strictly enforce duplicate-key rejection behavior.
 
-This branch started as a one-line performance fix and accumulated related schedule-evidence and backup-pipeline work. It is documented here in full rather than as "just a regex optimisation".
+### Exact test commands run
+- `source .venv/bin/activate && python -m pytest tests/test_dca_console_state.py tests/test_dca_console_runs.py -q`
+- `source .venv/bin/activate && ruff check .`
+- `source .venv/bin/activate && python -m pytest -q`
+- `source .venv/bin/activate && python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`
 
-**Performance (the original change)**
-- `near_close_dca._artifact_day_matches_scheduled_provenance` uses a module-level precompiled `re` object instead of an inline `re.match` (about 2.3x faster in `python3 -m timeit`; see `.jules/bolt.md`). No other change to `near_close_dca.py`.
+### Known limitations/proposed workflow diffs
+- None.
 
-**Schedule evidence and monitoring**
-- `scripts/finalize_run_evidence.py`, `scripts/backfill_afternoon_evidence.py`: deployment accounting, operator-attributed order backfill, separate invocation vs write timestamps.
-- `scripts/verify_schedule.py`: failed-start classification over the finalizer's acceptance window (so an early crash is a crash, not `slot_did_not_fire`); undecodable attempt logs degrade to missing evidence.
-- `scripts/schedule_watchdog.py`, `scripts/planner_stamp_check.py`, `deploy/launchd/*.plist.template`, `scripts/agent_entry_points.py`: weekday post-close audit and planner-freshness notifications; `osascript` failures propagate.
-- `scripts/drift_detection.py`, `deploy/run-drift-check.sh`, `deploy/systemd/dca-drift-*.service`: header-only signal files, sanitized Slack failures, `REPO_ROOT` parameterized with `$$` deferral and quoting.
+### Confirmation of no secrets added
+- No secrets were added.
 
-**Backup pipeline and prompts**
-- `scripts/backup_procedure.py`, `scripts/assemble_market_data.py`, `claude/dca-executor-prompts/**`: published-set discovery, interpreter guard, bridge install diagnostics, dry-run switch, regenerated Perplexity prompts.
-- `backup_planner.pyz`: rebuilt from the merged sources (`scripts/build_backup_planner.py`). `scripts/backup_planner.py` itself is identical to `main` (decimal-string quotes are still accepted).
-- `config/recommendations.json` is identical to `main` (GitHub publisher stays enabled).
+### Entry-point coverage statement
+- `run_dca.py` tests correctly passed, ensuring safe fallback states inside the console pipelines.
 
-**Not in this PR:** any change to sizing, budgets, or order placement in `near_close_dca.py`, `morning_dca.py`, or the console state/config modules (restored to `main`).
-
-✅ **Verification:**
-```bash
-ruff check .
-python -m pytest -q
-python -m pytest scripts/tests -q
-python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo
-python -m scripts.build_backup_planner --out backup_planner.pyz --check
-```
-🔒 **Secrets Confirmation:** Confirmed no secrets were added.
-🧭 **Entry-Point Coverage:** `run_dca.run_slot()` (regex only); prompt-driven slots and backup execution via the evidence/finalizer/prompt changes above.
+### Findings Table
+| Severity | File:Line | Issue | Entry Point | Confidence % | Minimal Fix |
+|---|---|---|---|---|---|
+| CRITICAL | `dca_console_state.py:322` | Parameter Pollution via Duplicate JSON Keys allows silent logic override | Console Reader / Runs | 96% | Pass `object_pairs_hook=_reject_duplicate_keys` |
+| HIGH | `dca_console_runs.py:487`, `560` | Parameter Pollution via Duplicate JSON Keys | Console Reader / Runs | 96% | Pass `object_pairs_hook=_reject_duplicate_keys` |

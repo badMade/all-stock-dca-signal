@@ -712,7 +712,11 @@ class SlotSpec:
 SLOTS: dict[str, SlotSpec] = {
     # The window opens AT nominal (9:35), never before: the 9:35 decision reads the
     # completed 9:30 bar, so an earlier fire has no decision bar to trade on.
-    "0935": SlotSpec("0935", (9, 35), (9, 35), (10, 0), "market-open"),
+    # It closes at 10:20, not 10:00 (operator decision 2026-10-28): on 2026-10-27 the
+    # scheduler fired this slot about 18 minutes late and the run aborted for lack of
+    # time with 32 candidates unplaced. The close stays before the 10:30 slot's open,
+    # and Gate 4's interlock reads the same bounds, so it widens with the window.
+    "0935": SlotSpec("0935", (9, 35), (9, 35), (10, 20), "market-open"),
     "1030": SlotSpec("1030", (10, 30), (10, 30), (11, 0), "morning"),
     "1130": SlotSpec("1130", (11, 30), (11, 30), (12, 0), "intraday"),
     "1230": SlotSpec("1230", (12, 30), (12, 30), (13, 0), "midday"),

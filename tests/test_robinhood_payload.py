@@ -1,5 +1,6 @@
 """scripts/robinhood_payload.py: the validation that stands between an LLM-copied fetch and a live slot."""
 
+import hashlib
 import json
 from datetime import date, time
 
@@ -111,7 +112,7 @@ def test_low_coverage_publishes_nothing(tmp_path):
     chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
-    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "out" / "payload.json").exists()
     assert rp.check(plan, min_coverage=0.8) == 2
 
 
@@ -137,7 +138,7 @@ def test_default_floor_still_refuses_a_stale_feed(tmp_path):
     chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-8]})
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
-    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "out" / "payload.json").exists()
 
 
 def test_default_floor_boundary_is_ninety_five_percent(tmp_path):
@@ -323,7 +324,7 @@ def test_a_quote_just_before_the_decision_bar_makes_the_payload_stale(tmp_path):
     assert payload["sources"]["robinhood"] == {}
     assert all("stale payload" in reason for reason in failed.values())
     assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
-    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "out" / "payload.json").exists()
 
 
 def test_one_thin_ticker_with_an_old_last_trade_does_not_fail_a_fresh_payload(tmp_path):
@@ -366,7 +367,24 @@ def test_publish_refuses_before_the_decision_anchor(tmp_path):
     payload, failed = rp.assemble(plan, [write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})])
     early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
     assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
-    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "out" / "payload.json").exists()
+
+
+def test_published_bytes_match_the_sidecar_checksum_even_with_windows_newlines(tmp_path, monkeypatch):
+    # Text mode turns "\n" into "\r\n" on Windows, so publish hashed one file and wrote another and `check` failed with
+    # "payload does not match its sidecar checksum". Simulate that translation here so the regression shows on any OS.
+    real_fdopen = rp.os.fdopen
+
+    def windows_fdopen(fd, mode="r", *args, newline=None, **kwargs):
+        return real_fdopen(fd, mode, *args, newline="\r\n" if newline is None else newline, **kwargs)
+
+    monkeypatch.setattr(rp.os, "fdopen", windows_fdopen)
+    plan = _published(tmp_path)
+    out = tmp_path / "out"
+    written = (out / "payload.json").read_bytes()
+    assert b"\r" not in written
+    assert hashlib.sha256(written).hexdigest() == json.loads((out / "payload.meta.json").read_text())["payload_sha256"]
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=5)) == 0
 
 
 def test_missing_or_mismatched_sidecar_fails_closed(tmp_path):
@@ -449,15 +467,96 @@ def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():
     assert rp.validate_ticker(raw, **kw(), now=datetime(2026, 10, 15, 14, 30, tzinfo=rp.ET))  # within the skew
 
 
+# --- refusal marker: `check` must say WHY a payload is missing (2026-10-21: three slots aborted while the
+# 13:30 alert guessed "the launchd job is probably not running"; the job had run and refused at 89/90). ---
+
+
+def _refuse_one_of_ten(tmp_path):
+    tickers = [f"T{i}" for i in range(10)]
+    plan = plan_for(tmp_path, tickers)
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-1]})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=1.0) == 2
+    return plan
+
+
+def test_refused_publish_writes_a_marker_naming_the_stale_ticker(tmp_path):
+    plan = _refuse_one_of_ten(tmp_path)
+    marker = json.loads((tmp_path / "out" / "payload.refused.json").read_text())
+    assert (marker["slot"], marker["trading_day"]) == ("1430", "2026-10-15")
+    assert (marker["valid"], marker["universe"]) == (9, 10)
+    assert "T9" in marker["failed"] and marker["min_coverage"] == 1.0
+    assert "below 100%" in marker["reason"]
+    assert not (tmp_path / "out" / "payload.json").exists()
+    assert plan["tickers"][-1] == "T9"
+
+
+def test_check_reports_the_refusal_instead_of_a_bare_missing(tmp_path, capsys):
+    plan = _refuse_one_of_ten(tmp_path)
+    assert rp.check(plan, min_coverage=1.0) == 2
+    err = capsys.readouterr().err
+    assert "missing" in err
+    assert "publisher ran and refused" in err
+    assert "9/10" in err and "T9" in err
+
+
+def test_check_without_a_marker_says_no_publisher_record(tmp_path, capsys):
+    plan = plan_for(tmp_path, ["AAA"])
+    assert rp.check(plan, min_coverage=1.0) == 2
+    err = capsys.readouterr().err
+    assert "no record that the publisher ran" in err
+    assert "refused" not in err
+
+
+def test_marker_for_another_slot_or_day_is_ignored(tmp_path, capsys):
+    plan = _refuse_one_of_ten(tmp_path)
+    capsys.readouterr()  # drop the refusal's own stderr, which names T9; only check's output is under test
+    path = tmp_path / "out" / "payload.refused.json"
+    marker = json.loads(path.read_text())
+    marker["slot"] = "1330"
+    path.write_text(json.dumps(marker))
+    assert rp.check(plan, min_coverage=1.0) == 2
+    err = capsys.readouterr().err
+    assert "no record that the publisher ran" in err
+    assert "T9" not in err
+
+
+def test_unreadable_marker_degrades_to_no_record(tmp_path, capsys):
+    plan = _refuse_one_of_ten(tmp_path)
+    (tmp_path / "out" / "payload.refused.json").write_text("{not json")
+    assert rp.check(plan, min_coverage=1.0) == 2
+    assert "no record that the publisher ran" in capsys.readouterr().err
+
+
+def test_a_successful_publish_clears_an_earlier_refusal(tmp_path):
+    plan = _refuse_one_of_ten(tmp_path)
+    assert (tmp_path / "out" / "payload.refused.json").is_file()
+    tickers = plan["tickers"]
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=1.0) == 0
+    assert not (tmp_path / "out" / "payload.refused.json").exists()
+
+
+def test_refusal_before_the_anchor_is_recorded_too(tmp_path):
+    plan = plan_for(tmp_path, ["AAA"])
+    payload, failed = rp.assemble(plan, [write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})])
+    early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
+    assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
+    marker = json.loads((tmp_path / "out" / "payload.refused.json").read_text())
+    assert "before the 14:30 anchor" in marker["reason"]
+
+
 # -- launcher timing log (2026-10-21 09:35 abort: nobody knew how long a real 12-chunk build takes) -----------------
 
 LAUNCHER = "deploy/launchd/robinhood_payload.sh"
 
 
-def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None):
+def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_script=None):
     """Run the real launcher for a past trading day with a stub `codex` (default: answers every chunk with `{}`).
 
     The merge then publishes nothing (no data for any ticker), which is fine: this exercises the fetch loop's logging only.
+    ``fake_script`` replaces the whole stub when a test needs one that reads the prompt (``_RESCUE_STUB``).
     """
     import os
     import subprocess
@@ -467,7 +566,8 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None):
     repo = Path(__file__).resolve().parents[1]
     fake = tmp_path / "fake_codex"
     fake.write_text(
-        f'#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n{reply}\n'
+        fake_script
+        or f'#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n{reply}\n'
     )
     fake.chmod(0o755)
     env = {
@@ -518,6 +618,155 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     ), log
 
 
+# -- a whole dead chunk (2026-10-26 09:35 abort) -----------------------------------------------------------------------
+# Chunks 4 and 10 of the 0935 plan each failed both attempts, so 16 of 91 tickers (two whole chunks) went missing and
+# the 95% floor refused the payload. The floor tolerates 4 misses but the unit that fails is an 8-ticker chunk, so one
+# dead chunk alone was enough to cost the slot; and the launcher's cleanup deleted the workers' logs, so nobody could
+# say afterwards why those two workers died. The incident's plan is replayed here (2026-10-20 has the same universe).
+
+#: Stub ``codex``: answers each requested ticker with valid 0935 data for 2026-10-20, except that it dies (stderr line,
+#: no reply, exit 1) on a request for a DEAD_CHUNKS chunk: with DEAD_MODE=whole only when the request is that whole
+#: chunk, with DEAD_MODE=always whenever the request names any of its tickers.
+_RESCUE_STUB = """#!{python}
+import json, re, sys
+out = sys.argv[sys.argv.index("-o") + 1]
+tickers = re.search(r"Tickers: (.*)", sys.stdin.read()).group(1).split(", ")
+dead = [set(c) for c in json.loads({dead!r})]
+if any(set(tickers) == c if {mode!r} == "whole" else set(tickers) & c for c in dead):
+    print("stub codex: simulated worker death for " + ",".join(tickers), file=sys.stderr)
+    sys.exit(1)
+bar = lambda ts: dict(timestamp=ts, open=10.0, high=10.2, low=9.9, close=10.1, volume=100)
+reply = {{t: dict(previous_close_bar=bar("2026-10-19T00:00:00Z"), intraday_bars=[bar("2026-10-20T13:30:00Z")],
+              quote=dict(price=10.1, as_of="2026-10-20T13:36:00Z")) for t in tickers}}
+open(out, "w").write(json.dumps(reply))
+"""
+
+_DEAD = (4, 10)  # the two chunks lost on 2026-10-26
+
+
+def _run_with_dead_chunks(tmp_path, mode):
+    import sys
+
+    plan = _plan_0935(tmp_path)
+    dead = [plan["chunks"][i] for i in _DEAD]
+    stub = _RESCUE_STUB.format(python=sys.executable, dead=json.dumps(dead), mode=mode)
+    done, _ = _run_launcher(tmp_path, fake_script=stub)
+    return done, plan, dead
+
+
+def _plan_0935(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {**os.environ, "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct")}
+    plan = subprocess.run(
+        [sys.executable, "-m", "scripts.robinhood_payload", "plan", "--slot", "0935", "--day", "2026-10-20"],
+        env=env, capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1], check=True,
+    )
+    return json.loads(plan.stdout)
+
+
+def test_launcher_rescues_the_tickers_of_a_chunk_that_died_on_both_attempts(tmp_path):
+    from pathlib import Path
+
+    # The dead chunks' tickers are fine; only the 8-ticker request that carries them dies. Re-asking for them in
+    # smaller requests must recover them, so the slot publishes its whole universe instead of aborting at Gate 5.
+    done, plan, dead = _run_with_dead_chunks(tmp_path, "whole")
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["valid"] == meta["universe"] == len(plan["tickers"]) and meta["failed"] == {}, meta
+    assert set(json.loads(out.read_text())["sources"]["robinhood"]) == set(plan["tickers"])
+
+
+# -- a chunk that replied but left tickers out (2026-10-26 13:30 refusal) -----------------------------------------------
+# Eight tickers came back "no data returned for this ticker" (coverage 83/91 < 95%) although Robinhood served every one
+# of them minutes later: their chunks replied, so the dead-chunk rescue never ran and run_chunk's whole-chunk retry had
+# not recovered them. They are now re-asked for alone.
+
+#: Stub ``codex``: valid data for every requested ticker, except that a request for a whole LOSSY chunk loses its first
+#: ticker (omitted, or answered with a per-ticker error when MODE=error). LOSS_ALWAYS=1 also loses it in a small request.
+_PARTIAL_STUB = """#!{python}
+import json, re, sys
+out = sys.argv[sys.argv.index("-o") + 1]
+tickers = re.search(r"Tickers: (.*)", sys.stdin.read()).group(1).split(", ")
+bar = lambda ts: dict(timestamp=ts, open=10.0, high=10.2, low=9.9, close=10.1, volume=100)
+reply = {{t: dict(previous_close_bar=bar("2026-10-19T00:00:00Z"), intraday_bars=[bar("2026-10-20T13:30:00Z")],
+              quote=dict(price=10.1, as_of="2026-10-20T13:36:00Z")) for t in tickers}}
+for chunk in json.loads({lossy!r}):
+    if {always!r} and chunk[0] in tickers or set(tickers) == set(chunk):
+        if {mode!r} == "error":
+            reply[chunk[0]] = {{"error": "no data"}}
+        else:
+            del reply[chunk[0]]
+open(out, "w").write(json.dumps(reply))
+"""
+
+
+def _run_with_lossy_chunks(tmp_path, mode, *, always=False):
+    import sys
+
+    plan = _plan_0935(tmp_path)
+    lossy = [plan["chunks"][i] for i in _DEAD]
+    stub = _PARTIAL_STUB.format(python=sys.executable, lossy=json.dumps(lossy), mode=mode, always=always)
+    done, _ = _run_launcher(tmp_path, fake_script=stub)
+    return done, plan, lossy
+
+
+@pytest.mark.parametrize("mode", ["omitted", "error"])
+def test_launcher_rescues_tickers_a_replying_chunk_left_out_or_errored(tmp_path, mode):
+    from pathlib import Path
+
+    # Two chunks reply, each minus its first ticker (absent, or a per-ticker error). The re-ask for just those tickers
+    # succeeds, so the slot publishes the whole universe instead of 89/91.
+    done, plan, lossy = _run_with_lossy_chunks(tmp_path, mode)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["valid"] == meta["universe"] == len(plan["tickers"]) and meta["failed"] == {}, meta
+    # Only the lossy chunks are rescued, and only for the one ticker each lost: no chunk that replied in full is re-asked.
+    import re
+
+    rescued = re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)
+    assert sorted(rescued) == sorted((str(i), "1") for i in _DEAD), log
+
+
+def test_launcher_rescue_never_makes_a_still_missing_ticker_worse(tmp_path):
+    from pathlib import Path
+
+    # The ticker is lost again in the small request, so it stays failed (one miss is inside the 95% floor, so the
+    # payload still publishes) and the rest of its chunk keeps the data the first reply gave it.
+    done, plan, lossy = _run_with_lossy_chunks(tmp_path, "omitted", always=True)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert set(meta["failed"]) == {chunk[0] for chunk in lossy}, meta
+    assert set(json.loads(out.read_text())["sources"]["robinhood"]) == set(plan["tickers"]) - set(meta["failed"])
+
+
+def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
+    from pathlib import Path
+
+    # The dead chunks' tickers fail however they are asked for, so the slot still refuses (the floor is unchanged);
+    # but the workers' own output must survive the launcher's cleanup next to the refusal marker, or the next
+    # incident is as undiagnosable as this one. Healthy chunks leave nothing behind.
+    done, plan, dead = _run_with_dead_chunks(tmp_path, "always")
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 2 and out.with_suffix(".refused.json").exists() and not out.exists(), log
+    kept = [p for p in out.parent.rglob("*") if p.is_file() and ".log" in p.name]
+    assert kept, f"no worker log kept under {out.parent}: {sorted(p.name for p in out.parent.rglob('*'))}"
+    texts = [p.read_text() for p in kept]
+    assert all("simulated worker death" in t for t in texts), kept  # only the dead requests' logs are kept
+    for chunk in dead:
+        assert any(f"simulated worker death for {','.join(chunk)}" in t for t in texts), (chunk, kept)
+
+
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
 
 
@@ -527,7 +776,9 @@ def test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk(tmp_path):
     done, chunks = _run_launcher(tmp_path)
     log = done.stdout + done.stderr
     assert "deadline chunk=" not in log and re.search(r"timing total .* deadline=0\b", log), log
-    assert len(re.findall(r"timing chunk=", log)) == chunks, log
+    # Whole chunks only (2026-10-26): the stub's empty replies now also trigger rescue requests, which log
+    # `timing chunk=<i>.r<k>`; those are rescue parts, not first-pass chunks, so they must not count here.
+    assert len(re.findall(r"timing chunk=\d+ attempt=", log)) == chunks, log
 
 
 def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):
@@ -552,6 +803,13 @@ def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):
 def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
     done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_SECONDS": "soon"})
     assert done.returncode == 2 and "must be whole numbers" in done.stderr
+
+
+@pytest.mark.parametrize("size, needle", [("two", "must be whole numbers"), ("0", "must be at least 1")])
+def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
+    # 0 would make the rescue loop's step zero; refuse it before any chunk is fetched.
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_RESCUE_CHUNK_SIZE": size})
+    assert done.returncode == 2 and needle in done.stderr and "timing chunk=" not in done.stderr, done.stderr
 
 
 # -- 3:30 PM (shadow only): plannable and buildable on demand, never scheduled, never read by a live prompt -------
@@ -645,3 +903,125 @@ def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())
+
+
+# -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
+# The same eight thinly traded names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between
+# 12:30 and 13:30, so 82/90 (91%) refused the slot on both days. A name that did not trade is not a failed fetch:
+# it is reported as "quiet" (Gate 5 scores it NO_DATA, never a BUY), kept out of the coverage denominator, and
+# capped so a real feed outage, which also yields empty series, still refuses.
+
+
+def quiet_ticker():
+    raw = good_ticker()
+    raw["intraday_bars"] = []
+    return raw
+
+
+def stale_ticker():
+    # FLKR 2026-10-27: it traded, but its newest bar is far before the anchor, so this stays a real failure.
+    return good_ticker(minutes=range(30, 40, 5)) | {"intraday_bars": [bar("2026-10-15T17:30:00Z")]}
+
+
+def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, total=90):
+    tickers = [f"T{i}" for i in range(total)]
+    plan = plan_for(tmp_path, tickers)
+    replies = {t: good_ticker() for t in tickers}
+    cursor = 0
+    for count, make in ((quiet, quiet_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"})):
+        for t in tickers[cursor : cursor + count]:
+            replies[t] = make()
+        cursor += count
+    chunk = write_chunk(tmp_path, "chunk_0.json", replies)
+    return plan, tickers, chunk
+
+
+def test_a_ticker_with_no_bars_in_the_window_is_a_quiet_ticker_error():
+    with pytest.raises(rp.QuietTickerError):
+        rp.validate_ticker(quiet_ticker(), **kw())
+
+
+def test_a_stale_newest_bar_is_a_plain_failure_not_a_quiet_ticker():
+    with pytest.raises(rp.PayloadError) as excinfo:
+        rp.validate_ticker(stale_ticker(), **kw())
+    assert not isinstance(excinfo.value, rp.QuietTickerError)
+
+
+def test_quiet_tickers_are_reported_apart_from_failed_fetches(tmp_path):
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"] == {"robinhood": [], "quiet": sorted(tickers[:8])}
+    assert sorted(payload["sources"]["robinhood"]) == sorted(tickers[8:])
+    assert set(failed) == set(tickers[:8])  # the reason is still recorded for the log and the sidecar
+
+
+def test_eight_quiet_tickers_of_ninety_still_publish(tmp_path):
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    assert not (tmp_path / "out" / "payload.refused.json").exists()
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    # generate_buy_candidates rejects unknown ticker_errors keys and scores errored names NO_DATA (never a BUY),
+    # so a quiet name stays under "robinhood" in the file; the sidecar says which of those did not trade.
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:8])}
+    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
+    assert meta["quiet"] == sorted(tickers[:8])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0  # re-validation must not read them as misses
+
+
+def test_more_quiet_tickers_than_the_cap_still_refuse(tmp_path):
+    # An outage that returns empty series looks the same as a quiet market; the cap keeps it a refusal.
+    plan, _, chunk = universe_plan(tmp_path, quiet=10)
+    assert rp.MAX_QUIET_SHARE == 0.10
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+    assert not (tmp_path / "out" / "payload.json").exists()
+    assert (tmp_path / "out" / "payload.refused.json").is_file()
+
+
+def test_the_floor_applies_to_the_non_quiet_tickers(tmp_path):
+    # 4 quiet leaves 86; 5 real failures give 81/86 = 94.2%, under the floor.
+    plan, _, chunk = universe_plan(tmp_path, quiet=4, errored=5)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+
+
+def test_real_failures_within_the_floor_publish_beside_quiet_tickers(tmp_path):
+    # 4 quiet leaves 86; 4 real failures give 82/86 = 95.3%, at or over the floor.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=4, errored=4)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:8])}
+    assert json.loads((tmp_path / "out" / "payload.meta.json").read_text())["quiet"] == sorted(tickers[:4])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+def test_a_stale_newest_bar_still_counts_against_the_floor(tmp_path):
+    # 2026-10-27 FLKR: 8 quiet plus 1 stale. The stale name stays under ticker_errors.robinhood, where the
+    # live prompts' ">5% errored aborts" rule still sees it; only the quiet names move to their own key.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=8, stale=1)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"]["robinhood"] == [tickers[8]]
+    assert payload["ticker_errors"]["quiet"] == sorted(tickers[:8])
+
+
+def test_a_published_payload_with_quiet_tickers_is_accepted_by_the_candidate_generator(tmp_path):
+    # generate_buy_candidates rejects ticker_errors keys that are not source names; the file must stay valid.
+    from scripts.generate_buy_candidates import _VALID_SOURCE_NAMES
+
+    plan, _, chunk = universe_plan(tmp_path, quiet=8)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert set(published["ticker_errors"]) <= set(_VALID_SOURCE_NAMES)
+
+
+def test_live_mirror_prompts_leave_quiet_tickers_out_of_the_errored_count():
+    from pathlib import Path
+
+    mirror = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "live-mirror"
+    for slot in rp.SLOTS:
+        (path,) = mirror.glob(f"{slot}ET-*.txt")
+        _, rule = _errored_ticker_rule(path)
+        assert '"quiet"' in rule and ".meta.json" in rule, path.name

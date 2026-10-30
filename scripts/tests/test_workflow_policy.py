@@ -149,6 +149,22 @@ def test_ci_runs_the_documented_market_breadth_suite():
 
 # --- Synthetic fixtures: the violation and exception mechanisms themselves ---
 
+def test_ci_gives_every_main_push_its_own_concurrency_group():
+    """A push to main must never be superseded by a later push (#1901's run was cancelled unstarted).
+
+    ``cancel-in-progress: false`` still lets GitHub drop an older run that is merely *pending* in a
+    group when a newer one queues, so main's runs, which are the record of what landed (and the only
+    place the 3.11 leg runs), must not share a group. Other refs keep one group per ref so a PR's
+    older runs are still cancelled by its newer pushes.
+    """
+    concurrency = REAL_DOCS[".github/workflows/ci.yml"]["concurrency"]
+    group = concurrency["group"]
+    assert "github.sha" in group, group
+    assert "refs/heads/main" in group, group
+    assert "github.ref" in group, group
+    assert concurrency["cancel-in-progress"] == "${{ github.ref != 'refs/heads/main' }}"
+
+
 def test_missing_timeout_is_reported_with_file_and_job():
     docs = {"x.yml": {"jobs": {"build": {"steps": []}}}}
     violations = check_timeout_minutes(docs)

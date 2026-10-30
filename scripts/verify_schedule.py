@@ -272,7 +272,9 @@ def verify_day(
     Attribution is informational only and never changes the audit verdict.
     ``root`` defaults to the cron-tracking root.
     """
-    base = Path(root) if root is not None else cron_tracking_root()
+    # Path() around BOTH branches: cron_tracking_root() returns a str, and a str base crashed
+    # _attempt_times's `base / "attempt_log"` on every default-root run (2026-10-28 operator run).
+    base = Path(root if root is not None else cron_tracking_root())
     slots = []
     for slot_id in SLOT_EVIDENCE_LAYOUT:
         run_dir = base / slot_run_dir_relative(slot_id, day)

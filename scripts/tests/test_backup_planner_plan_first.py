@@ -505,6 +505,84 @@ def test_executor_ids_refuses_an_unreadable_placement(tmp_path, capsys):
     assert (code, report["status"], [e["code"] for e in report["errors"]]) == (2, "FAILED", ["placement_corrupt"])
 
 
+# 2026-10-26: the 09:35 stand-down (on 25 orders a manual backup run placed, not Claude's: see
+# docs/incident_2026-10-26_0935_unrecognized_orders.md) exposed a gap. The live slots still run the gate-sequence
+# prompt (claude/dca-executor-prompts/live-mirror/), which saves each response as `$ROOT/place_<TICKER>.json` in the
+# slot's run directory, never under recommendations/<day>/placements/<slot>/, so executor-ids would print an empty
+# list for a day Claude did buy. These pin that the live prompt's own responses are read too.
+
+def _legacy_run_dir(cron_root, *, slot=SLOT, folder=None):
+    from scripts.verify_schedule import slot_run_dir_relative
+
+    relative = slot_run_dir_relative(slot, date.fromisoformat(DAY))
+    directory = cron_root / relative.parent / (folder or relative.name)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _executor_ids_argv(rec_root, cron_root, slot=SLOT):
+    return ["executor-ids", "--rec-root", str(rec_root), "--cron-root", str(cron_root),
+            "--trading-day", DAY, "--slot", slot]
+
+
+def test_executor_ids_lists_the_live_prompts_saved_responses(tmp_path, capsys):
+    cron_root = tmp_path / "cron"
+    directory = _legacy_run_dir(cron_root)
+    (directory / "place_MSFT.json").write_text(json.dumps(_placement("order-live-b")))
+    (directory / "place_BRK.B.json").write_text(json.dumps(_placement("order-live-a")))
+    (directory / "prior_ids_MSFT.json").write_text(json.dumps(["order-from-earlier"]))  # history, not placements
+    (directory / "cands_2026-10-07_1130.json").write_text(json.dumps([]))
+    code, report, _ = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root))
+    assert (code, report["status"], report["order_ids"]) == (0, "OK", ["order-live-a", "order-live-b"])
+    assert report["sources"] == {"plan_first_placements": 0, "live_prompt_placements": 2}
+
+
+def test_executor_ids_merges_both_sources(tmp_path, capsys):
+    cron_root = tmp_path / "cron"
+    (_legacy_run_dir(cron_root) / "place_MSFT.json").write_text(json.dumps(_placement("order-live")))
+    directory = RecommendationStore(tmp_path / "rec").placements_dir(date.fromisoformat(DAY), SLOT)
+    directory.mkdir(parents=True)
+    (directory / "AAPL.json").write_text(json.dumps(_placement("order-reader")))
+    code, report, _ = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root))
+    assert (code, report["order_ids"]) == (0, ["order-live", "order-reader"])
+    assert report["sources"] == {"plan_first_placements": 1, "live_prompt_placements": 1}
+
+
+def test_executor_ids_reads_the_1530_prompts_dashed_run_directory(tmp_path, capsys):
+    """The 15:30 prompt resolves $ROOT as `<YYYY-MM-DD>_1530ET`, unlike the compact folder Gate 9 writes."""
+    cron_root = tmp_path / "cron"
+    (_legacy_run_dir(cron_root, slot="1530", folder=f"{DAY}_1530ET") / "place_MSFT.json").write_text(
+        json.dumps(_placement("order-1530")))
+    code, report, _ = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root, slot="1530"))
+    assert (code, report["order_ids"]) == (0, ["order-1530"])
+
+
+def test_executor_ids_ignores_another_slots_live_responses(tmp_path, capsys):
+    cron_root = tmp_path / "cron"
+    (_legacy_run_dir(cron_root, slot="1330") / "place_MSFT.json").write_text(json.dumps(_placement("order-1330")))
+    code, report, _ = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root))
+    assert (code, report["order_ids"]) == (0, [])
+
+
+def test_executor_ids_refuses_an_unreadable_live_response(tmp_path, capsys):
+    cron_root = tmp_path / "cron"
+    (_legacy_run_dir(cron_root) / "place_MSFT.json").write_text("{not json")
+    code, report, _ = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root))
+    assert (code, report["status"], [e["code"] for e in report["errors"]]) == (2, "FAILED", ["placement_corrupt"])
+
+
+def test_live_prompt_order_id_feeds_classify(tmp_path, capsys):
+    """The 2026-10-26 case end to end: Claude's live order, no plan-first files at all, classifies as executor."""
+    cron_root = tmp_path / "cron"
+    row = _raw("MSFT", amount="4.00")
+    (_legacy_run_dir(cron_root) / "place_MSFT.json").write_text(json.dumps(_placement(row["id"])))
+    _, _, printed = _run(capsys, _executor_ids_argv(tmp_path / "rec", cron_root))
+    saved = _write(tmp_path, "executor_ids.json", printed)
+    code, report, _ = _classify(tmp_path, capsys, [row], ["--executor-ids", saved])
+    assert (code, report["status"]) == (0, "CLEAR")
+    assert report["executor_orders"][0]["basis"] == "plan_first_placement"
+
+
 def test_executor_ids_output_saved_verbatim_feeds_classify(tmp_path, capsys):
     """The prompt's round trip: the Mac prints, the task saves the text untouched, classify reads it."""
     directory = RecommendationStore(tmp_path).placements_dir(date.fromisoformat(DAY), SLOT)

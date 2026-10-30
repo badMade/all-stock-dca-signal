@@ -1,0 +1,90 @@
+name: Planner repaste notice
+
+# When a push to main changes backup_planner.pyz, its content_sha256 changes and every Perplexity backup task must be
+# repasted (prompt text AND attached planner) before its next slot. On 2026-10-28 the 9:35 backup failed at step 0
+# because the pasted prompt, the attached planner and main carried three different stamps. This opens (or updates) ONE
+# GitHub issue labelled planner-repaste, so the operator is emailed wherever they are. The Mac-side
+# scripts/planner_stamp_check.py is the second layer; it only helps when the Mac is on.
+#
+# The body is drafted by scripts/planner_repaste_notice.py and carries hashes, a symbol count, the names of the changed
+# bundled files and commands only, never a private value or file contents. A change that only touches comments or
+# docstrings is marked "optional"; it never rewrites an open "needed" issue.
+#
+# TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger, same rule as refresh-generated-docs.yml:
+# `push` runs this file and checks out main, never a dispatch-selected ref, and this job holds `issues: write`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backup_planner.pyz'
+
+# main's runs are the audit record and are never cancelled (scripts/workflow_policy.py convention). Serialised so two
+# quick pushes cannot both create an issue.
+concurrency:
+  group: planner-repaste-notice
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Opening, editing and commenting on issues, and `gh label create` (labels are scoped under Issues).
+  issues: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # The commit before the push is needed to read the previous planner's stamp.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Draft the repaste notice
+        id: draft
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          # A missing or unreadable previous planner (first push, history rewrite) is reported as "unknown", not skipped.
+          git show "${BEFORE_SHA}:backup_planner.pyz" > "${RUNNER_TEMP}/previous.pyz" 2>/dev/null || rm -f "${RUNNER_TEMP}/previous.pyz"
+          python -m scripts.planner_repaste_notice \
+            --previous "${RUNNER_TEMP}/previous.pyz" \
+            --current backup_planner.pyz \
+            --commit "${AFTER_SHA}" \
+            --out-dir "${RUNNER_TEMP}/notice"
+          if [ -f "${RUNNER_TEMP}/notice/title.txt" ]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Open or update the planner-repaste issue
+        if: steps.draft.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title="$(cat "${RUNNER_TEMP}/notice/title.txt")"
+          kind="$(cat "${RUNNER_TEMP}/notice/kind.txt")"
+          gh label create planner-repaste --color B60205 \
+            --description "Perplexity prompts and attached planner must be repasted" 2>/dev/null || true
+          existing="$(gh issue list --label planner-repaste --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            # A needed notice supersedes the open issue. An optional (comment-only) one must never retitle or rewrite
+            # an open "needed" issue, so it only comments. The comment is what emails the operator; an edit does not.
+            if [ "${kind}" = "needed" ]; then
+              gh issue edit "${existing}" --title "${title}" --body-file "${RUNNER_TEMP}/notice/body.md"
+            fi
+            gh issue comment "${existing}" --body-file "${RUNNER_TEMP}/notice/body.md"
+          else
+            gh issue create --title "${title}" --body-file "${RUNNER_TEMP}/notice/body.md" --label planner-repaste
+          fi

@@ -55,7 +55,7 @@ def test_resolve_ips_duplicate_ips():
         assert len(ips) == 1
         assert ipaddress.ip_address("93.184.216.34") in ips
 
-def test_proxy_configured_for_missing_host():
+def testproxy_configured_for_missing_host():
     # Line 78: missing host check in proxy_configured_for
     assert dca_net_utils.proxy_configured_for("file:///path/to/something") is False
 
@@ -66,7 +66,7 @@ def test_assert_safe_destination_missing_host():
         dca_net_utils.assert_safe_destination("http://")
 
 
-def test_connect_pinned_resolve_ips_oserror():
+def testconnect_pinned_resolve_ips_oserror():
     # Lines 171-172: OSError when resolving ips in connect_pinned
     conn = MagicMock()
     conn.host = "example.com"
@@ -75,7 +75,7 @@ def test_connect_pinned_resolve_ips_oserror():
             dca_net_utils.connect_pinned(conn)
 
 
-def test_connect_pinned_create_connection_oserror():
+def testconnect_pinned_create_connection_oserror():
     # Lines 182-184: OSError for all ips when creating connection
     conn = MagicMock()
     conn.host = "example.com"
@@ -347,3 +347,102 @@ def test_sanitize_exception_generic():
     sanitized = dca_net_utils.sanitize_exception(exc)
     assert sanitized == "ValueError"
     assert "secret token" not in sanitized
+
+def testproxy_configured_for_valid_host(monkeypatch):
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"https": "http://proxy:8080"})
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    assert dca_net_utils.proxy_configured_for("https://example.com") is True
+
+def testproxy_configured_for_bypassed_host(monkeypatch):
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"https": "http://proxy:8080"})
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+    assert dca_net_utils.proxy_configured_for("https://example.com") is False
+
+
+def test_proxy_configured_for_missing_scheme():
+    # If the URL has an unknown scheme, there might not be a proxy for it.
+    assert dca_net_utils.proxy_configured_for("unknown://example.com") is False
+
+def test_connect_pinned_no_addresses(monkeypatch):
+    import http.client
+    import socket
+    conn = http.client.HTTPConnection("example.com")
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: iter([__import__("ipaddress").ip_address("1.1.1.1")]))
+    def failing_create_connection(*args, **kwargs):
+        raise OSError("Failed to connect")
+    monkeypatch.setattr(socket, "create_connection", failing_create_connection)
+
+    with pytest.raises(OSError, match="Failed to connect"):
+        dca_net_utils.connect_pinned(conn)
+
+
+def test_connect_pinned_disallowed_addresses(monkeypatch):
+    import http.client
+    conn = http.client.HTTPConnection("example.com")
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: iter([__import__("ipaddress").ip_address("127.0.0.1")]))
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="disallowed address"):
+        dca_net_utils.connect_pinned(conn)
+
+
+def test_connect_pinned_no_valid_address_list_returns_default_error(monkeypatch):
+    import http.client
+    conn = http.client.HTTPConnection("example.com")
+    # Empty ips falls under 'not ips', but if we bypass that check:
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: iter([]))
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="disallowed address"):
+        dca_net_utils.connect_pinned(conn)
+
+
+def test_pinned_https_handler_proxied_request():
+    handler = dca_net_utils.PinnedHTTPSHandler()
+    req = MagicMock()
+    req.selector = "https://example.com/path"
+    req._tunnel_host = None
+    with patch.object(handler, "do_open") as mock_do_open:
+        handler.https_open(req)
+        # Should call do_open with standard HTTPSConnection
+        mock_do_open.assert_called_once_with(http.client.HTTPSConnection, req, context=handler._context)
+
+def test_pinned_https_handler_direct_request():
+    handler = dca_net_utils.PinnedHTTPSHandler()
+    req = MagicMock()
+    req.selector = "/path"
+    req._tunnel_host = None
+    with patch.object(handler, "do_open") as mock_do_open:
+        handler.https_open(req)
+        # Should call do_open with PinnedHTTPSConnection
+        mock_do_open.assert_called_once_with(dca_net_utils.PinnedHTTPSConnection, req, context=handler._context)
+
+
+def test_redact_url_with_malformed_port():
+    redacted = dca_net_utils.redact_url("https://example.com:notaport/path")
+    assert redacted == "https://example.com"
+
+
+def test_request_is_proxied_tunnel_host():
+    req = MagicMock()
+    req._tunnel_host = "proxy.example.com"
+    req.selector = "/path"
+    assert dca_net_utils.request_is_proxied(req) is True
+
+
+def test_pinned_http_handler_direct_request():
+    handler = dca_net_utils.PinnedHTTPHandler()
+    req = MagicMock()
+    req.selector = "/path"
+    req._tunnel_host = None
+    with patch.object(handler, "do_open") as mock_do_open:
+        handler.http_open(req)
+        # Should call do_open with PinnedHTTPConnection
+        mock_do_open.assert_called_once_with(dca_net_utils.PinnedHTTPConnection, req)
+
+
+def test_connect_pinned_success_on_first_ip(monkeypatch):
+    import http.client
+    import socket
+    conn = http.client.HTTPConnection("example.com")
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: iter([__import__("ipaddress").ip_address("8.8.8.8")]))
+    mock_sock = MagicMock()
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: mock_sock)
+    dca_net_utils.connect_pinned(conn)
+    assert conn.sock is mock_sock

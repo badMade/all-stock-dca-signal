@@ -51,8 +51,8 @@ set is the primary's own `{ticker, usd, ref_id}` list, which these backups now r
 | Command | Where | Output |
 | --- | --- | --- |
 | `plan --source mac_rec --trading-day D --slot S --now T` | Mac | The slot's set from the local store, by the reader's freshness rule (`config/recommendations.json` `max_age_minutes`), as a `plan_first` plan |
-| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set) |
-| `executor-ids --trading-day D --slot S` | Mac | The broker order ids the reader saved under `placements/<slot>/` |
+| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set). The Mac's `snapshot_cycle publish` launchd job pushes that branch (`docs/plan_first_recommendations.md`) |
+| `executor-ids --trading-day D --slot S` | Mac | The broker order ids Claude saved for the slot: the reader's `placements/<slot>/<TICKER>.json` and the live prompt's `place_<TICKER>.json` in the slot's run directory, with a per-source file count in `sources` |
 | `classify --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]` | sandbox | `CLEAR` or `UNRECOGNIZED` for every order inside this slot's window |
 
 A missing, stale or malformed set is `NO_VALID_PLAN`, and the backup falls back to `mac_plan`, `mac_compute` and
@@ -65,6 +65,20 @@ The broker echoes its own ref_id, so Claude's plan-first orders carry no `dca-ru
 recognises executor orders by the order ids `executor-ids` prints, by a legacy `dca-runner-<slot>-` reference or the
 native UUID if the broker ever echoes it, and, with the Mac out of reach, by a buy matching the published set's
 symbol and dollar amount to the cent. Any other order is UNRECOGNIZED, and the backup stands down.
+
+**2026-10-26 09:35 stand-down.** The 25 orders that read as UNRECOGNIZED were not Claude's: Claude's 09:35 run
+finalized at 09:40 with no orders, and a manual 09:46 run of this slot's own backup (task `4412c3c4`) placed them
+on a cloud-computed plan; the 9:57 scheduled run then stood down on them. See
+`docs/incident_2026-10-26_0935_unrecognized_orders.md`. The empty `executor-ids` list was correct for that day.
+It did expose a real gap, fixed since: `executor-ids` used to read only the reader's `placements/<slot>/`. The
+reader prompts (`drafts/plan-first/`) were never pasted live, so every Claude slot still runs the gate-sequence
+prompt in `live-mirror/`, which saves each response as `$ROOT/place_<TICKER>.json` in the slot's run directory
+(`market_open_dca/<YYYYMMDD>_0935ET/` for 09:35). No `placements/` directory exists in that case (`begin` creates
+it before any order, so its absence means the reader never ran, not that a write failed), so Claude's own orders
+would have read as UNRECOGNIZED on a day it did buy. `executor-ids` now reads both. Check after any Claude slot
+that bought:
+`sources.live_prompt_placements` plus `sources.plan_first_placements` should equal the number of orders placed. Zero
+for a slot that bought means the recognition chain is broken, and the backup will stand down (fail closed).
 
 ## Which slots take the safety-gate path
 
