@@ -79,3 +79,20 @@ def test_automatic_retry_cap_is_unchanged(name):
     # The new path must not loosen the existing rule: one automatic retry, then stop the batch.
     assert "Retry the FIRST refusal once and no more" in _text(name)
     assert "IT CONSUMES NO PLACEMENT ATTEMPT" in _text(name)
+
+
+@pytest.mark.parametrize("name", PROMPTS)
+def test_a_recheck_that_cannot_run_drops_the_ticker_and_never_passes_it(name):
+    rule = _rule(name)
+    # A recheck the session could not complete (tool error, empty or truncated result) is a failure, never a pass:
+    # the retry exists because the operator approved THESE checks being re-run, not a placement without them.
+    assert "a recheck that cannot be run is a failure, never a pass" in rule
+
+
+@pytest.mark.parametrize("name", PROMPTS)
+def test_a_retry_without_a_complete_scan_or_order_history_places_nothing(name):
+    rule = _rule(name)
+    # Gate 4's in-window scan and the Gate 6 order history guard the whole batch (duplicates, caps), so when either
+    # cannot be completed on the retry, nothing is placed: stop and alert, exactly as for a refusal.
+    assert "If Gate 4's in-window order scan or the Gate 6 order-history fetch cannot be completed" in rule
+    assert "place nothing on this retry" in rule
