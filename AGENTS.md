@@ -211,6 +211,10 @@ Every PR description should include:
   one does not propagate to the others. A reviewer cannot infer the coverage
   from the diff, so state it.
 
+Put the description in the PR body itself. Do not commit it as a file such as
+`pr_description.md` at the repo root: that path is gitignored, and a tracked copy
+made every agent PR conflict with `main`, because each one overwrote it.
+
 Never edit `.github/workflows/` in a pull request an agent drives. Those jobs
 hold `contents: write` and `pull-requests: write`, and the trust-boundary
 reasoning is written in the workflow headers themselves. Propose the change
