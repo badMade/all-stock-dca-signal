@@ -118,11 +118,11 @@ def test_a_second_abort_numbers_its_alert_file_instead_of_overwriting(root):
 
 
 def test_account_shaped_digits_and_email_addresses_are_redacted(root):
-    body = "Account 999000111222 failed; mail ops.person@example.com; at 2026-10-28 11:31.\n"
+    body = "Account 123456789 failed; mail ops.person@example.com; at 2026-10-28 11:31.\n"
     assert _record(root, "--slot", "1030", "--gate", "gate1", "--reason", "GATE1_OFF_WINDOW",
                    "--fired-at-utc", IN_WINDOW_UTC, body=body).returncode == 0
     text = (root / "morning_dca" / "alerts" / "2026-10-28-1030-gate1.txt").read_text()
-    assert "999000111222" not in text and "example.com" not in text
+    assert "123456789" not in text and "example.com" not in text
     assert "2026-10-28 11:31" in text
 
 
