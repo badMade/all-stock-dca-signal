@@ -245,3 +245,10 @@ def test_cli_show_prints_the_local_document(capsys):
     ss.record(DAY, "0935", "succeeded", now=NOW)
     assert ss.main(["show"]) == 0
     assert json.loads(capsys.readouterr().out)["slots"]["0935"]["status"] == "succeeded"
+
+
+def test_the_suite_never_publishes_for_real(monkeypatch):
+    # conftest.py sets the disable switch for every test, so local_heartbeat start/finish stay local.
+    assert ss._configured_publisher() is None
+    monkeypatch.delenv(ss.DISABLE_ENV)
+    assert ss._configured_publisher() is not None  # the checked-in config enables publishing on the operator's Mac

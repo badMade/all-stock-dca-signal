@@ -67,6 +67,7 @@ require_supported_python(sys.version_info)
 
 import dca_execution_router as router  # noqa: E402  (must follow the version guard)
 import dca_paths  # noqa: E402
+from scripts import slot_status  # noqa: E402
 from scripts.file_lock import cross_process_lock  # noqa: E402
 from scripts.scheduler_lease import SchedulerLease, window_key  # noqa: E402
 
@@ -185,6 +186,7 @@ def start(day: str, slot: str, *, now: float | None = None) -> dict:
         return {"ok": False, "reason": "state_lock_timeout"}
     except StateDirUnavailable:
         return {"ok": False, "reason": "state_dir_unavailable"}
+    _publish_slot_status(day, slot, "in_progress")  # after the lock: a slow push must never block a backup probe
     return {"ok": True, "reason": result.reason, "token": token}
 
 
@@ -206,7 +208,22 @@ def finish(day: str, slot: str, token: str, outcome: str) -> dict:
             released = lease.release_with(_holder(slot, token), write_marker)
     except (TimeoutError, StateDirUnavailable):
         return {"ok": False, "released": False}
+    if released:  # a superseded run publishes nothing, exactly as it writes no marker
+        _publish_slot_status(day, slot, "succeeded" if outcome == "success" else "failed")
     return {"ok": released, "released": released}
+
+
+def _publish_slot_status(day: str, slot: str, status: str) -> None:
+    """Best-effort public signal for the Perplexity backups (scripts/slot_status.py, 2026-10-30).
+
+    Only the primary's own start and finish call this; probes, claims, confirms and beats never do, so a backup
+    can never mark a slot done and the branch is not pushed every 60 s. Whatever happens here, start and finish
+    return exactly what they returned before: the lease and marker above stay the source of truth.
+    """
+    try:
+        slot_status.update(day, slot, status)
+    except Exception:  # noqa: BLE001 - publishing must never change the primary's own result
+        pass
 
 
 def _probe(day: str, slot: str, mac_status: str, now: float | None):

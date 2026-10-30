@@ -266,6 +266,9 @@ scripts = ["*.sh"]
     # Read by the plan-first recommendation store; without this the installed
     # courier has no freshness or publish policy and must fail closed.
     "config/recommendations.json",
+    # Read by scripts/slot_status.py (2026-10-30): without it an installed local_heartbeat cannot find the branch
+    # the Perplexity backups read, and the slot-status signal is never published.
+    "config/slot_status.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by
