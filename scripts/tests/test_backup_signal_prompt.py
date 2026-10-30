@@ -92,7 +92,7 @@ def test_step_a_stands_down_only_on_succeeded_today_or_a_closed_market(instructi
 
 @pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
 def test_every_other_signal_goes_to_step_b(instructions, backup):
-    step_a = instructions[backup.file].split("STEP A", 1)[1].split("STEP B", 1)[0]
+    step_a = instructions[backup.file].split("STEP A", 1)[1].split("STEP B -", 1)[0]
     for case in ("cannot be read", "not JSON", "another day", "in_progress", "failed", "no entry for this slot"):
         assert case in step_a, case
     assert "go to STEP B" in step_a

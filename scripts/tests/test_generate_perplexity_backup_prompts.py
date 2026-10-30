@@ -1,8 +1,7 @@
 """Tests for ``scripts/generate_perplexity_backup_prompts.py`` and the committed backup prompts.
 
-Phase 5 of docs/adr-plan-first-backup-executor.md. The six Perplexity backup prompts are thin
-I/O prompts generated from repo config, so they cannot drift from it and cannot silently lose a
-hard rule. Perplexity cannot read this repo, so every hard rule must be INLINE in each prompt.
+The six Perplexity prompts are generated from repo config and paired with the stamped planner.
+The pasteable prompt is signal-first; the full reference prompt includes the planner-served hard rules and procedure.
 
 Expected behavior is derived from the ADR and ``claude/PERPLEXITY-CLAUDE-COORDINATION.md``, not
 from the generator's output.
@@ -534,13 +533,13 @@ def test_every_prompt_embeds_the_expected_build_stamp(prompts, prefix, built_sta
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_step_0_compares_the_stamp_before_any_planner_command_runs(prompts, prefix, built_stamp):
+def test_step_b_compares_the_stamp_before_fetching_part_0(prompts, prefix, built_stamp):
     text = _by_prefix(prompts, prefix)
-    step0 = text[text.index("STEP 0"):text.index("STEP 1")]
-    assert step0.index(built_stamp) < step0.index("backup_planner.pyz universe"), "compare first, then run the planner"
-    assert "content_sha256" in step0 and "exactly" in step0
-    # A mismatch is a hard stop with the same fail-closed vocabulary the other STEP 0 refusals use.
-    compare = step0[step0.index(built_stamp):step0.index("backup_planner.pyz universe")]
+    step_b = text[text.index("STEP B"):text.index("PROCEDURE FOR TASK")]
+    assert step_b.index("--build-info") < step_b.index(built_stamp) < step_b.index("--part 0")
+    assert text.index("--part 0") < text.index("backup_planner.pyz universe"), "check first, then request part 0"
+    assert "content_sha256" in step_b and "exactly" in step_b
+    compare = step_b[step_b.index(built_stamp):step_b.index("--part 0")]
     assert "place NOTHING" in compare and "failed_unexpected_error" in compare and "notify" in compare
 
 

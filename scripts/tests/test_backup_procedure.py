@@ -1,9 +1,7 @@
-"""The Perplexity backup procedure is served by the stamped planner, not pasted (2026-10-18).
+"""The signal-first Perplexity prompt fetches its stamped rules and procedure from the planner.
 
-Perplexity's Instructions box keeps only the first 20,000 characters. The full prompts were ~27,300, so each
-was cut inside step 6 and the agent never saw the finalize arguments, order placement, the state record or the
-notifications. The pasteable prompt is now the hard rules + step 0 + a pointer; steps 1-9 come from
-``backup_planner.pyz procedure --task <id> --part <1|2|3>``, inside the same content-hash stamp.
+Part 0 holds the hard rules, calendar, universe check and stand-down gate. Parts 1-3 hold steps 1-9 and require
+the preceding part's token. The full reference prompt and pasteable prompt are both generated from the same sources.
 """
 
 from __future__ import annotations
@@ -63,10 +61,10 @@ def test_the_three_parts_concatenate_back_to_the_whole_procedure():
 
 def test_every_step_is_reachable_from_instructions_plus_parts(instructions):
     for backup in backup_procedure.BACKUPS:
-        text = instructions[backup.file] + "".join(
+        text = instructions[backup.file] + backup_procedure.render_part(backup.task_id, 0) + "".join(
             backup_procedure.render_part(
                 backup.task_id, part,
-                token=None if part == 0 else backup_procedure.part_token(backup.task_id, part - 1),
+                token=backup_procedure.part_token(backup.task_id, part - 1),
             )
             for part in backup_procedure.PARTS
         )
