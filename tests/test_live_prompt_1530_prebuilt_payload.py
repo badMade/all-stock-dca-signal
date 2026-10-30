@@ -12,18 +12,10 @@ import json
 import re
 from pathlib import Path
 
-import pytest
-
 from scripts import robinhood_payload as rp
 
 ROOT = Path(__file__).resolve().parents[1]
 MIRROR = ROOT / "claude" / "dca-executor-prompts" / "live-mirror"
-
-# The 1530ET live-mirror prompt still hand-fetches bars; changing a live prompt needs operator approval. Strict xfail
-# keeps CI green until then and fails loudly (XPASS) once the prompt is updated, so the marker must be removed.
-PROMPT_NOT_YET_UPDATED = pytest.mark.xfail(
-    strict=True, reason="1530ET live prompt not yet switched to the prebuilt Robinhood payload (awaiting operator approval)"
-)
 
 
 def _prompt(slot: str) -> str:
@@ -36,7 +28,6 @@ def _errored_rule(text: str) -> str:
     return text[start : text.index("\n", start)]
 
 
-@PROMPT_NOT_YET_UPDATED
 def test_1530_gate5_reads_the_prebuilt_payload_and_never_hand_fetches():
     text = _prompt("1530")
     assert "PREBUILT ROBINHOOD PAYLOAD" in text
@@ -45,21 +36,18 @@ def test_1530_gate5_reads_the_prebuilt_payload_and_never_hand_fetches():
     assert "do NOT hand-fetch bars" in text
 
 
-@PROMPT_NOT_YET_UPDATED
 def test_1530_no_longer_asks_the_session_to_call_the_finance_connector():
     text = _prompt("1530")
     assert "call the Finance connector itself" not in text
     assert "Separately call Robinhood get_equity_historicals" not in text
 
 
-@PROMPT_NOT_YET_UPDATED
 def test_1530_waits_as_long_as_the_six_slots_for_the_payload():
     waits = {slot: re.findall(r"every 30 seconds for up to (\d+) minutes", _prompt(slot)) for slot in (*rp.SLOTS, "1530")}
     assert all(len(found) == 1 for found in waits.values()), waits
     assert len({found[0] for found in waits.values()}) == 1, waits
 
 
-@PROMPT_NOT_YET_UPDATED
 def test_1530_applies_the_same_errored_and_quiet_ticker_rule_as_the_six_slots():
     six = {_errored_rule(_prompt(slot)) for slot in rp.SLOTS}
     assert len(six) == 1
@@ -68,7 +56,6 @@ def test_1530_applies_the_same_errored_and_quiet_ticker_rule_as_the_six_slots():
     assert '"quiet"' in rule and ".meta.json" in rule
 
 
-@PROMPT_NOT_YET_UPDATED
 def test_1530_still_fails_closed_when_the_payload_is_missing_or_stale():
     text = _prompt("1530")
     gate5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
