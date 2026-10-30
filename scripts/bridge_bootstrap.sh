@@ -20,9 +20,18 @@ _bridge_dir=$_bridge_base/uv-$_bridge_user
 
 # A directory can exist yet be unusable by this bridge identity (the incident's
 # shared-cache failure). Check every child before exporting any uv/temp destination.
+# Writable is not enough: a world-writable dir another uid owns (the 2026-10-28
+# `nobody` cache) passes `test -w`, yet its owner can swap the interpreter that
+# `uv python find` returns. Owners come from `ls -ldn` because stat's flags differ
+# between GNU and BSD; an unreadable owner counts as foreign (fail closed).
+_bridge_foreign() {
+    test -e "$1" || return 1
+    _bridge_owner=$(ls -ldn "$1" 2>/dev/null | awk '{print $3}')
+    test "$_bridge_owner" != "$_bridge_user"
+}
 _bridge_candidate_ok=1
 for _bridge_child in "$_bridge_dir" "$_bridge_dir/python" "$_bridge_dir/cache" "$_bridge_dir/tmp"; do
-    if test -e "$_bridge_child" && test ! -w "$_bridge_child"; then
+    if { test -e "$_bridge_child" && test ! -w "$_bridge_child"; } || _bridge_foreign "$_bridge_child"; then
         _bridge_candidate_ok=0
     fi
 done
@@ -32,7 +41,7 @@ if test "$_bridge_candidate_ok" -eq 0; then
     _bridge_dir=$_bridge_base/uv-$_bridge_user-alt
     _bridge_candidate_ok=1
     for _bridge_child in "$_bridge_dir" "$_bridge_dir/python" "$_bridge_dir/cache" "$_bridge_dir/tmp"; do
-        if test -e "$_bridge_child" && test ! -w "$_bridge_child"; then
+        if { test -e "$_bridge_child" && test ! -w "$_bridge_child"; } || _bridge_foreign "$_bridge_child"; then
             _bridge_candidate_ok=0
         fi
     done
@@ -78,7 +87,7 @@ if test -z "$_bridge_dir" || ! test -d "$_bridge_dir/python" || ! test -d "$_bri
     return 1
 fi
 for _bridge_child in "$_bridge_dir" "$_bridge_dir/python" "$_bridge_dir/cache" "$_bridge_dir/tmp"; do
-    if test ! -w "$_bridge_child"; then
+    if test ! -w "$_bridge_child" || _bridge_foreign "$_bridge_child"; then
         unset PY
         BRIDGE_BOOTSTRAP_ERROR='no writable uv directory'
         export BRIDGE_BOOTSTRAP_ERROR

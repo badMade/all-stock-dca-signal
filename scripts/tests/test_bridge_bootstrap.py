@@ -163,3 +163,75 @@ def test_shell_syntax_and_option_preservation(tmp_path: Path, shell: str) -> Non
     env.update(PATH=f"{bindir}:{env['PATH']}", DCA_BRIDGE_UV_BASE=str(tmp_path / "base"), FAKE_PYTHON=str(python))
     result = subprocess.run([shell, "-c", f'set -e; . "{SCRIPT}"; case $- in *e*) : ;; *) exit 9 ;; esac'], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# 2026-10-30: `test -w` alone accepted a world-writable dir another uid owns -- the 2026-10-28 `nobody`
+# cache shape -- whose owner could swap the interpreter `uv python find` returns. Ownership cannot be faked
+# with chown as an ordinary user, so a fake `ls` reports uid 65534 for each colon-separated $FAKE_FOREIGN
+# path (and anything under it); everything else goes to the real ls.
+_FAKE_LS = r"""#!/bin/sh
+last=
+for a in "$@"; do last=$a; done
+rest=${FAKE_FOREIGN-}
+while [ -n "$rest" ]; do
+    dir=${rest%%:*}
+    case "$rest" in *:*) rest=${rest#*:} ;; *) rest= ;; esac
+    case "$last" in "$dir"|"$dir"/*) echo "drwxrwxrwx 2 65534 65534 64 Oct 28 15:30 $last"; exit 0 ;; esac
+done
+exec REAL_LS "$@"
+"""
+
+
+def _run_foreign(tmp_path: Path, shell: str, foreign: list[Path]):
+    bindir, python = _fixture(tmp_path)
+    fake_ls = bindir / "ls"
+    fake_ls.write_text(_FAKE_LS.replace("REAL_LS", shutil.which("ls")), encoding="utf-8")
+    fake_ls.chmod(0o755)
+    env = os.environ.copy()
+    env.update(PATH=f"{bindir}:{env['PATH']}", DCA_BRIDGE_UV_BASE=str(tmp_path / "base"), FAKE_PYTHON=str(python),
+               FAKE_FOREIGN=":".join(map(str, foreign)))
+    code = f'. "{SCRIPT}"; status=$?; printf "UVPY:%s\\n" "${{UV_PYTHON_INSTALL_DIR-}}"; exit "$status"'
+    return subprocess.run([shell, "-c", code], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_writable_pinned_dir_owned_by_another_uid_falls_back_to_alt(tmp_path: Path, shell: str) -> None:
+    pinned = tmp_path / "base" / f"uv-{os.getuid()}"
+    pinned.mkdir(parents=True)
+    result = _run_foreign(tmp_path, shell, [pinned])
+    assert result.returncode == 0, result.stderr
+    assert f"UVPY:{pinned}-alt/python" in result.stdout
+    assert f"BRIDGE_UV_FALLBACK: {pinned}-alt" in result.stderr
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_foreign_subdir_under_an_owned_pinned_dir_is_rejected(tmp_path: Path, shell: str) -> None:
+    pinned = tmp_path / "base" / f"uv-{os.getuid()}"
+    (pinned / "python").mkdir(parents=True)
+    result = _run_foreign(tmp_path, shell, [pinned / "python"])
+    assert result.returncode == 0, result.stderr
+    assert f"UVPY:{pinned}-alt/python" in result.stdout
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_foreign_pinned_and_alt_use_an_owned_mktemp_dir(tmp_path: Path, shell: str) -> None:
+    """A planted world-writable uv-<uid>-alt must not be adopted either."""
+    pinned = tmp_path / "base" / f"uv-{os.getuid()}"
+    alt = tmp_path / "base" / f"uv-{os.getuid()}-alt"
+    pinned.mkdir(parents=True)
+    alt.mkdir()
+    result = _run_foreign(tmp_path, shell, [pinned, alt])
+    assert result.returncode == 0, result.stderr
+    used = result.stdout.split("UVPY:", 1)[1].strip()
+    assert used.startswith(f"{pinned}-") and not used.startswith(str(alt))
+    assert "BRIDGE_UV_FALLBACK:" in result.stderr
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_owned_pinned_dir_is_used_without_fallback(tmp_path: Path, shell: str) -> None:
+    pinned = tmp_path / "base" / f"uv-{os.getuid()}"
+    pinned.mkdir(parents=True)
+    result = _run_foreign(tmp_path, shell, [])
+    assert result.returncode == 0, result.stderr
+    assert f"UVPY:{pinned}/python" in result.stdout
+    assert "BRIDGE_UV_FALLBACK" not in result.stderr
