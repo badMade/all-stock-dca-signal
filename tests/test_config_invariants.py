@@ -1632,6 +1632,21 @@ def _tracked_files() -> list[str]:
     return [line for line in out.stdout.splitlines() if line]
 
 
+# Agents (Jules most often) used to commit their PR text as a root
+# pr_description.md, and every merge overwrote that one shared copy, so nearly
+# every open agent PR conflicted with main on it (PR #2033 twice in one day;
+# #1926 removed a stray pr_description.txt). #2047 untracked it and gitignored
+# /pr_description.*; this keeps it that way. A force-added copy brings the
+# conflicts straight back. See SELF_HEAL_SETUP.md, "Known Recurring Failures".
+def test_pr_description_scratch_file_is_not_tracked_and_stays_ignored():
+    tracked = [rel for rel in _tracked_files() if "/" not in rel and rel.startswith("pr_description.")]
+    assert not tracked, (
+        f"{tracked} is tracked again; put PR text in the PR body and `git rm --cached` the file"
+    )
+    ignore_rules = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "/pr_description.*" in ignore_rules, ".gitignore lost its /pr_description.* rule"
+
+
 def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
     """The live account number must never be re-inlined.
 
