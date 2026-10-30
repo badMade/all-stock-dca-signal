@@ -311,6 +311,16 @@ For every slot whose status is not `verified`/`not_due`/`awaiting_evidence`/
   status and `error_class`, exit code 1, and `error_slots` in the `--json` report. The desktop banner and Slack text
   name slot ids only. Quiet outcomes (no orders, no candidates, budget exhausted, confirmation required) are not
   errors and do not alert;
+* **Fired but aborted before evidence (2026-10-29).** A slot that aborts at Gate 1 (off-window) or at Gate 2 with
+  no Python 3.11 leaves no run directory, because `finalize_run_evidence` refuses an off-window start. It still
+  reads `no_evidence` and still alerts, but the live prompts now run `sh scripts/record_evidence_free_abort.sh`
+  FIRST on those paths. That plain-shell script writes the channel-2 alert file and appends a marker to
+  `<cron root>/abort_markers/<YYYYMMDD>/<slot>.jsonl`. `scripts/abort_markers.py` (applied in `audit_day`, not in
+  `verify_schedule`, which ships inside the backup planner) changes the Key from `slot_did_not_fire` to
+  `slot_fired_aborted_before_evidence` when a marker falls in the slot's acceptance window through its grace
+  deadline. An off-window marker, such as a manual night-time "Run now", keeps `slot_did_not_fire` and adds a
+  reason line naming it. A marker is never run evidence: it never verifies a slot and nothing that sizes, caps or
+  allocates reads it;
 * re-running it for a still-unresolved (day, slot) overwrites that same file
   rather than creating a numbered duplicate, so `alert_digest`'s per-slot
   counts and streaks reflect one unresolved incident, not one per invocation;
