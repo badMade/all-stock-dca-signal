@@ -9,7 +9,7 @@ window; the 11:30, 1:30 and 2:30 runs all aborted at Gate 5 with nothing placed.
 Robinhood MCP connection (`codex mcp list` -> `robinhood-trading`).
 
 **What runs.** `deploy/launchd/robinhood_payload.sh auto`, fired one minute after each Robinhood-primary slot's
-decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is Finance-primary and is not scheduled here; see "The 3:30 PM slot (shadow only)" below):
+decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is built by its own 15:31 agent instead; see "The 3:30 PM slot" below):
 
 1. `scripts/robinhood_payload.py plan` resolves the slot, the exact universe that slot's Gate 5 generator scores,
    the earliest bar the slot's 60-minute trend needs, and the output path.
@@ -115,7 +115,7 @@ last trade, so a thin ticker's may legitimately be old; the payload as a whole i
 `as_of` is earlier than one bar before the decision time (`_require_fresh_fetch`). `publish` and `check` both apply it.
 A payload built long after its slot (for example a manual after-hours test build) is therefore rejected.
 
-## The 3:30 PM slot (shadow only)
+## The 3:30 PM slot
 
 Step 1 of moving the 3:30 slot onto this job (2026-10-22). Nothing about the live slot changes: no launchd entry fires
 it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy with the Robinhood-only outage fallback.
@@ -152,3 +152,20 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   The shadow agent sets 480 s (a slow build ends by about 15:40).
 - **Go/no-go for step 2b (cutover):** five consecutive shadow days with total build time under 6 minutes, no deadline
   skips, and 95% or better coverage with fresh quotes.
+
+### Cutover (step 2b, 2026-10-30)
+
+- **Go/no-go met.** The 15:31 agent published on all five shadow days from 2026-10-23 to 10-29 in 220-264 s, with no
+  deadline skips: 90/90 or 91/91 tickers on four days, and 83/91 on 10-29, when 8 tickers were recorded as quiet.
+- **What changed.** The `1530ET` prompt's Gate 5 now runs the same PREBUILT ROBINHOOD PAYLOAD step as the six slots
+  (`plan --slot 1530`, `check`, the 12-minute wait, the errored and quiet-ticker rule) and no longer fetches Finance or
+  Robinhood bars itself. Scheduled sessions have no Finance connector and cannot write tool output into the checkout,
+  so the old step aborted at Gate 5 on 2026-10-19, 10-20, 10-21, 10-23 and 10-29.
+- **Source policy is unchanged.** The payload holds `sources.robinhood` only. `config/scheduled_tasks.json`'s 1530ET
+  `finance_outage_fallback: robinhood_only` (operator, 2026-10-21) already scores that absent-Finance shape off
+  Robinhood alone.
+- **The builder is the same agent.** `com.all-stock-dca.robinhood-payload-1530-shadow` keeps its Label, so an
+  installed copy needs no change; it is no longer a shadow. `due_slot` (`auto`) still never selects 1530.
+- **Open follow-up.** On 10-29 the build recorded NVDA, GOOGL, GOOG and AMZN as quiet (no bar in the window), which
+  cannot be a real hour for those names. Quiet tickers are never bought, so this skips buys rather than causing bad
+  ones, but they should be refetched rather than counted as quiet.

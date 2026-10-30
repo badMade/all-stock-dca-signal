@@ -194,7 +194,10 @@ def test_live_mirror_prompts_use_the_prebuilt_payload():
         text = path.read_text(encoding="utf-8")
         assert f"scripts.robinhood_payload plan --slot {slot}" in text, path.name
         assert "do NOT hand-fetch bars" in text, path.name
-    assert not any("robinhood_payload" in p.read_text() for p in mirror.glob("1530ET-*.txt"))
+    # 2026-10-30: the 3:30 PM slot moved onto the 15:31 build too (tests/test_live_prompt_1530_prebuilt_payload.py);
+    # it is not in rp.SLOTS because `auto` never selects it, so its prompt is checked here by name.
+    (final,) = mirror.glob("1530ET-*.txt")
+    assert "scripts.robinhood_payload plan --slot 1530" in final.read_text(encoding="utf-8")
 
 
 #: 2026-10-21 09:35 abort: 90 tickers are 12 chunks of 8, run 3 at a time (4 waves), so the Mac build lands several
@@ -812,7 +815,7 @@ def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
     assert done.returncode == 2 and needle in done.stderr and "timing chunk=" not in done.stderr, done.stderr
 
 
-# -- 3:30 PM (shadow only): plannable and buildable on demand, never scheduled, never read by a live prompt -------
+# -- 3:30 PM: plannable and buildable on demand by its own 15:31 agent, never by `auto`; its live prompt reads the payload since 2026-10-30 --
 
 
 def bars_from(start_h, start_m, end_h, end_m):
