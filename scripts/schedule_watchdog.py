@@ -89,6 +89,7 @@ from dca_net_utils import (
     sanitize_exception as _sanitize_exception,
 )
 from dca_paths import cron_tracking_root
+from scripts.abort_markers import apply_abort_markers
 from scripts.run_classification import ORDER_SUBMIT_STATUS_ERROR
 from scripts.scheduled_artifacts import ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE
 from scripts.verify_schedule import OK_STATUSES, STATUS_VERIFIED, verify_day
@@ -130,7 +131,8 @@ def failing_rows(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def audit_day(day: date, now: datetime, *, root: Optional[Path] = None) -> Dict[str, Any]:
-    """:func:`verify_day` plus each row's ``error_class``, read from that slot's own run_state.json.
+    """:func:`verify_day` plus each row's ``error_class``, read from that slot's own run_state.json,
+    and :func:`scripts.abort_markers.apply_abort_markers`'s retagging of fired-but-aborted slots.
 
     Done here, not in ``verify_day``: scripts/verify_schedule.py is a source of the Perplexity backup planner
     (its stamp changes with it, which forces a repaste of every backup prompt), and the audit verdict never
@@ -138,6 +140,10 @@ def audit_day(day: date, now: datetime, *, root: Optional[Path] = None) -> Dict[
     """
     report = verify_day(day, now, root=root)
     base = Path(root) if root is not None else Path(cron_tracking_root())
+    # Same reason as error_class below: a slot that fired and aborted before evidence (Gate 1
+    # off-window, Gate 2 with no Python) is told apart from one that never fired here, not in
+    # verify_schedule (2026-10-29; see scripts/abort_markers.py).
+    apply_abort_markers(report, root=base)
     for row in report["slots"]:
         error_class = None
         try:
