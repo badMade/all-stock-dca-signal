@@ -22,6 +22,11 @@ INVARIANTS = (
     "any abort",
     "scripts.finalize_run_evidence",
 )
+DRAFT_INVARIANTS = (
+    "durable alert to the destination",
+    "any abort",
+    "scripts.finalize_run_evidence",
+)
 
 
 def _discover(pattern: Path) -> list[Path]:
@@ -40,8 +45,26 @@ for _pattern, _paths in _DISCOVERED.items():
 PROMPT_FILES = [path for paths in _DISCOVERED.values() for path in paths]
 
 
-@pytest.mark.parametrize("prompt_path", PROMPT_FILES, ids=lambda path: path.name)
+@pytest.mark.parametrize("prompt_path", _DISCOVERED[PROMPT_GLOBS[1]], ids=lambda path: path.name)
 @pytest.mark.parametrize("invariant", INVARIANTS)
-def test_buying_prompt_retains_bridge_bootstrap_and_abort_alert(prompt_path: Path, invariant: str) -> None:
+def test_live_mirror_retains_existing_bridge_and_abort_alert_contract(prompt_path: Path, invariant: str) -> None:
     prompt = prompt_path.read_text(encoding="utf-8")
     assert invariant in prompt, f"{prompt_path.relative_to(REPO_ROOT)} is missing invariant: {invariant}"
+
+
+@pytest.mark.parametrize("prompt_path", _DISCOVERED[PROMPT_GLOBS[0]], ids=lambda path: path.name)
+@pytest.mark.parametrize("invariant", DRAFT_INVARIANTS)
+def test_bridge_shell_draft_retains_non_opener_alert_contract(prompt_path: Path, invariant: str) -> None:
+    prompt = prompt_path.read_text(encoding="utf-8")
+    assert invariant in prompt, f"{prompt_path.relative_to(REPO_ROOT)} is missing invariant: {invariant}"
+
+
+@pytest.mark.parametrize("prompt_path", _DISCOVERED[PROMPT_GLOBS[0]], ids=lambda path: path.name)
+def test_bridge_shell_draft_uses_bootstrap_and_records_early_aborts(prompt_path: Path) -> None:
+    prompt = prompt_path.read_text(encoding="utf-8")
+    assert ". scripts/bridge_bootstrap.sh" in prompt
+    assert "scripts/bridge_abort_marker.sh" in prompt
+    assert "--started-at" in prompt
+    assert "&& { PY=$(uv python find 3.11" not in prompt
+    assert "GATE 7 - PLACE THE ORDERS" in prompt
+    assert "ISOLATE ONLY A FAILURE THAT PROVES NO ORDER EXISTS" in prompt

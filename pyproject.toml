@@ -212,6 +212,11 @@ py-modules = [
 # (CLAUDE.md: "New top-level module or config file => update pyproject.toml").
 packages = ["scripts", "selfheal"]
 
+# The bridge-shell prompts call these checkout utilities directly; ship them with
+# scripts so the packaged source keeps the same bootstrap and abort-evidence path.
+[tool.setuptools.package-data]
+scripts = ["*.sh"]
+
 # Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
 # the live trading window instead of falling back to the hardcoded defaults. dca_config
 # resolves these via sys.prefix/share/all-stock-dca/config.

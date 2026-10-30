@@ -1,5 +1,13 @@
 # Executor prompt copies in this directory — which generation is which
 
+## Changelog
+
+* **2026-10-29 — Key `bridge_python_alert_channels`:** the seven
+  `*.bridge-shell.draft.txt` prompts now use the checked-in bridge bootstrap and
+  abort-marker scripts. The operator must repaste each live routine through
+  `update_scheduled_task` and re-capture its mirror. Nothing changes in the live
+  tasks until those operator steps are completed.
+
 There are **two generations** of executor prompt text committed here, and they
 disagree with each other. This file says which one is live, so a reader does not
 patch the wrong one.
