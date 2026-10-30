@@ -41,10 +41,12 @@ def test_every_pasteable_prompt_fits_the_perplexity_limit_with_headroom(instruct
         assert len(text) <= INSTRUCTIONS_BUDGET, f"{name}: {len(text)} chars leaves too little headroom"
 
 
-def test_full_reference_prompt_is_the_instructions_head_plus_the_whole_procedure(instructions, full):
+def test_full_reference_prompt_is_part_0_plus_the_whole_procedure(full):
+    # 2026-10-30: the pasted prompt is the short signal check; the rules, calendar, step 0 and stand-down gate are
+    # part 0. The full reference text is still the whole thing in one place.
     for backup in backup_procedure.BACKUPS:
-        head = instructions[backup.file].split("\nPROCEDURE (steps 1-9)")[0].rstrip("\n")
-        assert full[backup.file].startswith(head)
+        rules = full[backup.file].split("HARD RULES.", 1)[1].split("\nPROCEDURE (steps 1-9)")[0]
+        assert "HARD RULES." + rules in backup_procedure.render_part(backup.task_id, 0)
         procedure = backup_procedure.render_procedure(backup, backup_procedure.common_values())
         assert full[backup.file].rstrip("\n").endswith(procedure.rstrip("\n"))
 
@@ -64,7 +66,7 @@ def test_every_step_is_reachable_from_instructions_plus_parts(instructions):
         text = instructions[backup.file] + "".join(
             backup_procedure.render_part(
                 backup.task_id, part,
-                token=None if part == 1 else backup_procedure.part_token(backup.task_id, part - 1),
+                token=None if part == 0 else backup_procedure.part_token(backup.task_id, part - 1),
             )
             for part in backup_procedure.PARTS
         )
@@ -78,11 +80,13 @@ def test_every_step_is_reachable_from_instructions_plus_parts(instructions):
 def test_instructions_point_at_their_own_task_and_keep_the_stamp_check(instructions):
     for backup in backup_procedure.BACKUPS:
         text = instructions[backup.file]
+        assert f"procedure --task {backup.task_id} --part 0" in text
+        assert "content_sha256 must equal" in text
+        part0 = backup_procedure.render_part(backup.task_id, 0)
         for part in (1, 2, 3):
-            assert f"procedure --task {backup.task_id} --part {part}" in text
-        assert "STEP 0 - SETUP" in text and "content_sha256 must equal" in text
-        assert "HARD RULES." in text
-        assert "place NOTHING" in text.split("PROCEDURE (steps 1-9)")[1]
+            assert f"procedure --task {backup.task_id} --part {part}" in part0
+        assert "STEP 0 - SETUP" in part0 and "HARD RULES." in part0
+        assert "place NOTHING" in part0.split("PROCEDURE (steps 1-9)")[1]
 
 
 def _run(args):
@@ -92,8 +96,8 @@ def _run(args):
 
 def test_procedure_command_prints_exactly_the_requested_part():
     backup = backup_procedure.BACKUPS[4]  # the two-fire task
-    for part in (1, 2, 3):
-        token = [] if part == 1 else ["--token", backup_procedure.part_token(backup.task_id, part - 1)]
+    for part in (0, 1, 2, 3):
+        token = [] if part == 0 else ["--token", backup_procedure.part_token(backup.task_id, part - 1)]
         done = _run(["procedure", "--task", backup.task_id, "--part", str(part), *token])
         assert done.returncode == 0, done.stderr
         assert done.stdout == backup_procedure.render_part(backup.task_id, part, token=token[1] if token else None)
@@ -139,7 +143,7 @@ def test_the_run_values_the_procedure_names_are_defined_in_the_pasted_instructio
 
 def test_step_1_delegates_the_gate_decision_to_the_gates_command():
     for backup in backup_procedure.BACKUPS:
-        part1 = backup_procedure.render_part(backup.task_id, 1)
+        part1 = backup_procedure.render_part(backup.task_id, 1, token=backup_procedure.part_token(backup.task_id, 0))
         step1 = part1.split("STEP 2 - ")[0]
         assert f"gates --task {backup.task_id}" in step1
         for status in ("PROCEED", "skipped_market_closed", "skipped_outside_window", "failed_unexpected_error"):
@@ -153,8 +157,8 @@ def test_step_1_delegates_the_gate_decision_to_the_gates_command():
 def test_every_part_names_its_task_and_position_so_a_wrong_task_id_is_visible():
     """A prompt for one task must be able to notice it was served another task's procedure."""
     for backup in backup_procedure.BACKUPS:
-        for part in (1, 2, 3):
-            token = None if part == 1 else backup_procedure.part_token(backup.task_id, part - 1)
+        for part in (0, 1, 2, 3):
+            token = None if part == 0 else backup_procedure.part_token(backup.task_id, part - 1)
             text = backup_procedure.render_part(backup.task_id, part, token=token)
             assert text.startswith(f"PROCEDURE FOR TASK {backup.task_id} - PART {part} OF 3\n")
             assert f"END OF PART {part} OF 3 FOR TASK {backup.task_id}" in text
@@ -163,7 +167,7 @@ def test_every_part_names_its_task_and_position_so_a_wrong_task_id_is_visible():
 
 def test_parts_must_be_requested_in_order_with_the_token_the_previous_part_printed():
     task = backup_procedure.BACKUPS[0].task_id
-    part1 = backup_procedure.render_part(task, 1)
+    part1 = backup_procedure.render_part(task, 1, token=backup_procedure.part_token(task, 0))
     token = backup_procedure.part_token(task, 1)
     assert f"--token {token}" in part1  # part 1 tells the agent what part 2 needs
     with pytest.raises(ValueError, match="token"):
@@ -192,9 +196,10 @@ def test_the_command_refuses_part_2_without_the_token_from_part_1():
 
 def test_instructions_tell_the_agent_to_pass_the_token_and_check_the_task_line(instructions):
     for backup in backup_procedure.BACKUPS:
-        text = instructions[backup.file]
-        assert "--part 2 --token" in text and "--part 3 --token" in text
-        assert f"PROCEDURE FOR TASK {backup.task_id} - PART" in text
+        assert f"PROCEDURE FOR TASK {backup.task_id} - PART 0" in instructions[backup.file]
+        part0 = backup_procedure.render_part(backup.task_id, 0)
+        assert "--part 2 --token" in part0 and "--part 3 --token" in part0
+        assert f"PROCEDURE FOR TASK {backup.task_id} - PART" in part0
 
 
 # -- pre-procedure stand-down gate -------------------------------------------------------
@@ -245,4 +250,6 @@ def test_account_hard_rule_line_is_unchanged_regression_guard():
         "too. Keep all of these only in this run's working directory, delete them before the run ends (every status, "
         "including failures), and never sync, attach, submit, or copy them anywhere."
     )
-    assert account_rule in gen._HEAD_TEMPLATE
+    # 2026-10-30: the rules are served as part 0 of the stamped procedure; the text itself must not change.
+    for backup in backup_procedure.BACKUPS:
+        assert account_rule in backup_procedure.render_part(backup.task_id, 0)

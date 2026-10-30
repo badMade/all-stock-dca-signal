@@ -98,9 +98,12 @@ def test_every_prompt_carries_the_no_unprescribed_retries_rule(prompts, prefix):
                        "stop BETWEEN orders (never after a submission and before its check-placement)"):
         assert prescribed in text, prescribed
     assert "at 80 calls" not in text and "well under 60" not in text
-    pasteable = _by_prefix(gen.build_instructions(), prefix)
-    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in pasteable
-    assert len(pasteable) < 20_000
+    # 2026-10-30: the rules moved from the paste box into the stamped procedure's part 0 (credit plan, step 3).
+    from scripts import backup_procedure
+
+    task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
+    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in backup_procedure.render_part(task_id, 0)
+    assert len(_by_prefix(gen.build_instructions(), prefix)) < 20_000
 
 
 def test_the_served_procedure_forbids_requerying_to_double_check_the_order_pull():
@@ -267,13 +270,19 @@ def test_state_record_and_notification_are_specified(prompts, prefix):
 def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
     # ADR amendment 2026-10-25: a normal day (Claude succeeded) must stand down before the account lookup, the
     # 7-day get_equity_orders pull and any procedure fetch, which is where the Perplexity credits went.
-    text = _by_prefix(gen.build_instructions(), prefix)
+    # 2026-10-30: the gate moved into the stamped procedure's part 0; the pasted prompt checks the build stamp
+    # before it fetches part 0 (scripts/tests/test_backup_signal_prompt.py).
+    from scripts import backup_procedure
+
+    task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
+    pasted = _by_prefix(gen.build_instructions(), prefix)
+    assert pasted.index("--build-info") < pasted.index(f"procedure --task {task_id} --part 0")
+    text = backup_procedure.render_part(task_id, 0)
     heading = text.find("\nSTAND-DOWN GATE")
-    assert heading != -1, "the pasteable prompt has no STAND-DOWN GATE section"
+    assert heading != -1, "part 0 has no STAND-DOWN GATE section"
     section_end = text.index("PROCEDURE (steps 1-9)")
     section = text[heading:section_end]
 
-    assert text.index("--build-info") < heading
     assert text.index("python3 backup_planner.pyz universe") < heading
     assert heading < text.index("PROCEDURE (steps 1-9)")
     assert section.index("gates --task ") < section.index("list_devices")
