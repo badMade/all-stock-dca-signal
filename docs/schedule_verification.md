@@ -98,6 +98,12 @@ The agent runs Mon-Fri at 07:45, at least an hour before the earliest slot windo
 
 ## Verify a day
 
+Bridge-shell aborts before Python or a run directory exists can be recorded with
+`scripts/bridge_abort_marker.sh`. An in-window marker is failed-start evidence, so
+the slot reads as fired-and-aborted (`no_evidence` without `slot_did_not_fire`);
+an `off_window` marker still leaves its durable alert but deliberately does not
+count as a scheduled fire, so the slot remains `slot_did_not_fire`.
+
 ```bash
 python -m scripts.verify_schedule                 # today, ET
 python -m scripts.verify_schedule --date 2026-09-22 --json

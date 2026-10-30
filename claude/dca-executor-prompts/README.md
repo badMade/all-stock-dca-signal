@@ -265,6 +265,17 @@ Characteristics of this generation:
   they started in. Until it has been run with `--write`, these mirrors contain neither the
   bridge-shell change nor the `.env` edits. `drafts/*.bridge-shell.draft.txt` hold the
   bridge-shell text and become redundant once the mirrors are re-captured.
+* On 2026-10-29 (Key `bridge_python_alert_channels`) the seven `drafts/*.bridge-shell.draft.txt`
+  moved AHEAD of live: their BRIDGE PROTOCOL opener is now `. scripts/bridge_bootstrap.sh`
+  (one tested script owning the per-user `/tmp/uv-$(id -u)` dirs, a stable `uv-<uid>-alt`
+  fallback when a dir is owned by another user, and the Python 3.11 install), replacing the
+  ~500-character inline opener whose shared `/tmp/uv-cache` caused the 2026-10-28 11:30 and
+  3:30 Gate 2 aborts; and the Gate 2 no-Python and Gate 1 off-window aborts now run
+  `sh scripts/bridge_abort_marker.sh` first, so an abort that never had Python still leaves a
+  durable alert file and a failed-start marker (see `docs/schedule_verification.md`). Nothing
+  changes live until the operator repastes each routine through `update_scheduled_task` and
+  re-captures its mirror; until then the mirrors keep the inline opener, which
+  `scripts/tests/test_bridge_shell_prompt_invariants.py` still pins.
 
 ## `1-executor-*.txt` … `7-executor-*.txt` — SUPERSEDED. Do not patch these
 
