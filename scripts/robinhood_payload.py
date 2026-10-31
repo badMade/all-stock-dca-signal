@@ -531,6 +531,43 @@ def _load_chunk(path: str) -> dict[str, Any]:
     return loaded
 
 
+#: Prior-session share volume at or above which a ticker that came back with no intraday bars is re-asked for instead
+#: of being filed "quiet" (2026-10-31). At 1M shares a day a name averages ~2,500 shares a minute, so an hour with no
+#: 5-minute bar at all is a worker that dropped the series, not a quiet hour. The genuinely thin names of the universe
+#: sit well below it (QTOP, GFUZ and CHE under 100k; FLKR, DXYZ, IRDM, EVR, TRIN and AAAU 0.3-0.6M, 2026-10-15..10-30)
+#: and keep the old behaviour; NVDA, GOOGL, GOOG and AMZN (10-29 15:31: 10-78M) are far above it.
+LIQUID_PRIOR_VOLUME = 1_000_000
+
+
+def _implausibly_quiet(entry: Any) -> bool:
+    """True when ``entry`` carries no intraday bars although its prior session traded ``LIQUID_PRIOR_VOLUME`` or more.
+
+    A malformed or missing ``previous_close_bar`` reads as not liquid: this only decides whether to ask again, and a
+    ticker that is not re-asked for is still validated (and failed) by the merge exactly as before.
+    """
+    if not isinstance(entry, dict) or entry.get("error") or entry.get("intraday_bars"):
+        return False
+    prev = entry.get("previous_close_bar")
+    volume = prev.get("volume") if isinstance(prev, dict) else None
+    return isinstance(volume, (int, float)) and not isinstance(volume, bool) and volume >= LIQUID_PRIOR_VOLUME
+
+
+def rescue_targets(reply: dict[str, Any], tickers: list[str]) -> list[str]:
+    """The tickers of one chunk the launcher's rescue pass re-asks for, given that chunk's reply (``{}`` if none).
+
+    Absent or per-ticker-error tickers (2026-10-26); every ticker when every answered one has no bars (2026-10-30, the
+    whole-chunk case of 10-29 15:31); otherwise also any answered ticker with no bars whose prior session was liquid
+    (2026-10-31: the same 10-29 failure with one ticker of the chunk still answered would have filed NVDA, GOOGL, GOOG
+    and AMZN quiet again). Only *which tickers are asked for again* changes here: the merge still validates whatever
+    comes back, and a liquid name that is empty again is still filed quiet and counted against ``MAX_QUIET_SHARE``.
+    """
+    need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
+    answered = [reply[t] for t in tickers if t not in need]
+    if answered and all(isinstance(e, dict) and not e.get("intraday_bars") for e in answered):
+        return list(tickers)  # every answered ticker came back with no bars: the worker dropped the series
+    return [t for t in tickers if t in need or _implausibly_quiet(reply[t])]
+
+
 # The launchd script writes worker i's reply to chunk_<i>.json, where i indexes plan["chunks"]. The index is the only
 # link between a reply and the tickers its prompt asked for, so a file named any other way is not merged.
 _CHUNK_FILE = re.compile(r"^chunk_(\d+)\.json$")
