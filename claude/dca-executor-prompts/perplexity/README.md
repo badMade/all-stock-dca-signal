@@ -134,16 +134,15 @@ The prompts no longer contain an account number. Before pasting, set these in th
 locally, so the repo copies stay free of them:
 
 ```bash
-python3 -m scripts.fill_perplexity_backup_prompts --out ~/perplexity-filled \
-    --folder 4412c3c4=<automation UUID> --folder e028361e=<automation UUID> \
-    --folder e3590042=<automation UUID> --folder 062605c6=<automation UUID> \
-    --folder 54ab24d2=<automation UUID> --folder f83b8d62=<automation UUID>
+python3 -m scripts.fill_perplexity_backup_prompts --out ~/perplexity-filled
 ```
 
-Perplexity names each task's state folder after its automation UUID (the `automationId` in the task's URL), not the
-repo task id above, so pass one `--folder <task id>=<automation UUID>` per prompt. Without any `--folder` the repo
-task id is used, which starts a new, empty state folder. With at least one, every prompt must be mapped and no two
-tasks may share a folder. Recreating a task changes its UUID, so re-run the command then.
+The state folder is the one the prompt names, and the live tasks already write under the repo task id
+(`cron_tracking/<task id>/`; checked 2026-10-31 against the 2026-10-30 runs of `4412c3c4`, `062605c6` and
+`f83b8d62`). So the default, no `--folder`, keeps each task's existing folder and run history. An earlier version
+of this section said Perplexity names the folder after the task's automation UUID; the runs show it does not.
+Pass `--folder <task id>=<folder name>` only to move a task to a different folder on purpose. With at least one
+`--folder`, every prompt must be mapped and no two tasks may share a folder.
 
 | Placeholder | Where the script reads it |
 |---|---|
