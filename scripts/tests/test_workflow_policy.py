@@ -147,14 +147,39 @@ def test_ci_runs_the_documented_market_breadth_suite():
     )
 
 
+def test_ci_minute_budget_triggers():
+    """2026-10-31 Actions-spend cut: keep the cheap triggers cheap and the full run reachable.
+
+    Pushes to main used to run 3.11 + 3.12 and every sibling project (~59 runner-minutes a push,
+    ~60% of the repo's Actions minutes). Now only the weekday schedule / workflow_dispatch run the
+    3.11 leg, the research audit runs only when a dependency manifest moved (or on those full runs),
+    and every job's runner is switchable to a self-hosted one through the CI_RUNS_ON variable.
+    """
+    ci = REAL_DOCS[".github/workflows/ci.yml"]
+    on = _normalize_on_key(ci)["on"]
+    assert {"push", "pull_request", "schedule", "workflow_dispatch"} <= set(on)
+    assert on["schedule"], "the catch-all scheduled run is what still exercises 3.11 and every sibling"
+    jobs = ci["jobs"]
+    matrix = jobs["test"]["strategy"]["matrix"]["python-version"]
+    assert "'schedule'" in matrix and "'workflow_dispatch'" in matrix
+    assert "'[\"3.11\", \"3.12\"]'" in matrix and "'[\"3.12\"]'" in matrix
+    assert jobs["research-audit"]["needs"] == "changes"
+    assert jobs["research-audit"]["if"] == "needs.changes.outputs.deps == 'true'"
+    assert "deps" in jobs["changes"]["outputs"]
+    diff = jobs["changes"]["steps"][0]["run"]
+    assert "compare/$BEFORE...$AFTER" in diff, "pushes to main must diff their range, not run everything"
+    for name, job in jobs.items():
+        assert job["runs-on"] == "${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}", name
+
+
 # --- Synthetic fixtures: the violation and exception mechanisms themselves ---
 
 def test_ci_gives_every_main_push_its_own_concurrency_group():
     """A push to main must never be superseded by a later push (#1901's run was cancelled unstarted).
 
     ``cancel-in-progress: false`` still lets GitHub drop an older run that is merely *pending* in a
-    group when a newer one queues, so main's runs, which are the record of what landed (and the only
-    place the 3.11 leg runs), must not share a group. Other refs keep one group per ref so a PR's
+    group when a newer one queues, so main's runs, which are the record of what landed (and, with the
+    weekday scheduled run, where the 3.11 leg runs), must not share a group. Other refs keep one group per ref so a PR's
     older runs are still cancelled by its newer pushes.
     """
     concurrency = REAL_DOCS[".github/workflows/ci.yml"]["concurrency"]
