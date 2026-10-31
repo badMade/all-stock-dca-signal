@@ -793,16 +793,23 @@ for chunk in json.loads({blank!r}):
 for t in json.loads({thin!r}):
     if t in reply:
         reply[t]["intraday_bars"] = []
+for t in json.loads({liquid!r}):
+    reply.get(t, {{}}).setdefault("previous_close_bar", {{}})["volume"] = 77568070.0  # NVDA's 10-28 session
+    if t in reply and len(tickers) > {rescue_size}:  # dropped in the whole-chunk request, served in a small re-ask
+        reply[t]["intraday_bars"] = []
 open(out, "w").write(json.dumps(reply))
 """
 
 
-def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=()):
+def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=(), liquid=()):
     import sys
 
     plan = _plan_0935(tmp_path)
     blank = [plan["chunks"][i] for i in blank_chunks]
-    stub = _BLANK_STUB.format(python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)))
+    stub = _BLANK_STUB.format(
+        python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)), liquid=json.dumps(list(liquid)),
+        rescue_size=2,  # the launcher's default DCA_RESCUE_CHUNK_SIZE
+    )
     done, _ = _run_launcher(tmp_path, fake_script=stub)
     return done, plan, blank
 
@@ -837,6 +844,55 @@ def test_launcher_leaves_a_genuinely_quiet_name_in_a_replying_chunk_alone(tmp_pa
     assert done.returncode == 0 and out.exists(), log
     assert json.loads(out.with_suffix(".meta.json").read_text())["quiet"] == [thin]
     assert "0" not in {i for i, _ in re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)}, log
+
+
+# -- liquid names dropped from a chunk that still answered others (2026-10-31, the 10-29 follow-up) --------------------
+# The whole-chunk rule above needs EVERY answered ticker empty: had one ticker of 10-29's chunk 3 kept its bars, NVDA,
+# GOOGL, GOOG and AMZN would have been filed quiet again. An empty name whose prior session traded LIQUID_PRIOR_VOLUME
+# shares or more is now re-asked for alone; a thin empty name in the same chunk is still left alone and stays quiet.
+
+
+def test_rescue_targets_reasks_an_empty_liquid_name_but_not_an_empty_thin_one():
+    from scripts.robinhood_payload import LIQUID_PRIOR_VOLUME, rescue_targets
+
+    def entry(volume, bars):
+        return {"previous_close_bar": {"volume": volume}, "intraday_bars": bars, "quote": {}}
+
+    bar = [{"timestamp": "x"}]
+    reply = {
+        "NVDA": entry(77568070.0, []),  # 10-29 15:31: no bar in the hour, ~78M shares the session before
+        "AMZN": entry(LIQUID_PRIOR_VOLUME, []),  # the threshold itself is liquid
+        "QTOP": entry(87085.0, []),  # a genuinely thin name: still quiet, never re-asked
+        "AAPL": entry(35714331.0, bar),  # answered with bars: never re-fetched
+        "ODD": {"previous_close_bar": "garbage", "intraday_bars": []},  # unreadable volume reads as not liquid
+        "BOOL": entry(True, []),
+        "ERR": {"error": "no data"},
+    }
+    tickers = ["NVDA", "AMZN", "QTOP", "AAPL", "ODD", "BOOL", "ERR", "GONE"]
+    assert rescue_targets(reply, tickers) == ["NVDA", "AMZN", "ERR", "GONE"]
+    # Unchanged rules: a dead chunk, and a chunk whose every answered ticker is empty, are re-asked in full.
+    assert rescue_targets({}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, []), "B": entry(10.0, [])}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, bar), "B": entry(10.0, [])}, ["A", "B"]) == []
+
+
+def test_launcher_rescues_an_empty_liquid_name_in_a_chunk_that_answered_others(tmp_path):
+    import re
+    from pathlib import Path
+
+    # Chunk 0 answers in full, but its first two tickers come back with no bars and a ~78M-share prior session (the
+    # 10-29 shape, minus the "whole chunk empty" that the earlier rule needed), and its third is a genuinely thin name.
+    # The two liquid names are re-asked for and recovered; the thin one is not re-asked for and is still filed quiet.
+    plan = _plan_0935(tmp_path)
+    liquid, thin = plan["chunks"][0][:2], plan["chunks"][0][2]
+    done, plan, _ = _run_with_blank_chunks(tmp_path, blank_chunks=(), thin=[thin], liquid=liquid)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["quiet"] == [thin] and set(meta["failed"]) == {thin}, meta
+    assert set(liquid) <= set(json.loads(out.read_text())["sources"]["robinhood"])
+    assert re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log) == [("0", "2")], log
 
 
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
@@ -875,6 +931,36 @@ def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):
 def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
     done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_SECONDS": "soon"})
     assert done.returncode == 2 and "must be whole numbers" in done.stderr
+
+
+def test_launcher_et_cutoff_that_already_passed_fetches_nothing_and_refuses(tmp_path):
+    import re
+
+    # 2026-10-30: a relative deadline counts from whenever launchd started the build, so a late 15:31 job could fetch
+    # past the 3:30 session's 12-minute re-check. The ET cutoff is absolute on the plan's trading day (2026-10-20 here,
+    # long past), so every chunk is skipped, the launcher says why, and the merge refuses instead of publishing late.
+    done, chunks = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40"})
+    log = done.stdout + done.stderr
+    assert "deadline 15:40 ET had already passed when the build started; fetching nothing" in log, log
+    assert set(range(chunks)) <= {int(i) for i in re.findall(r"deadline chunk=(\d+) attempt=1 skipped", log)}, log
+    assert "timing chunk=" not in log and re.search(r"timing total .* deadline_et=15:40\b", log), log
+    assert "is below 95%" in log and done.returncode == 2, log
+
+
+def test_launcher_et_cutoff_still_ahead_does_not_skip_any_chunk(tmp_path):
+    import re
+
+    # A future trading day's 15:40 is hours away, so no chunk is skipped: the cutoff binds only when the clock reaches it.
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40", "DCA_TRADING_DAY": "2027-01-04"})
+    log = done.stdout + done.stderr
+    assert "deadline chunk=" not in log and "already passed" not in log, log
+    assert re.search(r"timing chunk=0 attempt=1", log) and re.search(r"deadline=0 deadline_et=15:40\b", log), log
+
+
+@pytest.mark.parametrize("cutoff", ["3:40", "15:4", "25:00", "15:40:00", "soon"])
+def test_launcher_rejects_a_malformed_et_cutoff(tmp_path, cutoff):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": cutoff})
+    assert done.returncode == 2 and "must be HH:MM" in done.stderr and "timing chunk=" not in done.stderr, done.stderr
 
 
 @pytest.mark.parametrize("size, needle", [("two", "must be whole numbers"), ("0", "must be at least 1")])
@@ -972,6 +1058,10 @@ def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
     # the generator's 60-minutes-back lookback bar (14:25) is missing: bars that start late must not pass
     with pytest.raises(rp.PayloadError, match="do not cover"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
+    # 2026-10-30 regression: one interval late used to pass (the old `> start + interval` slack), and a 14:30-first
+    # series is exactly what the generator then scored NO_DATA/provider_error for all 91 tickers
+    with pytest.raises(rp.PayloadError, match=r"do not cover the 14:25 .*first bar 14:30"):
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 10)), **final_buy_kw())
