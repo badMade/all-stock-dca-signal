@@ -1,0 +1,8 @@
+{
+  "$schema": "../schemas/backup_dispatch.schema.json",
+  "version": "2026-10-31",
+  "description": "Event-triggered Perplexity backup (scripts/backup_dispatch.py, credit plan step 6). The Mac checks each slot check_after_minutes after it starts and emails Perplexity Computer (to) only when the slot failed or never started; a GitHub Actions watcher covers days the Mac is down. mode shadow reports what it would send and sends nothing; switch to live only after a shadow week and one forced-failure test.",
+  "mode": "shadow",
+  "to": "computer@perplexity.com",
+  "check_after_minutes": 15
+}

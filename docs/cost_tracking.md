@@ -320,6 +320,19 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
 4. **Fewer fires (operator decision 2026-10-31).** Only the backups at 09:55, 12:50 and 15:45 stay scheduled
    (for the 09:35, 12:30 and 15:30 slots); the 10:50, 11:50 and 13:50/14:50 tasks are paused, not retired
    (`config/scheduled_tasks.json`, `standing_perplexity_backup_policy.amendment_2026_10_31`).
+5. **Backup only on failure (step 6, `scripts/backup_dispatch.py`).** The goal is zero Perplexity credits on a normal
+   day.
+   - **Mac checker:** a launchd job (`deploy/launchd/com.all-stock-dca.backup-dispatch.plist.template`) checks each
+     slot 15 minutes after it starts. It emails Perplexity Computer (computer@perplexity.com) only when the slot
+     failed or never started: one email per slot, with the filled prompt and `backup_planner.pyz`.
+   - **GitHub watcher:** `.github/workflows/backup-dispatch-watch.yml` covers days the Mac is down. It sends only
+     when today's public slot-status document has no entry for the slot.
+   - **Shadow first:** `config/backup_dispatch.json` starts in `shadow` mode, which reports `would_send` and sends
+     nothing.
+   - **Going live:** run a shadow week and one forced-failure test, set `mode` to `live`, then pause the remaining
+     scheduled Perplexity tasks.
+   - **Mail settings:** sender address, SMTP host, user and app password come from the `.env`
+     (`docs/local_env_file.md`) or from repository secrets for the watcher.
 
 ## Levers
 

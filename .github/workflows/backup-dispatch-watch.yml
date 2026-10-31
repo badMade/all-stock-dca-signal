@@ -1,0 +1,65 @@
+name: Backup dispatch watch
+
+# Credit plan step 6 (2026-10-31): Perplexity runs ONLY when a Claude slot fails. The Mac's own dispatcher
+# (scripts/backup_dispatch.py run, launchd) decides 15 minutes after each slot. This workflow covers the day the Mac is
+# DOWN: 20 minutes after each slot it reads the public slot-status document and emails Perplexity Computer only when
+# today's document has no entry for the slot, or there is no document for today. Any entry means the Mac is alive and
+# owns the decision. After a send it marks the slot backup_requested on the slot-status branch, so the next 5-minute
+# run does not send again.
+#
+# The script decides from the America/New_York clock and its own windows, so the schedule only has to fire often
+# enough: every 5 minutes, 13:00-21:59 UTC on weekdays, covering both EDT and EST market hours. Outside a window a run
+# prints no_slot_due and exits.
+#
+# config/backup_dispatch.json mode "shadow" makes every run report would_send and send nothing; it starts there.
+#
+# TRUST BOUNDARY: both triggers run main only. workflow_dispatch exists for the operator's forced-failure test; the
+# job refuses any other ref, and the checkout pins main, so a dispatch cannot run another branch's code with this
+# job's contents: write token or the mail secrets.
+on:
+  schedule:
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: backup-dispatch-watch
+  cancel-in-progress: false
+
+permissions:
+  # Pushing one backup_requested mark to the data-only slot-status branch (never main or claude/**).
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check the due slot and trigger a backup if the Mac never handled it
+        env:
+          DCA_DISABLE_DOTENV: "1"
+          DCA_PERPLEXITY_SENDER: ${{ secrets.DCA_PERPLEXITY_SENDER }}
+          DCA_SMTP_HOST: ${{ secrets.DCA_SMTP_HOST }}
+          DCA_SMTP_USER: ${{ secrets.DCA_SMTP_USER }}
+          DCA_SMTP_PASSWORD: ${{ secrets.DCA_SMTP_PASSWORD }}
+          DCA_ALERT_EMAIL_ADDRESS: ${{ secrets.DCA_ALERT_EMAIL_ADDRESS }}
+          ROBINHOOD_AGENTIC_ACCOUNT_LAST4: ${{ secrets.ROBINHOOD_AGENTIC_ACCOUNT_LAST4 }}
+          DCA_PPLX_STATE_FOLDERS: ${{ secrets.DCA_PPLX_STATE_FOLDERS }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The token is set on the remote only for this step, so the slot-status push works without persisted
+          # checkout credentials. The publisher reports a failed git step by name only, never the remote URL.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          python -m scripts.backup_dispatch cloud

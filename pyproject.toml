@@ -269,6 +269,9 @@ scripts = ["*.sh"]
     # Read by scripts/slot_status.py (2026-10-30): without it an installed local_heartbeat cannot find the branch
     # the Perplexity backups read, and the slot-status signal is never published.
     "config/slot_status.json",
+    # Read by scripts/backup_dispatch.py (2026-10-31): the event-triggered backup's mode (shadow or live), so an
+    # installed copy cannot fall back to sending.
+    "config/backup_dispatch.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by
