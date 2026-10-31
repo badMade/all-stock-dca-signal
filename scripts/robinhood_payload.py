@@ -77,8 +77,11 @@ DEFAULT_CHUNK_SIZE = 8
 #: At 90 tickers this tolerates 4 misses; a stale-feed slot (2026-10-20 13:30: 8 of 90) still publishes nothing.
 DEFAULT_MIN_COVERAGE = 0.95
 #: Share of the universe that may be "quiet" (no bar in the slot window) before the payload is refused anyway.
-#: 2026-10-26 and 2026-10-27 13:30: the same eight thin names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed
-#: nothing between 12:30 and 13:30, so 82/90 refused the slot although the fetch worked. A quiet name is reported under
+#: Introduced for 2026-10-27 13:30, where eight names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed
+#: nothing between 12:30 and 13:30 and 82/90 refused the slot. Corrected 2026-10-31: those eight are exactly plan
+#: chunk 0, which on 10-26 13:30 had left them all out ("no data returned"), and SPCX, LUNR and DFTX traded 1-68M
+#: shares the session before, so that was one worker dropping one chunk, not eight thin names; the launcher's rescue
+#: now re-asks such a chunk (``rescue_targets``). Real quiet names exist all the same (QTOP, GFUZ, CHE under 100k). A quiet name is reported under
 #: ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the coverage denominator. A feed outage
 #: also returns empty series, so more than this share still refuses.
 MAX_QUIET_SHARE = 0.10

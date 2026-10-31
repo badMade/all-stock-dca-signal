@@ -180,7 +180,8 @@ wait
 # Extended 2026-10-30 (10-29 15:31 shadow build): chunk 3 (NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW) replied with
 # every ticker's intraday_bars empty, so all eight were filed "quiet" and published as NO_DATA although NVDA, GOOGL, GOOG
 # and AMZN trade every minute. A whole chunk with no bars is a worker that dropped the series, so it is re-asked like a
-# dead chunk. A chunk where only some names are empty (the thin names of 10-26/27 13:30) is left alone: those are quiet.
+# dead chunk (as was chunk 0 at 10-27 13:30, once read as eight thin names). A chunk where only some names are empty
+# is left alone: those are quiet.
 # Narrowed 2026-10-31: in a partly-empty chunk, an empty name whose prior session traded LIQUID_PRIOR_VOLUME shares or
 # more is re-asked for too, so one answered ticker no longer hides a dropped NVDA. The rule lives in rescue_targets.
 targets=()

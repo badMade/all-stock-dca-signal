@@ -775,7 +775,7 @@ def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
 # empty, so all eight were filed as "quiet" (no trade in the window) and the payload published 83/91. NVDA, GOOGL, GOOG
 # and AMZN trade every minute of the session: a whole chunk with no bars is a worker that dropped the series, not eight
 # names that all stopped trading at once. A chunk whose every ticker has no bars is re-asked for like a dead chunk; a
-# chunk where only some names are empty (the thin names of 2026-10-26/27 13:30) is left alone, so it costs no rescue.
+# chunk where only some names are empty (a genuinely thin name) is left alone, so it costs no rescue.
 
 #: Stub ``codex``: valid data for every requested ticker, except that a request for a whole BLANK chunk answers every
 #: ticker with ``intraday_bars: []``, and a request naming a THIN ticker answers that one ticker with no bars.
@@ -1068,8 +1068,10 @@ def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
 
 
 # -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
-# The same eight thinly traded names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between
-# 12:30 and 13:30, so 82/90 (91%) refused the slot on both days. A name that did not trade is not a failed fetch:
+# Eight names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between 12:30 and 13:30 on
+# 10-27, so 82/90 (91%) refused the slot (on 10-26 the same eight were left out of the reply instead). 2026-10-31: they
+# are exactly plan chunk 0 and include names trading 1-68M shares a day, so this was a dropped chunk, now re-asked by
+# the launcher's rescue; the quiet rule below still holds for names that really did not trade. A name that did not trade is not a failed fetch:
 # it is reported as "quiet" (Gate 5 scores it NO_DATA, never a BUY), kept out of the coverage denominator, and
 # capped so a real feed outage, which also yields empty series, still refuses.
 

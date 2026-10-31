@@ -25,7 +25,9 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is b
    guarded against Gate 6 handing a missing high-priority ticker's cap headroom to lower-priority names; in the
    recorded runs the daily cap peaked near 42% and the weekly cap near 13%, so that reshuffle had no room to occur.
    **Quiet tickers (2026-10-28).** A ticker that printed no bar at all in the slot window did not trade; it is not a failed
-   fetch (2026-10-26 and 10-27 13:30: the same eight thin names refused the slot at 82/90). `publish` leaves it in
+   fetch. (It was added for 10-27 13:30, where eight empty names refused the slot at 82/90; 2026-10-31: those eight were
+   exactly plan chunk 0, left out of the reply on 10-26 too, and include SPCX, LUNR and DFTX at 1-68M shares a day, so
+   that was a dropped chunk, which the rescue below now re-asks. Real quiet names exist: QTOP, GFUZ, CHE under 100k.) `publish` leaves it in
    `ticker_errors.robinhood` (NO_DATA, never a BUY; omitting it would read as "not covered" and allow a single-source BUY),
    lists it under `quiet` in the `.meta.json` sidecar, and takes it out of the coverage denominator. More than
    `MAX_QUIET_SHARE` (10%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
