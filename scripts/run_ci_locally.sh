@@ -8,23 +8,27 @@
 #   scripts/run_ci_locally.sh -j test         # one job (job ids: act -W .github/workflows/ci.yml -l)
 #   scripts/run_ci_locally.sh --pr 2066 -j audit
 #   scripts/run_ci_locally.sh --push          # as a push to main (both Python versions, every sibling job)
+#   scripts/run_ci_locally.sh --report        # also post each job's result to GitHub as a commit status
 #
 # Any other argument is passed straight to act (e.g. --matrix python-version:3.11).
-# Results print here; nothing is reported back to the PR's checks.
+# Without --report, results print here only; with it, HEAD (which must be pushed and
+# clean) gets one "local-ci (act) / <job>" status per job plus an overall one.
 set -eu
 
 usage() {
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 image=all-stock-dca/act-runner:24.04
 event=pull_request
 pr=
+report=0
 while test "$#" -gt 0; do
     case $1 in
         --pr) test "$#" -ge 2 || { usage >&2; exit 2; }; pr=$2; shift 2 ;;
         --push) event=push; shift ;;
+        --report) report=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) break ;;
     esac
@@ -90,6 +94,19 @@ fi
 # (not ignored) files on top, so "runs your working tree" still holds.
 snapshot=$work/repo
 head=$(git -C "$repo_root" rev-parse HEAD)
+if test "$report" -eq 1; then
+    # A commit status is a claim about one commit, so it may only describe that
+    # commit exactly: refuse uncommitted or untracked files, and a HEAD GitHub has
+    # never seen (the statuses API rejects it with 422 after a 16-minute run).
+    if test -n "$(git -C "$repo_root" status --porcelain --untracked-files=normal)"; then
+        echo "--report needs a clean tree: commit or stash first, so the status describes $head" >&2
+        exit 2
+    fi
+    gh api "repos/$repo/commits/$head" --silent 2>/dev/null || {
+        echo "--report needs HEAD on GitHub: push $head first" >&2
+        exit 2
+    }
+fi
 git clone -q "$repo_root" "$snapshot"
 git -C "$snapshot" fetch -q "$repo_root" "$head"
 git -C "$snapshot" checkout -q --detach "$head"
@@ -107,7 +124,19 @@ cd "$snapshot"
 GITHUB_TOKEN=$(gh auth token)
 export GITHUB_TOKEN
 # Not exec: the EXIT trap above must still remove the snapshot.
+host=$(hostname -s)
+post_status() {
+    # $1 state, $2 context suffix ("" for the overall status), $3 description.
+    context="local-ci (act)${2:+ / $2}"
+    gh api -X POST "repos/$repo/statuses/$head" --silent \
+        -f state="$1" -f context="$context" -f description="$(printf '%s' "$3" | cut -c1-140)" ||
+        echo "could not post status '$context' (run results are unaffected)" >&2
+}
+if test "$report" -eq 1; then
+    post_status pending "" "running ci.yml with act on $host (linux/arm64), started $(date '+%Y-%m-%d %H:%M %Z')"
+fi
 status=0
+{
 act "$event" \
     -W .github/workflows/ci.yml \
     -e "$event_file" \
@@ -119,5 +148,31 @@ act "$event" \
     --container-options "--user 1001:1001" \
     --rm \
     -s GITHUB_TOKEN \
-    "$@" || status=$?
+    "$@" || echo "$?" > "$work/act.status"
+} 2>&1 | tee "$work/act.log"
+test ! -s "$work/act.status" || status=$(cat "$work/act.status")
+
+if test "$report" -eq 1; then
+    # act ends every job with "[CI/<job name>] 🏁  Job succeeded|failed", the name
+    # padded with spaces and a matrix leg suffixed -1, -2 in matrix order.
+    passed=0
+    failed=0
+    sed -n -E 's/^\[CI\/(.*)\] 🏁  Job (succeeded|failed)$/\2|\1/p' "$work/act.log" > "$work/jobs.txt"
+    while IFS='|' read -r outcome name; do
+        name=$(printf '%s' "$name" | sed 's/[[:space:]]*$//')
+        if test "$outcome" = succeeded; then
+            passed=$((passed + 1))
+            post_status success "$name" "passed locally with act on $host (linux/arm64)"
+        else
+            failed=$((failed + 1))
+            post_status failure "$name" "failed locally with act on $host (linux/arm64); see the operator's run log"
+        fi
+    done < "$work/jobs.txt"
+    if test "$status" -eq 0 && test "$failed" -eq 0 && test "$passed" -gt 0; then
+        post_status success "" "$passed job(s) passed locally with act on $host (linux/arm64)"
+    else
+        post_status failure "" "$failed of $((passed + failed)) job(s) failed locally (act exit $status) on $host"
+    fi
+    echo "reported $passed passed, $failed failed to $repo@$head" >&2
+fi
 exit "$status"
