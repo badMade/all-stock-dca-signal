@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.local-ci-sweep</string>
+  <!-- Local CI sweep (scripts/local_ci_sweep.py): every 30 minutes it runs scripts/local_ci_status.sh in quick mode in a
+       throwaway worktree for each open same-repo PR whose head commit has no finished local-ci status, so the PR
+       shows a real local-ci check while GitHub-hosted Actions are skipped. A lock stops overlapping sweeps. Started
+       through the checkout's venv Python, like the other agents, because macOS privacy protection (TCC) grants
+       ~/Documents access per binary. gh and uv live in /opt/homebrew/bin. See docs/local_ci.md. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.local_ci_sweep</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>StandardOutPath</key><string>/tmp/dca-local-ci-sweep.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-local-ci-sweep.log</string>
+</dict>
+</plist>
