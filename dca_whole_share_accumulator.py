@@ -3334,6 +3334,7 @@ class WholeShareAccumulationLedger:
             not isinstance(state, dict)
             or state.get("version") != 1
             or state.get("ticker") != ticker
+            or isinstance(state.get("pending_usd"), bool)
             or not isinstance(state.get("pending_usd"), (int, float))
             or not isinstance(state.get("events"), list)
             # setdefault only fills this field in when it is ABSENT -- a
