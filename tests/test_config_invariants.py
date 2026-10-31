@@ -2824,9 +2824,12 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
     backup_ids = {v["backup_task_id"] for v in slots.values()}
     for backup_id in backup_ids:
         assert backup_id in task_ids, f"{backup_id} has no tasks[] entry"
+    # 2026-10-31 (credit plan step 5): the operator paused the 10:50, 11:50, 13:50 and 14:50 backup fires
+    # (tests/test_backup_fire_reduction.py). Paused, not removed: every slot still names its backup task, the task
+    # keeps its trading contract, and its status is active or paused, never disabled.
     for task in data["tasks"]:
         if task["id"] in backup_ids:
-            assert task["status"] == "active", task["id"]
+            assert task["status"] in ("active", "paused"), task["id"]
             assert task["trades"] is True, task["id"]
 
     # The now-superseded week-limited override must say so, not silently

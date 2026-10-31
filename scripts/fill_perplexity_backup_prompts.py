@@ -18,10 +18,11 @@ loads; see ``docs/local_env_file.md``):
 * last four digits: ``ROBINHOOD_AGENTIC_ACCOUNT_LAST4`` if set, otherwise the last four digits of
   ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (the variable the rest of the repo already uses, so no new secret).
 * alert email: ``DCA_ALERT_EMAIL_ADDRESS`` (the same variable the executors use).
-* state folder: ``--state-root`` (default ``cron_tracking``) plus a folder name per prompt. Perplexity names each
-  task's folder after its automation UUID (the ``automationId`` in the task URL), which is not the repo task id,
-  so pass ``--folder <task id>=<automation UUID>`` once per prompt. Without any ``--folder`` the repo task id is
-  used; with at least one, every prompt must be mapped (fail closed, so a typo cannot silently split state).
+* state folder: ``--state-root`` (default ``cron_tracking``) plus a folder name per prompt. Without any
+  ``--folder`` the repo task id is used, which is the folder the live tasks already write to (checked 2026-10-31
+  against the 2026-10-30 runs; an earlier note here said Perplexity used the automation UUID, and it does not).
+  Pass ``--folder <task id>=<folder name>`` only to move a task on purpose; with at least one, every prompt must
+  be mapped (fail closed, so a typo cannot silently split state).
 
 Fail closed and all-or-nothing: a missing or malformed value, a prompt without a task header or one of the three
 placeholders, or any other ``${NAME}`` left over after filling writes NOTHING and exits 2.
@@ -30,7 +31,7 @@ Usage::
 
     python3 -m scripts.fill_perplexity_backup_prompts --out ~/perplexity-filled
     python3 -m scripts.fill_perplexity_backup_prompts --out ~/perplexity-filled \\
-        --folder 4412c3c4=<automation UUID> --folder e028361e=<automation UUID> ...
+        --folder 4412c3c4=<folder name> --folder e028361e=<folder name> ...
 
 Standard library only; no network.
 """

@@ -90,3 +90,76 @@ def test_help_exits_zero_before_touching_any_tool() -> None:
 def test_bad_pr_flag_is_a_usage_error() -> None:
     result = subprocess.run(["sh", str(SCRIPT), "--pr"], capture_output=True, text=True)
     assert result.returncode == 2
+
+
+def test_report_refuses_to_describe_a_commit_it_did_not_run() -> None:
+    # A status is a claim about one commit: a dirty tree or an unpushed HEAD
+    # must be refused before the run, not discovered after it.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "--report needs a clean tree" in script
+    assert "--report needs HEAD on GitHub" in script
+
+
+def test_report_parses_acts_job_end_lines(tmp_path) -> None:
+    # The same sed expression the script uses, run on act's real line shapes,
+    # including the padded name and a matrix leg suffix.
+    script = SCRIPT.read_text(encoding="utf-8")
+    expression = re.search(r"sed -n -E '([^']+)'", script).group(1)
+    log = tmp_path / "act.log"
+    log.write_text(
+        "[CI/Detect changed projects      ] 🏁  Job succeeded\n"
+        "[CI/Dependency audit (research)-2] 🏁  Job failed\n"
+        "[CI/Lint & test (core DCA)       ]   | 13207 passed\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(["sed", "-n", "-E", expression, str(log)], capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == [
+        "succeeded|Detect changed projects      ",
+        "failed|Dependency audit (research)-2",
+    ]
+
+
+def test_one_act_run_per_machine() -> None:
+    # Concurrent act runs share container names and delete each other's
+    # containers (exit 137 on 2026-10-31); the script must serialize them.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'while ! mkdir "$lock" 2>/dev/null; do' in script
+    assert "trap 'rm -rf \"$work\" \"$lock\"' EXIT" in script
+
+
+def test_snapshot_keeps_a_loose_ref_so_git_works_inside_the_container() -> None:
+    # 2026-10-31: a fresh clone packs every ref, act's copy drops the then-empty .git/refs, and git in the job said
+    # "not a git repository": 12 tests that call git failed under act and nowhere else.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'git -C "$snapshot" update-ref refs/heads/act-ci-snapshot "$head"' in script
+    assert script.index("update-ref refs/heads/act-ci-snapshot") < script.index('cd "$snapshot"')
+
+
+# -- salvaged from the closed #2075 and #2080 (2026-10-31): behaviour #2076 did not carry over ---------------------
+
+
+@pytest.mark.parametrize("act_args", [["-j", "test"], ["--matrix", "python-version:3.11"]])
+def test_report_refuses_a_partial_run(act_args: list[str]) -> None:
+    # With `-j test` the job loop would see one passing job and post an overall success for a run that skipped
+    # every other job. Refused before the tool check, so this runs on a machine without act.
+    result = subprocess.run(["sh", str(SCRIPT), "--report", *act_args], capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert "--report runs the whole workflow" in result.stderr
+
+
+def test_an_interrupted_report_run_does_not_stay_pending() -> None:
+    # Once "pending" is posted, any exit before the overall status marks the commit "error"; a signal must reach
+    # the EXIT trap at all (dash skips it on an untrapped INT/TERM); and the final status disarms the error path.
+    script = SCRIPT.read_text(encoding="utf-8")
+    pending = script.index('post_status pending ""')
+    error_trap = script.index('post_status error ""')
+    assert pending < error_trap < script.index("act \"$event\""), "the error trap must be armed before act starts"
+    assert "trap 'exit 130' INT TERM" in script
+    assert script.index("report=2") > script.index('post_status success "" ')
+
+
+def test_waiting_for_the_act_lock_is_bounded() -> None:
+    # A wedged holder must not park every later run (a --report one included) forever without an error.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'test "$waited" -ge "${ACT_LOCK_WAIT_SECONDS:-3600}"' in script
+    assert "waited=$((waited + 30))" in script

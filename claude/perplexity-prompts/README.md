@@ -28,7 +28,7 @@ could never be bought. Each file now:
 
 ## Secrets
 
-This repo is public. The account number and operator email are placeholders
+Treat this repo as if it were public (it is private as of 2026-10-31, but secrets never belong in it). The account number and operator email are placeholders
 (`${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}`, `${DCA_ALERT_EMAIL_ADDRESS}`) and are
 substituted only inside the Perplexity task at paste time. That substitution is
 the only permitted divergence from the live text.

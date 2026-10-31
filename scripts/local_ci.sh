@@ -20,6 +20,7 @@
 #   scripts/local_ci.sh ticker-advisor ...    # also lint+test the named sibling projects
 #   scripts/local_ci.sh --changed             # also the siblings CI would run for this branch vs origin/main
 #   scripts/local_ci.sh --changed=REF         # ...diffed against REF instead
+#   scripts/local_ci.sh --py311               # also run the core tests on 3.11 (main's second matrix leg)
 #   scripts/local_ci.sh --audit               # also run pip-audit (needs network)
 #   scripts/local_ci.sh --research-audit      # also the research dependency audit (needs network)
 #   scripts/local_ci.sh --all                 # everything CI can run: core, both audits, every sibling
@@ -34,8 +35,22 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-PY="${PYTHON:-.venv/bin/python}"
-[ -x "$PY" ] || PY="$(command -v python3)"
+main_checkout="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  for candidate in .venv/bin/python "$main_checkout/.venv/bin/python"; do
+    if [ -x "$candidate" ]; then PY="$candidate"; break; fi
+  done
+fi
+# A git worktree (.claude/worktrees/*) has no .venv of its own, and a bare `python3` fallback
+# picked up Homebrew's 3.14 with no pytest/ruff, so every worktree run died with "No module
+# named ruff" (2026-10-31). Stop with the fix instead. (--dry-run and --help only print, so they skip this.)
+if [[ " $* " != *" --dry-run "* && " $* " != *" --help "* && " $* " != *" -h "* ]] && { [ -z "$PY" ] || ! "$PY" -c 'import pytest, ruff, pytest_cov' 2>/dev/null; }; then
+  echo "local_ci: no interpreter with the dev tooling (tried \$PYTHON, ./.venv, $main_checkout/.venv)." >&2
+  echo "  Fix: python3.12 -m venv $main_checkout/.venv && $main_checkout/.venv/bin/pip install -r requirements-dev.txt" >&2
+  exit 2
+fi
+[ -n "$PY" ] || PY="$(command -v python3)"
 
 # Every sibling job in ci.yml, in its order there. tests/test_local_ci.py fails if this list
 # and ci.yml's `changes` job drift apart, so a new sibling job cannot silently go unrun here.
@@ -47,6 +62,7 @@ VENVS="${DCA_LOCAL_CI_VENVS:-$HOME/.cache/all-stock-dca/ci-venvs}"
 
 quick=0
 audit=0
+py311=0
 research_audit=0
 keep_going=0
 dry_run=0
@@ -59,6 +75,7 @@ for arg in "$@"; do
   case "$arg" in
     --quick) quick=1 ;;
     --audit) audit=1 ;;
+    --py311) py311=1 ;;
     --research-audit) research_audit=1 ;;
     --keep-going) keep_going=1 ;;
     --dry-run) dry_run=1 ;;
@@ -68,12 +85,13 @@ for arg in "$@"; do
     --pr=*) pr="${arg#--pr=}" ;;
     --all)
       audit=1
+      py311=1
       research_audit=1
       # word-splitting SIBLINGS is the point here
       # shellcheck disable=SC2206
       siblings+=($SIBLINGS)
       ;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "local_ci: unknown option $arg" >&2; exit 2 ;;
     *)
       case " $SIBLINGS " in
@@ -247,6 +265,12 @@ run_step "ruff check ." "$PY" -m ruff check .
 if [ "$quick" -eq 0 ]; then
   run_step "pytest (coverage gate, same as CI)" \
     "$PY" -m pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
+fi
+
+if [ "$py311" -eq 1 ]; then
+  # main's second matrix leg; a throwaway uv env so it never touches the shared .venv.
+  run_step "pytest on Python 3.11 (main's second matrix leg)" \
+    uv run --no-project --quiet --python 3.11 --with-requirements requirements-dev.txt python -m pytest
 fi
 
 run_step "scripts/tests" "$PY" -m pytest scripts/tests -q

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -48,10 +49,13 @@ FILENAME = "slot_status.json"
 # The seven canonical slots, in order (dca_order_plan.LATEST_PLACEMENT_ET's keys). Spelled out rather than imported
 # so this module stays light enough for local_heartbeat to import on every start and finish.
 SLOTS = ("0935", "1030", "1130", "1230", "1330", "1430", "1530")
-STATUSES = ("in_progress", "succeeded", "failed")
+# backup_requested (2026-10-31, scripts/backup_dispatch.py): a backup was triggered for the slot. It never stands a
+# backup down (is_done needs succeeded), and it tells the GitHub watcher the Mac already handled the slot.
+STATUSES = ("in_progress", "succeeded", "failed", "backup_requested")
 MARKETS = ("open", "closed")
-# The public repository whose data branch the Perplexity backups read (same slug as backup_procedure's).
-GITHUB_REPOSITORY = "badMade/all-stock-dca"
+# The signal's repository comes from config/slot_status.json "repository": a separate PUBLIC data-only repository,
+# because badMade/all-stock-dca is private and an unauthenticated raw read of it returns 404 (found 2026-10-31).
+_REPOSITORY = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
 # The branch publisher force-pushes a one-file tree: sharing the recommendations branch would erase
 # recommendations.json. main and claude/** are refused by the publisher itself (they trigger CI).
 _RESERVED_BRANCHES = {"recommendations"}
@@ -68,9 +72,11 @@ def state_path() -> Path:
     return state_dir() / FILENAME
 
 
-def raw_url(branch: str) -> str:
-    """Where a cloud reader fetches the published document."""
-    return f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/{branch}/{FILENAME}"
+def raw_url(branch: str, repository: str) -> str:
+    """Where a cloud reader fetches the published document (the public signal repository, never the trading one)."""
+    if not _REPOSITORY.fullmatch(repository or "") or ".." in repository:
+        raise ValueError("repository must look like owner/name")
+    return f"https://raw.githubusercontent.com/{repository}/{branch}/{FILENAME}"
 
 
 def _stamp(now: datetime) -> str:
