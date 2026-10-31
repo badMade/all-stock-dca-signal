@@ -12,6 +12,7 @@ belong in a public repository. Output is one JSON document; exit 0 when usable, 
     python3 -m scripts.backup_cost_ledger add --day 2026-10-29 --task 4412c3c4 --credits 312 \\
         [--status stood_down_local_active]
     python3 -m scripts.backup_cost_ledger report [--since 2026-10-27]
+    python3 -m scripts.backup_cost_ledger report --split 2026-11-02     # before vs from that day on
 """
 
 from __future__ import annotations
@@ -128,6 +129,25 @@ def report(since: str | None = None) -> dict[str, Any]:
             "by_task": _means(rows, "task_id")}
 
 
+def _side(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    days = {row["trading_day"] for row in rows}
+    total = sum(row["credits"] for row in rows)
+    return {"days": len(days), "fires": len(rows),
+            "mean_credits_per_fire": round(total / len(rows), 2) if rows else None,
+            "mean_credits_per_day": round(total / len(days), 2) if days else None}
+
+
+def split_report(split: str) -> dict[str, Any]:
+    """Credits per fire and per day before ``split`` and from ``split`` on: did a change pay off (2026-10-31)?"""
+    cutoff = _day(split)
+    rows = _rows()
+    before = _side([row for row in rows if row["trading_day"] < cutoff])
+    after = _side([row for row in rows if row["trading_day"] >= cutoff])
+    per_day = after["mean_credits_per_day"]
+    return {"target_per_day": TARGET_PER_DAY, "split": cutoff, "before": before, "after": after,
+            "after_under_target": None if per_day is None else per_day < TARGET_PER_DAY}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -138,10 +158,13 @@ def main(argv: list[str] | None = None) -> int:
     add_parser.add_argument("--status")
     report_parser = sub.add_parser("report", help="Daily totals against the target, means by status and task.")
     report_parser.add_argument("--since")
+    report_parser.add_argument("--split", help="YYYY-MM-DD: compare the days before it with the days from it on")
     args = parser.parse_args(argv)
     try:
         if args.command == "add":
             out: dict[str, Any] = {"ok": True, "row": add(args.day, args.task, args.credits, args.status)}
+        elif args.split:
+            out = {"ok": True, **split_report(args.split)}
         else:
             out = {"ok": True, **report(args.since)}
     except LedgerError as exc:
