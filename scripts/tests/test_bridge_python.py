@@ -26,6 +26,13 @@ SCRIPT = REPO / "scripts" / "bridge_python.sh"
 # dash is /bin/sh on the Ubuntu bridge VM; bash and the host's sh cover the rest.
 SHELLS = [s for s in ("sh", "dash", "bash") if shutil.which(s)]
 
+# chmod 0o555 cannot make a directory unwritable for root, which ignores permission bits, so these tests cannot
+# set up their condition under uid 0 (a root container or act run). CI runs them as a non-root runner user, where
+# they still gate the fallback and the exit codes (2026-10-31 local check of main: 4 false failures as root).
+needs_permission_bits = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores directory permission bits; run as a non-root user"
+)
+
 FAKE_UV = r"""#!/bin/sh
 echo "uv $*" >> "$FAKE_UV_LOG"
 if [ "$1 $2" = "python find" ]; then
@@ -134,6 +141,7 @@ def test_pinned_dir_owned_by_nobody_falls_back_to_an_owned_mktemp_dir(env, shell
     assert env.installs() == [str(fallback / "python")]
 
 
+@needs_permission_bits
 def test_a_read_only_pinned_dir_falls_back(env):
     env.pinned.mkdir()
     env.pinned.chmod(0o555)
@@ -147,6 +155,7 @@ def test_a_read_only_pinned_dir_falls_back(env):
     assert "cannot be created" in done.stderr or "not writable" in done.stderr
 
 
+@needs_permission_bits
 def test_a_read_only_pinned_subdir_falls_back(env):
     """The cache dir alone being unwritable is enough to break uv, so every subdir is checked."""
     for sub in ("python", "cache", "tmp"):
@@ -220,6 +229,7 @@ def test_no_uv_on_path_exits_3(tmp_path):
     assert "BRIDGE_PYTHON_ERROR: uv is not on PATH" in done.stderr
 
 
+@needs_permission_bits
 def test_no_writable_dir_anywhere_exits_4(env):
     env.base.chmod(0o555)
     try:
