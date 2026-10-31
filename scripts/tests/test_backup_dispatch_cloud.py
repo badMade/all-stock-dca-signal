@@ -78,3 +78,23 @@ def test_the_workflow_runs_after_each_slot_and_reads_its_secrets_by_name():
     # Seven slots, UTC crons for both EDT and EST would be ambiguous; the script decides from the ET clock, so the
     # workflow only needs to fire often enough: every 5 minutes inside market hours on weekdays.
     assert "*/5" in workflow and "1-5" in workflow
+
+
+def test_the_workflow_can_push_the_backup_requested_mark_to_the_public_signal_repository():
+    # GITHUB_TOKEN cannot push to another repository, so the mark goes through a fine-grained token secret scoped
+    # to the signal repository only.
+    workflow = (REPO / ".github" / "workflows" / "backup-dispatch-watch.yml").read_text(encoding="utf-8")
+    assert "secrets.DCA_SIGNAL_PUSH_TOKEN" in workflow
+    assert "git remote add signal" in workflow
+    assert "badMade/all-stock-dca-signal" in workflow
+
+
+def test_the_cloud_command_reads_the_signal_from_the_public_repository(monkeypatch, capsys):
+    import json
+
+    seen = []
+    monkeypatch.setattr(bd, "_calendar", lambda: CALENDAR)
+    monkeypatch.setattr(bd, "_fetch_document", lambda url: seen.append(url) or None)
+    assert bd.main(["cloud", "--now", "2026-10-29T09:56:00-04:00", "--dry-run"]) == 0
+    assert seen == ["https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json"]
+    assert json.loads(capsys.readouterr().out)["action"] == "would_send"
