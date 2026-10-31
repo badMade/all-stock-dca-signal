@@ -124,8 +124,8 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   plan and build `robinhood_payload_<day>_1530.json` on demand. `merge` and `check` need no change.
 - **What it plans:** the universe and interval the 3:30 generator itself uses (`load_strategy_config(...).tickers` minus
   `excluded_tickers`, `robinhood_interval_minutes` = 5, `generate_buy_candidates.SLOT_SPECS["1530ET"]` decision time 15:30),
-  with bars from **14:30**. The generator bypasses the trend filter at 1530ET and only needs the 60-minutes-back lookback bar
-  (14:30), the completed decision bar (15:25) and the previous close; the live prompt's "09:30 onward" is wider than that
+  with bars from **14:25**. The generator bypasses the trend filter at 1530ET and only needs the 60-minutes-back lookback bar
+  (14:25, anchored on the completed 15:25 bar), the completed decision bar (15:25) and the previous close; the live prompt's "09:30 onward" is wider than that
   and would make each chunk reply 72 bars per ticker instead of 12.
 - **What stays off:** `due_slot` (launchd's `auto`) only ever returns the six scheduled slots, so adding a 15:31 plist
   entry is a separate, deliberate step. A test pins this.
