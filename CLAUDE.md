@@ -42,6 +42,11 @@ ruff check .
 # The coverage gate CI enforces
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 
+# Every CI job, run locally (core by default; --all adds both audits and every sibling
+# suite in its own venv under ~/.cache; --changed runs only the siblings CI would run;
+# --pr N posts the summary on a PR). Use it when Actions cannot run (2026-10-31: billing block)
+scripts/local_ci.sh --all --keep-going
+
 # Dry-run smoke test (the third standard pre-handoff check)
 python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo
 
