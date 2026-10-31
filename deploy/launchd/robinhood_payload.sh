@@ -35,6 +35,15 @@ PARALLEL="${DCA_CODEX_PARALLEL:-3}"
 # than DCA_MIN_ATTEMPT_SECONDS left, and the merge then sees the missing tickers and enforces its coverage floor,
 # so a late build fails fast at Gate 5 instead of arriving too late to be read.
 BUILD_DEADLINE_SECONDS="${DCA_BUILD_DEADLINE_SECONDS:-0}"
+# Opt-in wall-clock cutoff, HH:MM America/New_York on the plan's trading day (2026-10-30). DCA_BUILD_DEADLINE_SECONDS
+# counts from whenever the build happened to start, so a 15:31 job that launchd fires late (the Mac woke at 15:36) would
+# still fetch until 15:44, after the 3:30 session's 12-minute re-check of `check` has already given up and aborted. The
+# cutoff bounds the fetch in ET whatever the start time; when both are set the earlier one wins. A build that starts
+# after it fetches nothing, and the merge refuses with its marker, so the session's `check` names the refusal.
+BUILD_DEADLINE_ET="${DCA_BUILD_DEADLINE_ET:-}"
+if [ -n "$BUILD_DEADLINE_ET" ] && ! [[ "$BUILD_DEADLINE_ET" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+  echo "robinhood_payload: DCA_BUILD_DEADLINE_ET must be HH:MM (24-hour, America/New_York)" >&2; exit 2
+fi
 MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
 # Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
 # costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).
@@ -83,10 +92,10 @@ fi
 
 # One codex call per chunk of tickers, a few at a time. A chunk that times out or errors simply leaves its
 # tickers without data; the merge records them in ticker_errors and enforces the coverage floor.
-# Seconds left before the opt-in build deadline; empty when none is set. BUILD_STARTED is assigned before the first
-# chunk starts, and each chunk worker is a subshell that reads it, so every worker measures from the same instant.
+# Seconds left before the opt-in build deadline; empty when none is set. DEADLINE_EPOCH is assigned before the first
+# chunk starts, and each chunk worker is a subshell that reads it, so every worker measures against the same instant.
 seconds_left() {
-  if [ "$BUILD_DEADLINE_SECONDS" -gt 0 ]; then echo $(( BUILD_DEADLINE_SECONDS - ( $(date +%s) - BUILD_STARTED ) )); fi
+  if [ -n "$DEADLINE_EPOCH" ]; then echo $(( DEADLINE_EPOCH - $(date +%s) )); fi
 }
 
 run_chunk() {
@@ -134,6 +143,20 @@ run_chunk() {
 }
 
 BUILD_STARTED="$(date +%s)"
+DEADLINE_EPOCH=""
+[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( BUILD_STARTED + BUILD_DEADLINE_SECONDS ))
+if [ -n "$BUILD_DEADLINE_ET" ]; then
+  # zoneinfo, not the Mac's own clock zone: the cutoff is ET even on a Mac that is not pinned to New York.
+  CUTOFF_EPOCH="$("$PY" -c '
+import datetime as dt, json, sys
+from zoneinfo import ZoneInfo
+day = dt.date.fromisoformat(json.load(open(sys.argv[1]))["trading_day"])
+print(int(dt.datetime.combine(day, dt.time.fromisoformat(sys.argv[2]), ZoneInfo("America/New_York")).timestamp()))
+' "$WORK/plan.json" "$BUILD_DEADLINE_ET")"
+  if [ -z "$DEADLINE_EPOCH" ] || [ "$CUTOFF_EPOCH" -lt "$DEADLINE_EPOCH" ]; then DEADLINE_EPOCH="$CUTOFF_EPOCH"; fi
+  [ "$CUTOFF_EPOCH" -le "$BUILD_STARTED" ] \
+    && echo "robinhood_payload: deadline $BUILD_DEADLINE_ET ET had already passed when the build started; fetching nothing" >&2
+fi
 "$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json" >"$WORK/chunks.txt"
 idx=0
 while IFS= read -r tickers; do
@@ -237,7 +260,7 @@ shopt -s nullglob
 # The total covers the fetch and the merge; the merge's exit status still decides the launcher's.
 MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
-echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS" >&2
+echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS deadline_et=${BUILD_DEADLINE_ET:-none}" >&2
 
 # Plan-first half (2026-10-26): the retired 5-minute Claude courier's order-history and buying-power read, now a second
 # `codex exec` after the payload is published, followed by `ingest`, which writes the recommendation files. Opt-in
