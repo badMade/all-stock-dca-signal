@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in pre-push gate: `git config core.hooksPath scripts/git-hooks` (see docs/actions_minutes.md).
+# Opt-in pre-push gate: `git config core.hooksPath scripts/git-hooks` (see docs/local_ci.md).
 # Runs the quick local CI subset (ruff, scripts/tests, dry-run demo) so a push does not spend
 # Actions minutes on a failure a laptop would have caught. `git push --no-verify` skips it.
 exec "$(git rev-parse --show-toplevel)/scripts/local_ci.sh" --quick
