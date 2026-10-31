@@ -48,8 +48,8 @@ PR #2067 (the base of this change) makes draft PRs skip CI: `pull_request` also 
    `uv.lock`, `pyproject.toml`), plus on every scheduled/manual run, which is where a new advisory
    against unchanged pins gets caught.
 4. **Every job's runner is a variable**: `runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}`.
-   Unset, nothing changes. Set it to a self-hosted runner's label and the whole workflow runs at
-   zero Actions-minute cost (see below).
+   Unset, nothing changes. Set it to a self-hosted runner's label and the whole workflow stops
+   using GitHub-hosted runner minutes (see below for the pricing caveat).
 
 `scripts/tests/test_workflow_policy.py::test_ci_minute_budget_triggers` pins all four.
 
@@ -67,10 +67,13 @@ minutes together; the other workflows are ≤1 run a week. No workflow was disab
 1. **Run `scripts/local_ci.sh` before pushing** (below). It is the same gate set as CI, takes
    about as long as the PR leg did, and costs nothing.
 2. **Register a self-hosted runner on this Mac and set `CI_RUNS_ON`**, so the existing workflows,
-   self-heal, and PR checks keep running unchanged at no minute cost. Self-hosted runner minutes
-   are free and do not count against the spending limit. Whether a *failed-payment* lock also
-   stops self-hosted jobs is not documented clearly. Check with one `workflow_dispatch` after
-   setting the variable.
+   self-heal, and PR checks keep running unchanged without using GitHub-hosted runner minutes.
+   **Check current pricing before relying on this being free:** in December 2025 GitHub announced
+   a per-minute platform charge for self-hosted runners on private repositories, then postponed
+   it, so whether self-hosted minutes cost anything (and count toward the spending limit) depends
+   on GitHub's pricing page at the time you set this up, not on this doc. It is also not
+   documented clearly whether a *failed-payment* lock stops self-hosted jobs. Check with one
+   `workflow_dispatch` after setting the variable.
 3. **If you stay on GitHub-hosted runners**, the biggest remaining lever is the push-to-main
    core run (~22 min × ~76 pushes a week). The PR already ran the same 3.12 suite, so a push run
    mostly re-proves a merge. Dropping it in favour of the weekday scheduled run would save another

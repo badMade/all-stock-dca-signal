@@ -44,8 +44,9 @@ concurrency:
 # Runner: every job reads `runs-on` from the CI_RUNS_ON repository variable and
 # falls back to GitHub-hosted ubuntu-26.04 when it is unset. Set it to the label of
 # a self-hosted runner (e.g. `gh variable set CI_RUNS_ON --body self-hosted`) to run
-# this whole workflow at zero Actions-minute cost; delete the variable to switch
-# back. See docs/local_ci.md for the runner setup and its security caveats.
+# this whole workflow off GitHub-hosted runner minutes (check GitHub's current
+# self-hosted pricing first); delete the variable to switch back. See
+# docs/local_ci.md for the runner setup, the pricing note and its security caveats.
 
 # Read-only by default; no job here needs to write to the repository.
 permissions:
