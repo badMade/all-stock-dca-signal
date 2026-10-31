@@ -93,9 +93,9 @@ def _render_short_prompt(backup: Backup, common: dict[str, str], settings: dict)
         slot_from_clock = 'before 14:30 ET the slot is "1330"; from 14:30 ET the slot is "1430"'
     values = {
         **backup_procedure.backup_values(backup, common),
-        "@@RAW_URL@@": slot_status.raw_url(settings["branch"]),
+        "@@RAW_URL@@": slot_status.raw_url(settings["branch"], settings["repository"]),
         "@@BRANCH@@": settings["branch"],
-        "@@GITHUB_REPOSITORY@@": slot_status.GITHUB_REPOSITORY,
+        "@@GITHUB_REPOSITORY@@": settings["repository"],
         "@@SLOT_FROM_CLOCK@@": slot_from_clock,
         "@@BUILD_STAMP@@": _build_stamp(),
     }

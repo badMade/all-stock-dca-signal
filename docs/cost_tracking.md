@@ -301,8 +301,10 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
 
 2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the primary's own
    `local_heartbeat start` and `finish`.
-   - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch
-     (`config/slot_status.json`).
+   - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch of
+     the separate PUBLIC repository `badMade/all-stock-dca-signal` (`config/slot_status.json`). This repository is
+     private, so Perplexity cannot read a file here (found 2026-10-31). One-time Mac setup: create that repository,
+     then run `git remote add signal https://github.com/badMade/all-stock-dca-signal.git` in the checkout.
    - Content: only the day, whether the market is open, and each slot's status and time.
    - Failure: publishing is best-effort and never fails the primary run.
    - Closed days: run `python3 -m scripts.slot_status market-day` once each morning to publish a holiday as closed.

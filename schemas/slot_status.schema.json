@@ -3,13 +3,37 @@
   "title": "Slot-status signal settings (config/slot_status.json)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "enabled", "branch", "remote"],
+  "required": [
+    "version",
+    "enabled",
+    "repository",
+    "branch",
+    "remote"
+  ],
   "properties": {
-    "$schema": {"type": "string"},
-    "version": {"type": "string"},
-    "description": {"type": "string"},
-    "enabled": {"type": "boolean"},
-    "branch": {"type": "string", "pattern": "^[A-Za-z0-9._/-]+$"},
-    "remote": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._/-]+$"
+    },
+    "remote": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$"
+    }
   }
 }

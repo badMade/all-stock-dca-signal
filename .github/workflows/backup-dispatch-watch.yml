@@ -4,8 +4,9 @@ name: Backup dispatch watch
 # (scripts/backup_dispatch.py run, launchd) decides 15 minutes after each slot. This workflow covers the day the Mac is
 # DOWN: 20 minutes after each slot it reads the public slot-status document and emails Perplexity Computer only when
 # today's document has no entry for the slot, or there is no document for today. Any entry means the Mac is alive and
-# owns the decision. After a send it marks the slot backup_requested on the slot-status branch, so the next 5-minute
-# run does not send again.
+# owns the decision. After a send it marks the slot backup_requested on the slot-status branch of the PUBLIC signal
+# repository badMade/all-stock-dca-signal (this repository is private, so Perplexity cannot read a file here), so the
+# next 5-minute run does not send again.
 #
 # The script decides from the America/New_York clock and its own windows, so the schedule only has to fire often
 # enough: every 5 minutes, 13:00-21:59 UTC on weekdays, covering both EDT and EST market hours. Outside a window a run
@@ -15,7 +16,7 @@ name: Backup dispatch watch
 #
 # TRUST BOUNDARY: both triggers run main only. workflow_dispatch exists for the operator's forced-failure test; the
 # job refuses any other ref, and the checkout pins main, so a dispatch cannot run another branch's code with this
-# job's contents: write token or the mail secrets.
+# job's mail secrets or the signal-repository token.
 on:
   schedule:
     - cron: "*/5 13-21 * * 1-5"
@@ -26,8 +27,10 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  # Pushing one backup_requested mark to the data-only slot-status branch (never main or claude/**).
-  contents: write
+  # This repository is only read. The backup_requested mark goes to the signal repository through
+  # DCA_SIGNAL_PUSH_TOKEN (a fine-grained token with contents write on badMade/all-stock-dca-signal only), because the
+  # job's own token cannot push to another repository.
+  contents: read
 
 jobs:
   watch:
@@ -57,9 +60,9 @@ jobs:
           DCA_ALERT_EMAIL_ADDRESS: ${{ secrets.DCA_ALERT_EMAIL_ADDRESS }}
           ROBINHOOD_AGENTIC_ACCOUNT_LAST4: ${{ secrets.ROBINHOOD_AGENTIC_ACCOUNT_LAST4 }}
           DCA_PPLX_STATE_FOLDERS: ${{ secrets.DCA_PPLX_STATE_FOLDERS }}
-          GH_TOKEN: ${{ github.token }}
+          SIGNAL_TOKEN: ${{ secrets.DCA_SIGNAL_PUSH_TOKEN }}
         run: |
-          # The token is set on the remote only for this step, so the slot-status push works without persisted
-          # checkout credentials. The publisher reports a failed git step by name only, never the remote URL.
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # The remote "signal" (config/slot_status.json) exists only for this step. The publisher reports a failed git
+          # step by name only, never the remote URL that carries the token.
+          git remote add signal "https://x-access-token:${SIGNAL_TOKEN}@github.com/badMade/all-stock-dca-signal.git"
           python -m scripts.backup_dispatch cloud

@@ -327,7 +327,8 @@ def main(argv: list[str] | None = None) -> int:
             report = dispatch(day=day, slot=slot, now=now, mode=mode, calendar=_calendar(), probe=_probe,
                               send=_smtp_send, message_for=_message_for, notify=_notify, after_minutes=after)
         else:
-            url = slot_status.raw_url(slot_status.load_settings()["branch"])
+            signal = slot_status.load_settings()
+            url = slot_status.raw_url(signal["branch"], signal["repository"])
             document = _fetch_document(url)
             report = {**cloud_decide(document, day=day, slot=slot, now=now, calendar=_calendar()), "slot": slot}
             if report["action"] == "send":

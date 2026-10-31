@@ -9,7 +9,7 @@ RUN VALUES (filled in when this prompt is pasted):
    ROBINHOOD_AGENTIC_ACCOUNT_LAST4 (the last four digits rule 2 requires): ${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}
 
 STEP A - SIGNAL CHECK
-Read https://raw.githubusercontent.com/badMade/all-stock-dca/slot-status/slot_status.json once, without any other tool call. It is the public badMade/all-stock-dca branch "slot-status" file `slot_status.json`; expect this schema: {"schema": "slot_status/1", "trading_day": "YYYY-MM-DD", "market": "open" or "closed", "updated_at": "...", "slots": {"0935": {"status": "in_progress", "stamped_at": "..."}}}.
+Read https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json once, without any other tool call. It is the public badMade/all-stock-dca-signal branch "slot-status" file `slot_status.json`; expect this schema: {"schema": "slot_status/1", "trading_day": "YYYY-MM-DD", "market": "open" or "closed", "updated_at": "...", "slots": {"0935": {"status": "in_progress", "stamped_at": "..."}}}.
 Use the current date and clock in America/New_York. This task backs up slot 1130; the slot is "1130". Stand down only when "schema" is "slot_status/1", the trading_day is today, and either "market" is "closed" or today's entry for this task's slot has a nonempty "stamped_at" and "status" is "succeeded". On either result, make no Robinhood call, place nothing, make no other tool call, write no file, send no notification, and end the run.
 If the file cannot be read, is not JSON, has another schema or another day, is malformed, the market is not closed and the slot is in_progress or failed, or there is no entry for this slot, do not stand down: go to STEP B. This signal never authorizes a buy. Read it once and do not retry.
 
