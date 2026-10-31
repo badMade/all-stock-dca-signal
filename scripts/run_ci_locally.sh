@@ -141,6 +141,12 @@ git clone -q "$repo_root" "$snapshot"
 git -C "$snapshot" fetch -q "$repo_root" "$head"
 git -C "$snapshot" checkout -q --detach "$head"
 git -C "$snapshot" remote set-url origin "$(git -C "$repo_root" remote get-url origin)"
+# A fresh clone packs every ref, leaving .git/refs/heads and refs/tags empty, and
+# act's copy into the job container drops empty directories. Without .git/refs git
+# does not recognise the checkout ("not a git repository"), so every test that runs
+# git failed under act (12 on the 2026-10-31 #2075 run; GitHub's checkout has refs).
+# One loose ref keeps the directory; HEAD stays detached at the same commit.
+git -C "$snapshot" update-ref refs/heads/act-ci-snapshot "$head"
 git -C "$repo_root" diff --binary HEAD > "$work/uncommitted.patch"
 if test -s "$work/uncommitted.patch"; then
     git -C "$snapshot" apply --whitespace=nowarn "$work/uncommitted.patch"

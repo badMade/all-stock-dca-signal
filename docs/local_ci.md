@@ -112,6 +112,9 @@ Exit status is act's: 0 when every job that ran succeeded.
   act copies whatever directory it runs in, and a linked worktree's `.git` is a file naming a host path the
   container cannot see: run directly, every `git` call exited 128 and `from.py` looked for the main
   checkout's `.venv` (14 of the first run's 17 failures). To check a PR, check out its branch first.
+* **The snapshot keeps one loose ref** (`refs/heads/act-ci-snapshot`, 2026-10-31). A fresh clone packs every
+  ref, act's copy into the container drops the empty `.git/refs`, and git there then reports "not a git
+  repository": 12 tests that call git failed under act only.
 * **Jobs run as `runner` (uid 1001), not root,** as on GitHub. Root ignores file modes, so the tests that
   prove a read-only directory is refused failed locally as root.
 * **A PR run needs the PR number.** The `changes` job lists the PR's files through the GitHub API to decide

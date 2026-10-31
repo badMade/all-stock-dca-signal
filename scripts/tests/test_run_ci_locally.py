@@ -125,3 +125,11 @@ def test_one_act_run_per_machine() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     assert 'while ! mkdir "$lock" 2>/dev/null; do' in script
     assert "trap 'rm -rf \"$work\" \"$lock\"' EXIT" in script
+
+
+def test_snapshot_keeps_a_loose_ref_so_git_works_inside_the_container() -> None:
+    # 2026-10-31: a fresh clone packs every ref, act's copy drops the then-empty .git/refs, and git in the job said
+    # "not a git repository": 12 tests that call git failed under act and nowhere else.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'git -C "$snapshot" update-ref refs/heads/act-ci-snapshot "$head"' in script
+    assert script.index("update-ref refs/heads/act-ci-snapshot") < script.index('cd "$snapshot"')
