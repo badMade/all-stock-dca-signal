@@ -133,3 +133,33 @@ def test_snapshot_keeps_a_loose_ref_so_git_works_inside_the_container() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     assert 'git -C "$snapshot" update-ref refs/heads/act-ci-snapshot "$head"' in script
     assert script.index("update-ref refs/heads/act-ci-snapshot") < script.index('cd "$snapshot"')
+
+
+# -- salvaged from the closed #2075 and #2080 (2026-10-31): behaviour #2076 did not carry over ---------------------
+
+
+@pytest.mark.parametrize("act_args", [["-j", "test"], ["--matrix", "python-version:3.11"]])
+def test_report_refuses_a_partial_run(act_args: list[str]) -> None:
+    # With `-j test` the job loop would see one passing job and post an overall success for a run that skipped
+    # every other job. Refused before the tool check, so this runs on a machine without act.
+    result = subprocess.run(["sh", str(SCRIPT), "--report", *act_args], capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert "--report runs the whole workflow" in result.stderr
+
+
+def test_an_interrupted_report_run_does_not_stay_pending() -> None:
+    # Once "pending" is posted, any exit before the overall status marks the commit "error"; a signal must reach
+    # the EXIT trap at all (dash skips it on an untrapped INT/TERM); and the final status disarms the error path.
+    script = SCRIPT.read_text(encoding="utf-8")
+    pending = script.index('post_status pending ""')
+    error_trap = script.index('post_status error ""')
+    assert pending < error_trap < script.index("act \"$event\""), "the error trap must be armed before act starts"
+    assert "trap 'exit 130' INT TERM" in script
+    assert script.index("report=2") > script.index('post_status success "" ')
+
+
+def test_waiting_for_the_act_lock_is_bounded() -> None:
+    # A wedged holder must not park every later run (a --report one included) forever without an error.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'test "$waited" -ge "${ACT_LOCK_WAIT_SECONDS:-3600}"' in script
+    assert "waited=$((waited + 30))" in script

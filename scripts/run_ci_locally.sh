@@ -34,6 +34,15 @@ while test "$#" -gt 0; do
     esac
 done
 
+# --report posts a claim about the whole workflow, so a partial run must not make
+# it (salvaged 2026-10-31 from the closed #2075): with `-j test` the job loop below
+# would see one passing job and post an overall success for a run that skipped
+# every other job. Refused here, before any tool is needed, so it costs nothing.
+if test "$report" -eq 1 && test "$#" -gt 0; then
+    echo "--report runs the whole workflow; drop the act arguments ($*)" >&2
+    exit 2
+fi
+
 for tool in act colima docker gh; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing $tool: brew install act colima docker gh" >&2; exit 1; }
 done
@@ -61,9 +70,12 @@ fi
 # container mid-test: on 2026-10-31 a second session's run killed this one's core
 # job with exit 137 ("removal of container ... already in progress") and, before
 # that, with "...-env: no such volume". mkdir is atomic; a lock whose pid is gone
-# is stale and taken over.
+# is stale and taken over. A live holder is waited on for at most an hour (salvaged
+# 2026-10-31 from the closed #2080): a wedged run would otherwise park every later
+# one, including a --report run someone is waiting on, with no error at all.
 lock=${XDG_CACHE_HOME:-$HOME/.cache}/all-stock-dca/act.lock
 mkdir -p "$(dirname "$lock")"
+waited=0
 while ! mkdir "$lock" 2>/dev/null; do
     holder=$(cat "$lock/pid" 2>/dev/null || true)
     if test -n "$holder" && ! kill -0 "$holder" 2>/dev/null; then
@@ -71,8 +83,13 @@ while ! mkdir "$lock" 2>/dev/null; do
         rm -rf "$lock"
         continue
     fi
+    if test "$waited" -ge "${ACT_LOCK_WAIT_SECONDS:-3600}"; then
+        echo "another act run (pid ${holder:-?}) has held $lock for ${waited}s; giving up" >&2
+        exit 4
+    fi
     echo "another act run holds $lock (pid ${holder:-?}); waiting..." >&2
     sleep 30
+    waited=$((waited + 30))
 done
 echo "$$" > "$lock/pid"
 
@@ -87,6 +104,9 @@ docker volume ls -q --filter name='^act-CI-' | xargs docker volume rm >/dev/null
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/act-ci.XXXXXX")
 trap 'rm -rf "$work" "$lock"' EXIT
+# A signal must still run the EXIT trap (dash skips it on an untrapped INT/TERM),
+# or a Ctrl-C would leave the lock and, with --report, a "pending" status behind.
+trap 'exit 130' INT TERM
 event_file=$work/event.json
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 if test "$event" = pull_request; then
@@ -169,6 +189,10 @@ post_status() {
 }
 if test "$report" -eq 1; then
     post_status pending "" "running ci.yml with act on $host (linux/arm64), started $(date '+%Y-%m-%d %H:%M %Z')"
+    # Until the final overall status is posted, an exit (Ctrl-C, a script error)
+    # marks the commit "error" instead of leaving it "pending" forever (salvaged
+    # 2026-10-31 from the closed #2075).
+    trap 'test "$report" -ne 1 || post_status error "" "ended before act finished (interrupted or script error) on $host"; rm -rf "$work" "$lock"' EXIT
 fi
 status=0
 {
@@ -208,5 +232,6 @@ if test "$report" -eq 1; then
         post_status failure "" "$failed of $((passed + failed)) job(s) failed locally (act exit $status) on $host"
     fi
     echo "reported $passed passed, $failed failed to $repo@$head" >&2
+    report=2  # the overall status is posted; the EXIT trap must not overwrite it with "error"
 fi
 exit "$status"
