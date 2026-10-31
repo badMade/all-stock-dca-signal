@@ -76,6 +76,15 @@ while ! mkdir "$lock" 2>/dev/null; do
 done
 echo "$$" > "$lock/pid"
 
+# Holding the lock, any act-CI-* container or volume is a leftover from a run
+# that was killed or crashed; clear them so this run starts from nothing. This
+# replaces act's --rm, which on 2026-10-31 made the core job fail at setup
+# ("...-env: no such volume") whenever it ran after another job in the same
+# invocation, while the same job alone set up fine. act-toolcache is kept: it is
+# the shared Python cache, not per-run state.
+docker ps -aq --filter name='^act-CI-' | xargs docker rm -f >/dev/null 2>&1 || true
+docker volume ls -q --filter name='^act-CI-' | xargs docker volume rm >/dev/null 2>&1 || true
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/act-ci.XXXXXX")
 trap 'rm -rf "$work" "$lock"' EXIT
 event_file=$work/event.json
@@ -140,7 +149,6 @@ fi
 #
 # --user 1001:1001 runs steps as the image's `runner` user, as GitHub does; as
 # root, read-only-directory tests could not fail the way they are meant to.
-# --rm removes a failed job's container instead of leaving it running.
 cd "$snapshot"
 GITHUB_TOKEN=$(gh auth token)
 export GITHUB_TOKEN
@@ -167,7 +175,6 @@ act "$event" \
     --pull=false \
     --concurrent-jobs 1 \
     --container-options "--user 1001:1001" \
-    --rm \
     -s GITHUB_TOKEN \
     "$@" || echo "$?" > "$work/act.status"
 } 2>&1 | tee "$work/act.log"
