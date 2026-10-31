@@ -127,6 +127,12 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   with bars from **14:25**. The generator bypasses the trend filter at 1530ET and only needs the 60-minutes-back lookback bar
   (14:25, anchored on the completed 15:25 bar), the completed decision bar (15:25) and the previous close; the live prompt's "09:30 onward" is wider than that
   and would make each chunk reply 72 bars per ticker instead of 12.
+- **The window start is exact (2026-10-30).** `validate_ticker` used to accept a series whose first bar came up to one
+  interval after the planned start. On 2026-10-30 the 3:30 plan still started at 14:30 (fixed in #2059), every series
+  began at 14:30, the payload checked 91/91, and the generator then scored all 91 `NO_DATA`/provider_error for want of
+  the 14:25 lookback bar. A series must now include the bar at the planned start, or that ticker fails in `merge` and
+  `check` with `do not cover the HH:MM trend-window start (first bar HH:MM ET)` and counts against the coverage floor.
+  No published series from 2026-10-19 to 10-30, in any slot, started anywhere else.
 - **What stays off:** `due_slot` (launchd's `auto`) only ever returns the six scheduled slots, so adding a 15:31 plist
   entry is a separate, deliberate step. A test pins this.
 - **Known risk for the next step:** 90 tickers are 12 chunks of 8, run 3 at a time (4 waves of up to 240 s), so a worst-case
