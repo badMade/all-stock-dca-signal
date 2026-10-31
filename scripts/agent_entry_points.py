@@ -227,6 +227,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Summarize a trading day's slot outcomes (aborts, caps, errors, gate9 notes) for the triage routine, redacted",
+        command="python -m scripts.triage_log_summary [--date YYYY-MM-DD] [--root <cron-tracking root>] [--json]",
+        exists_path="scripts/triage_log_summary.py",
+        doc_ref="docs/triage_routine.md",
+        symbols=("main", "summarize_day", "summarize_slot", "redact", "latest_trading_day"),
+        notes=(
+            "Read-only. Joins verify_schedule with each slot's own run_state status, error and "
+            "gate9 notes, which verify_schedule's ok does not judge (2026-10-30: ok true while "
+            "9:35 and 3:30 aborted). Defaults to the latest trading day on/before today ET. "
+            "Strips the account number and account-shaped digits; emits relative paths only. "
+            "Exits 1 when a slot needs attention, 2 with LOGS UNAVAILABLE when the root is unreadable."
+        ),
+    ),
+    EntryPoint(
         need="Check after a slot that no order was platform-refused and every eligible buy was submitted or accounted for",
         command="python -m scripts.check_slot_fills --slot <HHMM> --date YYYY-MM-DD [--root <cron-tracking root>] [--json]",
         exists_path="scripts/check_slot_fills.py",
