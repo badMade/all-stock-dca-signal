@@ -188,7 +188,7 @@ def test_the_canonical_schedule_table_precedes_the_expired_override_records():
     the first schedule table in the section that calls itself authoritative.
     """
     text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
-    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (ET) | Trades | Status |")
     expired_records = text.index("### Expired temporary live scheduler overrides")
     assert canonical < expired_records, (
         "the canonical schedule table must appear before the expired override records, "
@@ -230,7 +230,7 @@ def _active_schedule_preamble() -> str:
     """Everything in the Active schedule section before its canonical table."""
     text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
     section = text.index("## Active schedule (canonical, verified 2026-07-27)")
-    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (ET) | Trades | Status |")
     assert section < canonical, "the canonical table must live inside the Active schedule section"
     return text[section:canonical]
 
