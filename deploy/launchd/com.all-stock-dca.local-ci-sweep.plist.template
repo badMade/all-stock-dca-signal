@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.local-ci-sweep</string>
+  <!-- Local CI sweep (scripts/local_ci_sweep.py): every 30 minutes, test each open PR whose head commit has no
+       `local-ci` result yet (same-repo branches only, drafts included) in a throwaway git worktree and post the
+       result as a commit status through scripts/local_ci_status.sh. A failing CI shows in the status, not in this
+       agent's exit code. Started through the checkout's venv Python, like the other agents, because macOS privacy
+       protection (TCC) grants ~/Documents access per binary. Needs `gh` logged in and uv on PATH. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.local_ci_sweep</string>
+  </array>
+  <!-- `-m scripts.local_ci_sweep` resolves from the checkout root; the sweep's git worktrees are created from here. -->
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- gh and uv live under /opt/homebrew/bin on Apple silicon. -->
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>StandardOutPath</key><string>/tmp/dca-local-ci-sweep.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-local-ci-sweep.log</string>
+</dict>
+</plist>
