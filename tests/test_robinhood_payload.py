@@ -793,16 +793,23 @@ for chunk in json.loads({blank!r}):
 for t in json.loads({thin!r}):
     if t in reply:
         reply[t]["intraday_bars"] = []
+for t in json.loads({liquid!r}):
+    reply.get(t, {{}}).setdefault("previous_close_bar", {{}})["volume"] = 77568070.0  # NVDA's 10-28 session
+    if t in reply and len(tickers) > {rescue_size}:  # dropped in the whole-chunk request, served in a small re-ask
+        reply[t]["intraday_bars"] = []
 open(out, "w").write(json.dumps(reply))
 """
 
 
-def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=()):
+def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=(), liquid=()):
     import sys
 
     plan = _plan_0935(tmp_path)
     blank = [plan["chunks"][i] for i in blank_chunks]
-    stub = _BLANK_STUB.format(python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)))
+    stub = _BLANK_STUB.format(
+        python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)), liquid=json.dumps(list(liquid)),
+        rescue_size=2,  # the launcher's default DCA_RESCUE_CHUNK_SIZE
+    )
     done, _ = _run_launcher(tmp_path, fake_script=stub)
     return done, plan, blank
 
@@ -837,6 +844,55 @@ def test_launcher_leaves_a_genuinely_quiet_name_in_a_replying_chunk_alone(tmp_pa
     assert done.returncode == 0 and out.exists(), log
     assert json.loads(out.with_suffix(".meta.json").read_text())["quiet"] == [thin]
     assert "0" not in {i for i, _ in re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)}, log
+
+
+# -- liquid names dropped from a chunk that still answered others (2026-10-31, the 10-29 follow-up) --------------------
+# The whole-chunk rule above needs EVERY answered ticker empty: had one ticker of 10-29's chunk 3 kept its bars, NVDA,
+# GOOGL, GOOG and AMZN would have been filed quiet again. An empty name whose prior session traded LIQUID_PRIOR_VOLUME
+# shares or more is now re-asked for alone; a thin empty name in the same chunk is still left alone and stays quiet.
+
+
+def test_rescue_targets_reasks_an_empty_liquid_name_but_not_an_empty_thin_one():
+    from scripts.robinhood_payload import LIQUID_PRIOR_VOLUME, rescue_targets
+
+    def entry(volume, bars):
+        return {"previous_close_bar": {"volume": volume}, "intraday_bars": bars, "quote": {}}
+
+    bar = [{"timestamp": "x"}]
+    reply = {
+        "NVDA": entry(77568070.0, []),  # 10-29 15:31: no bar in the hour, ~78M shares the session before
+        "AMZN": entry(LIQUID_PRIOR_VOLUME, []),  # the threshold itself is liquid
+        "QTOP": entry(87085.0, []),  # a genuinely thin name: still quiet, never re-asked
+        "AAPL": entry(35714331.0, bar),  # answered with bars: never re-fetched
+        "ODD": {"previous_close_bar": "garbage", "intraday_bars": []},  # unreadable volume reads as not liquid
+        "BOOL": entry(True, []),
+        "ERR": {"error": "no data"},
+    }
+    tickers = ["NVDA", "AMZN", "QTOP", "AAPL", "ODD", "BOOL", "ERR", "GONE"]
+    assert rescue_targets(reply, tickers) == ["NVDA", "AMZN", "ERR", "GONE"]
+    # Unchanged rules: a dead chunk, and a chunk whose every answered ticker is empty, are re-asked in full.
+    assert rescue_targets({}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, []), "B": entry(10.0, [])}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, bar), "B": entry(10.0, [])}, ["A", "B"]) == []
+
+
+def test_launcher_rescues_an_empty_liquid_name_in_a_chunk_that_answered_others(tmp_path):
+    import re
+    from pathlib import Path
+
+    # Chunk 0 answers in full, but its first two tickers come back with no bars and a ~78M-share prior session (the
+    # 10-29 shape, minus the "whole chunk empty" that the earlier rule needed), and its third is a genuinely thin name.
+    # The two liquid names are re-asked for and recovered; the thin one is not re-asked for and is still filed quiet.
+    plan = _plan_0935(tmp_path)
+    liquid, thin = plan["chunks"][0][:2], plan["chunks"][0][2]
+    done, plan, _ = _run_with_blank_chunks(tmp_path, blank_chunks=(), thin=[thin], liquid=liquid)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["quiet"] == [thin] and set(meta["failed"]) == {thin}, meta
+    assert set(liquid) <= set(json.loads(out.read_text())["sources"]["robinhood"])
+    assert re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log) == [("0", "2")], log
 
 
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
