@@ -223,9 +223,24 @@ def test_the_checked_in_config_names_the_slot_status_branch():
     assert isinstance(settings["enabled"], bool)
 
 
-def test_raw_url_points_at_the_public_data_branch():
-    assert ss.raw_url("slot-status") == (
-        "https://raw.githubusercontent.com/badMade/all-stock-dca/slot-status/slot_status.json")
+def test_raw_url_points_at_the_public_signal_repository():
+    # 2026-10-31: badMade/all-stock-dca is PRIVATE, so a raw.githubusercontent.com read of it returns 404 to
+    # Perplexity and every fire took the full path. The signal lives in a separate public data-only repository.
+    assert ss.raw_url("slot-status", "badMade/all-stock-dca-signal") == (
+        "https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json")
+
+
+@pytest.mark.parametrize("repository", ["", "badMade", "badMade/x/y", "bad Made/x", "../x/y"])
+def test_raw_url_refuses_a_malformed_repository(repository):
+    with pytest.raises(ValueError):
+        ss.raw_url("slot-status", repository)
+
+
+def test_the_checked_in_config_publishes_to_the_public_signal_repository():
+    settings = ss.load_settings()
+    assert settings["repository"] == "badMade/all-stock-dca-signal"
+    assert settings["repository"] != "badMade/all-stock-dca"  # private: Perplexity cannot read it
+    assert settings["remote"] == "signal"  # a git remote the Mac adds for the public repository
 
 
 # --- CLI -------------------------------------------------------------------------------------

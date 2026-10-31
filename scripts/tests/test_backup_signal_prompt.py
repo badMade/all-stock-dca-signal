@@ -71,11 +71,13 @@ def test_step_a_reads_the_signal_before_any_other_command(instructions, backup):
 
 def test_step_a_names_the_published_branch_and_the_raw_url(instructions):
     settings = slot_status.load_settings()
-    url = slot_status.raw_url(settings["branch"])
+    url = slot_status.raw_url(settings["branch"], settings["repository"])
     for text in instructions.values():
         assert url in text
         assert f'branch "{settings["branch"]}"' in text
-        assert slot_status.GITHUB_REPOSITORY in text
+        assert settings["repository"] in text
+        # The trading repository is private: the signal must never be read from it (2026-10-31).
+        assert "raw.githubusercontent.com/badMade/all-stock-dca/" not in text
 
 
 @pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)

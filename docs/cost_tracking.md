@@ -296,12 +296,15 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
    ```bash
    python3 -m scripts.backup_cost_ledger add --day 2026-10-29 --task 4412c3c4 --credits 312 --status stood_down_local_active
    python3 -m scripts.backup_cost_ledger report --since 2026-10-27
+   python3 -m scripts.backup_cost_ledger report --split 2026-11-02   # before vs from that day on
    ```
 
 2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the primary's own
    `local_heartbeat start` and `finish`.
-   - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch
-     (`config/slot_status.json`).
+   - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch of
+     the separate PUBLIC repository `badMade/all-stock-dca-signal` (`config/slot_status.json`). This repository is
+     private, so Perplexity cannot read a file here (found 2026-10-31). One-time Mac setup: create that repository,
+     then run `git remote add signal https://github.com/badMade/all-stock-dca-signal.git` in the checkout.
    - Content: only the day, whether the market is open, and each slot's status and time.
    - Failure: publishing is best-effort and never fails the primary run.
    - Closed days: run `python3 -m scripts.slot_status market-day` once each morning to publish a holiday as closed.
@@ -316,6 +319,22 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
      parts 1-3 as before.
    - A bad signal costs credits but never skips a check or adds a buy.
    - See `docs/adr-plan-first-backup-executor.md`, "Amendment: read the slot-status signal first".
+4. **Fewer fires (operator decision 2026-10-31).** Only the backups at 09:55, 12:50 and 15:45 stay scheduled
+   (for the 09:35, 12:30 and 15:30 slots); the 10:50, 11:50 and 13:50/14:50 tasks are paused, not retired
+   (`config/scheduled_tasks.json`, `standing_perplexity_backup_policy.amendment_2026_10_31`).
+5. **Backup only on failure (step 6, `scripts/backup_dispatch.py`).** The goal is zero Perplexity credits on a normal
+   day.
+   - **Mac checker:** a launchd job (`deploy/launchd/com.all-stock-dca.backup-dispatch.plist.template`) checks each
+     slot 15 minutes after it starts. It emails Perplexity Computer (computer@perplexity.com) only when the slot
+     failed or never started: one email per slot, with the filled prompt and `backup_planner.pyz`.
+   - **GitHub watcher:** `.github/workflows/backup-dispatch-watch.yml` covers days the Mac is down. It sends only
+     when today's public slot-status document has no entry for the slot.
+   - **Shadow first:** `config/backup_dispatch.json` starts in `shadow` mode, which reports `would_send` and sends
+     nothing.
+   - **Going live:** run a shadow week and one forced-failure test, set `mode` to `live`, then pause the remaining
+     scheduled Perplexity tasks.
+   - **Mail settings:** sender address, SMTP host, user and app password come from the `.env`
+     (`docs/local_env_file.md`) or from repository secrets for the watcher.
 
 ## Levers
 

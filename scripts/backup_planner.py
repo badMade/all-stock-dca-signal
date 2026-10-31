@@ -77,7 +77,8 @@ def require_supported_python(version_info) -> None:
     if tuple(version_info[:2]) >= MIN_PYTHON:
         return
     detail = "python>=%d.%d required, found %d.%d" % (MIN_PYTHON + tuple(version_info[:2]))
-    print(json.dumps({"status": "ABORT", "plan": None, "errors": [{"code": "python_too_old", "detail": detail}]}, indent=2))
+    print(json.dumps({"status": "ABORT", "plan": None, "errors": [{"code": "python_too_old", "detail": detail}]},
+                     separators=(",", ":")))
     sys.exit(2)
 
 
@@ -176,7 +177,9 @@ def _skipped_dicts(skipped: Any) -> list[dict[str, str]]:
 
 
 def _emit(report: dict[str, Any], code: int) -> int:
-    print(json.dumps(report, indent=2))
+    # One compact line (2026-10-31, credit plan step 4): the Perplexity agent re-reads every tool output on each later
+    # turn, and indent=2 roughly doubled the 91-symbol universe list.
+    print(json.dumps(report, separators=(",", ":")))
     return code
 
 

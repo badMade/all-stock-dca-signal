@@ -35,6 +35,21 @@ python3 -c "import dca_paths, os; print({k: bool(os.environ.get(k)) for k in ('R
 
 Both should print `True`. The command prints booleans only, never the values.
 
+## Event-triggered backup settings (2026-10-31)
+
+`scripts/backup_dispatch.py` reads these from the same `.env`; it never prints any of them:
+
+| Name | Meaning |
+| --- | --- |
+| `DCA_PERPLEXITY_SENDER` | The address tied to your Perplexity account; Perplexity only accepts tasks from it |
+| `DCA_SMTP_HOST`, `DCA_SMTP_USER` | Your mail provider's SMTP server (port 465, SSL) and login |
+| `DCA_SMTP_PASSWORD` | A mail app password, not your account password |
+| `DCA_FILLED_PROMPTS_DIR` | The private folder `scripts/fill_perplexity_backup_prompts.py --out` wrote; optional |
+| `DCA_PPLX_STATE_FOLDERS` | Only when `DCA_FILLED_PROMPTS_DIR` is unset: `task=automation-uuid` pairs, comma-separated |
+
+The GitHub watcher reads the same names from repository secrets, plus `DCA_ALERT_EMAIL_ADDRESS` and
+`ROBINHOOD_AGENTIC_ACCOUNT_LAST4` to fill the prompt.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |

@@ -72,7 +72,7 @@ def every_builder(cfg):
 def test_config_files_enumerates_the_committed_configs_and_schemas():
     stems = {stem for stem, _schema, _publisher in reader.CONFIG_FILES}
     assert stems == {path.stem for path in CONFIG.glob("*.json")}
-    assert len(reader.CONFIG_FILES) == 23
+    assert len(reader.CONFIG_FILES) == 24
     for stem, schema, _publisher in reader.CONFIG_FILES:
         committed = json.loads((CONFIG / f"{stem}.json").read_bytes()).get("$schema")
         if schema is None:
@@ -90,7 +90,7 @@ def test_config_files_enumerates_the_committed_configs_and_schemas():
 def test_catalog_on_committed_config_parses_every_file(cfg):
     result = reader.config_catalog(cfg, REPO)
     rows = {row["stem"]: row for row in result["files"]}
-    assert len(rows) == 23 and result["warnings"] == []
+    assert len(rows) == 24 and result["warnings"] == []
     assert all(row["exists"] and row["parse_ok"] and row["error"] is None for row in rows.values())
     assert rows["tickers"]["schema_exists"] is True and rows["tickers"]["schema_ref"].endswith("tickers.schema.json")
     assert rows["per_ticker_sizing"]["schema_exists"] is None and rows["per_ticker_sizing"]["publisher_only"] is True
