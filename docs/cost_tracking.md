@@ -307,9 +307,15 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
    - Closed days: run `python3 -m scripts.slot_status market-day` once each morning to publish a holiday as closed.
    - Local copy: `python3 -m scripts.slot_status show` prints it.
    - Tests: set `DCA_DISABLE_SLOT_STATUS_PUBLISH` so nothing is pushed (`conftest.py` does).
-3. **Next: a short backup prompt.** It reads that file first and ends the fire on a slot marked `succeeded` today
-   or a closed market. Anything else (in progress, failed, missing, stale) falls through to today's full check, so
-   a bad signal costs credits but never skips a check or adds a buy. This needs a repaste of the six tasks.
+3. **A short backup prompt (generated 2026-10-30; live only after a repaste).** Each pasted prompt is now about
+   3,000 characters instead of about 12,000.
+   - STEP A reads `slot_status.json` once and ends the fire on a slot marked `succeeded` today or a closed market,
+     with no other tool call, no file and no notification.
+   - Anything else (in progress, failed, missing, stale) goes to STEP B: the build-stamp check, then
+     `procedure --part 0` (the unchanged hard rules, calendar, step 0 and the 2026-10-25 stand-down gate), then
+     parts 1-3 as before.
+   - A bad signal costs credits but never skips a check or adds a buy.
+   - See `docs/adr-plan-first-backup-executor.md`, "Amendment: read the slot-status signal first".
 
 ## Levers
 

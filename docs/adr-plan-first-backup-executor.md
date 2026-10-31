@@ -317,3 +317,41 @@ Answers to the four open questions (operator, 2026-10-25):
 The cost effect is measured outside the repo. Take 5 trading days of per-task usage from Perplexity's usage page
 before the repaste, then compare 5 shadow days after it, and check each task's model setting. The live tasks are
 repasted only after the operator confirms shadow mode.
+
+## Amendment: read the slot-status signal first (2026-10-30)
+
+Status: accepted by the operator; the tests came first and were approved before the code. Not live until the six
+tasks are repasted.
+
+**Problem.** With the 2026-10-25 stand-down gate live, the backups still cost about 2,500 Perplexity credits a
+trading day; the new target is under 200 (`docs/cost_tracking.md`). On a normal day every fire still:
+- ingested a ~12 KB prompt;
+- ran `--build-info`, `universe` and `gates`;
+- listed devices;
+- ran a whole Mac sub-agent for `local_heartbeat status`.
+
+All of that only to stand down.
+
+**Decision.**
+1. **The primary publishes a signal.** It is a small public document (`scripts/slot_status.py`, written by
+   `local_heartbeat start` / `finish` to the `slot-status` branch). It holds the day, open or closed, and each
+   slot's status and time.
+2. **The pasted prompt reads it first (STEP A).** It ends the fire, with no other tool call, file or notification,
+   only on a slot marked `succeeded` today or a closed market. Every other case goes to STEP B: missing,
+   unreadable, another day, `in_progress`, `failed`, or no entry for the slot.
+3. **STEP B checks the build stamp, then fetches `procedure --part 0`.** Part 0 is the hard rules, calendar,
+   step 0 and the 2026-10-25 stand-down gate, word for word, served by the stamped planner. Parts 1-3 are
+   unchanged. Part 1 now needs the token part 0 prints.
+
+**Accepted trade-offs.**
+- **The hard rules are no longer pasted.** They still bind every broker step: the pasted prompt names no broker or
+  Mac tool, and part 1 cannot be fetched without part 0's token. `content_sha256` covers the rule text.
+- **A STEP A stand-down writes no Perplexity state record.** The primary's own artifacts and the status file are
+  the record of a normal day.
+- **The status file is public.** It reveals only that a slot ran, and when.
+- **A false `succeeded` can only cause a missed backup.** It requires write access to the repository.
+- **`in_progress` never stands down at STEP A.** A run still going 20 minutes after its slot may have crashed, so
+  the existing Mac probe judges it.
+
+**Rollback.** Repaste the previous prompts with the planner build they name, or set `"enabled": false` in
+`config/slot_status.json`. With publishing off, every fire takes STEP B and behaves as before this amendment.
