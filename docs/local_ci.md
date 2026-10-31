@@ -33,6 +33,9 @@ rules, and `main` has no branch protection, so skipping a job blocks nothing.
 
 ## What changed in `ci.yml`
 
+PR #2067 (the base of this change) makes draft PRs skip CI: `pull_request` also fires on
+`ready_for_review`, and the root jobs skip while the PR is a draft. This change adds:
+
 1. **Pushes to `main` run 3.12 only.** The 3.11 leg moves to a new weekday scheduled run
    (`cron: "0 10 * * 1-5"`, 06:00 ET) and `workflow_dispatch`, which run the whole matrix, every
    sibling, and the research audit. Self-heal still reacts: the scheduled run is a CI run on
@@ -51,8 +54,10 @@ rules, and `main` has no branch protection, so skipping a job blocks nothing.
 `scripts/tests/test_workflow_policy.py::test_ci_minute_budget_triggers` pins all four.
 
 Estimated effect of 1-3 alone: ~4,500 min/week (PR ~2,170, push ~1,900, schedule ~300, other
-workflows ~190), a ~38% cut. That is still far over any included allowance, so 1-3 are a floor,
-not the fix. The fix is 4 (self-hosted) and/or running the gates locally before pushing.
+workflows ~190), a ~38% cut. #2067's draft skip removes most of the PR share, since nearly every
+PR here spends its life as a draft. Together that is roughly ~2,500 min/week (push ~1,900,
+schedule ~300, ready PRs and other workflows ~300), still over a monthly allowance. 4 (self-hosted)
+plus running the gates locally is the real fix.
 
 Not changed, and why: `Sync Labelled PR Branches` and `Refresh Generated Docs` are about 2.5% of
 minutes together; the other workflows are ≤1 run a week. No workflow was disabled or deleted.
@@ -66,39 +71,38 @@ minutes together; the other workflows are ≤1 run a week. No workflow was disab
    are free and do not count against the spending limit. Whether a *failed-payment* lock also
    stops self-hosted jobs is not documented clearly. Check with one `workflow_dispatch` after
    setting the variable.
-3. **If you stay on GitHub-hosted runners**, the biggest remaining lever is the PR leg (~2,170
-   min/week, almost all of it on draft PRs that agents push to repeatedly). Skipping CI on draft
-   PRs (plus `ready_for_review` in `pull_request.types`) would cut most of it, but it removes the
-   CI signal that agent auto-fix loops read on drafts. That decision is yours, so it is not in
-   this change.
+3. **If you stay on GitHub-hosted runners**, the biggest remaining lever is the push-to-main
+   core run (~22 min × ~76 pushes a week). The PR already ran the same 3.12 suite, so a push run
+   mostly re-proves a merge. Dropping it in favour of the weekday scheduled run would save another
+   ~1,700 min/week. But self-heal reacts to push-run failures within minutes, and that would then
+   wait up to a day. That is your decision, so it is not in this change.
 
 A pre-push hook is available but opt-in (below): `core.hooksPath` is shared by every worktree,
 so turning it on makes every agent session's push wait for the quick gates too.
 
 ## `scripts/local_ci.sh`
 
+(Rewritten for full CI parity in PR #2067; summarised here.)
+
 ```bash
-scripts/local_ci.sh                     # ruff, coverage-gated pytest, scripts/tests, dry-run demo
-scripts/local_ci.sh --quick             # same minus the full coverage run (~1 min)
-scripts/local_ci.sh --siblings changed  # + sibling projects changed vs origin/main (ci.yml's rule)
-scripts/local_ci.sh --full              # everything the scheduled CI run does
+scripts/local_ci.sh              # ruff, coverage-gated pytest, scripts/tests, dry-run demo
+scripts/local_ci.sh --quick      # same minus the full coverage run (~1 min)
+scripts/local_ci.sh --changed    # + sibling projects changed vs origin/main (ci.yml's rule)
+scripts/local_ci.sh --all        # everything the scheduled CI run does
 ```
 
 | CI job | Local equivalent |
 | --- | --- |
 | Lint & test (core DCA) (3.12) | default run (ruff, `pytest --cov=. --cov-fail-under=90`, demo) |
-| Lint & test (core DCA) (3.11) | `--py311` (cached uv venv, Python 3.11) |
+| Lint & test (core DCA) (3.11) | `--py311` (uv-managed env, Python 3.11) |
 | Dependency & secret audit | `--audit` (`pip-audit --requirement requirements-dev.txt --strict`) |
 | Dependency audit (research) ×2 | `--audit` (the same `uv export` / `uv pip compile` / `pip-audit --locked` sequence, for 3.11 and 3.12) |
-| Lint & test (\<sibling\>) | `--siblings changed\|all` or a project name; each gets a cached venv built from the same requirement files and Python version as its CI job |
+| Lint & test (\<sibling\>) | `--changed`, `--all`, or a project name; each runs in a uv-managed env built from the same requirement files and Python version as its CI job |
 | *(not in CI)* | `scripts/tests` (incl. the workflow-policy tests), always run |
 
 The core interpreter is `$PYTHON`, else `./.venv`, else the main checkout's `.venv` (worktrees
-under `.claude/worktrees/` have none of their own). Sibling and 3.11 venvs live under
-`${DCA_LOCAL_CI_CACHE:-~/.cache/all-stock-dca-local-ci}` and are rebuilt automatically when their
-requirement files change. `--py311`, `--audit` and the siblings need `uv` and network on first use.
-Differences from CI: macOS rather than Ubuntu, and wondrous-octopus installs PyPI's torch (CPU-only
-on macOS) instead of the PyTorch CPU index.
+under `.claude/worktrees/` have none of their own). `--py311`, `--audit` and the siblings need
+`uv` and network on first use. The main difference from CI is the OS: macOS rather than Ubuntu.
 
 ### Optional pre-push hook
 

@@ -72,10 +72,10 @@ ruff check --isolated --select=E,F,B --line-length=120 llm-providers
 ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ```
 
-**Run `scripts/local_ci.sh` before pushing** (`--quick`, `--siblings changed`, `--full`; see
+**Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
 `docs/local_ci.md`). It mirrors every CI job locally; since the 2026-10-31 Actions billing block,
-PR and push CI run only Python 3.12 and path-filtered siblings, and the 3.11 leg runs on a weekday
-schedule. Set the `CI_RUNS_ON` repo variable to move CI onto a self-hosted runner.
+draft PRs skip CI, push CI runs only Python 3.12 and path-filtered siblings, and the 3.11 leg runs
+on a weekday schedule. Set the `CI_RUNS_ON` repo variable to move CI onto a self-hosted runner.
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
 demo smoke test, `pip-audit` on pinned dev tooling and the resolved transitive dependencies
