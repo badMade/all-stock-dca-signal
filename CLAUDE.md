@@ -55,6 +55,9 @@ python3 from.py --local --no-browser
 
 # 3D market graph -- emits one self-contained HTML file, no network (docs/market_graph.md)
 python -m scripts.generate_market_graph --source csv --out /tmp/ocean.html
+
+# Run .github/workflows/ci.yml locally with act + Colima, not billed (docs/local_ci.md)
+scripts/run_ci_locally.sh -j test
 ```
 
 Two suites sit outside the root `pytest` sweep and must be run separately:
@@ -245,6 +248,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
 | `docs/adr-plan-first-backup-executor.md` | Proposed ADR for the plan-first backup executor: order-plan files (`dca_order_plan.py`, `schemas/order_plan.schema.json`), Mac-first backup, compute fallbacks, fail-closed re-validation |
 | `docs/plan_first_recommendations.md` | Plan-first recommendation courier, freshness, slot reader, placement evidence and rollout |
+| `docs/local_ci.md` | Running `ci.yml` on the operator's Mac with act + Colima (`scripts/run_ci_locally.sh`, `deploy/act/Dockerfile`); added when a GitHub billing block stopped hosted runners |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |

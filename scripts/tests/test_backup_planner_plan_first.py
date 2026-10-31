@@ -549,7 +549,8 @@ def test_executor_ids_merges_both_sources(tmp_path, capsys):
 
 
 def test_executor_ids_reads_the_1530_prompts_dashed_run_directory(tmp_path, capsys):
-    """The 15:30 prompt resolves $ROOT as `<YYYY-MM-DD>_1530ET`, unlike the compact folder Gate 9 writes."""
+    """Until 2026-10-30 the 15:30 prompt resolved $ROOT as `<YYYY-MM-DD>_1530ET`, unlike the compact folder Gate 9
+    writes; it now uses the compact folder, but runs from 2026-10-20 to 2026-10-30 left their placements dashed."""
     cron_root = tmp_path / "cron"
     (_legacy_run_dir(cron_root, slot="1530", folder=f"{DAY}_1530ET") / "place_MSFT.json").write_text(
         json.dumps(_placement("order-1530")))
