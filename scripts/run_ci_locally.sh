@@ -55,8 +55,29 @@ if test "$built_sha" != "$dockerfile_sha"; then
     docker build -q --label "dockerfile-sha=$dockerfile_sha" -t "$image" "$repo_root/deploy/act" >&2
 fi
 
+# One act run per machine. act names a job's container and volumes after the
+# workflow and job only (act-CI-Lint--test-core-DCA-<hash>), not the checkout, so
+# two concurrent runs share them and each one's cleanup deletes the other's
+# container mid-test: on 2026-10-31 a second session's run killed this one's core
+# job with exit 137 ("removal of container ... already in progress") and, before
+# that, with "...-env: no such volume". mkdir is atomic; a lock whose pid is gone
+# is stale and taken over.
+lock=${XDG_CACHE_HOME:-$HOME/.cache}/all-stock-dca/act.lock
+mkdir -p "$(dirname "$lock")"
+while ! mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if test -n "$holder" && ! kill -0 "$holder" 2>/dev/null; then
+        echo "removing stale act lock left by pid $holder" >&2
+        rm -rf "$lock"
+        continue
+    fi
+    echo "another act run holds $lock (pid ${holder:-?}); waiting..." >&2
+    sleep 30
+done
+echo "$$" > "$lock/pid"
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/act-ci.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work" "$lock"' EXIT
 event_file=$work/event.json
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 if test "$event" = pull_request; then

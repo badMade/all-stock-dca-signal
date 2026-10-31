@@ -117,3 +117,11 @@ def test_report_parses_acts_job_end_lines(tmp_path) -> None:
         "succeeded|Detect changed projects      ",
         "failed|Dependency audit (research)-2",
     ]
+
+
+def test_one_act_run_per_machine() -> None:
+    # Concurrent act runs share container names and delete each other's
+    # containers (exit 137 on 2026-10-31); the script must serialize them.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'while ! mkdir "$lock" 2>/dev/null; do' in script
+    assert "trap 'rm -rf \"$work\" \"$lock\"' EXIT" in script

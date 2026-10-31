@@ -78,6 +78,11 @@ Exit status is act's: 0 when every job that ran succeeded.
 * **The token is gh's.** `gh auth token` is handed to act as the `GITHUB_TOKEN` secret and never printed.
 * **The Docker socket is not mounted** (`--container-daemon-socket -`). act's default bind-mount fails under
   Colima and no job here starts containers of its own.
+* **One run per Mac.** act names each job's container and volumes after the workflow and job, not the
+  checkout, so two runs at once (two sessions, two worktrees) delete each other's containers mid-test: on
+  2026-10-31 that killed a core-test run with exit 137 and failed another at setup with
+  "...-env: no such volume". The script takes a lock in `~/.cache/all-stock-dca/act.lock` and waits for
+  any other run of it to finish; a lock whose process is gone is cleared.
 * **Jobs run one at a time** (`--concurrent-jobs 1`). act shares one Python tool cache across jobs, and on
   the first run the audit job's pip upgrade broke the 3.12 research-audit leg that was using the same
   Python at that moment. A full run is therefore slower than on GitHub; `-j <job>` runs just one.
