@@ -238,3 +238,12 @@ def test_every_step_is_reachable_from_the_short_prompt_and_four_parts(instructio
         assert f"STEP {step} - " in text, step
     for needle in ("--plan plan.json", "check-placement", "STEP 8 - STATE RECORD", "STEP 9 - NOTIFY"):
         assert needle in text, needle
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_the_stand_down_condition_itself_requires_the_schema(instructions, backup):
+    # slot_status.is_done refuses any other schema; the sentence that ends the run must say so, not only an example
+    # elsewhere in STEP A (review of the Copilot step 3 commit, 2026-10-31).
+    step_a = instructions[backup.file].split("\nSTEP A", 1)[1].split("\nSTEP B", 1)[0]
+    condition = step_a[step_a.index("Stand down only when"):].split(".", 1)[0]
+    assert f'"schema" is "{slot_status.SCHEMA}"' in condition
