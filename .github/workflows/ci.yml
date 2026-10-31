@@ -19,6 +19,16 @@ on:
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, ready_for_review]
+  # 2026-10-31 Actions-spend cut (billing block): pushes to main no longer run the
+  # 3.11 leg or untouched sibling projects, so a weekday scheduled run is the
+  # catch-all that still exercises everything on main once a day (3.11 + 3.12,
+  # every sibling, the research audit). self-heal reacts to its failures exactly as
+  # it does to a push run's -- both are CI runs whose head_branch is main.
+  # workflow_dispatch gives the same full run on demand. The day-to-day gate is now
+  # scripts/local_ci.sh (docs/local_ci.md).
+  schedule:
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
 
 # A rapid series of pushes to the same branch should leave one running build,
 # not N. Never cancel on main -- those runs are the record of what landed.
@@ -31,20 +41,30 @@ concurrency:
   group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Runner: every job reads `runs-on` from the CI_RUNS_ON repository variable and
+# falls back to GitHub-hosted ubuntu-26.04 when it is unset. Set it to the label of
+# a self-hosted runner (e.g. `gh variable set CI_RUNS_ON --body self-hosted`) to run
+# this whole workflow off GitHub-hosted runner minutes (check GitHub's current
+# self-hosted pricing first); delete the variable to switch back. See
+# docs/local_ci.md for the runner setup, the pricing note and its security caveats.
+
 # Read-only by default; no job here needs to write to the repository.
 permissions:
   contents: read
 
 jobs:
-  # Decides which sibling-project jobs a PR needs. Each sibling is an isolated
-  # tree with its own deps, so a change elsewhere cannot break it. Pushes to main
-  # always run everything (that run is the record of what landed, and self-heal
-  # reacts to it), as does any change to the shared dev pins or this workflow.
+  # Decides which sibling-project jobs (and whether the research audit) a run
+  # needs. Each sibling is an isolated tree with its own deps, so a change
+  # elsewhere cannot break it. PRs diff against their base; pushes to main diff
+  # the pushed range (before..after) -- until 2026-10-31 pushes ran everything,
+  # which made main's ~76 pushes a week ~60% of all Actions minutes. The scheduled
+  # and manual runs still run everything, as does any change to the shared dev
+  # pins or this workflow, or a push whose range cannot be listed.
   changes:
     name: Detect changed projects
     # Skipped on drafts, which also skips every sibling job (they `need` this one).
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -57,6 +77,7 @@ jobs:
       ticker-market-breadth: ${{ steps.diff.outputs.ticker-market-breadth }}
       llm-providers: ${{ steps.diff.outputs.llm-providers }}
       yfinance-prefetch: ${{ steps.diff.outputs.yfinance-prefetch }}
+      deps: ${{ steps.diff.outputs.deps }}
     steps:
       - id: diff
         env:
@@ -64,18 +85,36 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
         run: |
           projects="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch"
           all=false
           files=""
-          if [ "$EVENT" != "pull_request" ]; then
-            all=true
-          else
+          if [ "$EVENT" = "pull_request" ]; then
             files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
-            # Shared inputs every sibling job installs from.
-            if echo "$files" | grep -Eq '^(requirements-dev\.txt|\.github/workflows/ci\.yml)$'; then
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # The compare API lists at most 300 files; at that size (or on any
+            # error) fail open to running everything rather than skip a sibling.
+            if ! files=$(gh api "repos/$REPO/compare/$BEFORE...$AFTER" --jq '.files[].filename'); then
+              all=true
+            elif [ "$(printf '%s\n' "$files" | wc -l)" -ge 300 ]; then
               all=true
             fi
+          else
+            all=true
+          fi
+          # Shared inputs every sibling job installs from.
+          if echo "$files" | grep -Eq '^(requirements-dev\.txt|\.github/workflows/ci\.yml)$'; then
+            all=true
+          fi
+          # The research audit only has something new to say when a dependency
+          # manifest moved (a new advisory against unchanged pins is caught by the
+          # scheduled run, which always audits).
+          if [ "$all" = true ] || echo "$files" | grep -Eq '(^|/)requirements[^/]*\.txt$|^uv\.lock$|^pyproject\.toml$'; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deps=false" >> "$GITHUB_OUTPUT"
           fi
           for p in $projects; do
             if [ "$all" = true ] || echo "$files" | grep -q "^$p/"; then
@@ -88,7 +127,7 @@ jobs:
   test:
     name: Lint & test (core DCA)
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     # The suite (~12k tests) now takes ~13-15 minutes on a cold runner; the old
     # 15-minute ceiling cancelled the 3.12 leg after its tests had passed
     # on PR 1712. Still a ceiling that stops a hung job from burning the
@@ -97,9 +136,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs run 3.12 only; main (the post-merge record, and what self-heal
-        # reacts to) keeps both interpreters. Halves PR minutes.
-        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.11", "3.12"]') }}
+        # PRs and pushes to main run 3.12 only; the 3.11 leg runs on the
+        # weekday scheduled run and workflow_dispatch. Until 2026-10-31 every
+        # push to main ran both (~20 min each); scripts/local_ci.sh --py311 runs
+        # the 3.11 leg locally.
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.11", "3.12"]' || '["3.12"]') }}
     steps:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
@@ -139,7 +180,7 @@ jobs:
   audit:
     name: Dependency & secret audit
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -175,8 +216,10 @@ jobs:
   # core lint/test/dev-audit surface and must not claim to repair research.
   research-audit:
     name: Dependency audit (research)
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-26.04
+    needs: changes
+    # Skipped on drafts too: `changes` is, and a job whose need is skipped skips.
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -226,7 +269,7 @@ jobs:
     name: Lint & test (production-safe-agent-loop)
     needs: changes
     if: needs.changes.outputs.production-safe-agent-loop == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -262,7 +305,7 @@ jobs:
     name: Lint & test (ticker-advisor)
     needs: changes
     if: needs.changes.outputs.ticker-advisor == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -306,7 +349,7 @@ jobs:
     name: Lint & test (ml-forecaster)
     needs: changes
     if: needs.changes.outputs.ml-forecaster == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -350,7 +393,7 @@ jobs:
     name: Lint & test (wondrous-octopus)
     needs: changes
     if: needs.changes.outputs.wondrous-octopus == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
     # download plus the transformer tests' training time.
     timeout-minutes: 20
@@ -402,7 +445,7 @@ jobs:
     name: Lint & test (ticker-market-breadth)
     needs: changes
     if: needs.changes.outputs.ticker-market-breadth == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -433,7 +476,7 @@ jobs:
     name: Lint & test (llm-providers)
     needs: changes
     if: needs.changes.outputs.llm-providers == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -464,7 +507,7 @@ jobs:
     name: Lint & test (yfinance-prefetch)
     needs: changes
     if: needs.changes.outputs.yfinance-prefetch == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
