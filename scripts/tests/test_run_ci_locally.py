@@ -90,3 +90,38 @@ def test_help_exits_zero_before_touching_any_tool() -> None:
 def test_bad_pr_flag_is_a_usage_error() -> None:
     result = subprocess.run(["sh", str(SCRIPT), "--pr"], capture_output=True, text=True)
     assert result.returncode == 2
+
+
+def test_report_refuses_to_describe_a_commit_it_did_not_run() -> None:
+    # A status is a claim about one commit: a dirty tree or an unpushed HEAD
+    # must be refused before the run, not discovered after it.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "--report needs a clean tree" in script
+    assert "--report needs HEAD on GitHub" in script
+
+
+def test_report_parses_acts_job_end_lines(tmp_path) -> None:
+    # The same sed expression the script uses, run on act's real line shapes,
+    # including the padded name and a matrix leg suffix.
+    script = SCRIPT.read_text(encoding="utf-8")
+    expression = re.search(r"sed -n -E '([^']+)'", script).group(1)
+    log = tmp_path / "act.log"
+    log.write_text(
+        "[CI/Detect changed projects      ] 🏁  Job succeeded\n"
+        "[CI/Dependency audit (research)-2] 🏁  Job failed\n"
+        "[CI/Lint & test (core DCA)       ]   | 13207 passed\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(["sed", "-n", "-E", expression, str(log)], capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == [
+        "succeeded|Detect changed projects      ",
+        "failed|Dependency audit (research)-2",
+    ]
+
+
+def test_one_act_run_per_machine() -> None:
+    # Concurrent act runs share container names and delete each other's
+    # containers (exit 137 on 2026-10-31); the script must serialize them.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'while ! mkdir "$lock" 2>/dev/null; do' in script
+    assert "trap 'rm -rf \"$work\" \"$lock\"' EXIT" in script
