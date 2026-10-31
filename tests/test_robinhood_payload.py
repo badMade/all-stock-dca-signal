@@ -877,6 +877,36 @@ def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
     assert done.returncode == 2 and "must be whole numbers" in done.stderr
 
 
+def test_launcher_et_cutoff_that_already_passed_fetches_nothing_and_refuses(tmp_path):
+    import re
+
+    # 2026-10-30: a relative deadline counts from whenever launchd started the build, so a late 15:31 job could fetch
+    # past the 3:30 session's 12-minute re-check. The ET cutoff is absolute on the plan's trading day (2026-10-20 here,
+    # long past), so every chunk is skipped, the launcher says why, and the merge refuses instead of publishing late.
+    done, chunks = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40"})
+    log = done.stdout + done.stderr
+    assert "deadline 15:40 ET had already passed when the build started; fetching nothing" in log, log
+    assert set(range(chunks)) <= {int(i) for i in re.findall(r"deadline chunk=(\d+) attempt=1 skipped", log)}, log
+    assert "timing chunk=" not in log and re.search(r"timing total .* deadline_et=15:40\b", log), log
+    assert "is below 95%" in log and done.returncode == 2, log
+
+
+def test_launcher_et_cutoff_still_ahead_does_not_skip_any_chunk(tmp_path):
+    import re
+
+    # A future trading day's 15:40 is hours away, so no chunk is skipped: the cutoff binds only when the clock reaches it.
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40", "DCA_TRADING_DAY": "2027-01-04"})
+    log = done.stdout + done.stderr
+    assert "deadline chunk=" not in log and "already passed" not in log, log
+    assert re.search(r"timing chunk=0 attempt=1", log) and re.search(r"deadline=0 deadline_et=15:40\b", log), log
+
+
+@pytest.mark.parametrize("cutoff", ["3:40", "15:4", "25:00", "15:40:00", "soon"])
+def test_launcher_rejects_a_malformed_et_cutoff(tmp_path, cutoff):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": cutoff})
+    assert done.returncode == 2 and "must be HH:MM" in done.stderr and "timing chunk=" not in done.stderr, done.stderr
+
+
 @pytest.mark.parametrize("size, needle", [("two", "must be whole numbers"), ("0", "must be at least 1")])
 def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
     # 0 would make the rescue loop's step zero; refuse it before any chunk is fetched.

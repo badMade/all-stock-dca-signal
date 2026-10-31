@@ -149,7 +149,8 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   build from the start of the fetch. Each attempt's timeout is capped to the time left, and no attempt starts with less than
   `DCA_MIN_ATTEMPT_SECONDS` (default 20) left; skipped chunks log `robinhood_payload: deadline chunk=N ... skipped`, the
   merge enforces the 95% coverage floor, and a late build publishes nothing instead of arriving after the slot's window.
-  The shadow agent sets 480 s (a slow build ends by about 15:40).
+  The shadow agent sets 480 s (a slow build ends by about 15:40), and since 2026-10-30 also the absolute
+  `DCA_BUILD_DEADLINE_ET=15:40` (HH:MM ET on the plan's trading day; see "Build timing vs. the window" under Cutover).
 - **Go/no-go for step 2b (cutover):** five consecutive shadow days with total build time under 6 minutes, no deadline
   skips, and 95% or better coverage with fresh quotes.
 
@@ -166,6 +167,18 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   Robinhood alone.
 - **The builder is the same agent.** `com.all-stock-dca.robinhood-payload-1530-shadow` keeps its Label, so an
   installed copy needs no change; it is no longer a shadow. `due_slot` (`auto`) still never selects 1530.
+- **Build timing vs. the window (2026-10-30).** Measured 1530 builds (`timing total` in the 15:31 log, `generated_at_et`
+  in each `.meta.json`): 220-264 s, published 15:34:45 to 15:35:26 on 10-23 to 10-30, so three of six published after
+  15:35. That is not a miss. `scheduled_window_end_et` 15:35 bounds only the reporting fallback that attributes broker
+  orders to a run whose state lost its order IDs; nothing gates the payload on it. The real limit is Gate 5's 12-minute
+  re-check of `check`: the session fires at 15:30, so it never gives up before 15:42. The relative 480 s deadline ends
+  an on-time build by about 15:39, but counts from the build's own start, so a job launchd fires late could still fetch
+  past 15:42. The 15:31 agent therefore also sets `DCA_BUILD_DEADLINE_ET=15:40`: an absolute America/New_York cutoff on
+  the plan's trading day (the earlier of the two deadlines wins). A build that starts after it logs
+  `deadline 15:40 ET had already passed when the build started; fetching nothing`, skips every chunk, and the merge
+  writes its refusal marker, so the session's `check` names a refusal instead of waiting on a payload that arrives
+  after it stopped looking. No freshness or coverage check changed. Orders a session places after 15:35 still fall
+  outside that reporting fallback's window; that is a reporting question, not a build one, and is left as is.
 - **Open follow-up.** On 10-29 the build recorded NVDA, GOOGL, GOOG and AMZN as quiet (no bar in the window), which
   cannot be a real hour for those names. Quiet tickers are never bought, so this skips buys rather than causing bad
   ones, but they should be refetched rather than counted as quiet.
