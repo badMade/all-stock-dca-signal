@@ -112,6 +112,9 @@ Exit status is act's: 0 when every job that ran succeeded.
   act copies whatever directory it runs in, and a linked worktree's `.git` is a file naming a host path the
   container cannot see: run directly, every `git` call exited 128 and `from.py` looked for the main
   checkout's `.venv` (14 of the first run's 17 failures). To check a PR, check out its branch first.
+* **The snapshot keeps one loose ref** (`refs/heads/act-ci-snapshot`, 2026-10-31). A fresh clone packs every
+  ref, act's copy into the container drops the empty `.git/refs`, and git there then reports "not a git
+  repository": 12 tests that call git failed under act only.
 * **Jobs run as `runner` (uid 1001), not root,** as on GitHub. Root ignores file modes, so the tests that
   prove a read-only directory is refused failed locally as root.
 * **A PR run needs the PR number.** The `changes` job lists the PR's files through the GitHub API to decide
@@ -122,7 +125,9 @@ Exit status is act's: 0 when every job that ran succeeded.
   and then `success` or `failure`. They show in the PR's checks list beside the hosted Actions checks. Those
   hosted checks still read failed: a status cannot change an Actions check run, and if branch protection
   ever requires the hosted checks, these statuses do not satisfy it. `--report` refuses a dirty tree (the
-  status must describe exactly one commit) and a HEAD that is not on GitHub yet. A matrix leg is reported
+  status must describe exactly one commit), a HEAD that is not on GitHub yet, and any act argument such as
+  `-j test` (one passing job would otherwise post an overall success). A run that is interrupted or errors
+  after posting `pending` marks the overall status `error` rather than leaving it pending. A matrix leg is reported
   with act's `-1`/`-2` suffix, in matrix order (for research audit: `-1` is 3.11, `-2` is 3.12).
   Without `--report`, results stay in the terminal.
 * **The token is gh's.** `gh auth token` is handed to act as the `GITHUB_TOKEN` secret and never printed.
@@ -132,7 +137,8 @@ Exit status is act's: 0 when every job that ran succeeded.
   checkout, so two runs at once (two sessions, two worktrees) delete each other's containers mid-test: on
   2026-10-31 that killed a core-test run with exit 137 and failed another at setup with
   "...-env: no such volume". The script takes a lock in `~/.cache/all-stock-dca/act.lock` and waits for
-  any other run of it to finish; a lock whose process is gone is cleared.
+  any other run of it to finish, for at most an hour (`ACT_LOCK_WAIT_SECONDS`), then exits 4; a lock whose
+  process is gone is cleared.
 * **Jobs run one at a time** (`--concurrent-jobs 1`). act shares one Python tool cache across jobs, and on
   the first run the audit job's pip upgrade broke the 3.12 research-audit leg that was using the same
   Python at that moment. A full run is therefore slower than on GitHub; `-j <job>` runs just one.
