@@ -72,6 +72,11 @@ fi
 # into every job, which fails under Colima ("mkdir .../docker.sock: operation not
 # supported") and none of these jobs runs containers. The token comes from gh's
 # own login and is handed to act as a secret, never printed.
+# --concurrent-jobs 1: act shares one /opt/hostedtoolcache volume across jobs, so
+# on the first run (2026-10-31) the audit job's `pip install --upgrade pip` swapped
+# out Python 3.12's pip while the 3.12 research-audit leg was importing it
+# (FileNotFoundError .../pip/_vendor/rich/style.py). GitHub gives each job its own
+# VM; one job at a time is the local equivalent.
 cd "$repo_root"
 GITHUB_TOKEN=$(gh auth token)
 export GITHUB_TOKEN
@@ -84,6 +89,7 @@ act "$event" \
     --container-architecture linux/arm64 \
     --container-daemon-socket - \
     --pull=false \
+    --concurrent-jobs 1 \
     -s GITHUB_TOKEN \
     "$@" || status=$?
 exit "$status"

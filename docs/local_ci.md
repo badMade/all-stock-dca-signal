@@ -50,6 +50,9 @@ Exit status is act's: 0 when every job that ran succeeded.
 * **The token is gh's.** `gh auth token` is handed to act as the `GITHUB_TOKEN` secret and never printed.
 * **The Docker socket is not mounted** (`--container-daemon-socket -`). act's default bind-mount fails under
   Colima and no job here starts containers of its own.
+* **Jobs run one at a time** (`--concurrent-jobs 1`). act shares one Python tool cache across jobs, and on
+  the first run the audit job's pip upgrade broke the 3.12 research-audit leg that was using the same
+  Python at that moment. A full run is therefore slower than on GitHub; `-j <job>` runs just one.
 * **arm64, not amd64.** Jobs run as native `linux/arm64`. `actions/setup-python` downloads arm64 builds;
   a dependency with no arm64 wheel would fail here and not on GitHub.
 * **Colima keeps running** after a run. Stop it with `colima stop` to free its memory; the script starts it
