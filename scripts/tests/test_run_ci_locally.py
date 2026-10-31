@@ -21,10 +21,40 @@ def _mapped_labels() -> set[str]:
     return set(re.findall(r"-P ([A-Za-z0-9._-]+)=", SCRIPT.read_text(encoding="utf-8")))
 
 
+def _runner_labels(workflow: str) -> set[str]:
+    """The label each job lands on under act.
+
+    A plain ``runs-on: ubuntu-26.04`` is the label itself. PR #2072 makes it
+    ``${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}``; act does not read repository
+    variables, so locally that resolves to the quoted fallback, which is what
+    must be mapped.
+    """
+    labels = set()
+    for value in re.findall(r"^\s+runs-on:\s*(.+?)\s*$", workflow, flags=re.M):
+        if value.startswith("${{"):
+            fallback = re.search(r"\|\|\s*'([^']+)'\s*}}$", value)
+            assert fallback, f"runs-on expression without a quoted fallback label: {value}"
+            labels.add(fallback.group(1))
+        else:
+            labels.add(value)
+    return labels
+
+
 def test_every_ci_runner_label_is_mapped_to_the_local_image() -> None:
-    labels = set(re.findall(r"^\s+runs-on:\s*(\S+)\s*$", CI.read_text(encoding="utf-8"), flags=re.M))
+    labels = _runner_labels(CI.read_text(encoding="utf-8"))
     assert labels, "no runs-on labels found in ci.yml"
     assert labels <= _mapped_labels(), f"unmapped runner label(s): {sorted(labels - _mapped_labels())}"
+
+
+@pytest.mark.parametrize(
+    ("line", "label"),
+    [
+        ("    runs-on: ubuntu-26.04", "ubuntu-26.04"),
+        ("    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}", "ubuntu-26.04"),
+    ],
+)
+def test_runner_label_reads_plain_and_variable_runs_on(line: str, label: str) -> None:
+    assert _runner_labels(f"jobs:\n  test:\n{line}\n") == {label}
 
 
 def test_runner_image_dockerfile_exists_and_adds_gh() -> None:

@@ -9,6 +9,22 @@ It was added on 2026-10-31, when a failed account payment stopped GitHub from st
 job ("The job was not started because recent account payments have failed or your spending limit needs
 to be increased"). Every PR check then failed in 2-3 seconds without running.
 
+## Which local tool
+
+Two scripts check a branch before GitHub does. They are complementary, not duplicates:
+
+| | `scripts/local_ci.sh` | `scripts/run_ci_locally.sh` (this page) |
+| --- | --- | --- |
+| Runs | its own copy of `ci.yml`'s steps | `ci.yml` itself, through act |
+| Where | the checkout's `.venv`, on macOS | Ubuntu 24.04 containers, as GitHub's `runner` user |
+| Needs | nothing beyond the dev setup | act, Colima, Docker CLI (below) |
+| Speed | fast: no image, no clone, `--quick` skips coverage | a full run is ~16 minutes, one job at a time |
+| Can drift from CI | yes, when `ci.yml` changes and the script does not | no |
+
+Use `local_ci.sh` while iterating, and `run_ci_locally.sh` before merging when GitHub cannot run the PR
+(it matched GitHub exactly on PR #2066: 13,207 tests, 91.16% coverage). Both only report locally; neither
+turns a PR's failed hosted checks green.
+
 ## Setup (once)
 
 ```bash
