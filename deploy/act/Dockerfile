@@ -10,3 +10,10 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
  && apt-get update \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
+# GitHub's hosted runners execute steps as the unprivileged `runner` user (uid
+# 1001, passwordless sudo), not root. Root ignores file modes, so tests that
+# prove a read-only directory is refused (scripts/tests/test_bridge_python.py,
+# test_record_evidence_free_abort.py) failed locally and passed on GitHub.
+RUN useradd -m -u 1001 -s /bin/bash runner \
+ && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+ && chmod 0440 /etc/sudoers.d/runner

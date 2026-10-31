@@ -41,15 +41,19 @@ if ! colima status >/dev/null 2>&1; then
     colima start --cpu 8 --memory 16 --disk 100 --vm-type vz --vz-rosetta >&2
 fi
 
-# The runner image is act's medium Ubuntu 24.04 image plus the GitHub CLI
-# (deploy/act/Dockerfile). Rebuilt only when missing; `docker rmi` it to refresh.
-if ! docker image inspect "$image" >/dev/null 2>&1; then
+# The runner image is act's medium Ubuntu 24.04 image plus the GitHub CLI and a
+# `runner` user (deploy/act/Dockerfile). It is labelled with the Dockerfile's
+# hash and rebuilt whenever that file changes, so an edit there takes effect.
+dockerfile_sha=$(shasum -a 256 "$repo_root/deploy/act/Dockerfile" | cut -d' ' -f1)
+built_sha=$(docker image inspect -f '{{ index .Config.Labels "dockerfile-sha" }}' "$image" 2>/dev/null || true)
+if test "$built_sha" != "$dockerfile_sha"; then
     echo "building $image..." >&2
-    docker build -q -t "$image" "$repo_root/deploy/act" >&2
+    docker build -q --label "dockerfile-sha=$dockerfile_sha" -t "$image" "$repo_root/deploy/act" >&2
 fi
 
-event_file=$(mktemp "${TMPDIR:-/tmp}/act-event.XXXXXX")
-trap 'rm -f "$event_file"' EXIT
+work=$(mktemp -d "${TMPDIR:-/tmp}/act-ci.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+event_file=$work/event.json
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 if test "$event" = pull_request; then
     # The "Detect changed projects" job lists the PR's files through the API, so
@@ -77,10 +81,32 @@ fi
 # out Python 3.12's pip while the 3.12 research-audit leg was importing it
 # (FileNotFoundError .../pip/_vendor/rich/style.py). GitHub gives each job its own
 # VM; one job at a time is the local equivalent.
-cd "$repo_root"
+#
+# act copies the directory it runs in into the job. A linked worktree's `.git` is
+# a file naming a host path the container cannot see, so every git call there
+# exited 128 and from.py looked for the main checkout's .venv: 14 of 17 local
+# failures on 2026-10-31. GitHub checks out a plain clone, so do the same: clone
+# this checkout's HEAD into $work/repo, then lay its uncommitted and untracked
+# (not ignored) files on top, so "runs your working tree" still holds.
+snapshot=$work/repo
+head=$(git -C "$repo_root" rev-parse HEAD)
+git clone -q "$repo_root" "$snapshot"
+git -C "$snapshot" fetch -q "$repo_root" "$head"
+git -C "$snapshot" checkout -q --detach "$head"
+git -C "$snapshot" remote set-url origin "$(git -C "$repo_root" remote get-url origin)"
+git -C "$repo_root" diff --binary HEAD > "$work/uncommitted.patch"
+if test -s "$work/uncommitted.patch"; then
+    git -C "$snapshot" apply --whitespace=nowarn "$work/uncommitted.patch"
+fi
+(cd "$repo_root" && git ls-files -z --others --exclude-standard | tar --null -T - -cf -) | tar -C "$snapshot" -xf -
+#
+# --user 1001:1001 runs steps as the image's `runner` user, as GitHub does; as
+# root, read-only-directory tests could not fail the way they are meant to.
+# --rm removes a failed job's container instead of leaving it running.
+cd "$snapshot"
 GITHUB_TOKEN=$(gh auth token)
 export GITHUB_TOKEN
-# Not exec: the EXIT trap above must still remove the event file.
+# Not exec: the EXIT trap above must still remove the snapshot.
 status=0
 act "$event" \
     -W .github/workflows/ci.yml \
@@ -90,6 +116,8 @@ act "$event" \
     --container-daemon-socket - \
     --pull=false \
     --concurrent-jobs 1 \
+    --container-options "--user 1001:1001" \
+    --rm \
     -s GITHUB_TOKEN \
     "$@" || status=$?
 exit "$status"

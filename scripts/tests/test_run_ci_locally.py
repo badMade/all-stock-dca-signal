@@ -31,6 +31,17 @@ def test_runner_image_dockerfile_exists_and_adds_gh() -> None:
     dockerfile = (REPO_ROOT / "deploy/act/Dockerfile").read_text(encoding="utf-8")
     assert dockerfile.startswith("#") and "FROM catthehacker/ubuntu:act-24.04" in dockerfile
     assert "apt-get install -y --no-install-recommends gh" in dockerfile
+    # Steps run as this user (the script's --user 1001:1001), as on GitHub's runners.
+    assert "useradd -m -u 1001 -s /bin/bash runner" in dockerfile
+
+
+def test_script_runs_act_from_a_clean_clone_as_the_runner_user() -> None:
+    # A linked worktree's `.git` file points outside the container (14 of 17
+    # failures on the first local run); root ignored read-only modes (3 more).
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'git clone -q "$repo_root" "$snapshot"' in script
+    assert 'cd "$snapshot"' in script
+    assert '--container-options "--user 1001:1001"' in script
 
 
 @pytest.mark.parametrize("shell", ["sh", "dash", "bash"])

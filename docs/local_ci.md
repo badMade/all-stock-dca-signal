@@ -40,8 +40,13 @@ Exit status is act's: 0 when every job that ran succeeded.
 
 ## What to know
 
-* **It runs your working tree.** act copies the checkout, uncommitted edits included (gitignored files are
-  left out). To check a PR, check out its branch first.
+* **It runs your working tree, from a clean clone.** The script clones this checkout's HEAD into a temporary
+  directory, applies uncommitted edits and copies untracked (not ignored) files on top, and runs act there.
+  act copies whatever directory it runs in, and a linked worktree's `.git` is a file naming a host path the
+  container cannot see: run directly, every `git` call exited 128 and `from.py` looked for the main
+  checkout's `.venv` (14 of the first run's 17 failures). To check a PR, check out its branch first.
+* **Jobs run as `runner` (uid 1001), not root,** as on GitHub. Root ignores file modes, so the tests that
+  prove a read-only directory is refused failed locally as root.
 * **A PR run needs the PR number.** The `changes` job lists the PR's files through the GitHub API to decide
   which sibling jobs run. With no `--pr`, the script uses this branch's open PR; with no open PR, pass
   `--pr N` or use `--push`.
@@ -56,4 +61,6 @@ Exit status is act's: 0 when every job that ran succeeded.
 * **arm64, not amd64.** Jobs run as native `linux/arm64`. `actions/setup-python` downloads arm64 builds;
   a dependency with no arm64 wheel would fail here and not on GitHub.
 * **Colima keeps running** after a run. Stop it with `colima stop` to free its memory; the script starts it
-  again when needed. To rebuild the runner image, `docker rmi all-stock-dca/act-runner:24.04`.
+  again when needed. The runner image is rebuilt automatically whenever `deploy/act/Dockerfile` changes.
+* **If pip warns that scripts went to `/home/runner/.local/bin`**, act's shared tool cache still holds a
+  Python extracted by an older root run. Reset it with `docker volume rm act-toolcache`.
