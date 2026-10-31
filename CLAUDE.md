@@ -50,6 +50,9 @@ python3 from.py --local --no-browser
 
 # 3D market graph -- emits one self-contained HTML file, no network (docs/market_graph.md)
 python -m scripts.generate_market_graph --source csv --out /tmp/ocean.html
+
+# Run .github/workflows/ci.yml locally with act + Colima, not billed (docs/local_ci.md)
+scripts/run_ci_locally.sh -j test
 ```
 
 Two suites sit outside the root `pytest` sweep and must be run separately:
@@ -73,7 +76,7 @@ ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ```
 
 **Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
-`docs/local_ci.md`). It mirrors every CI job locally; since the 2026-10-31 Actions billing block,
+`docs/actions_minutes.md`). It mirrors every CI job locally; since the 2026-10-31 Actions billing block,
 draft PRs skip CI, push CI runs only Python 3.12 and path-filtered siblings, and the 3.11 leg runs
 on a weekday schedule. `scripts/local_ci_status.sh <flags>` posts the result to
 the tested commit as a `local-ci` status. Set the `CI_RUNS_ON` repo variable to move CI onto a self-hosted runner.
@@ -246,7 +249,8 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
 | `docs/adr-plan-first-backup-executor.md` | Proposed ADR for the plan-first backup executor: order-plan files (`dca_order_plan.py`, `schemas/order_plan.schema.json`), Mac-first backup, compute fallbacks, fail-closed re-validation |
 | `docs/plan_first_recommendations.md` | Plan-first recommendation courier, freshness, slot reader, placement evidence and rollout |
-| `docs/local_ci.md` | `scripts/local_ci.sh` (every CI gate run locally), the measured Actions-minute breakdown, the 2026-10-31 trigger cuts, and the self-hosted-runner switch (`CI_RUNS_ON`) |
+| `docs/actions_minutes.md` | The measured Actions-minute breakdown, the 2026-10-31 trigger cuts, `scripts/local_ci.sh` / `scripts/local_ci_status.sh` (local gates, result posted as a `local-ci` commit status), and the opt-in self-hosted-runner switch (`CI_RUNS_ON`) |
+| `docs/local_ci.md` | Running `ci.yml` on the operator's Mac with act + Colima (`scripts/run_ci_locally.sh`, `deploy/act/Dockerfile`); added when a GitHub billing block stopped hosted runners |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |

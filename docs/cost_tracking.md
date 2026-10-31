@@ -285,6 +285,38 @@ a ceiling the operator reads off Perplexity's own usage page. It is not a figure
 the proxy-band rule above still holds and no report may claim a credit count against it. The lever is the early
 stand-down gate in `docs/adr-plan-first-backup-executor.md` ("Amendment: stand down before the broker pull").
 
+**2026-10-30 update.** With that gate live, the operator measured about 2,500 credits per trading day and set a new
+target of **under 200 per trading day**. Most of the cost is the stand-down path itself: every fire still lists devices
+and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
+
+1. **Measure.** The operator records each fire's credits, read off Perplexity's usage page, in a local ledger. The
+   ledger lives under the gitignored cron root, never in this repo, so the proxy-band rule above still holds for
+   every generated report:
+
+   ```bash
+   python3 -m scripts.backup_cost_ledger add --day 2026-10-29 --task 4412c3c4 --credits 312 --status stood_down_local_active
+   python3 -m scripts.backup_cost_ledger report --since 2026-10-27
+   ```
+
+2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the primary's own
+   `local_heartbeat start` and `finish`.
+   - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch
+     (`config/slot_status.json`).
+   - Content: only the day, whether the market is open, and each slot's status and time.
+   - Failure: publishing is best-effort and never fails the primary run.
+   - Closed days: run `python3 -m scripts.slot_status market-day` once each morning to publish a holiday as closed.
+   - Local copy: `python3 -m scripts.slot_status show` prints it.
+   - Tests: set `DCA_DISABLE_SLOT_STATUS_PUBLISH` so nothing is pushed (`conftest.py` does).
+3. **A short backup prompt (generated 2026-10-30; live only after a repaste).** Each pasted prompt is now about
+   3,000 characters instead of about 12,000.
+   - STEP A reads `slot_status.json` once and ends the fire on a slot marked `succeeded` today or a closed market,
+     with no other tool call, no file and no notification.
+   - Anything else (in progress, failed, missing, stale) goes to STEP B: the build-stamp check, then
+     `procedure --part 0` (the unchanged hard rules, calendar, step 0 and the 2026-10-25 stand-down gate), then
+     parts 1-3 as before.
+   - A bad signal costs credits but never skips a check or adds a buy.
+   - See `docs/adr-plan-first-backup-executor.md`, "Amendment: read the slot-status signal first".
+
 ## Levers
 
 - Prefer compact Notion "Latest Run" updates daily; full dashboard only weekly/monthly.

@@ -59,11 +59,11 @@ BAR_START_ET = {
 SLOTS = tuple(BAR_START_ET)
 #: Slots that can be planned and built on demand but are NOT scheduled: ``due_slot`` ignores them, so launchd's
 #: ``auto`` never fires one and no live prompt waits on one. 3:30 only needs the lookback bar (decision anchor minus
-#: ``trend_lookback_minutes`` = 14:30) and the decision bar, because ``scripts/generate_buy_candidates`` bypasses the
+#: ``trend_lookback_minutes``, measured from the completed 15:25 bar = 14:25) and the decision bar, because ``scripts/generate_buy_candidates`` bypasses the
 #: trend filter at 1530ET; the live prompt's "09:30 onward" is wider than the generator's own check and would turn a
 #: 5-minute fetch into 72 bars per ticker for no scoring benefit.
 SHADOW_BAR_START_ET = {
-    "1530": time(14, 30),
+    "1530": time(14, 25),
 }
 PLANNABLE_SLOTS = SLOTS + tuple(SHADOW_BAR_START_ET)
 
@@ -191,8 +191,18 @@ def validate_ticker(
             by_stamp[stamp] = bar
     if not by_stamp:
         raise QuietTickerError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
-    if min(by_stamp) > start + timedelta(minutes=interval):
-        raise PayloadError(f"intraday bars do not cover the {bar_start:%H:%M} trend-window start")
+    # The bar AT the window start is required, not one interval after it (2026-10-30). The old `> start + interval`
+    # slack let a 3:30 series beginning at 14:30 pass `merge` and `check` against a 14:25 start, but the generator's
+    # 60-minute lookback bar is exactly 14:25 (bars before `start` are dropped above, so nothing else can stand in):
+    # every such ticker then scored NO_DATA/provider_error behind a payload that had just checked 91/91, which is how
+    # the 10-30 slot aborted with an unexplained market_data_unavailable. A late series now fails here, by name, and
+    # counts against the coverage floor. Cost: none of the 5,646 published per-ticker series (all seven slots,
+    # 2026-10-19..10-30) started anywhere but exactly on their planned start.
+    if min(by_stamp) > start:
+        raise PayloadError(
+            f"intraday bars do not cover the {bar_start:%H:%M} trend-window start "
+            f"(first bar {min(by_stamp):%H:%M} ET)"
+        )
     bars = [by_stamp[k] for k in sorted(by_stamp)]
     last_stamp = max(by_stamp)
     # The newest completed bar must be near the anchor, or the series stopped early (a truncated copy).
@@ -519,6 +529,43 @@ def _load_chunk(path: str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise PayloadError("chunk output is not an object")
     return loaded
+
+
+#: Prior-session share volume at or above which a ticker that came back with no intraday bars is re-asked for instead
+#: of being filed "quiet" (2026-10-31). At 1M shares a day a name averages ~2,500 shares a minute, so an hour with no
+#: 5-minute bar at all is a worker that dropped the series, not a quiet hour. The genuinely thin names of the universe
+#: sit well below it (QTOP, GFUZ and CHE under 100k; FLKR, DXYZ, IRDM, EVR, TRIN and AAAU 0.3-0.6M, 2026-10-15..10-30)
+#: and keep the old behaviour; NVDA, GOOGL, GOOG and AMZN (10-29 15:31: 10-78M) are far above it.
+LIQUID_PRIOR_VOLUME = 1_000_000
+
+
+def _implausibly_quiet(entry: Any) -> bool:
+    """True when ``entry`` carries no intraday bars although its prior session traded ``LIQUID_PRIOR_VOLUME`` or more.
+
+    A malformed or missing ``previous_close_bar`` reads as not liquid: this only decides whether to ask again, and a
+    ticker that is not re-asked for is still validated (and failed) by the merge exactly as before.
+    """
+    if not isinstance(entry, dict) or entry.get("error") or entry.get("intraday_bars"):
+        return False
+    prev = entry.get("previous_close_bar")
+    volume = prev.get("volume") if isinstance(prev, dict) else None
+    return isinstance(volume, (int, float)) and not isinstance(volume, bool) and volume >= LIQUID_PRIOR_VOLUME
+
+
+def rescue_targets(reply: dict[str, Any], tickers: list[str]) -> list[str]:
+    """The tickers of one chunk the launcher's rescue pass re-asks for, given that chunk's reply (``{}`` if none).
+
+    Absent or per-ticker-error tickers (2026-10-26); every ticker when every answered one has no bars (2026-10-30, the
+    whole-chunk case of 10-29 15:31); otherwise also any answered ticker with no bars whose prior session was liquid
+    (2026-10-31: the same 10-29 failure with one ticker of the chunk still answered would have filed NVDA, GOOGL, GOOG
+    and AMZN quiet again). Only *which tickers are asked for again* changes here: the merge still validates whatever
+    comes back, and a liquid name that is empty again is still filed quiet and counted against ``MAX_QUIET_SHARE``.
+    """
+    need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
+    answered = [reply[t] for t in tickers if t not in need]
+    if answered and all(isinstance(e, dict) and not e.get("intraday_bars") for e in answered):
+        return list(tickers)  # every answered ticker came back with no bars: the worker dropped the series
+    return [t for t in tickers if t in need or _implausibly_quiet(reply[t])]
 
 
 # The launchd script writes worker i's reply to chunk_<i>.json, where i indexes plan["chunks"]. The index is the only

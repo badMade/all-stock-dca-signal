@@ -275,6 +275,41 @@ def test_github_branch_against_a_real_bare_remote(tmp_path):
     assert git("status", "--porcelain", cwd=work) == ""  # working tree untouched
 
 
+def test_github_branch_default_file_name_is_unchanged(tmp_path):
+    assert pub.GitHubBranchPublisher(tmp_path).filename == "recommendations.json"
+
+
+def test_github_branch_can_publish_another_file_name(tmp_path):
+    # The slot-status signal (scripts/slot_status.py) reuses this publisher on its own branch and file.
+    git = FakeGit()
+    publisher = pub.GitHubBranchPublisher(tmp_path, branch="slot-status", filename="slot_status.json", runner=git)
+    assert publisher.publish({"trading_day": "2026-10-29"}).ok
+    assert git.calls[1][2] == f"{pub._REGULAR_FILE_MODE} blob blobsha\tslot_status.json\n"
+    assert git.calls[3][1][-1] == "commitsha1234567:refs/heads/slot-status"
+
+
+@pytest.mark.parametrize("filename", ["", "a/b.json", "../x.json", "x.txt", ".json", "bad name.json"])
+def test_github_branch_refuses_an_unsafe_file_name(tmp_path, filename):
+    with pytest.raises(ValueError):
+        pub.GitHubBranchPublisher(tmp_path, filename=filename)
+
+
+def test_two_branches_on_one_remote_never_clobber_each_other(tmp_path):
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    remote = tmp_path / "remote.git"
+    work = tmp_path / "work"
+    git("init", "--bare", str(remote))
+    git("init", str(work))
+    git("remote", "add", "origin", str(remote), cwd=work)
+    assert pub.GitHubBranchPublisher(work).publish(_doc()).ok
+    assert pub.GitHubBranchPublisher(work, branch="slot-status", filename="slot_status.json").publish(
+        {"trading_day": "2026-10-29"}).ok
+    assert git("ls-tree", "--name-only", "recommendations", cwd=remote) == "recommendations.json"
+    assert git("ls-tree", "--name-only", "slot-status", cwd=remote) == "slot_status.json"
+
+
 # --- settings + fan-out --------------------------------------------------------------------
 
 

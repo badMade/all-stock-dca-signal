@@ -2,7 +2,7 @@
 # Run scripts/local_ci.sh and publish its real result to GitHub as a commit status
 # on the exact commit it tested, so a PR shows a green/red `local-ci` check while
 # GitHub-hosted Actions are unavailable or deliberately skipped (draft PRs since
-# #2067; the 2026-10-31 billing block). See docs/local_ci.md.
+# #2067; the 2026-10-31 billing block). See docs/actions_minutes.md.
 #
 # Usage:
 #   scripts/local_ci_status.sh [local_ci.sh flags...]     # e.g. --all, --quick, --changed

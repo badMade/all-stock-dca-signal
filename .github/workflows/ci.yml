@@ -25,7 +25,7 @@ on:
   # every sibling, the research audit). self-heal reacts to its failures exactly as
   # it does to a push run's -- both are CI runs whose head_branch is main.
   # workflow_dispatch gives the same full run on demand. The day-to-day gate is now
-  # scripts/local_ci.sh (docs/local_ci.md).
+  # scripts/local_ci.sh (docs/actions_minutes.md).
   schedule:
     - cron: "0 10 * * 1-5"
   workflow_dispatch:
@@ -46,7 +46,7 @@ concurrency:
 # a self-hosted runner (e.g. `gh variable set CI_RUNS_ON --body self-hosted`) to run
 # this whole workflow off GitHub-hosted runner minutes (check GitHub's current
 # self-hosted pricing first); delete the variable to switch back. See
-# docs/local_ci.md for the runner setup, the pricing note and its security caveats.
+# docs/actions_minutes.md for the runner setup, the pricing note and its security caveats.
 
 # Read-only by default; no job here needs to write to the repository.
 permissions:

@@ -1,148 +1,82 @@
-# Local CI and the Actions-minute budget
+# Running CI locally (act + Colima)
 
-On 2026-10-31 every GitHub Actions job in this repository stopped starting: the check-run
-annotation read "recent account payments have failed or your spending limit needs to be
-increased". This page records where the minutes were going, what was changed, and how to run
-the same gates on this Mac instead.
+`scripts/run_ci_locally.sh` runs `.github/workflows/ci.yml` on the operator's Mac with
+[act](https://github.com/nektos/act), in Linux containers under [Colima](https://github.com/abiosoft/colima).
+It runs the real workflow file, so there is no second copy of the CI steps to keep in sync, and nothing is
+billed to the GitHub account.
 
-## Where the minutes went (measured)
+It was added on 2026-10-31, when a failed account payment stopped GitHub from starting any hosted Actions
+job ("The job was not started because recent account payments have failed or your spending limit needs
+to be increased"). Every PR check then failed in 2-3 seconds without running.
 
-Sampled from the Actions API for 2026-10-24 20:37Z → 2026-10-31 04:20Z (6.3 days, the most the
-runs API returns: 1,000 runs). Minutes are per job, rounded up to the minute the way GitHub bills
-them, averaged over the 10-12 most recent finished runs of each kind.
+## Which local tool
 
-| Workflow | Trigger | Runs | Billed runs | Avg min/run | Min in window | Share |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| CI | push to `main` | 76 | 76 | 59.1 | ~4,490 | 61% |
-| CI | pull_request | 286 | 252 | 10.6 | ~2,670 | 36% |
-| Sync Labelled PR Branches | push to `main` | 109 | 109 | 1.0 | ~109 | 1.5% |
-| Refresh Generated Docs | push to `main` (+ weekly) | 64 | 64 | 1.0 | ~64 | 0.9% |
-| Drift detector self-test, planner repaste, self-heal | schedule / push / workflow_run | ~320 | ~15 | 1.0 | ~15 | 0.2% |
-| Claude Code Review | issue_comment | 82 | 0 | – | 0 | 0% |
-| CapEx scan, compute-schedule | weekly / monthly | 0-1 | – | – | – | ~0% |
+Two scripts check a branch before GitHub does. They are complementary, not duplicates:
 
-Total ≈ 7,350 minutes in 6.3 days, i.e. **~35,000 Linux minutes a month**, against a private-repo
-allowance of 2,000 (Free) or 3,000 (Pro). (Self-heal fires on every CI completion but its job is
-`if:`-skipped unless main failed, and skipped jobs are not billed.)
+| | `scripts/local_ci.sh` | `scripts/run_ci_locally.sh` (this page) |
+| --- | --- | --- |
+| Runs | its own copy of `ci.yml`'s steps | `ci.yml` itself, through act |
+| Where | the checkout's `.venv`, on macOS | Ubuntu 24.04 containers, as GitHub's `runner` user |
+| Needs | nothing beyond the dev setup | act, Colima, Docker CLI (below) |
+| Speed | fast: no image, no clone, `--quick` skips coverage | a full run is ~16 minutes, one job at a time |
+| Can drift from CI | yes, when `ci.yml` changes and the script does not | no |
 
-Inside a push-to-main CI run, per job: core DCA 3.11 ≈ 19.4 min, core DCA 3.12 ≈ 21.9 min,
-wondrous-octopus ≈ 10.4 min (the CPU torch install and training tests), and eight one-minute jobs
-(changes, dev audit, research audit ×2, the other six siblings). On a PR the core 3.12 leg
-averaged 6.6 min. There are no required status checks: the only ruleset (`protection`) has no
-rules, and `main` has no branch protection, so skipping a job blocks nothing.
+Use `local_ci.sh` while iterating, and `run_ci_locally.sh` before merging when GitHub cannot run the PR
+(it matched GitHub exactly on PR #2066: 13,207 tests, 91.16% coverage). Both only report locally; neither
+turns a PR's failed hosted checks green.
 
-## What changed in `ci.yml`
-
-PR #2067 (the base of this change) makes draft PRs skip CI: `pull_request` also fires on
-`ready_for_review`, and the root jobs skip while the PR is a draft. This change adds:
-
-1. **Pushes to `main` run 3.12 only.** The 3.11 leg moves to a new weekday scheduled run
-   (`cron: "0 10 * * 1-5"`, 06:00 ET) and `workflow_dispatch`, which run the whole matrix, every
-   sibling, and the research audit. Self-heal still reacts: the scheduled run is a CI run on
-   `main`, and its scope pattern (`^Lint & test \(core DCA\)`) matches the 3.11 leg too.
-2. **Pushes to `main` path-filter sibling projects.** The `changes` job now diffs the pushed range
-   (`compare/$BEFORE...$AFTER`) the way it already diffed PRs. It fails open: an API error, a
-   300-file (truncated) listing, a new branch, a change to `requirements-dev.txt` or `ci.yml`, or
-   any non-push/non-PR event runs everything.
-3. **The research audit runs only when a dependency manifest moved** (`requirements*.txt`,
-   `uv.lock`, `pyproject.toml`), plus on every scheduled/manual run, which is where a new advisory
-   against unchanged pins gets caught.
-4. **Every job's runner is a variable**: `runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}`.
-   Unset, nothing changes. Set it to a self-hosted runner's label and the whole workflow stops
-   using GitHub-hosted runner minutes (see below for the pricing caveat).
-
-`scripts/tests/test_workflow_policy.py::test_ci_minute_budget_triggers` pins all four.
-
-Estimated effect of 1-3 alone: ~4,500 min/week (PR ~2,170, push ~1,900, schedule ~300, other
-workflows ~190), a ~38% cut. #2067's draft skip removes most of the PR share, since nearly every
-PR here spends its life as a draft. Together that is roughly ~2,500 min/week (push ~1,900,
-schedule ~300, ready PRs and other workflows ~300), still over a monthly allowance. 4 (self-hosted)
-plus running the gates locally is the real fix.
-
-Not changed, and why: `Sync Labelled PR Branches` and `Refresh Generated Docs` are about 2.5% of
-minutes together; the other workflows are ≤1 run a week. No workflow was disabled or deleted.
-
-## Recommendation
-
-1. **Run `scripts/local_ci.sh` before pushing** (below). It is the same gate set as CI, takes
-   about as long as the PR leg did, and costs nothing.
-2. **Register a self-hosted runner on this Mac and set `CI_RUNS_ON`**, so the existing workflows,
-   self-heal, and PR checks keep running unchanged without using GitHub-hosted runner minutes.
-   **Check current pricing before relying on this being free:** in December 2025 GitHub announced
-   a per-minute platform charge for self-hosted runners on private repositories, then postponed
-   it, so whether self-hosted minutes cost anything (and count toward the spending limit) depends
-   on GitHub's pricing page at the time you set this up, not on this doc. It is also not
-   documented clearly whether a *failed-payment* lock stops self-hosted jobs. Check with one
-   `workflow_dispatch` after setting the variable.
-3. **If you stay on GitHub-hosted runners**, the biggest remaining lever is the push-to-main
-   core run (~22 min × ~76 pushes a week). The PR already ran the same 3.12 suite, so a push run
-   mostly re-proves a merge. Dropping it in favour of the weekday scheduled run would save another
-   ~1,700 min/week. But self-heal reacts to push-run failures within minutes, and that would then
-   wait up to a day. That is your decision, so it is not in this change.
-
-A pre-push hook is available but opt-in (below): `core.hooksPath` is shared by every worktree,
-so turning it on makes every agent session's push wait for the quick gates too.
-
-## `scripts/local_ci.sh`
-
-(Rewritten for full CI parity in PR #2067; summarised here.)
+## Setup (once)
 
 ```bash
-scripts/local_ci.sh              # ruff, coverage-gated pytest, scripts/tests, dry-run demo
-scripts/local_ci.sh --quick      # same minus the full coverage run (~1 min)
-scripts/local_ci.sh --changed    # + sibling projects changed vs origin/main (ci.yml's rule)
-scripts/local_ci.sh --all        # everything the scheduled CI run does
+brew install act colima docker gh
+gh auth login            # the script reuses gh's token; skip if already logged in
 ```
 
-| CI job | Local equivalent |
-| --- | --- |
-| Lint & test (core DCA) (3.12) | default run (ruff, `pytest --cov=. --cov-fail-under=90`, demo) |
-| Lint & test (core DCA) (3.11) | `--py311` (uv-managed env, Python 3.11) |
-| Dependency & secret audit | `--audit` (`pip-audit --requirement requirements-dev.txt --strict`) |
-| Dependency audit (research) ×2 | `--audit` (the same `uv export` / `uv pip compile` / `pip-audit --locked` sequence, for 3.11 and 3.12) |
-| Lint & test (\<sibling\>) | `--changed`, `--all`, or a project name; each runs in a uv-managed env built from the same requirement files and Python version as its CI job |
-| *(not in CI)* | `scripts/tests` (incl. the workflow-policy tests), always run |
+Nothing else. On the first run the script starts Colima (8 CPUs, 16 GB, 100 GB disk, Apple
+Virtualization with Rosetta) and builds the runner image from `deploy/act/Dockerfile`: act's medium
+Ubuntu 24.04 image plus the GitHub CLI, which the "Detect changed projects" job calls. The full act image
+that already carries `gh` is about 20 GB, so it is not used.
 
-The core interpreter is `$PYTHON`, else `./.venv`, else the main checkout's `.venv` (worktrees
-under `.claude/worktrees/` have none of their own). `--py311`, `--audit` and the siblings need
-`uv` and network on first use. The main difference from CI is the OS: macOS rather than Ubuntu.
-
-### Reporting the result to GitHub
+## Use
 
 ```bash
-scripts/local_ci_status.sh --all     # any local_ci.sh flags pass straight through
+scripts/run_ci_locally.sh                        # every job, as a PR run of this branch's open PR
+scripts/run_ci_locally.sh -j test                # one job
+scripts/run_ci_locally.sh --pr 2066 -j audit     # name the PR explicitly
+scripts/run_ci_locally.sh --push                 # as a push to main: both Pythons, every sibling job
+scripts/run_ci_locally.sh -l                     # list job ids
 ```
 
-This runs `local_ci.sh` and posts its real result as a `local-ci` commit status on the commit it
-tested: `pending` at the start, then `success` only on exit 0, `failure` otherwise, and `error` if
-interrupted. PRs then show a green or red local check while Actions is skipped (drafts) or
-unavailable (the billing block). It refuses a dirty tree, since the status would describe code
-that isn't the commit, and refuses a commit GitHub doesn't have yet (push first).
-`$LOCAL_CI_CONTEXT` renames the context. It is a plain commit status: no ruleset requires it, and
-making it required would be a ruleset change for you to decide.
+Job ids are `changes`, `test`, `audit`, `research-audit`, and one per sibling project
+(`production-safe-agent-loop`, `ticker-advisor`, `ml-forecaster`, `wondrous-octopus`,
+`ticker-market-breadth`, `llm-providers`, `yfinance-prefetch`). Any other argument goes straight to act,
+for example `--matrix python-version:3.11`.
 
-### Optional pre-push hook
+Exit status is act's: 0 when every job that ran succeeded.
 
-```bash
-git config core.hooksPath scripts/git-hooks   # on; affects every worktree of this clone
-git config --unset core.hooksPath             # off
-```
+## What to know
 
-`scripts/git-hooks/pre-push` runs `scripts/local_ci.sh --quick`; `git push --no-verify` skips it.
-
-## Self-hosted runner on this Mac
-
-1. GitHub → repository Settings → Actions → Runners → *New self-hosted runner* → macOS / ARM64,
-   and follow its download + `./config.sh` steps, accepting the default `self-hosted` label.
-2. **Run it as a separate, unprivileged macOS user**, not your own account. PR branches (including
-   those that Jules, Copilot, Codex and Claude push) execute arbitrary code on the runner. Your account holds
-   the `.env` with `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`, the shared `cron_tracking/` tree, and the
-   agent sessions with Robinhood MCP access. The repository is private, so fork PRs from
-   strangers are not a concern, but agent-authored branches are.
-3. Install it as a service (`./svc.sh install && ./svc.sh start`) so it survives logout.
-4. `gh variable set CI_RUNS_ON --body self-hosted`, then `gh workflow run CI` once to confirm.
-   `gh variable delete CI_RUNS_ON` switches back to GitHub-hosted runners.
-
-One runner runs one job at a time, so a full scheduled run (≈ 60 job-minutes) serializes. The
-other workflows still use `ubuntu-latest` (≈ 190 min/week, inside the free allowance); point
-them at the same variable if you want them off GitHub-hosted runners too.
+* **It runs your working tree, from a clean clone.** The script clones this checkout's HEAD into a temporary
+  directory, applies uncommitted edits and copies untracked (not ignored) files on top, and runs act there.
+  act copies whatever directory it runs in, and a linked worktree's `.git` is a file naming a host path the
+  container cannot see: run directly, every `git` call exited 128 and `from.py` looked for the main
+  checkout's `.venv` (14 of the first run's 17 failures). To check a PR, check out its branch first.
+* **Jobs run as `runner` (uid 1001), not root,** as on GitHub. Root ignores file modes, so the tests that
+  prove a read-only directory is refused failed locally as root.
+* **A PR run needs the PR number.** The `changes` job lists the PR's files through the GitHub API to decide
+  which sibling jobs run. With no `--pr`, the script uses this branch's open PR; with no open PR, pass
+  `--pr N` or use `--push`.
+* **Results stay local.** Nothing is posted to the PR's checks, so a PR still shows the hosted failures
+  until GitHub can run them again.
+* **The token is gh's.** `gh auth token` is handed to act as the `GITHUB_TOKEN` secret and never printed.
+* **The Docker socket is not mounted** (`--container-daemon-socket -`). act's default bind-mount fails under
+  Colima and no job here starts containers of its own.
+* **Jobs run one at a time** (`--concurrent-jobs 1`). act shares one Python tool cache across jobs, and on
+  the first run the audit job's pip upgrade broke the 3.12 research-audit leg that was using the same
+  Python at that moment. A full run is therefore slower than on GitHub; `-j <job>` runs just one.
+* **arm64, not amd64.** Jobs run as native `linux/arm64`. `actions/setup-python` downloads arm64 builds;
+  a dependency with no arm64 wheel would fail here and not on GitHub.
+* **Colima keeps running** after a run. Stop it with `colima stop` to free its memory; the script starts it
+  again when needed. The runner image is rebuilt automatically whenever `deploy/act/Dockerfile` changes.
+* **If pip warns that scripts went to `/home/runner/.local/bin`**, act's shared tool cache still holds a
+  Python extracted by an older root run. Reset it with `docker volume rm act-toolcache`.

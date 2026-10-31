@@ -60,3 +60,28 @@ def test_shadow_agent_sets_a_build_deadline_that_fits_before_the_slot_window_clo
 def test_shadow_template_holds_no_secret_or_account_shaped_literal():
     text = SHADOW.read_text(encoding="utf-8")
     assert not re.search(r"\d{8,}", text) and "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in text
+
+
+def test_1530_agent_publishes_or_refuses_before_the_live_prompt_stops_re_checking():
+    # 2026-10-30: the first live 3:30 build published at 15:34:48, and the shadow builds of 10-23 to 10-30 at 15:34:45 to
+    # 15:35:26 (220-264 s). The run-classification window's 15:35 end is a reporting bound on order attribution, not a
+    # gate on the payload: the session waits on `check`, re-checking for 12 minutes, and its session fires at 15:30, so
+    # 15:42 is the earliest it can give up. Both deadlines must end the fetch before then whatever time launchd starts it.
+    import datetime as dt
+
+    prompt = (DIR.parent.parent / "claude/dca-executor-prompts/live-mirror/1530ET-330-final-buying-run.txt").read_text(
+        encoding="utf-8"
+    )
+    wait = re.search(r"re-run check every 30 seconds for up to (\d+) minutes", prompt)
+    assert wait, "the 1530ET prompt's payload wait changed; re-derive the build cutoff"
+    gives_up = dt.datetime(2026, 10, 30, 15, 30) + dt.timedelta(minutes=int(wait.group(1)))
+
+    env = _load(SHADOW)["EnvironmentVariables"]
+    cutoff = dt.datetime.combine(dt.date(2026, 10, 30), dt.time.fromisoformat(env["DCA_BUILD_DEADLINE_ET"]))
+    relative_end = dt.datetime(2026, 10, 30, 15, 31) + dt.timedelta(seconds=int(env["DCA_BUILD_DEADLINE_SECONDS"]))
+    # At least one 30-second re-check, plus the merge, after the fetch stops.
+    assert cutoff <= gives_up - dt.timedelta(minutes=2), (cutoff, gives_up)
+    assert relative_end <= cutoff  # an on-time start is bounded by the relative deadline alone
+    # And neither may cut a normal build short: the slowest measured build (264 s from 15:31) with room to spare.
+    assert cutoff >= dt.datetime(2026, 10, 30, 15, 31) + dt.timedelta(seconds=2 * 264)
+    assert "DCA_BUILD_DEADLINE_ET" not in _load(LIVE)["EnvironmentVariables"]
