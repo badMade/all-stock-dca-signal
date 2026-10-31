@@ -156,7 +156,7 @@ class NotionPublisher:
 
 
 class GitHubBranchPublisher:
-    """Force-push one orphan commit holding ``recommendations.json`` to a data-only branch.
+    """Force-push one orphan commit holding one JSON file (``recommendations.json`` by default) to a data-only branch.
 
     Plumbing only (hash-object, mktree, commit-tree, push). It never checks out, stashes or
     touches the working tree or index, because the operator commits from this same checkout
@@ -166,15 +166,20 @@ class GitHubBranchPublisher:
     channel = "github_branch"
 
     def __init__(self, repo_dir: str | Path, *, branch: str = "recommendations", remote: str = "origin",
-                 runner: Callable[..., Any] = subprocess.run) -> None:
+                 filename: str = "recommendations.json", runner: Callable[..., Any] = subprocess.run) -> None:
         if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch in {"main", "master"} or branch.startswith("claude/"):
             # main and claude/** trigger CI on push (.github/workflows/ci.yml); a data branch must not.
             raise ValueError("branch must be a plain data branch outside main and claude/**")
         if not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
             raise ValueError("unsafe remote name")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.json", filename):
+            # Goes into a mktree line verbatim: one plain file name, no path, no whitespace (2026-10-30, the
+            # slot-status signal reuses this publisher with its own file on its own branch).
+            raise ValueError("filename must be one plain *.json name")
         self.repo_dir = Path(repo_dir)
         self.branch = branch
         self.remote = remote
+        self.filename = filename
         self.runner = runner
 
     def _git(self, *args: str, stdin: str | None = None, env: dict[str, str] | None = None) -> str:
@@ -188,10 +193,11 @@ class GitHubBranchPublisher:
     def publish(self, document: Mapping[str, Any]) -> PublishResult:
         try:
             blob = self._git("hash-object", "-w", "--stdin", stdin=_canonical(document) + "\n")
-            tree = self._git("mktree", stdin=f"{_REGULAR_FILE_MODE} blob {blob}\trecommendations.json\n")
+            tree = self._git("mktree", stdin=f"{_REGULAR_FILE_MODE} blob {blob}\t{self.filename}\n")
             env = {**os.environ, "GIT_AUTHOR_NAME": "all-stock-dca", "GIT_AUTHOR_EMAIL": "noreply@all-stock-dca",
                    "GIT_COMMITTER_NAME": "all-stock-dca", "GIT_COMMITTER_EMAIL": "noreply@all-stock-dca"}
-            commit = self._git("commit-tree", tree, "-m", f"recommendations {document.get('generated_at', '')}",
+            stamp = document.get("generated_at", document.get("updated_at", ""))
+            commit = self._git("commit-tree", tree, "-m", f"{self.filename[:-5]} {stamp}",
                                env=env)
             self._git("push", "--force", "--quiet", self.remote, f"{commit}:refs/heads/{self.branch}")
         except OSError as exc:

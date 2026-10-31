@@ -198,25 +198,28 @@ pair that verified yesterday can be stale today. `python3 -m scripts.planner_sta
 compares your attached planner with what `origin/main` builds, and a launchd agent can run it each weekday morning
 and notify you; see "Stale-planner check (launchd)" in `docs/schedule_verification.md`.
 
-## The 20,000-character limit and the `procedure` command (2026-10-18)
+## Signal-first prompt and the `procedure` command (2026-10-30)
 
 Perplexity's Instructions box keeps only the first 20,000 characters. The full generated prompts were about 27,300,
 so every pasted prompt was cut inside step 6 and the agent never saw the finalize arguments, order placement, the state
 record or the notifications.
 
-The committed `*-backup.txt` files are now the PASTEABLE prompts (about 8,000 characters): hard rules, the calendar,
-the step 0 build-stamp check, a `RUN VALUES` block and a pointer. Steps 1-9 are served by the planner:
+The committed `*-backup.txt` files are the PASTEABLE prompts (under 3,500 characters). They first read the public
+`slot_status.json` signal and stand down only when the market is closed or the backed-up slot succeeded today. Otherwise
+they verify the attached planner's build stamp, fetch part 0, and require its token before requesting part 1. No broker
+or Mac tool is named in the pasteable prompt.
 
 ```
-python3 backup_planner.pyz procedure --task <task id> --part <1|2|3>
+python3 backup_planner.pyz procedure --task <task id> --part <0|1|2|3>
 ```
 
-Part 1 is steps 1-3, part 2 is steps 4-6, part 3 is steps 7-9. The text lives in `scripts/backup_procedure.py`, which ships
-inside the `.pyz`, so it is covered by the same `content_sha256` stamp the prompt checks in step 0. The full reference
-text (rules plus steps, for reading in one place) is `gen.build_prompts()`; the pasteable files are
-`gen.build_instructions()`, which is what `--write` and `--check` use. `scripts/tests/test_backup_procedure.py` fails if
-any pasteable prompt grows past the limit. Changing a step now changes the planner stamp, so rebuild the `.pyz`, repaste
-the prompts and re-run the pair check in "Checking the pair before you paste it".
+Part 0 carries the hard rules, calendar, universe check and stand-down gate. Part 1 is steps 1-3, part 2 is steps 4-6,
+and part 3 is steps 7-9. All four parts live in `scripts/backup_procedure.py`, which ships inside the `.pyz`, so they are
+covered by the same `content_sha256` stamp the prompt checks. The full reference text (rules plus steps, for reading in
+one place) is `gen.build_prompts()`; the pasteable files are `gen.build_instructions()`, which is what `--write` and
+`--check` use. `scripts/tests/test_backup_signal_prompt.py` keeps the pasted prompts under 3,500 characters. Changing
+any served part changes the planner stamp, so rebuild the `.pyz`, regenerate the prompts and re-run the pair check in
+"Checking the pair before you paste it".
 
 Step 1 is code too: `backup_planner gates --task <id>` reads the real clock, picks the slot, applies the holiday and
 early-close calendar and the window, and prints PROCEED / skipped_market_closed / skipped_outside_window

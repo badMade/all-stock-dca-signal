@@ -44,7 +44,8 @@ _LAYER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     )),
     ("backup_executor", (
         "dca_execution_router", "dca_order_plan", "dca_number_check", "scripts.backup_planner", "scripts.backup_stream_specs",
-        "scripts.local_heartbeat", "scripts.assemble_market_data", "scripts.build_backup_planner",
+        "scripts.local_heartbeat", "scripts.slot_status", "scripts.backup_cost_ledger", "scripts.assemble_market_data",
+        "scripts.build_backup_planner",
         "scripts.stream_candidates", "scripts.generate_",
     )),
     ("entry_points", (

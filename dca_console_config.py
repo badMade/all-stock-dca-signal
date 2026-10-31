@@ -66,6 +66,7 @@ CONFIG_FILES: tuple[tuple[str, str | None, bool], ...] = (
     ("scheduled_tasks", "scheduled_tasks", False),
     ("self_heal", "self_heal", False),
     ("sizing_ladder", "sizing_ladder", False),
+    ("slot_status", "slot_status", False),
     ("tickers", "tickers", False),
     ("trading_window", "trading_window", False),
 )
@@ -96,6 +97,7 @@ LOADERS: dict[str, str] = {
     "notion_issue_loop": "selfheal.notion_issue_loop.load_config",
     "backtest_intraday_cap_curve": "analytics only; never loaded live",
     "recommendations": "dca_rec_store.load_settings (plan-first courier and reader)",
+    "slot_status": "scripts.slot_status.load_settings (Perplexity backup stand-down signal)",
 }
 # What a malformed file does to a live start. Line references are dca_config.py:
 # _read_json raises on any unparsable/duplicate-key/non-object file (199-201);
@@ -125,6 +127,7 @@ FAIL_MODES: dict[str, str] = {
     "notifications": "degrades",
     "reporting": "degrades",
     "run_classification": "degrades",
+    "slot_status": "degrades",
     "backtest_intraday_cap_curve": "n/a",
 }
 

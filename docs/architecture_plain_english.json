@@ -113,6 +113,8 @@
   "scripts.healthcheck": "A pass/fail health check: lint, tests, smoke test and a dependency audit. It says nothing unless something is wrong.",
   "scripts.idempotency": "Gives every order a unique key, so a run and its re-run asking for the same buy produce the same key and the broker never takes it twice.",
   "scripts.ingest_market_data": "Checks raw broker prices and quotes and saves them, unchanged, as the data file the signal step reads.",
+  "scripts.slot_status": "Posts a small public note saying which buying slots finished today, so the backup can stop at once instead of checking everything.",
+  "scripts.backup_cost_ledger": "A private log of how many Perplexity credits each backup run cost, with a daily total against the target.",
   "scripts.local_heartbeat": "The Mac's \"I'm alive\" signal for a slot, and the check the backup uses to see whether it must step in.",
   "scripts.merge_order_pages": "Adds the newest orders to a saved order history without re-reading the whole day, and refuses if anything could have been missed.",
   "scripts.model_usage_log": "Writes one line per run recording which AI model was used, for the usage audit.",
