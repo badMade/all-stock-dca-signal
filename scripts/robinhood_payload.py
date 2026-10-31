@@ -191,8 +191,18 @@ def validate_ticker(
             by_stamp[stamp] = bar
     if not by_stamp:
         raise QuietTickerError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
-    if min(by_stamp) > start + timedelta(minutes=interval):
-        raise PayloadError(f"intraday bars do not cover the {bar_start:%H:%M} trend-window start")
+    # The bar AT the window start is required, not one interval after it (2026-10-30). The old `> start + interval`
+    # slack let a 3:30 series beginning at 14:30 pass `merge` and `check` against a 14:25 start, but the generator's
+    # 60-minute lookback bar is exactly 14:25 (bars before `start` are dropped above, so nothing else can stand in):
+    # every such ticker then scored NO_DATA/provider_error behind a payload that had just checked 91/91, which is how
+    # the 10-30 slot aborted with an unexplained market_data_unavailable. A late series now fails here, by name, and
+    # counts against the coverage floor. Cost: none of the 5,646 published per-ticker series (all seven slots,
+    # 2026-10-19..10-30) started anywhere but exactly on their planned start.
+    if min(by_stamp) > start:
+        raise PayloadError(
+            f"intraday bars do not cover the {bar_start:%H:%M} trend-window start "
+            f"(first bar {min(by_stamp):%H:%M} ET)"
+        )
     bars = [by_stamp[k] for k in sorted(by_stamp)]
     last_stamp = max(by_stamp)
     # The newest completed bar must be near the anchor, or the series stopped early (a truncated copy).

@@ -972,6 +972,10 @@ def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
     # the generator's 60-minutes-back lookback bar (14:25) is missing: bars that start late must not pass
     with pytest.raises(rp.PayloadError, match="do not cover"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
+    # 2026-10-30 regression: one interval late used to pass (the old `> start + interval` slack), and a 14:30-first
+    # series is exactly what the generator then scored NO_DATA/provider_error for all 91 tickers
+    with pytest.raises(rp.PayloadError, match=r"do not cover the 14:25 .*first bar 14:30"):
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 10)), **final_buy_kw())
