@@ -906,7 +906,7 @@ def final_buy_ticker(bars):
 
 
 def final_buy_kw(**over):
-    return kw(bar_start=time(14, 30), decision=time(15, 30), **over)
+    return kw(bar_start=time(14, 25), decision=time(15, 30), **over)
 
 
 def test_1530_is_plannable_but_the_scheduled_slots_stay_the_six_prompt_wired_ones():
@@ -934,7 +934,7 @@ def test_1530_plan_scores_the_universe_and_interval_the_final_buy_generator_uses
     assert plan["tickers"] == [t for t in config.tickers if t not in config.excluded_tickers]
     assert plan["decision_time_et"] == SLOT_SPECS["1530ET"]["decision_time_et"].strftime("%H:%M") == "15:30"
     assert plan["interval_minutes"] == config.robinhood_interval_minutes == 5
-    assert plan["bar_start_et"] == "14:30" and plan["shadow"] is True
+    assert plan["bar_start_et"] == "14:25" and plan["shadow"] is True
     assert plan["out"].endswith("robinhood_payload_2026-10-15_1530.json")
     assert rp.build_plan("1230", DAY)["shadow"] is False
 
@@ -967,14 +967,14 @@ def test_1530_plan_refuses_an_early_close_and_an_unapproved_day(monkeypatch):
 
 
 def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
-    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
-    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:30") and len(ok["intraday_bars"]) == 12
-    # the generator's 60-minutes-back lookback bar (14:30) is missing: bars that start late must not pass
+    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 30)), **final_buy_kw())
+    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:25") and len(ok["intraday_bars"]) == 13
+    # the generator's 60-minutes-back lookback bar (14:25) is missing: bars that start late must not pass
     with pytest.raises(rp.PayloadError, match="do not cover"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
-        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 10)), **final_buy_kw())
 
 
 # -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
@@ -1097,3 +1097,75 @@ def test_live_mirror_prompts_leave_quiet_tickers_out_of_the_errored_count():
         (path,) = mirror.glob(f"{slot}ET-*.txt")
         _, rule = _errored_ticker_rule(path)
         assert '"quiet"' in rule and ".meta.json" in rule, path.name
+
+
+# -- 3:30 PM: the payload window must reach the generator's own lookback bar (2026-10-30 Gate 5 abort) -----------------
+# The first live 3:30 run on the prebuilt payload passed `check` 91/91 and still scored every ticker NO_DATA with
+# provider_error: generate_buy_candidates anchors 15:30 on the COMPLETED 15:25 bar, so its 60-minute lookback is 14:25,
+# but the plan fetched bars from 14:30. The shadow week only ran `check`, never the generator, so nothing caught it.
+# These tests feed a payload built to the plan's own window through the generator, and derive the window from the
+# generator's anchor so the two cannot drift apart again.
+
+
+def _plan_window_entry(plan: dict, ticker_close_start: float = 100.0) -> dict:
+    """One Robinhood entry covering exactly the plan's window: bars from bar_start_et up to the open decision bar."""
+    from datetime import datetime, time, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    day = date.fromisoformat(plan["trading_day"])
+    start = datetime.combine(day, time.fromisoformat(plan["bar_start_et"]), et)
+    decision = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), et)
+    step = timedelta(minutes=int(plan["interval_minutes"]))
+
+    def bar(stamp, price):
+        return {"timestamp": stamp.isoformat(), "open": price, "high": price * 1.01, "low": price * 0.99,
+                "close": price, "volume": 100}
+
+    bars, stamp, price = [], start, ticker_close_start
+    while stamp < decision:
+        bars.append(bar(stamp, price))
+        stamp, price = stamp + step, price - 0.05  # a steady intraday dip below the previous close
+    # Robinhood stamps a daily bar at 00:00Z of its own session (scripts/ingest_market_data._session_date).
+    previous = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    return {
+        "previous_close_bar": bar(previous, ticker_close_start),
+        "intraday_bars": bars,
+        "quote": {"price": bars[-1]["close"], "as_of": (decision + timedelta(minutes=1)).isoformat()},
+    }
+
+
+def test_1530_plan_window_starts_at_or_before_the_generators_lookback_bar():
+    from datetime import datetime, time
+
+    from near_close_dca import StrategyConfig, _compute_signal_timestamps
+
+    plan = rp.build_plan("1530", date(2026, 10, 30))
+    decision = datetime.combine(date(2026, 10, 30), time.fromisoformat(plan["decision_time_et"]), rp.ET)
+    *_, lookback_anchor = _compute_signal_timestamps(decision, StrategyConfig(), int(plan["interval_minutes"]))
+    assert time.fromisoformat(plan["bar_start_et"]) <= lookback_anchor.time(), (plan["bar_start_et"], lookback_anchor)
+
+
+def test_a_payload_built_to_the_1530_plan_window_scores_in_the_generator():
+    from datetime import datetime, time
+
+    from near_close_dca import StrategyConfig
+    from scripts import generate_buy_candidates as gbc
+
+    day = date(2026, 10, 30)
+    plan = rp.build_plan("1530", day)
+    ticker = plan["tickers"][0]
+    entry = _plan_window_entry(plan)
+    decision = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), rp.ET)
+    # The entry is exactly what `check` accepts for this plan...
+    rp.validate_ticker(entry, day=day, bar_start=time.fromisoformat(plan["bar_start_et"]), decision=decision.time(),
+                       interval=int(plan["interval_minutes"]), now=decision)
+    # ...and the 3:30 generator, on the Robinhood-only payload (1530ET finance_outage_fallback), must be able to score it.
+    candidates = gbc.generate_candidates(
+        slot="1530ET", now=decision, config=StrategyConfig(), market_data_by_source={"robinhood": {ticker: entry}},
+        finance_outage_robinhood_only=True, source_errors=(), ticker_errors={"robinhood": []},
+        already_covered_tickers=(),
+    )
+    (row,) = [c for c in candidates if c["ticker"] == ticker]
+    assert row["provider_error"] is False, row
+    assert row["action"] == "BUY", row

@@ -1,8 +1,7 @@
 """Tests for ``scripts/generate_perplexity_backup_prompts.py`` and the committed backup prompts.
 
-Phase 5 of docs/adr-plan-first-backup-executor.md. The six Perplexity backup prompts are thin
-I/O prompts generated from repo config, so they cannot drift from it and cannot silently lose a
-hard rule. Perplexity cannot read this repo, so every hard rule must be INLINE in each prompt.
+The six Perplexity prompts are generated from repo config and paired with the stamped planner.
+The pasteable prompt is signal-first; the full reference prompt includes the planner-served hard rules and procedure.
 
 Expected behavior is derived from the ADR and ``claude/PERPLEXITY-CLAUDE-COORDINATION.md``, not
 from the generator's output.
@@ -98,9 +97,12 @@ def test_every_prompt_carries_the_no_unprescribed_retries_rule(prompts, prefix):
                        "stop BETWEEN orders (never after a submission and before its check-placement)"):
         assert prescribed in text, prescribed
     assert "at 80 calls" not in text and "well under 60" not in text
-    pasteable = _by_prefix(gen.build_instructions(), prefix)
-    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in pasteable
-    assert len(pasteable) < 20_000
+    # 2026-10-30: the rules moved from the paste box into the stamped procedure's part 0 (credit plan, step 3).
+    from scripts import backup_procedure
+
+    task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
+    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in backup_procedure.render_part(task_id, 0)
+    assert len(_by_prefix(gen.build_instructions(), prefix)) < 20_000
 
 
 def test_the_served_procedure_forbids_requerying_to_double_check_the_order_pull():
@@ -267,13 +269,19 @@ def test_state_record_and_notification_are_specified(prompts, prefix):
 def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
     # ADR amendment 2026-10-25: a normal day (Claude succeeded) must stand down before the account lookup, the
     # 7-day get_equity_orders pull and any procedure fetch, which is where the Perplexity credits went.
-    text = _by_prefix(gen.build_instructions(), prefix)
+    # 2026-10-30: the gate moved into the stamped procedure's part 0; the pasted prompt checks the build stamp
+    # before it fetches part 0 (scripts/tests/test_backup_signal_prompt.py).
+    from scripts import backup_procedure
+
+    task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
+    pasted = _by_prefix(gen.build_instructions(), prefix)
+    assert pasted.index("--build-info") < pasted.index(f"procedure --task {task_id} --part 0")
+    text = backup_procedure.render_part(task_id, 0)
     heading = text.find("\nSTAND-DOWN GATE")
-    assert heading != -1, "the pasteable prompt has no STAND-DOWN GATE section"
+    assert heading != -1, "part 0 has no STAND-DOWN GATE section"
     section_end = text.index("PROCEDURE (steps 1-9)")
     section = text[heading:section_end]
 
-    assert text.index("--build-info") < heading
     assert text.index("python3 backup_planner.pyz universe") < heading
     assert heading < text.index("PROCEDURE (steps 1-9)")
     assert section.index("gates --task ") < section.index("list_devices")
@@ -525,13 +533,13 @@ def test_every_prompt_embeds_the_expected_build_stamp(prompts, prefix, built_sta
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_step_0_compares_the_stamp_before_any_planner_command_runs(prompts, prefix, built_stamp):
+def test_step_b_compares_the_stamp_before_fetching_part_0(prompts, prefix, built_stamp):
     text = _by_prefix(prompts, prefix)
-    step0 = text[text.index("STEP 0"):text.index("STEP 1")]
-    assert step0.index(built_stamp) < step0.index("backup_planner.pyz universe"), "compare first, then run the planner"
-    assert "content_sha256" in step0 and "exactly" in step0
-    # A mismatch is a hard stop with the same fail-closed vocabulary the other STEP 0 refusals use.
-    compare = step0[step0.index(built_stamp):step0.index("backup_planner.pyz universe")]
+    step_b = text[text.index("STEP B"):text.index("PROCEDURE FOR TASK")]
+    assert step_b.index("--build-info") < step_b.index(built_stamp) < step_b.index("--part 0")
+    assert text.index("--part 0") < text.index("backup_planner.pyz universe"), "check first, then request part 0"
+    assert "content_sha256" in step_b and "exactly" in step_b
+    compare = step_b[step_b.index(built_stamp):step_b.index("--part 0")]
     assert "place NOTHING" in compare and "failed_unexpected_error" in compare and "notify" in compare
 
 

@@ -378,6 +378,36 @@ from the trend rule itself, and the list is always empty here.
 `withheld_contradictory_base_tickers` **does** apply, so `buy_count > 0` with an
 empty `cands` is still possible on this slot.
 
+## The window end is 09:50 here and 10:20 in the runner, on purpose
+
+Two window ends for this slot coexist, and PR #2056 (closed unmerged, operator
+decision 2026-10-30) tried to align them and was reverted. Keep both unless you
+change every copy below together.
+
+| Side | Where | End | Meaning |
+| --- | --- | --- | --- |
+| Executor / evaluation | `market_open_dca.py` `MARKET_OPEN_LIVE_WINDOW_END_ET`, `config/market_open_dca.json`, `schemas/market_open_run_classification.schema.json`, `scripts/run_classification.py` | 09:50 | The evaluation boundary: 9:35 plus this module's `evaluation_delay_minutes=15`. The candidate generator grades the connector snapshot here, and several tests pin `decision_time_et == "09:50"`. |
+| Runner / live prompt | `dca_runner.SLOTS["0935"]`, the 0935 live prompt's Gate 1 | 10:20 | The acceptance window: a fire is accepted, and orders may be placed, until 10:20. Widened on 2026-10-28 after the scheduler fired this slot about 18 minutes late. |
+
+Effect: `MarketOpenDCAExecutor.run()` blocks a fire after 09:50 as "outside
+scheduled slot window" (`morning_dca.py`, the inherited slot-window check),
+while the live prompt path (`evaluate()` plus the runner gates) still accepts
+it until 10:20. Nothing in this repo calls `run()` for the live 9:35 slot, and
+whether an external agent does is unknown.
+
+Why this is not a two-line change:
+
+- The run-classification schema pins `scheduled_window_end_et` to `"09:50"`,
+  as does `scripts/run_classification.py`, `config/market_open_dca.json`
+  (twice) and several test fixtures.
+- `config/market_open_dca.json` and `market_open_dca.py` are bundled into the
+  backup planner, so any edit to either, even a code comment, changes the
+  planner stamp and `scripts/tests/test_verify_perplexity_pair.py` fails until
+  the six Perplexity backup prompts are regenerated and repasted. That is why
+  this note lives here and not beside the constant.
+- Whether late fires should be graded after 09:50 is a sizing decision, not
+  only a window decision.
+
 ## Scope
 
 This covers **0935ET only**.
