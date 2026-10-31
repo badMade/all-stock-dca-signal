@@ -107,6 +107,20 @@ The core interpreter is `$PYTHON`, else `./.venv`, else the main checkout's `.ve
 under `.claude/worktrees/` have none of their own). `--py311`, `--audit` and the siblings need
 `uv` and network on first use. The main difference from CI is the OS: macOS rather than Ubuntu.
 
+### Reporting the result to GitHub
+
+```bash
+scripts/local_ci_status.sh --all     # any local_ci.sh flags pass straight through
+```
+
+This runs `local_ci.sh` and posts its real result as a `local-ci` commit status on the commit it
+tested: `pending` at the start, then `success` only on exit 0, `failure` otherwise, and `error` if
+interrupted. PRs then show a green or red local check while Actions is skipped (drafts) or
+unavailable (the billing block). It refuses a dirty tree, since the status would describe code
+that isn't the commit, and refuses a commit GitHub doesn't have yet (push first).
+`$LOCAL_CI_CONTEXT` renames the context. It is a plain commit status: no ruleset requires it, and
+making it required would be a ruleset change for you to decide.
+
 ### Optional pre-push hook
 
 ```bash
