@@ -85,6 +85,12 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   rescue never ran). Only the absent or errored tickers are re-asked, in the same `DCA_RESCUE_CHUNK_SIZE` requests,
   logged as `rescue chunk=<i> tickers=<n> size=<s>`. A ticker that replied with data is never re-fetched, and a rescue
   reply that is again missing or an error leaves the original entry in place, so the rescue cannot make a ticker worse.
+- A chunk whose every answered ticker has empty `intraday_bars` is re-asked in full (2026-10-30, the 10-29 15:31
+  chunk 3), and in a chunk that answered others, an empty ticker whose `previous_close_bar.volume` is at least
+  `LIQUID_PRIOR_VOLUME` (1,000,000 shares) is re-asked alone (2026-10-31): an hour with no bar cannot be real for a
+  name that traded that much the session before. Thinner empty names are left alone and filed quiet. A liquid name
+  that comes back empty again is still filed quiet and still counts toward `MAX_QUIET_SHARE`; the rule only decides
+  what is asked for again. The rule is `rescue_targets` in `scripts/robinhood_payload.py`.
 - Every attempt that returns no reply keeps its worker output in
   `robinhood_payload_<day>_<slot>.chunk_logs/chunk_<i>.attempt<k>.<build epoch>.log` beside the payload (the
   launcher's temp folder, and every log in it, is deleted on exit). A healthy build writes nothing there. Read
@@ -185,6 +191,11 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   writes its refusal marker, so the session's `check` names a refusal instead of waiting on a payload that arrives
   after it stopped looking. No freshness or coverage check changed. Orders a session places after 15:35 still fall
   outside that reporting fallback's window; that is a reporting question, not a build one, and is left as is.
-- **Open follow-up.** On 10-29 the build recorded NVDA, GOOGL, GOOG and AMZN as quiet (no bar in the window), which
-  cannot be a real hour for those names. Quiet tickers are never bought, so this skips buys rather than causing bad
-  ones, but they should be refetched rather than counted as quiet.
+- **10-29 "quiet" NVDA/GOOGL/GOOG/AMZN (closed 2026-10-31).** The 15:31 build's `.meta.json` files exactly one chunk
+  as quiet: chunk 3 (NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW) replied with every ticker's `intraday_bars` empty,
+  so the worker dropped the series for the whole request; no other ticker of that build was quiet, and no
+  `chunk_logs` were kept because the chunk did reply. f74eae58 (10-30) re-asks a chunk whose every answered ticker is
+  empty, which covers that exact shape. It would not have covered the same failure with one ticker of the chunk still
+  answered, so the rescue now also re-asks any empty ticker whose prior session traded at least
+  `LIQUID_PRIOR_VOLUME` (1,000,000) shares (`rescue_targets` in `scripts/robinhood_payload.py`); see the rescue list
+  above. Quiet, freshness and coverage checks are unchanged.

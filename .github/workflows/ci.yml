@@ -11,8 +11,14 @@ on:
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+  # Draft PRs do not run CI (2026-10-31): every agent PR opens as a draft and
+  # pushes several times, which was 285 PR runs (~12k runner-minutes) in one week.
+  # The jobs below skip while the PR is a draft; ready_for_review starts the
+  # first real run. Check a draft locally with scripts/local_ci.sh --changed.
+  # Skipped jobs report success, and main has no required status checks.
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # A rapid series of pushes to the same branch should leave one running build,
 # not N. Never cancel on main -- those runs are the record of what landed.
@@ -36,6 +42,8 @@ jobs:
   # reacts to it), as does any change to the shared dev pins or this workflow.
   changes:
     name: Detect changed projects
+    # Skipped on drafts, which also skips every sibling job (they `need` this one).
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -79,6 +87,7 @@ jobs:
 
   test:
     name: Lint & test (core DCA)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     # The suite (~12k tests) now takes ~13-15 minutes on a cold runner; the old
     # 15-minute ceiling cancelled the 3.12 leg after its tests had passed
@@ -129,6 +138,7 @@ jobs:
 
   audit:
     name: Dependency & secret audit
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -165,6 +175,7 @@ jobs:
   # core lint/test/dev-audit surface and must not claim to repair research.
   research-audit:
     name: Dependency audit (research)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:

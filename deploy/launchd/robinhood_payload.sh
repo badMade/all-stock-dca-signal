@@ -181,22 +181,19 @@ wait
 # every ticker's intraday_bars empty, so all eight were filed "quiet" and published as NO_DATA although NVDA, GOOGL, GOOG
 # and AMZN trade every minute. A whole chunk with no bars is a worker that dropped the series, so it is re-asked like a
 # dead chunk. A chunk where only some names are empty (the thin names of 10-26/27 13:30) is left alone: those are quiet.
+# Narrowed 2026-10-31: in a partly-empty chunk, an empty name whose prior session traded LIQUID_PRIOR_VOLUME shares or
+# more is re-asked for too, so one answered ticker no longer hides a dropped NVDA. The rule lives in rescue_targets.
 targets=()
 for ((i = 0; i < idx; i++)); do
   # A crash here only means this chunk is not rescued (set -e must not end the launcher before the merge).
   need="$("$PY" -c '
 import sys
-from scripts.robinhood_payload import _load_chunk
+from scripts.robinhood_payload import _load_chunk, rescue_targets
 try:
     reply = _load_chunk(sys.argv[1])
 except (OSError, ValueError):  # no file, or one that holds no usable object: every ticker of the chunk is missing
     reply = {}
-tickers = [t for t in sys.argv[2].split(",") if t]
-need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
-answered = [reply[t] for t in tickers if t not in need]
-if answered and all(isinstance(e, dict) and not e.get("intraday_bars") for e in answered):
-    need = tickers  # every answered ticker came back with no bars: the worker dropped the series
-print(",".join(need))
+print(",".join(rescue_targets(reply, [t for t in sys.argv[2].split(",") if t])))
 ' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
   if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
 done
