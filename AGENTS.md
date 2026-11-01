@@ -31,7 +31,7 @@ working-tree state, verification results, and remaining integration setup.
 5. Run the narrowest relevant check first, then the standard checks before handing off:
    - `ruff check .`
    - `pytest`
-   - `python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo`
+   - `python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo/scheduled_runs/demo`
      (use any near-close timestamp, e.g. today's date at 15:45)
 6. Document any check that cannot be run and why.
 7. Before committing, review the diff for secrets, generated artifacts, and excessive churn.

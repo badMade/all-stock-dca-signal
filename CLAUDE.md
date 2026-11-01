@@ -48,7 +48,7 @@ pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 scripts/local_ci.sh --all --keep-going
 
 # Dry-run smoke test (the third standard pre-handoff check)
-python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo/scheduled_runs/demo
 
 # Checkout-only local console; remote-access rules: docs/local_console.md#remote-access
 python3 from.py --local --no-browser

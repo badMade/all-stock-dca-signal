@@ -227,7 +227,10 @@ test_sibling() {
 demo_smoke() {
   local demo_dir status=0
   demo_dir="$(mktemp -d)"
-  "$PY" run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$demo_dir" || status=$?
+  # The demo scans the parent of the scheduled_runs/ segment for prior same-day run_state files, recursively.
+  # With a bare mktemp dir that parent was the shared $TMPDIR, so it read the pytest folders left by the run
+  # just before (UnicodeDecodeError tracebacks, 2026-10-31). Nesting under scheduled_runs/ keeps the scan private.
+  "$PY" run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$demo_dir/scheduled_runs/demo" || status=$?
   rm -rf "$demo_dir"
   return $status
 }
