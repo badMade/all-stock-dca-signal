@@ -43,11 +43,6 @@ working-tree state, verification results, and remaining integration setup.
    far more tokens than invoking the command that already encapsulates it, and risks
    silently drifting from the real logic. See also `docs/live_wiring.md`'s "Local agent
    quick reference".
-9. Never read massive modules like `near_close_dca.py` (~40k lines) end-to-end. Use `rg -n`
-   and read specific line slices.
-10. When formatting with `ruff format`, target only the modified file (`ruff format path/to/file.py`),
-    never the entire repo (`ruff format .`), and inspect `git diff` to ensure collapsed
-    multi-line strings do not violate the 120-character line limit.
 
 ## Development setup
 
@@ -100,12 +95,9 @@ findings. Four traps recur:
 - **Booleans where a number is expected (8 findings).** `bool` subclasses `int`,
   so `isinstance(value, int)` accepts `True` and it silently becomes `1`. Guard
   `isinstance(value, bool)` *before* the integer check, every time.
-- **Non-finite floats and unbounded integers (10 findings).** Python's JSON
-  decoder accepts `NaN`, `Infinity`, and arbitrarily large integers. Reject
-  non-finite values explicitly; a `NaN` price or multiplier propagates silently
-  through arithmetic. Note that `math.isfinite(val)` raises `OverflowError` on
-  unbounded JSON integers that exceed C double range—wrap `math.isfinite()` in
-  `try...except OverflowError` unless `val` is already narrowed to `float`.
+- **Non-finite floats (10 findings).** Python's JSON decoder accepts `NaN` and
+  `Infinity` even though the format does not. Reject them explicitly; a `NaN`
+  price or multiplier propagates silently through arithmetic.
 - **Duplicate JSON keys (6 findings).** `json.loads` keeps the last value, so
   file order silently decides which limit applies. Use an `object_pairs_hook`
   that refuses duplicates for anything that carries a safety bound.
@@ -140,15 +132,7 @@ external error response: they echo credentials.
 ## Checks beyond the standard three
 
 `## Agent workflow` step 5 covers `ruff check .`, `pytest` and the demo smoke
-test. During incremental edits, run the targeted test file or test case first
-(`.venv/bin/python -m pytest path/to/test.py -k <name> -q`) rather than the full
-multi-minute root suite on every step. If running an isolated test file raises
-`ModuleNotFoundError: No module named 'conftest'`, prepend `PYTHONPATH=.:tests`
-(or pass `-o rootdir=.`). When targeting a single module with `--cov`, use
-Python module dot notation (`--cov=scripts.finalize_run_evidence`) rather than a
-file path (`--cov=scripts/finalize_run_evidence`) to avoid `CoverageWarning`.
-
-`scripts/tests/` needs no separate command: `testpaths = ["."]` and the
+test. `scripts/tests/` needs no separate command: `testpaths = ["."]` and the
 `addopts` ignore list does not exclude `scripts/`, so a bare `pytest` already
 collects it (39 cases at the time of writing).
 
@@ -193,12 +177,10 @@ a local run.
 Each of these passes locally until one specific test, or an installed wheel,
 disagrees. Make the companion edit in the same commit.
 
-| If you add or change | Also update |
+| If you add | Also update |
 | --- | --- |
 | A `config/*.json` file | `dca_console_config.CONFIG_FILES` and its consumer map, plus the two count assertions in `tests/test_dca_console_config.py` |
 | A top-level module, or a config read at runtime | `pyproject.toml`: `[tool.setuptools] packages`/`py-modules`, and `[tool.setuptools.data-files]` for the config |
-| Added, renamed, or deleted modules, or changed imports/line counts | `docs/architecture_plain_english.json`, module lists in `dca_console_diagnostics.py` (`tests/test_dca_console_diagnostics.py`), and `python3 -m scripts.generate_module_graph` |
-| Core modules bundled in `backup_planner.pyz` (e.g. `near_close_dca.py`, `dca_cumulative.py`) | Rebuild `python3 scripts/build_backup_planner.py --out backup_planner.pyz` and `PYTHONPATH=. python3 scripts/generate_perplexity_backup_prompts.py --write` (enforced by `tests/test_verify_perplexity_pair.py`) |
 
 Packaging is worth proving rather than assuming, because a checkout hides the
 failure completely:

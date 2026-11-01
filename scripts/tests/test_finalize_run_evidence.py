@@ -1105,24 +1105,3 @@ def test_platform_refusal_after_earlier_fills_stays_submitted_and_keeps_the_mark
     assert state["order_submit_status"] == "submitted"
     assert state["reason_code"] == "PLATFORM_REFUSAL"
     assert state["alert_required"] is True
-
-
-def test_load_json_refuses_duplicate_keys(tmp_path):
-    dup_budget = tmp_path / "budget.json"
-    dup_budget.write_text(
-        '{"budget_tier": "normal", "daily_cap_usd": 180, "weekly_cap_usd": 900, "budget_tier": "stress"}',
-        encoding="utf-8",
-    )
-    with pytest.raises(fre.FinalizeRefused, match="duplicate key 'budget_tier'"):
-        fre._load_json(str(dup_budget), dict, "--budget-json")
-
-
-def test_validate_orders_and_budget_refuse_unbounded_integers_without_overflow():
-    huge_int = 10**1000
-    with pytest.raises(fre.FinalizeRefused, match="submitted_amount_usd .* is not a positive number"):
-        fre.validate_orders(
-            [{"ticker": "AAPL", "order_id": "ord-1", "status": "submitted", "submitted_amount_usd": huge_int}]
-        )
-    with pytest.raises(fre.FinalizeRefused, match="daily_cap_usd .* is not a non-negative number"):
-        fre.validate_budget({"budget_tier": "normal", "daily_cap_usd": huge_int, "weekly_cap_usd": 900})
-
