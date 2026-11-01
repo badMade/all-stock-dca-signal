@@ -12,7 +12,9 @@ are) from a launchd timer. Contract:
 * Each PR is tested in a throwaway git worktree under the work directory, never in the operator's checkout, and the
   worktree is always removed, even when the run fails or raises. One PR failing never stops the others.
 * A lock stops two sweeps overlapping (a sweep can outlast the 30-minute timer); a stale lock is taken over.
-* ``--quick`` is the default mode, passed straight through to ``local_ci_status.sh``. A failing CI is reported through
+* The default mode is the full core gate (no flag: lint, coverage-gated tests, ``scripts/tests``, demo), passed straight
+  through to ``local_ci_status.sh``; 2026-11-01: a ``--quick`` pass skips the root suite, so it showed ``local-ci: success``
+  on #2088 while 14 root tests failed. ``--quick`` stays opt-in. A failing CI is reported through
   the status, not the sweep's exit code. ``--dry-run`` lists what it would test and runs nothing.
 * The launchd template runs it every 30 minutes from the checkout's venv Python, like the other agents.
 """
@@ -132,10 +134,10 @@ def do_sweep(tmp_path, prs, statuses=None, rec=None, **kw):
     return result, rec
 
 
-def test_each_pr_is_tested_in_its_own_worktree_with_quick_mode_by_default(tmp_path):
+def test_each_pr_is_tested_in_its_own_worktree_with_the_full_core_gate_by_default(tmp_path):
     result, rec = do_sweep(tmp_path, [pr(1), pr(2)])
     assert [Path(cwd).parent for _, cwd in rec.runs] == [tmp_path / "work"] * 2  # under the work dir only
-    assert all(cmd[0].endswith("scripts/local_ci_status.sh") and cmd[1:] == ("--quick",) for cmd, _ in rec.runs)
+    assert all(cmd[0].endswith("scripts/local_ci_status.sh") and cmd[1:] == () for cmd, _ in rec.runs)
     adds = [c for c, _ in rec.git_calls if c[:2] == ("worktree", "add")]
     assert len(adds) == 2 and all("--detach" in c for c in adds)
     assert adds[0][-1] == pr(1).head_sha  # the exact commit that gets the status
@@ -221,3 +223,56 @@ def test_the_launchd_agent_sweeps_every_30_minutes_from_the_checkout():
     assert agent["WorkingDirectory"] == "/repo"
     assert agent["StartInterval"] == 1800
     assert "/opt/homebrew/bin" in agent["EnvironmentVariables"]["PATH"]  # gh and uv live there
+
+
+# -- full core gate by default (2026-11-01) ----------------------------------------------------------------------
+# The first real sweep tested #2088 with --quick and posted `local-ci: success`, although that PR carries 14 failing
+# root tests (hosted CI failed on the same commit): --quick skips the coverage-gated root suite, where tests/ lives.
+
+
+def test_the_default_mode_is_the_full_core_gate_and_quick_is_opt_in():
+    assert sweep.DEFAULT_MODE == "core"
+    assert sweep.MODES == {"core": (), "quick": ("--quick",), "changed": ("--changed",), "all": ("--all",)}
+
+
+def test_run_sweep_with_no_mode_runs_local_ci_status_with_no_flag(tmp_path):
+    _, rec = do_sweep(tmp_path, [pr(1)])
+    assert [cmd[1:] for cmd, _ in rec.runs] == [()]
+
+
+def _record_run_sweep(monkeypatch):
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return sweep.SweepResult()
+
+    monkeypatch.setattr(sweep, "run_sweep", fake)
+    monkeypatch.setattr(sweep, "list_open_prs", lambda repo: [pr(1)])
+    monkeypatch.setattr(sweep, "fetch_statuses", lambda repo, prs: {})
+    return seen
+
+
+@pytest.mark.parametrize("argv, expected", [
+    ([], ()),
+    (["--mode", "core"], ()),
+    (["--mode", "quick"], ("--quick",)),
+    (["--mode", "changed"], ("--changed",)),
+    (["--mode", "all"], ("--all",)),
+])
+def test_the_cli_passes_the_chosen_mode_through(tmp_path, monkeypatch, argv, expected):
+    seen = _record_run_sweep(monkeypatch)
+    rc = sweep.main(["--repo", REPO, "--workdir", str(tmp_path / "w"), "--lock", str(tmp_path / "l"), *argv])
+    assert rc == 0 and tuple(seen["mode_args"]) == expected
+
+
+def test_dry_run_names_the_mode_and_warns_that_quick_skips_the_root_suite(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(sweep, "list_open_prs", lambda repo: [pr(1)])
+    monkeypatch.setattr(sweep, "fetch_statuses", lambda repo, prs: {})
+    base = ["--repo", REPO, "--dry-run", "--workdir", str(tmp_path / "w"), "--lock", str(tmp_path / "l")]
+    assert sweep.main(base) == 0
+    default_out = capsys.readouterr().out
+    assert "full core gate" in default_out and "skips" not in default_out
+    assert sweep.main([*base, "--mode", "quick"]) == 0
+    quick_out = capsys.readouterr().out
+    assert "--quick" in quick_out and "skips the coverage-gated root suite" in quick_out
