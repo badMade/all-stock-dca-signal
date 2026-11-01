@@ -175,7 +175,8 @@ jobs:
             --cov-fail-under=90
 
       - name: Smoke-test orchestrator (dry-run demo)
-        run: python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$RUNNER_TEMP/dca-demo"
+        # scheduled_runs/ keeps the demo's same-day artifact scan inside $RUNNER_TEMP/dca-demo (see tests/test_demo_artifacts_dir.py).
+        run: python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$RUNNER_TEMP/dca-demo/scheduled_runs/demo"
 
   audit:
     name: Dependency & secret audit
