@@ -102,21 +102,21 @@ and all launcher options are documented in [the local console guide](docs/local_
 ### CLI dry run
 
 ```bash
-python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo/scheduled_runs/demo
 # Use any near-close timestamp, e.g. today's date at 15:45
 ```
 
 ### Installed console scripts
 
 ```bash
-run-dca --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
+run-dca --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo/scheduled_runs/demo
 run-dca-risk --help
 ```
 
 ### Local tests and coverage
 
 ```bash
-.venv/bin/python -m pytest                 # ~8,300 tests, ~5 min; tests live in tests/
+.venv/bin/python -m pytest                 # ~13,300 tests; tests live in tests/
 .venv/bin/python -m pytest tests/test_midday_dca.py -q
 .venv/bin/python -m pytest scripts/tests -q   # reliability engines; separate from the root sweep
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90   # the CI gate
@@ -198,7 +198,7 @@ Recommended checks before handoff:
 ```bash
 ruff check .
 pytest
-python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo/scheduled_runs/demo
 # Use any near-close timestamp, e.g. today's date at 15:45
 ```
 
@@ -206,7 +206,7 @@ python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/
 
 - **Import errors for test tools:** install `requirements-dev.txt` or `pip install -e '.[dev]'`.
 - **Unexpected config values:** inspect `config/` and validate against `schemas/`.
-- **Dry-run artifact confusion:** write artifacts to a temporary directory such as `/tmp/dca-demo` and remove it after review.
+- **Dry-run artifact confusion:** write artifacts to a temporary directory such as `/tmp/dca-demo/scheduled_runs/demo` and remove it after review. Keep the `scheduled_runs/` segment: without it the run scans the parent directory (for example all of `/tmp`) for prior same-day artifacts.
 - **Research dependency failures:** keep the core workflow separate from `trading-strategies/`; those scripts require optional dependencies.
 
 ## Contributing

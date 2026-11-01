@@ -64,6 +64,30 @@ that isn't the commit, and refuses a commit GitHub doesn't have yet (push first)
 `$LOCAL_CI_CONTEXT` renames the context. It is a plain commit status: no ruleset requires it, and
 making it required would be a ruleset change for you to decide.
 
+### Sweeping every open PR (`scripts/local_ci_sweep.py`)
+
+`local_ci_status.sh` tests one commit. The sweeper runs it for all open PRs, unattended, on the Mac:
+
+```bash
+python3 -m scripts.local_ci_sweep --dry-run     # list the PRs it would test; runs nothing
+python3 -m scripts.local_ci_sweep               # test up to 3 PRs with --quick
+python3 -m scripts.local_ci_sweep --mode changed --max-prs 5
+```
+
+- **Which PRs:** only branches of this repo, never forks (their code would run on the Mac). Drafts are
+  included. A head commit that already has a `local-ci` `success` or `failure` is skipped; a new head
+  commit, an `error` (interrupted run), or a `pending` older than 2 hours (a run that died) is tested.
+- **Isolation:** each PR runs in a throwaway `git worktree` under `$TMPDIR/dca-local-ci-sweep`, never your
+  checkout, and the worktree is always removed. One PR failing never stops the others.
+- **Overlap:** a lock file (`$TMPDIR/dca-local-ci-sweep.lock`) stops two sweeps overlapping; a lock older
+  than 4 hours is taken over.
+- **Exit codes:** a failing CI shows in the commit status, not here. 1 means a PR could not be tested at all
+  (git or the runner broke); 3 means another sweep holds the lock.
+- **Schedule:** `deploy/launchd/com.all-stock-dca.local-ci-sweep.plist.template` runs it every 30 minutes
+  (fill in `REPLACE_WITH_REPO_PATH`, copy to `~/Library/LaunchAgents/`, then
+  `launchctl bootstrap gui/$(id -u) <plist>`). It needs `gh` logged in and uv on PATH; log at
+  `/tmp/dca-local-ci-sweep.log`.
+
 ### Optional pre-push hook
 
 ```bash
@@ -198,7 +222,8 @@ PR #2067 (the base of this change) makes draft PRs skip CI: `pull_request` also 
 3. **The research audit runs only when a dependency manifest moved** (`requirements*.txt`,
    `uv.lock`, `pyproject.toml`), plus on every scheduled/manual run, which is where a new advisory
    against unchanged pins gets caught.
-4. **Every job's runner is a variable**: `runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}`.
+4. **Every job's runner is a variable**: `runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}`
+   (`inputs.runner` lets one manual run pick a label: `gh workflow run CI -f runner=self-hosted`).
    Unset, nothing changes. Set it to a self-hosted runner's label and the whole workflow stops
    using GitHub-hosted runner minutes (see below for the pricing caveat).
 
@@ -255,3 +280,15 @@ The macOS runner has not been tried yet. The first `workflow_dispatch` on it sho
 `actions/setup-python` installs 3.11 and 3.12 on macOS arm64, and that the wondrous-octopus job's
 `--index-url https://download.pytorch.org/whl/cpu` torch install resolves there. That index is
 built for Linux, while PyPI's plain macOS wheel is already CPU-only.
+
+### Python on the self-hosted runners
+
+`actions/setup-python` cannot run there: its macOS builds install a system-wide package with
+`sudo installer` (every job failed with "sudo: a password is required" on 2026-11-01), and giving
+`ghrunner` passwordless sudo would make it an admin. So every `ci.yml` job uses
+`.github/actions/setup-python` instead. It calls `actions/setup-python` unchanged on GitHub-hosted
+runners. On self-hosted ones it builds a per-job virtualenv from a uv-managed standalone Python
+inside `ghrunner`'s home, with uv pinned to `requirements-dev.txt`. No sudo is needed, and the
+interpreter and pip caches persist across jobs. The runner setup also points `AGENT_TOOLSDIRECTORY`
+at `/Users/runner/hostedtoolcache` (owned by `ghrunner`), since the workflows' other actions expect
+a tool cache to exist.

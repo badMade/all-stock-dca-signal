@@ -1,0 +1,56 @@
+# Drop-in for actions/setup-python that also works on the self-hosted macOS runners
+# (CI_RUNS_ON=self-hosted, docs/local_ci.md).
+#
+# GitHub-hosted runners: delegates to actions/setup-python unchanged.
+#
+# Self-hosted: actions/setup-python's macOS builds install a system-wide .pkg with
+# `sudo installer` into /Library/Frameworks (2026-11-01: every job failed with "sudo: a
+# password is required"). Granting the runner user passwordless sudo would make it an
+# admin and defeat the point of running PR code as an unprivileged `ghrunner`. Instead
+# this builds a per-job virtualenv from a uv-managed standalone Python, all inside the
+# runner user's home: no sudo, and the interpreter and pip caches persist across jobs.
+name: Set up Python (hosted or self-hosted)
+description: actions/setup-python on GitHub-hosted runners; a uv-managed venv on self-hosted ones.
+inputs:
+  python-version:
+    description: Python version, e.g. "3.12"
+    required: true
+  cache:
+    description: Passed to actions/setup-python on hosted runners (ignored on self-hosted)
+    required: false
+    default: ""
+  cache-dependency-path:
+    description: Passed to actions/setup-python on hosted runners (ignored on self-hosted)
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - if: runner.environment != 'self-hosted'
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: ${{ inputs.cache }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    - if: runner.environment == 'self-hosted'
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: |
+        set -euo pipefail
+        # uv itself, pinned to requirements-dev.txt's version, in a per-runner bootstrap venv
+        # built from whatever python3 the machine has (only used to run uv).
+        uv_pin="$(grep -E '^uv==' requirements-dev.txt | head -1 || true)"
+        boot="$HOME/.ci-bootstrap/${RUNNER_NAME}"
+        if [ ! -x "$boot/bin/uv" ] || ! "$boot/bin/uv" --version | grep -q "${uv_pin#uv==}"; then
+          rm -rf "$boot"
+          python3 -m venv "$boot"
+          "$boot/bin/python" -m pip install --quiet --disable-pip-version-check "${uv_pin:-uv}"
+        fi
+        venv="$RUNNER_TEMP/python-$PYTHON_VERSION"
+        "$boot/bin/uv" python install "$PYTHON_VERSION"
+        "$boot/bin/uv" venv --quiet --seed --python "$PYTHON_VERSION" "$venv"
+        echo "$venv/bin" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=$venv" >> "$GITHUB_ENV"
+        "$venv/bin/python" -VV
