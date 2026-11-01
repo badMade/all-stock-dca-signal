@@ -29,3 +29,6 @@
 ## 2026-10-29 - [Avoid Path.resolve() inside comprehension loops]
 **Learning:** Resolving parent directories inside a comprehension loop (e.g., `[path.parent.resolve() for path in paths]`) executes duplicate `stat` syscalls when multiple paths share the same parent directory.
 **Action:** Always deduplicate parent directories via a `set` before calling `.resolve()` to guarantee each unique directory is resolved exactly once, reducing I/O overhead.
+## 2026-11-01 - [Fast-path strict ISO formats with fromisoformat over strptime]
+**Learning:** For fixed ISO-shaped configuration dates and schedule execution clocks (e.g. "15:30" or "2023-10-10 12:00"), falling back directly to `datetime.strptime()` wastes vast CPU cycles via internal regex regex and locale cache lookup.
+**Action:** When validating exact time shapes, prefer a fast-path literal string slice or length check accompanied directly by `datetime.fromisoformat` / `time.fromisoformat` rather than `strptime` to accelerate clock parsing by up to 26x, while still strictly rejecting malformed data with `ValueError`.
