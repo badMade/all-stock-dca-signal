@@ -19,7 +19,7 @@ import math
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1126,7 +1126,7 @@ def load_approved_dates(config_dir: Path) -> Dict[str, Any]:
     out: Dict[str, Any] = {"approved_test_dates": frozenset(approved)}
     if "decision_time_et" in data:
         try:
-            out["decision_time_et"] = datetime.strptime(str(data["decision_time_et"]), "%H:%M").time()
+            out["decision_time_et"] = time.fromisoformat(str(data["decision_time_et"]))
         except ValueError as exc:
             raise ValueError(
                 f"trading_window.json decision_time_et must be 'HH:MM', got {data['decision_time_et']!r}"

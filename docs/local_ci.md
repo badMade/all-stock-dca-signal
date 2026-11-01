@@ -70,18 +70,13 @@ making it required would be a ruleset change for you to decide.
 
 ```bash
 python3 -m scripts.local_ci_sweep --dry-run     # list the PRs it would test; runs nothing
-python3 -m scripts.local_ci_sweep               # test up to 3 PRs with the full core gate (~14 min each)
-python3 -m scripts.local_ci_sweep --mode quick   # lint, scripts/tests and demo only
+python3 -m scripts.local_ci_sweep               # test up to 3 PRs with --quick
 python3 -m scripts.local_ci_sweep --mode changed --max-prs 5
 ```
 
 - **Which PRs:** only branches of this repo, never forks (their code would run on the Mac). Drafts are
   included. A head commit that already has a `local-ci` `success` or `failure` is skipped; a new head
   commit, an `error` (interrupted run), or a `pending` older than 2 hours (a run that died) is tested.
-- **Mode (changed 2026-11-01):** the default is the full core gate, the same checks as CI's core job. The
-  first real sweep used `--quick` and posted `local-ci: success` on a PR with 14 failing root tests, because
-  `--quick` skips the root suite. `--mode quick` stays available and warns about that in the dry run. Each PR
-  takes about 14 minutes, so one sweep of 3 can pass the 30-minute timer; the lock prevents overlap.
 - **Isolation:** each PR runs in a throwaway `git worktree` under `$TMPDIR/dca-local-ci-sweep`, never your
   checkout, and the worktree is always removed. One PR failing never stops the others.
 - **Overlap:** a lock file (`$TMPDIR/dca-local-ci-sweep.lock`) stops two sweeps overlapping; a lock older

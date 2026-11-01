@@ -190,6 +190,16 @@ def _one_time(task: dict[str, Any]) -> datetime | None:
     raw = task.get("fires_at_et")
     if not isinstance(raw, str):
         return None
+
+    # ⚡ Bolt optimization: Use fromisoformat for strict ISO dates
+    try:
+        if len(raw) == 19 and raw[10] == "T":
+            return datetime.fromisoformat(raw).replace(tzinfo=ET)
+        elif len(raw) == 16 and raw[10] == " ":
+            return datetime.fromisoformat(raw).replace(tzinfo=ET)
+    except ValueError:
+        pass
+
     for pattern in ("%Y-%m-%d %I:%M %p ET", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(raw, pattern).replace(tzinfo=ET)

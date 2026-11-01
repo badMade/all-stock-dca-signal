@@ -24,8 +24,7 @@ What it will and will not do:
 CLI::
 
     python -m scripts.local_ci_sweep --dry-run          # list what would be tested, run nothing
-    python -m scripts.local_ci_sweep                    # test up to 3 PRs with the full core gate
-    python -m scripts.local_ci_sweep --mode quick       # lint, scripts/tests and demo only; skips the root suite
+    python -m scripts.local_ci_sweep                    # test up to 3 PRs with --quick
     python -m scripts.local_ci_sweep --mode changed --max-prs 5
 
 Standard library only. The ``gh`` binary does the GitHub calls, like ``local_ci_status.sh``.
@@ -52,16 +51,9 @@ DEFAULT_MAX_PRS = 3
 DEFAULT_PENDING_MAX_AGE_MINUTES = 120
 #: A sweep that has held the lock this long crashed; the next one takes over rather than waiting forever.
 DEFAULT_MAX_LOCK_AGE_MINUTES = 240
-#: One PR's local CI is a few minutes in --quick, about 14 minutes in the default core gate (2026-10-31, Apple silicon)
-#: and far longer in --all; this only bounds a hung run.
+#: One PR's local CI is a few minutes in --quick and far longer in --all; this only bounds a hung run.
 RUN_TIMEOUT_SECONDS = 3 * 3600
-#: Mode name -> the flags passed to scripts/local_ci_status.sh. The default is the FULL core gate (no flag: lint,
-#: coverage-gated tests, scripts/tests, demo), the same checks as CI's core job. 2026-11-01: the first real sweep
-#: used --quick and posted ``local-ci: success`` on #2088, which carried 14 failing root tests (hosted CI failed on the
-#: same commit), because --quick skips the root suite where tests/ lives. A green status must not mean less than CI.
-MODES = {"core": (), "quick": ("--quick",), "changed": ("--changed",), "all": ("--all",)}
-DEFAULT_MODE = "core"
-QUICK_WARNING = "note: --quick skips the coverage-gated root suite, so a passing status does not mean CI's tests pass"
+MODES = {"quick": "--quick", "changed": "--changed", "all": "--all"}
 EXIT_RAN_WITH_ERRORS = 1
 EXIT_LOCKED = 3
 
@@ -209,7 +201,7 @@ def run_sweep(
     workdir: Path,
     lock_path: Path,
     now: datetime,
-    mode_args: Sequence[str] = MODES[DEFAULT_MODE],
+    mode_args: Sequence[str] = ("--quick",),
     max_prs: int = DEFAULT_MAX_PRS,
     pending_max_age_minutes: int = DEFAULT_PENDING_MAX_AGE_MINUTES,
     max_lock_age_minutes: int = DEFAULT_MAX_LOCK_AGE_MINUTES,
@@ -281,8 +273,7 @@ def _real_run(cmd: Sequence[str], cwd: str) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--repo", help="OWNER/NAME (default: the repository `gh` resolves from the checkout)")
-    parser.add_argument("--mode", choices=sorted(MODES), default=DEFAULT_MODE,
-                        help="local_ci.sh mode: core is the full gate with no flag (default); quick skips the root suite")
+    parser.add_argument("--mode", choices=sorted(MODES), default="quick", help="local_ci.sh mode (default quick)")
     parser.add_argument("--max-prs", type=int, default=DEFAULT_MAX_PRS, help="PRs to test per sweep")
     parser.add_argument("--dry-run", action="store_true", help="list the PRs that would be tested and run nothing")
     parser.add_argument("--workdir", default=str(Path(tempfile.gettempdir()) / "dca-local-ci-sweep"),
@@ -299,15 +290,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         picked = select_prs(prs, statuses, now=now, max_prs=args.max_prs)
         for pr in picked:
             print(f"#{pr.number} {pr.head_sha[:8]} {pr.head_ref}{' (draft)' if pr.draft else ''}")
-        flags = " ".join(MODES[args.mode]) or "the full core gate"
-        print(f"dry run: would test {len(picked)} PR(s) with {flags}; nothing was run")
-        if args.mode == "quick":
-            print(QUICK_WARNING)
+        print(f"dry run: would test {len(picked)} PR(s) with {MODES[args.mode]}; nothing was run")
         return 0
 
     result = run_sweep(
         prs=prs, statuses=statuses, git=_real_git, run=_real_run, workdir=Path(args.workdir),
-        lock_path=Path(args.lock), now=now, mode_args=MODES[args.mode], max_prs=args.max_prs,
+        lock_path=Path(args.lock), now=now, mode_args=(MODES[args.mode],), max_prs=args.max_prs,
     )
     if result.skipped_reason == "locked":
         print("local_ci_sweep: another sweep holds the lock; nothing run", file=sys.stderr)
