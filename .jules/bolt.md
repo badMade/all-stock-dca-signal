@@ -28,7 +28,16 @@
 
 ## 2026-10-29 - [Avoid Path.resolve() inside comprehension loops]
 **Learning:** Resolving parent directories inside a comprehension loop (e.g., `[path.parent.resolve() for path in paths]`) executes duplicate `stat` syscalls when multiple paths share the same parent directory.
-**Action:** Always deduplicate parent directories via a `set` before calling `.resolve()` to guarantee each unique directory is resolved exactly once, reducing I/O overhead.
+**Action:** Always deduplicate parent directories via a `set` before calling `.resolve()` to guarantee each unique directory is resolved exactly once, reducing I/O overhead. Do not attempt to optimize `Path.resolve()` by caching across disjoint sets (mixing files and directories) or prefix/string matching on path boundaries, which introduces normalization bugs.
+
+## 2026-11-01 - [fromisoformat fast-paths, padding, and timezone strictness]
+**Learning:** When replacing `datetime.strptime` with `fromisoformat` in hot loops: (1) for mixed-format inputs, use a fast-path length/slice check (`len(raw) == 19 and raw[10] == "T"`) before falling back to `strptime`; (2) `fromisoformat()` strictly requires zero-padded components (`"09:30"`, `"2026-09-05"`), whereas `strptime` accepts unpadded single digits (`"9:30"`), so use `.split(":")` with integer boundary checks (`0 <= h <= 23`, `0 <= m <= 59`) when unpadded clock times must remain valid; (3) `datetime.fromisoformat(val.replace("Z", "+00:00"))` silently returns a naive `datetime` if no offset was present, so explicitly verify `parsed.tzinfo is not None` (or `val.endswith("Z")`) to preserve fail-closed validation.
+**Action:** Enforce explicit timezone awareness and padding-compatible bounds checks whenever substituting `fromisoformat()` or `time.fromisoformat()` for `strptime()`.
+
+## 2026-11-01 - [Unanchored regex vs str.split(':') regression]
+**Learning:** Replacing unanchored regexes like `re.search(r"(\d+):(\d+)")` with `str.split(":")` in time-parsing helpers breaks inputs that carry date prefixes or fractional-second suffixes.
+**Action:** When exact behavioral parity on loosely formatted strings is required, hoist and pre-compile the regex (`_PATTERN = re.compile(...)`) at the module level rather than replacing it with `str.split()`.
+
 ## 2026-11-01 - [Fast-path strict ISO formats with fromisoformat over strptime]
 **Learning:** For fixed ISO-shaped configuration dates and schedule execution clocks (e.g. "15:30" or "2023-10-10 12:00"), falling back directly to `datetime.strptime()` wastes vast CPU cycles via internal regex regex and locale cache lookup.
 **Action:** When validating exact time shapes, prefer a fast-path literal string slice or length check accompanied directly by `datetime.fromisoformat` / `time.fromisoformat` rather than `strptime` to accelerate clock parsing by up to 26x, while still strictly rejecting malformed data with `ValueError`.
