@@ -64,6 +64,30 @@ that isn't the commit, and refuses a commit GitHub doesn't have yet (push first)
 `$LOCAL_CI_CONTEXT` renames the context. It is a plain commit status: no ruleset requires it, and
 making it required would be a ruleset change for you to decide.
 
+### Sweeping every open PR (`scripts/local_ci_sweep.py`)
+
+`local_ci_status.sh` tests one commit. The sweeper runs it for all open PRs, unattended, on the Mac:
+
+```bash
+python3 -m scripts.local_ci_sweep --dry-run     # list the PRs it would test; runs nothing
+python3 -m scripts.local_ci_sweep               # test up to 3 PRs with --quick
+python3 -m scripts.local_ci_sweep --mode changed --max-prs 5
+```
+
+- **Which PRs:** only branches of this repo, never forks (their code would run on the Mac). Drafts are
+  included. A head commit that already has a `local-ci` `success` or `failure` is skipped; a new head
+  commit, an `error` (interrupted run), or a `pending` older than 2 hours (a run that died) is tested.
+- **Isolation:** each PR runs in a throwaway `git worktree` under `$TMPDIR/dca-local-ci-sweep`, never your
+  checkout, and the worktree is always removed. One PR failing never stops the others.
+- **Overlap:** a lock file (`$TMPDIR/dca-local-ci-sweep.lock`) stops two sweeps overlapping; a lock older
+  than 4 hours is taken over.
+- **Exit codes:** a failing CI shows in the commit status, not here. 1 means a PR could not be tested at all
+  (git or the runner broke); 3 means another sweep holds the lock.
+- **Schedule:** `deploy/launchd/com.all-stock-dca.local-ci-sweep.plist.template` runs it every 30 minutes
+  (fill in `REPLACE_WITH_REPO_PATH`, copy to `~/Library/LaunchAgents/`, then
+  `launchctl bootstrap gui/$(id -u) <plist>`). It needs `gh` logged in and uv on PATH; log at
+  `/tmp/dca-local-ci-sweep.log`.
+
 ### Optional pre-push hook
 
 ```bash
