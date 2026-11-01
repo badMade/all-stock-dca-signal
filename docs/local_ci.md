@@ -222,7 +222,8 @@ PR #2067 (the base of this change) makes draft PRs skip CI: `pull_request` also 
 3. **The research audit runs only when a dependency manifest moved** (`requirements*.txt`,
    `uv.lock`, `pyproject.toml`), plus on every scheduled/manual run, which is where a new advisory
    against unchanged pins gets caught.
-4. **Every job's runner is a variable**: `runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}`.
+4. **Every job's runner is a variable**: `runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}`
+   (`inputs.runner` lets one manual run pick a label: `gh workflow run CI -f runner=self-hosted`).
    Unset, nothing changes. Set it to a self-hosted runner's label and the whole workflow stops
    using GitHub-hosted runner minutes (see below for the pricing caveat).
 
@@ -279,3 +280,15 @@ The macOS runner has not been tried yet. The first `workflow_dispatch` on it sho
 `actions/setup-python` installs 3.11 and 3.12 on macOS arm64, and that the wondrous-octopus job's
 `--index-url https://download.pytorch.org/whl/cpu` torch install resolves there. That index is
 built for Linux, while PyPI's plain macOS wheel is already CPU-only.
+
+### Python on the self-hosted runners
+
+`actions/setup-python` cannot run there: its macOS builds install a system-wide package with
+`sudo installer` (every job failed with "sudo: a password is required" on 2026-11-01), and giving
+`ghrunner` passwordless sudo would make it an admin. So every `ci.yml` job uses
+`.github/actions/setup-python` instead. It calls `actions/setup-python` unchanged on GitHub-hosted
+runners. On self-hosted ones it builds a per-job virtualenv from a uv-managed standalone Python
+inside `ghrunner`'s home, with uv pinned to `requirements-dev.txt`. No sudo is needed, and the
+interpreter and pip caches persist across jobs. The runner setup also points `AGENT_TOOLSDIRECTORY`
+at `/Users/runner/hostedtoolcache` (owned by `ghrunner`), since the workflows' other actions expect
+a tool cache to exist.

@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -169,7 +170,31 @@ def test_ci_minute_budget_triggers():
     diff = jobs["changes"]["steps"][0]["run"]
     assert "compare/$BEFORE...$AFTER" in diff, "pushes to main must diff their range, not run everything"
     for name, job in jobs.items():
-        assert job["runs-on"] == "${{ vars.CI_RUNS_ON || 'ubuntu-26.04' }}", name
+        assert job["runs-on"] == "${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}", name
+
+
+def test_ci_python_setup_works_on_self_hosted_runners():
+    """Every ci.yml job sets up Python through the local composite action (2026-11-01).
+
+    actions/setup-python's macOS builds run `sudo installer`, which fails on the unprivileged
+    self-hosted `ghrunner` user, so the action must use it only on GitHub-hosted runners and
+    build a uv venv on self-hosted ones, without sudo.
+    """
+    root = Path(__file__).resolve().parents[2]
+    jobs = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]
+    for name, job in jobs.items():
+        for step in job.get("steps", []):
+            assert step.get("uses") != "actions/setup-python@v7", f"{name} bypasses the composite action"
+    action = yaml.safe_load((root / ".github/actions/setup-python/action.yml").read_text())
+    steps = action["runs"]["steps"]
+    hosted = [s for s in steps if s.get("uses", "").startswith("actions/setup-python@")]
+    assert len(hosted) == 1 and hosted[0]["if"] == "runner.environment != 'self-hosted'"
+    self_hosted = [s for s in steps if s.get("if") == "runner.environment == 'self-hosted'"]
+    assert len(self_hosted) == 1
+    assert "sudo" not in self_hosted[0]["run"]
+    assert '/bin/uv" venv' in self_hosted[0]["run"] and "GITHUB_PATH" in self_hosted[0]["run"]
+    dispatch = _normalize_on_key(REAL_DOCS[".github/workflows/ci.yml"])["on"]["workflow_dispatch"]
+    assert dispatch["inputs"]["runner"]["default"] == ""
 
 
 # --- Synthetic fixtures: the violation and exception mechanisms themselves ---
