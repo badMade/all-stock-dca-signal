@@ -34,9 +34,12 @@ top-up loading rules.
 > complete artifacts exist. Operational tracking lives in
 > [`dca_operational_todos.md`](dca_operational_todos.md).
 
-**Timezone note:** cron expressions are in **UTC**. ET equivalents below are in
-America/New_York and vary with DST (EDT, UTC-4, in Mar-Oct; EST, UTC-5, in Jan,
-Feb, Nov, Dec). Re-verify around DST transitions.
+**Timezone note (rewritten 2026-10-31):** the canonical schedule table below gives each
+cron in **America/New_York** wall-clock time, the way the live schedulers register it
+(`CRON_TZ=America/New_York`), so the same expression fires at the same ET time in EDT
+and EST. Dated override blocks and `config/scheduled_tasks.json`'s `cron_utc` fields
+still carry their original **UTC** values calibrated to EDT (UTC-4); see the
+[DST rule](#dst-rule-for-the-cron-et-column-and-for-slot-verifiers-added-2026-10-14-rewritten-2026-10-31).
 
 > **Afternoon completion rule (rewritten 2026-08-02):** the 3:05 PM monitor-only
 > signal check (`e3e6f09e`) and the 3:40 PM read-only live-run watchdog
@@ -821,32 +824,45 @@ Every dated override is a historical record and lives after it, under
 [Expired temporary live scheduler overrides](#expired-temporary-live-scheduler-overrides-historical-record) --
 see the note at the top of this section for why that ordering is load-bearing.
 
-| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
+| ET | Task | ID | Cadence | Cron (ET) | Trades | Status |
 |---|---|---|---|---|---|---|
-| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 13 * * 1-5` | **yes** | active |
-| 10:30 AM | Morning DCA live Robinhood execution | `42173154` | Weekdays | `30 14 * * 1-5` | **yes** | active |
-| 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
-| 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 16 * * 1-5` | **yes** | active |
-| 1:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
-| 2:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
-| 3:30 PM | Final DCA live Robinhood execution | `10ce362c` | Weekdays | `30 19 * * 1-5` | **yes** | active |
-| 5:00 PM | Post-trade slippage plus Notion latest-run sync | `67aa802b` | Weekdays | `0 21 * * 1-5` | no | active |
-| 5:30 PM | Weekly DCA Notion performance dashboard refresh | `041d9d90` | Fridays | `30 21 * * 5` | no | active |
-| 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 12 1-7 * 1-5` | no | active |
-| 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 21 25-31 3-10 *` | no | active |
-| 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 22 25-31 1,2,11,12 *` | no | active |
+| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 9 * * 1-5` | **yes** | active |
+| 10:30 AM | Morning DCA live Robinhood execution | `42173154` | Weekdays | `30 10 * * 1-5` | **yes** | active |
+| 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 11,13,14 * * 1-5` | **yes** | active |
+| 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 12 * * 1-5` | **yes** | active |
+| 1:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 11,13,14 * * 1-5` | **yes** | active |
+| 2:30 PM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 11,13,14 * * 1-5` | **yes** | active |
+| 3:30 PM | Final DCA live Robinhood execution | `10ce362c` | Weekdays | `30 15 * * 1-5` | **yes** | active |
+| 5:00 PM | Post-trade slippage plus Notion latest-run sync | `67aa802b` | Weekdays | `0 17 * * 1-5` | no | active |
+| 5:30 PM | Weekly DCA Notion performance dashboard refresh | `041d9d90` | Fridays | `30 17 * * 5` | no | active |
+| 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 8 1-7 * 1-5` | no | active |
+| 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 17 25-31 3-10 *` | no | active |
+| 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 17 25-31 1,2,11,12 *` | no | active |
 
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own
 `scheduled_for_et`.
 
-### DST rule for the Cron (UTC) column and for slot verifiers (added 2026-10-14)
+### DST rule for the Cron (ET) column and for slot verifiers (added 2026-10-14, rewritten 2026-10-31)
 
-Every `Cron (UTC)` value above is calibrated to **EDT (UTC-4)**. On 2026-11-01 the
-same expression fires one hour *late* in ET terms (`35 13` becomes 8:35 AM ET), so
-a fixed-UTC cron must be re-registered, or registered with `CRON_TZ=America/New_York`
-(or the scheduler's local-time field), before that date. Locally registered Claude
-Desktop tasks take their cron in the Mac's local time and are unaffected.
+Every `Cron (ET)` value above is America/New_York wall-clock time. Register it with
+`CRON_TZ=America/New_York` (or the scheduler's local-time field on a Mac set to
+America/New_York) and it needs no change at a DST transition. Until 2026-10-31 this
+column held UTC values calibrated to EDT (UTC-4), e.g. `35 13` for 9:35 AM. A fixed-UTC
+registration of one of those fires an hour *early* in EST (13:35 UTC is 8:35 AM EST; the
+2026-10-14 text said "late", which was backwards), so never register the old UTC values
+as-is.
+
+Audit 2026-10-31 (before the 2026-11-01 fall-back): all seven live Claude slot
+routines (9:35 through 3:30) plus the end-of-day digest, ticker daily update and Notion
+run-log routines are registered as `CRON_TZ=America/New_York <minute> <hour> ...`, and
+their next runs on 2026-11-02 resolved to EST (9:35 AM = 14:35 UTC). The Mac launchd
+jobs (`deploy/launchd/`) and Claude Desktop Code-tab tasks fire on the Mac's local
+clock, which is America/New_York. The Perplexity backup schedule is registered in
+Perplexity and was not checked by that audit; the month-end volatility routines
+(`c9fb1fb8`, `17a3b2a9`) were not found in the routine listing. `config/scheduled_tasks.json`
+`cron_utc` fields (and the local console's "Cron (UTC)" column that reads them) still
+carry the EDT-calibrated UTC values; they are not what the live routines are registered with.
 
 Verifier and watchdog prompts follow the same rule: **derive the slot window from the ET
 boundaries at run time, never hardcode a Z value.** Use, e.g. for the 9:35 slot (window
