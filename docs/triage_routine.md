@@ -37,9 +37,12 @@ Anything that is not exactly `Approved` counts as not approved.
 
 ## Daily flow
 
-1. **Logs.** If `$DCA_CRON_TRACKING_ROOT` is readable, run `scripts.verify_schedule`, `scripts.schedule_watchdog`
-   and `scripts.alert_digest` (all `--json`) and read the newest `attempt_log` file. Otherwise the digest opens with
-   `LOGS UNAVAILABLE in this container` and carries on with GitHub and Notion only. That is not a clean bill of health.
+1. **Logs.** The run files live only on the operator's Mac (`cron_tracking/`, gitignored), so the routine first
+   finds a shell that can read them: a local checkout (the routine runs as a Mac task with the repo folder), else the
+   `remote-devices` bridge at `$HOME/mnt/all-stock-dca`, as the live slot prompts do. There it runs
+   `python -m scripts.triage_log_summary --json`, then `scripts.schedule_watchdog` and `scripts.alert_digest` (both
+   `--json`), and reads the newest `attempt_log` file. With neither shell the digest opens with `LOGS UNAVAILABLE in
+   this container` and carries on with GitHub and Notion only. That is not a clean bill of health.
 2. **GitHub.** Issues, branches, PRs and the last 50 commits on the default branch. Commits need a full 40-char
    SHA plus URL, or `match_git_evidence` raises `EvidenceError`. The PR list can report `merged=false` for every PR,
    so each PR matched to a Key is fetched directly for its real merged state and check status.
