@@ -116,7 +116,7 @@ run-dca-risk --help
 ### Local tests and coverage
 
 ```bash
-.venv/bin/python -m pytest                 # ~8,300 tests, ~5 min; tests live in tests/
+.venv/bin/python -m pytest                 # ~13,300 tests; tests live in tests/
 .venv/bin/python -m pytest tests/test_midday_dca.py -q
 .venv/bin/python -m pytest scripts/tests -q   # reliability engines; separate from the root sweep
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90   # the CI gate

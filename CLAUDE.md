@@ -30,7 +30,7 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~8,300 tests, ~5 min for the whole suite. Tests live under tests/ (2026-08-23:
+# Tests — ~13,300 tests (the coverage-gated run took ~14 min on the operator's Mac, 2026-10-31). Tests live under tests/ (2026-08-23:
 # moved out of the repo root, which used to hold one test_<module>.py flat beside every
 # module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
 # and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
