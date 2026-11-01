@@ -202,7 +202,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.export_octopus_ledger` | 232 | 1 | 0 | 0 | `scripts.sequestered_truth_comparator` |
 | `scripts.file_lock` | 127 | 0 | 13 | 0 |  |
 | `scripts.fill_perplexity_backup_prompts` | 299 | 1 | 1 | 2 | `dca_env` |
-| `scripts.finalize_run_evidence` | 1168 | 13 | 3 | 22 | `dca_fileio`, `dca_paths`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, `scripts.file_lock`, +5 more |
+| `scripts.finalize_run_evidence` | 1181 | 13 | 3 | 22 | `dca_fileio`, `dca_paths`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, `scripts.file_lock`, +5 more |
 | `scripts.foreground_primary` | 620 | 0 | 1 | 5 |  |
 | `scripts.gate_failure_diagnostics` | 352 | 3 | 1 | 0 | `dca_paths`, `dca_risk`, `scripts.same_day_top_up_gate` |
 | `scripts.generate_buy_candidates` | 2105 | 3 | 5 | 8 | `dca_config`, `dca_runner`, `near_close_dca` |

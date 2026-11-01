@@ -234,7 +234,10 @@ def _load_json(path: Optional[str], kind: type, label: str) -> Any:
     if path is None:
         return None
     try:
-        value = json.loads(Path(path).read_bytes())
+        # Security: reject duplicate JSON keys across all CLI evidence inputs
+        # (--orders-json, --budget-json, --signals-json, --report-json) so parameter
+        # pollution cannot silently override safety-bound fields.
+        value = json.loads(Path(path).read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise FinalizeRefused(f"{label} {path!r} is not readable JSON: {exc}") from exc
     if not isinstance(value, kind) or (kind is list and not all(isinstance(row, dict) for row in value)):
@@ -270,6 +273,16 @@ def _load_inline_or_file_json(value: Optional[str], label: str) -> Any:
 BUDGET_TIERS = ("normal", "elevated", "high_volatility", "stress")
 
 
+def _is_finite_number(value: Any) -> bool:
+    """Return True when value is a finite int/float (excluding bool) without OverflowError on unbounded JSON ints."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def validate_orders(orders: Optional[List[Dict[str, Any]]]) -> None:
     """Refuse order rows that cannot be submitted-order evidence (Copilot review, PR #1514).
 
@@ -295,7 +308,7 @@ def validate_orders(orders: Optional[List[Dict[str, Any]]]) -> None:
                 f"order row {index} ({ticker}) status {status!r} is not a placed or in-flight "
                 f"order; expected one of {sorted(ORDER_ATTEMPT_STATUSES)}"
             )
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+        if not _is_finite_number(amount) or amount <= 0:
             raise FinalizeRefused(
                 f"order row {index} ({ticker}) submitted_amount_usd {amount!r} is not a positive number"
             )
@@ -320,7 +333,7 @@ def validate_budget(budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         raise FinalizeRefused(f"--budget-json budget_tier {tier!r} is not one of {list(BUDGET_TIERS)}")
     for key in ("daily_cap_usd", "weekly_cap_usd"):
         value = budget.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        if not _is_finite_number(value) or value < 0:
             raise FinalizeRefused(f"--budget-json {key} {value!r} is not a non-negative number")
     return normalized
 
