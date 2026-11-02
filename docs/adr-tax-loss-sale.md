@@ -46,6 +46,12 @@ tickers almost every trading day, so:
      not eligible until the ledger proves zero buys of that ticker in that window.
    - **Post-sale pause:** no buys for 31 calendar days after the sale date.
    - Dividend reinvestment for the ticker must be off for the whole period.
+   - **Options count too** (IRC section 1091(a): "entered into a contract or option so to
+     acquire"). During both pauses: no long calls on the ticker, and no open short puts on it
+     that could be assigned inside the window. A put sold before the window can still be
+     assigned inside it, so open short puts block eligibility. Whether merely writing a put
+     inside the window triggers the rule is unsettled; treat it as blocking (fail closed) until
+     a tax professional confirms.
    This is the operator's "31-day buy pause", applied on both sides because daily DCA buys would
    otherwise wash the loss.
 4. **Candidate report (research only, weekly).** Lists lots with an unrealized loss of at least
