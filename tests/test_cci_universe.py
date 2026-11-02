@@ -41,7 +41,7 @@ def test_cci_has_a_sizing_entry():
         assert [(tier["min_drop_pct"], tier["multiplier"]) for tier in entry["tiers"]] == list(GLOBAL_FALLBACK_TIERS)
 
 
-def test_active_count_is_91_everywhere():
-    assert len(_load("tickers.json")["active"]) == 91
+def test_active_count_is_90_everywhere():
+    assert len(_load("tickers.json")["active"]) == 90
     policy = _load("scheduled_tasks.json")["ticker_universe_policy"]
-    assert policy["active_count"] == 91
+    assert policy["active_count"] == 90

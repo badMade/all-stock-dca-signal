@@ -21,6 +21,9 @@ def _load(name):
 def test_all_new_tickers_are_active_in_constant_and_config():
     config_active = _load("tickers.json")["active"]
     for ticker in NEW:
+        if ticker == "KVUE":
+            # Moved to excluded 2026-11-02 (Robinhood inactive instrument) -- see test_kvue_exclusion.py.
+            continue
         assert ticker in near_close_dca.ACTIVE_TICKERS, ticker
         assert ticker not in near_close_dca.EXCLUDED_TICKERS, ticker
         assert ticker in config_active, ticker
