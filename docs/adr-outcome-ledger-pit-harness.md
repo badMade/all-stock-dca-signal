@@ -44,7 +44,7 @@ store; it does not add a dependency or a second engine.
    - `outcomes`: per fill and per baseline row, the price at fixed horizons (open question 5),
      joined with `ASOF JOIN` on `quote_date` so no later data leaks in.
    - `accounts`: one row per Robinhood account, keyed by an operator-chosen alias or a salted
-     hash. No account-shaped literal is ever stored or committed (open question 3).
+     HMAC. No account-shaped literal is ever stored or committed (open question 3).
    - `tax_lots`: read-only snapshots of lots across all Robinhood accounts, so lots that move
      from the agentic account to the main account stay traceable. Flags the 31-day buy pause
      any future loss sale would need (wash-sale rule, IRS Publication 550).
@@ -75,7 +75,7 @@ implementation PRs that use them say so.
 |---|---|---|---|
 | 1 | Historical index-membership source, with delisted prices | Community point-in-time S&P 500 lists (GitHub `fja05680/sp500`, `shardul0701/SP500-Survivorship-bias-data-2004-2026`), spot-checked against EDGAR filings; delisted prices via Tiingo free tier only if the operator adds a key. Results labelled "large-cap only" | Free and point-in-time; unaudited, so spot checks are required |
 | 2 | Location | Extend `dca-sizing-signals/` beside `market_data_ingest/prices/` | Shares the store, the macros and the boundary test; no second engine |
-| 3 | Account alias scheme | Salted SHA-256 of the account identifier; the salt comes from an environment variable at runtime and is never committed. Only the alias is stored | No account-shaped literal can reach a table or a file |
+| 3 | Account alias scheme | HMAC-SHA256 of the account identifier keyed by a secret from an environment variable at runtime (never committed). Only the alias is stored | No account-shaped literal can reach a table or a file |
 | 4 | Baseline | A flat 1x buy at the same slot timestamp and price | Isolates the effect of the sizing rule from slot timing |
 | 5 | Horizons and promotion bar | t+5 and t+20 sessions. Promotion needs deflated Sharpe >= 0.95 counting every registered trial, after a 50% haircut on backtest excess return | Matches the research evidence on out-of-sample decay |
 | 6 | Friday review output | Both: summary to the Notion dashboard, proposed config diffs as a draft PR | Notion for reading, the repo for changes |
