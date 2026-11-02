@@ -38,6 +38,7 @@ from universe import (
     compute_pool_stats,
     detect_hard_fails,
     filter_pool,
+    ineligible_tickers,
     proposal_to_dict,
     rank_tickers,
     sector_zscores,
@@ -106,7 +107,7 @@ def _incumbents(ranks, tenure: int = 4) -> dict[str, Incumbent]:
     return {_rank_sym(r): Incumbent(tenure_quarters=tenure) for r in ranks}
 
 
-def _select(board, prior, incumbents, hard_fails=None, config=None, pool_stats=None):
+def _select(board, prior, incumbents, hard_fails=None, config=None, pool_stats=None, ineligible=None):
     return select_universe(
         board,
         prior,
@@ -117,6 +118,7 @@ def _select(board, prior, incumbents, hard_fails=None, config=None, pool_stats=N
         as_of_date=AS_OF,
         generated_at=GENERATED_AT,
         pool_stats=pool_stats or PoolStats(pool_size=1000, factor_missing_fraction=_ZERO_MISSING),
+        ineligible=ineligible,
     )
 
 
@@ -161,6 +163,7 @@ def test_default_config_matches_spec_values():
     assert (cfg.bench_min_rank, cfg.bench_max_rank) == (101, 250)
     assert cfg.min_pool_coverage == 0.95
     assert cfg.max_quote_age_sessions == 3 and cfg.max_edgar_age_days == 7
+    assert cfg.max_quote_age_calendar_days == 7
     assert cfg.max_factor_missing_fraction == 0.10
     assert cfg.winsor_limit == 3.0 and cfg.max_missing_factors == 1
     assert dict(cfg.factor_weights) == {"momentum": 0.25, "profitability": 0.25, "low_volatility": 0.25, "value": 0.25}
@@ -239,6 +242,7 @@ def test_filter_pool_records_every_reason_and_rejects_missing_or_malformed_value
             _cand("BBB", price=True),  # bool must not pass as the number 1
             _cand("FFF", market_cap=float("nan")),
             _cand("UUU", fractional_eligible=None),  # unknown eligibility is not eligibility
+            _cand("LLL", nms_listed=None, security_type=None),
             _cand("brk-b"),
         ],
         PoolThresholds(),
@@ -248,7 +252,11 @@ def test_filter_pool_records_every_reason_and_rejects_missing_or_malformed_value
     assert result.rejections["NNN"] == ("missing:price",)
     assert result.rejections["BBB"] == ("missing:price",)
     assert result.rejections["FFF"] == ("missing:market_cap",)
-    assert result.rejections["UUU"] == ("not_fractional_eligible",)
+    # Unknown flags are reported as MISSING (not as a failed check), so a
+    # caller can tell "data did not arrive" (incumbent holds) apart from
+    # "genuinely fails the floor" (incumbent leaves the pool).
+    assert result.rejections["UUU"] == ("missing:fractional_eligible",)
+    assert result.rejections["LLL"] == ("missing:nms_listed", "missing:security_type")
     assert result.rejections["brk-b"] == ("invalid_symbol",)
 
 
@@ -486,6 +494,9 @@ def test_non_member_in_entry_band_two_reviews_in_a_row_enters(prior_rank):
     assert p.adds == (_rank_sym(60),)
     assert p.reasons[_rank_sym(60)] == "add:entry_band_two_reviews"
     assert len(p.active) == 100
+    # A genuine add carries the evidence validate_proposal re-checks.
+    assert p.prior_ranks[_rank_sym(60)] == prior_rank
+    assert validate_proposal(p, _prior_stats(), _fresh(), UniverseConfig()) == []
 
 
 def test_non_member_ranked_76_never_enters_even_with_room():
@@ -674,16 +685,17 @@ def test_selection_is_deterministic_regardless_of_input_order():
 
 
 def test_bench_is_ranks_101_to_250_excluding_active_and_hard_fails():
-    # 300 scored names, incumbents ranks 1..99 + 120 (rank 120 is held so it
-    # is active, not bench). Rank 130 hard-fails (not an incumbent) -> off
-    # the bench too. Rank 100 is a non-member but sits outside 101..250 (and
-    # outside the entry band), so it is neither active nor bench. Bench =
-    # ranks 101..250 minus {120, 130} = 150 - 2 = 148 names, in rank order.
+    # 300 scored names, incumbents at board positions 1..99 + 120 (120 is held
+    # so it is active, not bench). Position 130 hard-fails (not an incumbent):
+    # it is excluded BEFORE ranking, so every name below it moves up one rank
+    # and board position 251 becomes rank 250. Position 100 is a non-member
+    # outside both 101..250 and the entry band -> neither active nor bench.
+    # Bench = positions 101..251 minus {120, 130} = 151 - 2 = 149 names.
     board = _board(300)
     inc = _incumbents([*range(1, 100), 120])
     p = _select(board, _prior_same(board), inc, hard_fails={_rank_sym(130): "delisted"})
-    expected = tuple(_rank_sym(r) for r in range(101, 251) if r not in (120, 130))
-    assert p.bench == expected and len(p.bench) == 148
+    expected = tuple(_rank_sym(r) for r in range(101, 252) if r not in (120, 130))
+    assert p.bench == expected and len(p.bench) == 149
 
 
 # --------------------------------------------------------------------------
@@ -840,3 +852,159 @@ def test_rejected_proposal_serializes_failures():
     assert doc["safeguards"]["passed"] is False
     assert [f["code"] for f in doc["safeguards"]["failures"]] == ["too_many_swaps"]
     assert doc["recommended_active"] == doc["prior_active"]
+
+
+# --------------------------------------------------------------------------
+# Review round 1 (independent review of PR #2100)
+# --------------------------------------------------------------------------
+
+
+def test_hard_fails_do_not_occupy_rank_slots():
+    # Review finding 1: hard-failed names were ranked before removal, shifting
+    # the entry/keep edges. Config: entry band 2, keep band 3. Raw order:
+    #   AAA 1 (non-member, hard-failed)  CCC 2 (incumbent)
+    #   BBB 3 (non-member, prior rank 2) DDD 4 (incumbent, tenure 4)
+    # With AAA excluded BEFORE ranking: CCC 1, BBB 2, DDD 3 -> BBB is inside
+    # the entry band (enters) and DDD inside the keep band (stays). With the
+    # bug, BBB sat at 3 (> 2, no entry) and DDD at 4 (> 3, dropped).
+    cfg = UniverseConfig(max_active=3, min_active=1, entry_rank=2, incumbent_keep_rank=3, bench_min_rank=4,
+                         bench_max_rank=5)
+    board = _small_board([("AAA", "W", "W1"), ("CCC", "X", "X1"), ("BBB", "Y", "Y1"), ("DDD", "Z", "Z1")])
+    inc = {"CCC": Incumbent(4), "DDD": Incumbent(4)}
+    p = _select(board, {"BBB": 2}, inc, hard_fails={"AAA": "delisted"}, config=cfg)
+    assert "AAA" not in p.ranks
+    assert p.ranks == {"CCC": 1, "BBB": 2, "DDD": 3}
+    assert p.adds == ("BBB",) and p.drops == ()
+    assert p.reasons["AAA"] == "skip:hard_fail"
+
+
+def test_ineligible_tickers_separates_failed_floors_from_missing_data():
+    result = filter_pool(
+        [
+            _cand("AAA"),
+            _cand("CAP", market_cap=1e9),  # genuinely below the $2B floor
+            _cand("MIX", market_cap=1e9, price=None),  # one real failure is enough
+            _cand("GAP", price=None),  # only missing data -> not "ineligible"
+            _cand("DUP"),
+            _cand("DUP"),  # ambiguous rows -> missing data, not a verdict
+        ],
+        PoolThresholds(),
+    )
+    assert ineligible_tickers(result) == {
+        "CAP": "market_cap_at_or_below_min",
+        "MIX": "market_cap_at_or_below_min",
+    }
+
+
+def test_incumbent_that_leaves_the_pool_exits_even_inside_min_tenure():
+    # Review finding 3: an incumbent that no longer clears a pool floor has
+    # no score; it must exit, not be held as "missing data" forever. Leaving
+    # the pool is a rule exit, not a rank-based one, so the 2-quarter tenure
+    # protection (spec: "before any RANK-based exit") does not apply; it does
+    # use the swap budget (it is not a hard fail).
+    board = _board(200)
+    gone = _rank_sym(250)  # not on the 200-name board at all
+    inc = _incumbents(range(1, 100))
+    inc[gone] = Incumbent(tenure_quarters=1)
+    p = _select(board, _prior_same(board), inc, ineligible={gone: "market_cap_at_or_below_min"})
+    assert p.drops == (gone,) and p.ineligible_drops == (gone,)
+    assert p.reasons[gone] == "drop:left_pool:market_cap_at_or_below_min"
+    assert validate_proposal(p, _prior_stats(), _fresh(), UniverseConfig()) == []
+
+
+def test_pool_exits_use_the_swap_budget_ahead_of_rank_exits():
+    # 9 pool-ineligible incumbents (unranked) + 2 rank-based exit candidates
+    # (ranks 161, 162), 8-swap budget. Pool exits go first, in ticker order:
+    # the 8 alphabetically-first pool exits leave, the 9th and both
+    # rank-based candidates are deferred.
+    board = _board(200)
+    gone = [_sym(300 + i) for i in range(9)]
+    inc = _incumbents([*range(1, 90), 161, 162])
+    inc.update({t: Incumbent(4) for t in gone})
+    p = _select(board, _prior_same(board), inc, ineligible=dict.fromkeys(gone, "dollar_volume_at_or_below_min"))
+    assert set(p.drops) == set(gone[:8])
+    for ticker in (gone[8], _rank_sym(161), _rank_sym(162)):
+        assert p.reasons[ticker] == "hold:exit_deferred_swap_cap"
+
+
+def test_missing_incumbent_not_marked_ineligible_is_still_held():
+    board = _board(200, drop={_rank_sym(50)})
+    p = _select(board, _prior_same(_board(200)), _incumbents(range(1, 101)), ineligible={})
+    assert p.reasons[_rank_sym(50)] == "hold:missing_data"
+
+
+def _one_add_proposal() -> Proposal:
+    # Rank-60 non-member qualified at both reviews fills the one free seat.
+    board = _board(200)
+    return _select(board, _prior_same(board), _incumbents([r for r in range(1, 101) if r != 60]))
+
+
+def _tamper_unscored_add(p):
+    # Review finding 2's probe: swap the genuine add for a never-ranked symbol.
+    real = p.adds[0]
+    return dataclasses.replace(
+        p, adds=("ZZZZ",), active=tuple(sorted({*p.holds, "ZZZZ"})),
+        classification={**{t: c for t, c in p.classification.items() if t != real}, "ZZZZ": {"sector": "SEC0",
+                                                                                          "industry": "IND0"}},
+    )
+
+
+def _tamper_rank(p):
+    return dataclasses.replace(p, ranks={**p.ranks, p.adds[0]: 80})  # outside the entry band now
+
+
+def _tamper_prior(p):
+    return dataclasses.replace(p, prior_ranks={p.adds[0]: 80})  # outside the entry band last review
+
+
+def _tamper_no_prior(p):
+    return dataclasses.replace(p, prior_ranks={})
+
+
+def _tamper_no_class(p):
+    return dataclasses.replace(p, classification={t: c for t, c in p.classification.items() if t != p.adds[0]})
+
+
+@pytest.mark.parametrize("tamper", [_tamper_unscored_add, _tamper_rank, _tamper_prior, _tamper_no_prior,
+                                    _tamper_no_class])
+def test_unqualified_add_is_rejected(tamper):
+    p = _one_add_proposal()
+    assert validate_proposal(p, _prior_stats(), _fresh(), UniverseConfig()) == []
+    codes = _codes(validate_proposal(tamper(p), _prior_stats(), _fresh(), UniverseConfig()))
+    assert "add_not_qualified" in codes
+
+
+def test_add_breaching_a_cap_is_rejected():
+    # The rank-60 add lands in sector SEC9 (index 59 % 10), which holds 10
+    # active names after the add. Validated under a 9/sector cap -> rejected;
+    # under the default 25 it passes (previous test).
+    p = _one_add_proposal()
+    codes = _codes(validate_proposal(p, _prior_stats(), _fresh(), UniverseConfig(sector_cap=9)))
+    assert "add_not_qualified" in codes
+
+
+def test_hard_fail_drops_apply_even_when_the_proposal_is_rejected():
+    # Review finding 3b: 91 incumbents, 2 of them hard-fail -> 89 active ->
+    # rejected (active_too_small). Falling back to the full prior list would
+    # keep buying a delisted name; the fallback must still drop hard fails.
+    board = _board(200)
+    inc = _incumbents(range(1, 92))
+    hard = {_rank_sym(10): "delisted", _rank_sym(20): "pending_acquisition"}
+    out = apply_safeguards(_select(board, _prior_same(board), inc, hard_fails=hard), _prior_stats(), _fresh(),
+                           UniverseConfig())
+    assert out.status == "rejected" and "active_too_small" in _codes(out.safeguard_failures)
+    assert out.recommended_active == tuple(sorted(set(inc) - set(hard)))
+    assert len(out.recommended_active) == 89
+
+
+@pytest.mark.parametrize(
+    "freshness, code",
+    [
+        # Review finding 4: age 0 but dated ten months back -> calendar ceiling.
+        (InputFreshness(date(2026, 1, 1), 0, date(2026, 10, 29)), "stale_quotes_calendar"),
+        # More sessions than calendar days elapsed is impossible -> malformed record.
+        (InputFreshness(date(2026, 10, 28), 3, date(2026, 10, 29)), "freshness_inconsistent"),
+    ],
+)
+def test_quote_age_is_cross_checked_against_quote_date(freshness, code):
+    assert code in _codes(validate_proposal(_clean_proposal(), _prior_stats(), freshness, UniverseConfig()))
