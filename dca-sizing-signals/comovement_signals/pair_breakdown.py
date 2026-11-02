@@ -160,7 +160,8 @@ def pair_breakdown_shadow(
 
     Args:
         close_rows: daily close rows (shape as returns.returns_matrix).
-        as_of: the as-of date; nothing dated later is read.
+        as_of: the as-of date; nothing dated later is read, and a bar dated on it only
+            when the row is marked ``final`` (returns.py).
         config: thresholds; None means the ADR defaults.
         tickers: optionally restrict the universe; default every ticker with enough
             history.

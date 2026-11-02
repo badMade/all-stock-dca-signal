@@ -80,7 +80,8 @@ def rotation_log_shadow(
     semis: Iterable[str],
     config: RotationConfig | None = None,
 ) -> ShadowResult:
-    """The rotation log record for the newest session on or before ``as_of``."""
+    """The rotation log record for the newest usable session (before ``as_of``, or on it
+    when its bars are marked ``final``)."""
     config = config if config is not None else RotationConfig()
     staples_t = tuple(sorted(set(staples)))
     semis_t = tuple(sorted(set(semis)))

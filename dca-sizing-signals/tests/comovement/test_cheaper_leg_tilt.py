@@ -94,6 +94,9 @@ def test_ols_hedge_degenerate_inputs_return_none():
 # Fitted A1 on day(4): relative log 0.45 + 2.3 * (0.5 - 0.2) = 1.14.
 # Formation returns: B1 0.1, 0.2, 0.1; A1 0.2, 0.5, 0.2 = 3 * B1 - 0.1, so r = 1 >= 0.75.
 SD = math.sqrt(0.001 / 3)
+# The evaluation close is day(4); as_of is the next day so it is final by date (a bar ON
+# as_of counts only when marked final: PR #2106 review).
+AS_OF = day(5)
 TOY = TiltConfig(formation_sessions=4, min_overlap_sessions=3)
 
 
@@ -111,7 +114,7 @@ def _rows(eval_y: float, extra_history: bool = False) -> list[dict]:
 
 def test_cheap_leg_a_gets_more_dollars():
     # A1 one formation sd below its fitted value: z = -1, weight A = 0.65.
-    result = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=day(4), config=TOY,
+    result = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=AS_OF, config=TOY,
                                      pair_dollars={("A1", "B1"): 100.0})
     assert result.ok and result.signal == SIGNAL_CHEAPER_LEG_TILT and result.skipped == {}
     (record,) = result.records
@@ -131,7 +134,7 @@ def test_cheap_leg_a_gets_more_dollars():
 
 def test_rich_leg_a_is_clipped_at_the_lower_bound():
     # z = +3: 0.5 - 0.45 = 0.05, clipped up to 0.2; B gets 0.8.
-    (record,) = cheaper_leg_tilt_shadow(_rows(1.14 + 3 * SD), as_of=day(4), config=TOY).records
+    (record,) = cheaper_leg_tilt_shadow(_rows(1.14 + 3 * SD), as_of=AS_OF, config=TOY).records
     assert record.payload["z"] == pytest.approx(3.0, abs=1e-9)
     assert record.payload["weight_a"] == pytest.approx(0.2)
     assert record.payload["weight_b"] == pytest.approx(0.8)
@@ -139,13 +142,13 @@ def test_rich_leg_a_is_clipped_at_the_lower_bound():
 
 
 def test_hedge_ratio_uses_the_formation_window_only():
-    base = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=day(4), config=TOY).records[0].payload
+    base = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=AS_OF, config=TOY).records[0].payload
     # 1. A different evaluation-day close moves z but not the hedge ratio.
-    moved = cheaper_leg_tilt_shadow(_rows(1.14 + SD), as_of=day(4), config=TOY).records[0].payload
+    moved = cheaper_leg_tilt_shadow(_rows(1.14 + SD), as_of=AS_OF, config=TOY).records[0].payload
     assert moved["hedge_ratio"] == pytest.approx(base["hedge_ratio"])
     assert moved["z"] == pytest.approx(1.0, abs=1e-9)
     # 2. Wild history before the formation window changes nothing at all.
-    older = cheaper_leg_tilt_shadow(_rows(1.14 - SD, extra_history=True), as_of=day(4), config=TOY)
+    older = cheaper_leg_tilt_shadow(_rows(1.14 - SD, extra_history=True), as_of=AS_OF, config=TOY)
     assert older.records[0].payload == base
     # 3. Had the evaluation day been inside the fit, beta would differ from 2.3:
     #    OLS over all five points (x 0..0.5, y with EVAL = 1.14 - SD) is not 2.3.
@@ -154,22 +157,22 @@ def test_hedge_ratio_uses_the_formation_window_only():
 
 
 def test_no_lookahead_rows_after_as_of_change_nothing():
-    base = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=day(4), config=TOY)
-    future = rows_from_closes("A1", [1.0, 5000.0], start=5) + rows_from_closes("B1", [9000.0, 1.0], start=5)
-    later = cheaper_leg_tilt_shadow(_rows(1.14 - SD) + future, as_of=day(4), config=TOY)
+    base = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=AS_OF, config=TOY)
+    future = rows_from_closes("A1", [1.0, 5000.0], start=6) + rows_from_closes("B1", [9000.0, 1.0], start=6)
+    later = cheaper_leg_tilt_shadow(_rows(1.14 - SD) + future, as_of=AS_OF, config=TOY)
     assert later.records == base.records
 
 
 def test_low_correlation_pair_is_not_evaluated():
     # C1 formation returns -0.1, -0.2, -0.1: r = -1 with B1 and A1, below 0.75.
     rows = _rows(1.14 - SD) + rows_from_closes("C1", [100.0 * math.exp(v) for v in (0.0, -0.1, -0.3, -0.4, -0.5)])
-    result = cheaper_leg_tilt_shadow(rows, as_of=day(4), config=TOY)
+    result = cheaper_leg_tilt_shadow(rows, as_of=AS_OF, config=TOY)
     assert [r.payload["pair"] for r in result.records] == [["A1", "B1"]]
 
 
 def test_explicit_pairs_restrict_the_evaluation():
     rows = _rows(1.14 - SD) + rows_from_closes("C1", [100.0 * math.exp(v) for v in (0.0, 0.1, 0.3, 0.4, 0.5)])
-    result = cheaper_leg_tilt_shadow(rows, as_of=day(4), config=TOY, pairs=[("B1", "C1")])
+    result = cheaper_leg_tilt_shadow(rows, as_of=AS_OF, config=TOY, pairs=[("B1", "C1")])
     # Pair order is normalised (leg A first alphabetically). B1 and C1 are identical, so
     # the formation fit is perfect: zero residual sd, no z-score, no record.
     assert result.records == ()
@@ -182,14 +185,14 @@ def test_negative_hedge_ratio_is_skipped():
     # between legs that move apart is not a substitute pair.
     rows = _rows(1.14 - SD) + rows_from_closes("C1", [100.0 * math.exp(v) for v in (0.0, -0.1, -0.35, -0.4, -0.5)])
     cfg = TiltConfig(formation_sessions=4, min_overlap_sessions=3, min_pair_correlation=-1.0)
-    result = cheaper_leg_tilt_shadow(rows, as_of=day(4), config=cfg, pairs=[("B1", "C1")])
+    result = cheaper_leg_tilt_shadow(rows, as_of=AS_OF, config=cfg, pairs=[("B1", "C1")])
     assert result.records == ()
     assert result.skipped == {"B1|C1": "non_positive_hedge_ratio"}
 
 
 def test_insufficient_formation_history_gives_no_record():
     cfg = TiltConfig(formation_sessions=10, min_overlap_sessions=3)
-    result = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=day(4), config=cfg)
+    result = cheaper_leg_tilt_shadow(_rows(1.14 - SD), as_of=AS_OF, config=cfg)
     assert result.ok and result.records == ()
     assert result.skipped == {"A1|B1": "insufficient_history"}
 
@@ -201,7 +204,7 @@ def test_stale_prices_fail_closed():
 
 def test_stale_leg_is_skipped():
     rows = [r for r in _rows(1.14 - SD) if not (r["ticker"] == "B1" and r["date"] == day(4))]
-    result = cheaper_leg_tilt_shadow(rows, as_of=day(4), config=TOY)
+    result = cheaper_leg_tilt_shadow(rows, as_of=AS_OF, config=TOY)
     assert result.records == ()
     assert result.skipped == {"A1|B1": "stale_pair"}
 

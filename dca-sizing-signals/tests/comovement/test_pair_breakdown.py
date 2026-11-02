@@ -106,6 +106,9 @@ def test_rolling_correlation_uses_only_its_own_window():
 # Toy pair, rolling window 4 and run length 2 so it can be worked by hand. 43 closes on
 # day(0)..day(42) give 42 returns on day(1)..day(42). A1 alternates +1%, -1% (day 1 is
 # +1%). B1 copies A1 exactly except where noted.
+# The last toy close is day(42). as_of is the next day, so every close is final by date
+# (a bar dated ON as_of counts only when the caller marks it final: PR #2106 review).
+AS_OF = day(43)
 TOY = PairBreakdownConfig(rolling_sessions=4, consecutive_sessions=2, min_history_sessions=40,
                           min_reference_values=10)
 
@@ -132,7 +135,7 @@ def test_breakdown_flagged_and_suggests_hold_1x():
     # Window ending day(42) = days 39..42: A (1,-1,1,-1), B (1,-1,-1,1); both mean 0; sum
     #   dA*dB = 1 + 1 - 1 - 1 = 0; r = 0.
     # Both of the last 2 sessions sit below the threshold, so the pair is flagged.
-    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(42), config=TOY)
+    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=AS_OF, config=TOY)
     assert result.ok and result.signal == SIGNAL_PAIR_BREAKDOWN
     assert result.skipped == {}
     (record,) = result.records
@@ -144,13 +147,13 @@ def test_breakdown_flagged_and_suggests_hold_1x():
     assert p["run_length"] == 2 and p["breakdown"] is True
     assert p["suggestion"] == {"A1": "hold_1x", "B1": "hold_1x"}
     assert p["live_effect"] == "none"
-    assert record.as_of == day(42) and record.inputs_known_at == day(42)
+    assert record.as_of == AS_OF and record.inputs_known_at == day(42)
 
 
 def test_one_session_below_is_recorded_but_not_flagged():
     # Only day(42) is negated: window ending day(41) is all-agreeing (r = 1, not below the
     # threshold of 1), window ending day(42) has r = 1/sqrt(3). A run of 1 < 2.
-    result = pair_breakdown_shadow(_pair_rows(flip_last=1), as_of=day(42), config=TOY)
+    result = pair_breakdown_shadow(_pair_rows(flip_last=1), as_of=AS_OF, config=TOY)
     (record,) = result.records
     assert record.payload["run_length"] == 1
     assert record.payload["breakdown"] is False
@@ -161,25 +164,26 @@ def test_pairs_below_min_correlation_are_not_evaluated():
     # C1's returns are A1's negated (+1 where A1 is -1): r = -1 with A1 and -19/21 with
     # B1, both below 0.70, so only A1/B1 is evaluated.
     rows = _pair_rows(flip_last=2) + rows_from_returns("C1", [-x for x in _alternating(42)])
-    result = pair_breakdown_shadow(rows, as_of=day(42), config=TOY)
+    result = pair_breakdown_shadow(rows, as_of=AS_OF, config=TOY)
     assert [r.payload["pair"] for r in result.records] == [["A1", "B1"]]
 
 
 def test_no_lookahead_rows_after_as_of_change_nothing():
-    base = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(42), config=TOY)
+    base = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=AS_OF, config=TOY)
     # Wild closes after as_of, for both legs and for a ticker that only exists later.
-    future = (rows_from_closes("A1", [500.0, 1.0, 900.0], start=43)
-              + rows_from_closes("B1", [1.0, 700.0, 2.0], start=43)
-              + rows_from_closes("Z9", [10.0, 20.0], start=43))
-    later = pair_breakdown_shadow(_pair_rows(flip_last=2) + future, as_of=day(42), config=TOY)
+    future = (rows_from_closes("A1", [500.0, 1.0, 900.0], start=44)
+              + rows_from_closes("B1", [1.0, 700.0, 2.0], start=44)
+              + rows_from_closes("Z9", [10.0, 20.0], start=44))
+    later = pair_breakdown_shadow(_pair_rows(flip_last=2) + future, as_of=AS_OF, config=TOY)
     assert later.records == base.records
     assert later.skipped == base.skipped
 
 
 def test_as_of_mid_history_uses_only_data_up_to_it():
-    # At as_of = day(40) the flipped days 41 and 42 have not happened: the last two
-    # windows are all-agreeing (r = 1), so nothing is below and nothing is flagged.
-    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(40),
+    # At as_of = day(41), day(40) is the newest final close: the flipped days 41 and 42
+    # have not happened (the unmarked day(41) bar is still forming and ignored). The last
+    # two windows are all-agreeing (r = 1), so nothing is below and nothing is flagged.
+    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(41),
                                    config=PairBreakdownConfig(rolling_sessions=4, consecutive_sessions=2,
                                                               min_history_sessions=38, min_reference_values=10))
     (record,) = result.records
@@ -190,13 +194,13 @@ def test_as_of_mid_history_uses_only_data_up_to_it():
 def test_insufficient_history_gives_no_record_and_a_reason():
     cfg = PairBreakdownConfig(rolling_sessions=4, consecutive_sessions=2, min_history_sessions=40,
                               min_reference_values=100)  # only 37 reference values exist
-    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(42), config=cfg)
+    result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=AS_OF, config=cfg)
     assert result.ok and result.records == ()
     assert result.skipped == {"A1|B1": "insufficient_history"}
 
 
 def test_stale_prices_fail_closed():
-    # Newest close day(42), as_of 10 days later: beyond the 4-day staleness limit.
+    # Newest close day(42), as_of 10 days later (day 52): beyond the 4-day staleness limit.
     result = pair_breakdown_shadow(_pair_rows(flip_last=2), as_of=day(52), config=TOY)
     assert not result.ok and result.reason == "stale_prices" and result.records == ()
 
@@ -207,14 +211,14 @@ def test_pair_with_a_stale_leg_is_skipped():
     rows = [r for r in _pair_rows(flip_last=2) if not (r["ticker"] == "B1" and r["date"] == day(42))]
     cfg = PairBreakdownConfig(rolling_sessions=4, consecutive_sessions=2, min_history_sessions=40,
                               min_reference_values=10)
-    result = pair_breakdown_shadow(rows, as_of=day(42), config=cfg)
+    result = pair_breakdown_shadow(rows, as_of=AS_OF, config=cfg)
     assert result.records == ()
     assert result.skipped == {"A1|B1": "stale_pair"}
 
 
 def test_malformed_rows_fail_closed():
     rows = _pair_rows(flip_last=2) + [{"ticker": "A1", "date": day(10), "close": 1.0}]  # duplicate
-    result = pair_breakdown_shadow(rows, as_of=day(42), config=TOY)
+    result = pair_breakdown_shadow(rows, as_of=AS_OF, config=TOY)
     assert not result.ok and result.reason == "invalid_input" and result.records == ()
 
 

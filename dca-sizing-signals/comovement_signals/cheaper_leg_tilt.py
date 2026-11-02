@@ -16,8 +16,9 @@ file, and this module is not a SizingSuggester.
 Method, and how lookahead is kept out:
 
   * Leg A is the alphabetically first ticker; the spread is log(A) - c - beta * log(B).
-  * The evaluation session is the pair's newest shared close (on or before ``as_of``;
-    rows after it are dropped by returns.py before anything is read). The FORMATION
+  * The evaluation session is the pair's newest shared close (before ``as_of``, or on it
+    when the caller marks the bar ``final``; returns.py drops later and still-forming
+    bars before anything is read, and only dates on its session calendar count). The FORMATION
     window is the ``formation_sessions`` shared closes strictly before it. The hedge
     ratio beta, intercept c, residual mean and residual sd come from OLS over the
     formation window only, then are frozen and applied to the evaluation close, the
@@ -40,7 +41,12 @@ from dataclasses import dataclass
 from datetime import date
 
 from comovement_signals.clustering import pearson
-from comovement_signals.returns import ComovementInputError, _clean_rows
+from comovement_signals.returns import (
+    DEFAULT_CALENDAR_MIN_SHARE,
+    ComovementInputError,
+    _clean_rows,
+    _session_calendar,
+)
 from comovement_signals.shadow import (
     DEFAULT_MAX_PRICE_STALENESS_DAYS,
     SIGNAL_CHEAPER_LEG_TILT,
@@ -130,7 +136,8 @@ def cheaper_leg_tilt_shadow(
 
     Args:
         close_rows: daily close rows (shape as returns.returns_matrix).
-        as_of: the as-of date; nothing dated later is read.
+        as_of: the as-of date; nothing dated later is read, and a bar dated on it only
+            when the row is marked ``final`` (returns.py).
         config: thresholds.
         pairs: optionally the candidate pairs (either order); default every pair of
             tickers with prices. An explicitly named pair that misses the correlation
@@ -143,7 +150,12 @@ def cheaper_leg_tilt_shadow(
     rows = list(close_rows)
     try:
         matrix = fresh_matrix(rows, as_of, _ALL_SESSIONS, 1, config.max_price_staleness_days)
-        closes = _clean_rows(rows, as_of)
+        # The same rows returns_matrix reads (final-bar and lookahead rules included),
+        # restricted to its session calendar so a stray off-calendar close can never
+        # enter a formation window (PR #2106 review round 1).
+        raw = _clean_rows(rows, as_of)
+        calendar = set(_session_calendar(raw, DEFAULT_CALENDAR_MIN_SHARE))
+        closes = {t: {d: c for d, c in by_date.items() if d in calendar} for t, by_date in raw.items()}
         dollars = _normalise_dollars(pair_dollars or {})
     except ShadowUnavailable as failed:
         return ShadowResult(SIGNAL_CHEAPER_LEG_TILT, as_of, False, failed.reason)

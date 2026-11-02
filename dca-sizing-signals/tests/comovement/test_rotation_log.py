@@ -20,6 +20,9 @@ from ._toy import day, rows_from_closes, rows_from_returns
 
 STAPLES = ("S1", "S2")
 SEMIS = ("M1", "M2")
+# The last toy close is day(3); as_of is the next day so it is final by date (a bar ON
+# as_of counts only when marked final: PR #2106 review).
+AS_OF = day(4)
 TOY = RotationConfig(rolling_sessions=3)
 
 # Log returns on day(1), day(2), day(3):
@@ -42,7 +45,7 @@ def test_regime_value_by_hand():
 
 
 def test_rotation_record_by_hand():
-    result = rotation_log_shadow(_rows(), as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
+    result = rotation_log_shadow(_rows(), as_of=AS_OF, staples=STAPLES, semis=SEMIS, config=TOY)
     assert result.ok and result.signal == SIGNAL_ROTATION_LOG
     (record,) = result.records
     p = record.payload
@@ -59,32 +62,45 @@ def test_rotation_record_by_hand():
 
 
 def test_no_lookahead_rows_after_as_of_change_nothing():
-    base = rotation_log_shadow(_rows(), as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
-    future = rows_from_closes("S1", [1.0, 999.0], start=4) + rows_from_closes("M1", [999.0, 1.0], start=4)
-    later = rotation_log_shadow(_rows() + future, as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
+    base = rotation_log_shadow(_rows(), as_of=AS_OF, staples=STAPLES, semis=SEMIS, config=TOY)
+    future = rows_from_closes("S1", [1.0, 999.0], start=5) + rows_from_closes("M1", [999.0, 1.0], start=5)
+    later = rotation_log_shadow(_rows() + future, as_of=AS_OF, staples=STAPLES, semis=SEMIS, config=TOY)
     assert later.records == base.records
 
 
+def test_bar_on_as_of_counts_only_when_final():
+    # An end-of-day caller marks today's bar final and gets the same record as reading it
+    # the next morning. An unmarked bar dated on as_of is still forming and is ignored, so
+    # as_of = day(3) without the flag leaves only 2 sessions: too few for the 3-window.
+    final_rows = [dict(r, final=True) if r["date"] == day(3) else r for r in _rows()]
+    eod = rotation_log_shadow(final_rows, as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
+    morning = rotation_log_shadow(_rows(), as_of=AS_OF, staples=STAPLES, semis=SEMIS, config=TOY)
+    assert eod.records[0].payload == morning.records[0].payload
+    assert eod.records[0].inputs_known_at == day(3)
+    intraday = rotation_log_shadow(_rows(), as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
+    assert intraday.records == () and intraday.reason == "insufficient_history"
+
+
 def test_insufficient_history_gives_no_record():
-    result = rotation_log_shadow(_rows(), as_of=day(3), staples=STAPLES, semis=SEMIS,
+    result = rotation_log_shadow(_rows(), as_of=AS_OF, staples=STAPLES, semis=SEMIS,
                                  config=RotationConfig(rolling_sessions=4))
     assert result.records == () and result.reason == "insufficient_history"
 
 
 def test_missing_member_on_the_day_gives_no_record():
     rows = [r for r in _rows() if not (r["ticker"] == "M2" and r["date"] == day(3))]
-    result = rotation_log_shadow(rows, as_of=day(3), staples=STAPLES, semis=SEMIS, config=TOY)
+    result = rotation_log_shadow(rows, as_of=AS_OF, staples=STAPLES, semis=SEMIS, config=TOY)
     assert result.records == () and result.reason == "incomplete_group"
 
 
 def test_unknown_member_gives_no_record():
-    result = rotation_log_shadow(_rows(), as_of=day(3), staples=("S1", "S2", "S9"), semis=SEMIS, config=TOY)
+    result = rotation_log_shadow(_rows(), as_of=AS_OF, staples=("S1", "S2", "S9"), semis=SEMIS, config=TOY)
     assert result.records == () and result.reason == "incomplete_group"
 
 
 @pytest.mark.parametrize("staples,semis", [(("S1", "M1"), SEMIS), ((), SEMIS), (STAPLES, ())])
 def test_overlapping_or_empty_groups_are_refused(staples, semis):
-    result = rotation_log_shadow(_rows(), as_of=day(3), staples=staples, semis=semis, config=TOY)
+    result = rotation_log_shadow(_rows(), as_of=AS_OF, staples=staples, semis=semis, config=TOY)
     assert not result.ok and result.reason == "invalid_groups" and result.records == ()
 
 
