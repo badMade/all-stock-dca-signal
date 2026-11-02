@@ -210,10 +210,14 @@ def test_horizon_beyond_the_calendar_is_unscored_not_zero(ledger, staging_dir):
     assert out[20]["unscored_reason"] == "horizon_not_reached"
     assert out[20]["return_pct"] is None  # never 0.0
 
-    # Once the calendar catches up, a re-score appends a scored row; readers see it.
-    ingest_calendar(ledger, run_id="cal-2", as_of=LATER)
-    _score(ledger, run_id="score-2", as_of=KNOW_ALL)
-    assert _by_horizon(ledger, "ord-1")[20]["status"] == "scored"
+    # Once the calendar catches up (learned after the first score), a re-score with the newer
+    # known_at appends a scored row and readers prefer it. (Before the #2101 review fix this
+    # backdated the calendar row to LATER and re-scored at the SAME known_at, a tie that only
+    # resolved by write order.)
+    caught_up = KNOW_ALL + timedelta(days=1)
+    ingest_calendar(ledger, run_id="cal-2", as_of=caught_up)
+    _score(ledger, known_at=caught_up, run_id="score-2", as_of=caught_up)
+    assert _by_horizon(ledger, "ord-1", known_at=caught_up)[20]["status"] == "scored"
 
 
 def test_no_quote_after_the_fill_session_is_unscored(ledger, staging_dir):

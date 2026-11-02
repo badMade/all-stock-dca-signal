@@ -33,6 +33,12 @@ BASELINE_MULTIPLIER = 1.0
 OUTCOME_HORIZONS_SESSIONS: tuple[int, ...] = (5, 20)
 PROMOTION_DSR_THRESHOLD = 0.95
 
+# How many sessions before its horizon session an outcome's quote may be (review of #2101).
+# 0 = the bar must be ON the horizon session; a missing bar is unscored as stale_quote, never
+# silently replaced by an older close. A caller may pass a larger tolerance explicitly; it is
+# stored on every outcome row.
+OUTCOME_QUOTE_TOLERANCE_SESSIONS = 0
+
 # Not an open question: the repo's scheduled/manual vocabulary (docs/run_classification.md,
 # ``run_origin``), stored here as ``run_kind``. Manual runs and manual order ids never enter
 # scheduled metrics.

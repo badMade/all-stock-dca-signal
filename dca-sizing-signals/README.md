@@ -151,8 +151,13 @@ Same rules as the price store: append-only, `content_hash` keys, `ON CONFLICT DO
 `source, as_of, ingested_at, run_id` on every row, latest version wins at `known_at`. Table
 macros (`outcome_candidates`, `outcomes_known_at`, `scheduled_outcomes`, `trial_counts`,
 `universe_members_as_of`, ...) live in the database file. Outcomes use an `ASOF LEFT JOIN` on
-`quote_date <= horizon_session`, so no later quote can leak in; `scheduled_outcomes` drops
-manual runs and every manual order id (`docs/run_classification.md`).
+`quote_date <= horizon_session`, so no later quote can leak in, and the quote must be the
+horizon session's own bar (`OUTCOME_QUOTE_TOLERANCE_SESSIONS = 0`; an older one is
+`stale_quote`). A fill whose session is missing from `market_sessions` is
+`session_not_in_calendar`. `record_outcomes` refuses `as_of` earlier than `known_at`, and the
+reader prefers the row built from the newest `inputs_known_at`. `market_sessions` is
+append-only with no retraction row yet, so a session wrongly ingested as open stays counted.
+`scheduled_outcomes` drops manual runs and every manual order id (`docs/run_classification.md`).
 
 The answers to the ADR's open questions are **proposed defaults, not operator-approved**, kept
 as constants in `market_data_ingest/ledger/defaults.py`: location here; alias =

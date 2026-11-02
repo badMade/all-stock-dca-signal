@@ -16,7 +16,7 @@ DuckDB file as ``market_data_ingest.prices.store.PriceStore``, with the same rul
   broker access, where needed, is injected by the caller, never imported here.
 
 Point-in-time reads are DuckDB table macros stored in the database file, so the DuckDB CLI
-sees the same logic: ``outcome_candidates(known_at, horizons)`` scores each fill and each
+sees the same logic: ``outcome_candidates(known_at, horizons, tolerance)`` scores each fill and each
 baseline row at fixed SESSION horizons with an ``ASOF LEFT JOIN`` on ``quote_date``
 (``horizon_session >= quote_date``), so no quote dated after the horizon session -- or
 ingested after ``known_at`` -- can leak in. ``scheduled_outcomes(known_at)`` drops manual
@@ -43,6 +43,7 @@ from .defaults import (
     BASELINE_MULTIPLIER,
     BASELINE_RULE,
     OUTCOME_HORIZONS_SESSIONS,
+    OUTCOME_QUOTE_TOLERANCE_SESSIONS,
     PROMOTION_DSR_THRESHOLD,
     RUN_KINDS,
 )
@@ -81,10 +82,11 @@ CREATE TABLE IF NOT EXISTS outcomes (
     subject_kind VARCHAR NOT NULL CHECK (subject_kind IN ('fill', 'baseline')),
     subject_id VARCHAR NOT NULL, symbol VARCHAR NOT NULL, session DATE NOT NULL,
     entry_price DOUBLE NOT NULL, notional DOUBLE NOT NULL,
-    horizon_sessions INTEGER NOT NULL, horizon_session DATE, quote_date DATE,
+    horizon_sessions INTEGER NOT NULL, horizon_session DATE, quote_tolerance_sessions INTEGER NOT NULL,
+    quote_date DATE,
     close_raw DOUBLE, price_factor DOUBLE, close_fill_basis DOUBLE, return_pct DOUBLE,
     status VARCHAR NOT NULL CHECK (status IN ('scored', 'unscored')), unscored_reason VARCHAR,
-    known_at TIMESTAMP NOT NULL,
+    inputs_known_at TIMESTAMP NOT NULL,
     {_PROV},
     PRIMARY KEY (subject_kind, subject_id, horizon_sessions, content_hash)
 );
@@ -146,14 +148,31 @@ _SPLIT_TYPES = "('forward_split', 'reverse_split', 'stock_dividend')"
 _MACROS = f"""
 CREATE OR REPLACE MACRO fills_known_at(known_at) AS TABLE {_latest("fills", "order_id")};
 CREATE OR REPLACE MACRO baseline_fills_known_at(known_at) AS TABLE {_latest("baseline_fills", "decision_id")};
+-- Outcomes need two filters and a different order than the other tables (review of #2101):
+-- a row is visible only if it was both WRITTEN (as_of) and BUILT FROM data known (known_at)
+-- (inputs_known_at) by the reader's moment, and among visible rows the one built from the newest information
+-- wins -- a later re-score run with an older known_at must not displace a better-informed one.
+-- The column is inputs_known_at, not known_at, so it cannot collide with the macro parameter
+-- when another macro passes its own known_at through.
 CREATE OR REPLACE MACRO outcomes_known_at(known_at) AS TABLE
-    {_latest("outcomes", "subject_kind, subject_id, horizon_sessions")};
+    SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER (
+        PARTITION BY subject_kind, subject_id, horizon_sessions
+        ORDER BY inputs_known_at DESC, as_of DESC, ingested_at DESC, content_hash) AS rn
+        FROM outcomes WHERE as_of <= known_at AND inputs_known_at <= known_at)
+    WHERE rn = 1;
 
 -- One candidate outcome per (subject, horizon). Horizons count TRADING SESSIONS strictly after
 -- the subject's session, from the market_sessions calendar known at known_at. The quote is the
 -- latest bar ON OR BEFORE the horizon session (ASOF), so a quote dated after it can never be
 -- used; a bar ingested after known_at is invisible through bars_known_at.
-CREATE OR REPLACE MACRO outcome_candidates(known_at, horizons) AS TABLE
+--
+-- ASOF alone would accept a quote of ANY age (review of #2101: a lone t+1 bar was scored as
+-- the t+20 outcome). So the matched quote must itself be a calendar session no more than
+-- ``tolerance`` sessions before the horizon session (default 0: the horizon session exactly);
+-- otherwise the row is unscored as stale_quote. A subject whose own session is missing from
+-- the calendar is unscored (session_not_in_calendar) instead of having every horizon silently
+-- counted one session early. Reasons are checked in that order of precedence.
+CREATE OR REPLACE MACRO outcome_candidates(known_at, horizons, tolerance) AS TABLE
     WITH cal AS (
         SELECT session, row_number() OVER (ORDER BY session) AS n
         FROM (SELECT DISTINCT session FROM market_sessions WHERE as_of <= known_at)),
@@ -163,16 +182,19 @@ CREATE OR REPLACE MACRO outcome_candidates(known_at, horizons) AS TABLE
         UNION ALL
         SELECT 'baseline', decision_id, symbol, session, price, notional FROM baseline_fills_known_at(known_at)),
     based AS (
-        SELECT s.*, (SELECT count(*) FROM cal AS p WHERE p.session <= s.session) AS base_n FROM subj AS s),
+        SELECT s.*, (SELECT count(*) FROM cal AS p WHERE p.session <= s.session) AS base_n,
+            EXISTS (SELECT 1 FROM cal AS p WHERE p.session = s.session) AS in_calendar
+        FROM subj AS s),
     hz AS (SELECT unnest(horizons) AS horizon_sessions),
     targeted AS (
-        SELECT b.*, hz.horizon_sessions, c.session AS horizon_session
+        SELECT b.*, hz.horizon_sessions, c.session AS horizon_session, c.n AS horizon_n
         FROM based AS b CROSS JOIN hz LEFT JOIN cal AS c ON c.n = b.base_n + hz.horizon_sessions),
     quotes AS (SELECT symbol AS q_symbol, session AS quote_date, close AS q_close FROM bars_known_at(known_at)),
     matched AS (
-        SELECT t.*, q.quote_date, q.q_close
+        SELECT t.*, q.quote_date, q.q_close, qc.n AS quote_n
         FROM targeted AS t ASOF LEFT JOIN quotes AS q
-            ON t.symbol = q.q_symbol AND t.horizon_session >= q.quote_date),
+            ON t.symbol = q.q_symbol AND t.horizon_session >= q.quote_date
+        LEFT JOIN cal AS qc ON qc.session = q.quote_date),
     factors AS (
         SELECT m.subject_kind, m.subject_id, m.horizon_sessions, product(a.split_from / a.split_to) AS pf
         FROM matched AS m JOIN actions_known_at(known_at) AS a
@@ -181,11 +203,16 @@ CREATE OR REPLACE MACRO outcome_candidates(known_at, horizons) AS TABLE
         GROUP BY m.subject_kind, m.subject_id, m.horizon_sessions),
     graded AS (
         SELECT m.*, coalesce(f.pf, 1.0) AS pf,
-            CASE WHEN m.horizon_session IS NULL THEN 'horizon_not_reached'
-                 WHEN m.quote_date IS NULL OR m.quote_date <= m.session THEN 'no_quote' END AS unscored_reason
+            CASE WHEN NOT m.in_calendar THEN 'session_not_in_calendar'
+                 WHEN m.horizon_session IS NULL THEN 'horizon_not_reached'
+                 WHEN m.quote_date IS NULL OR m.quote_date <= m.session THEN 'no_quote'
+                 WHEN m.quote_n IS NULL OR m.quote_n < m.horizon_n - tolerance THEN 'stale_quote'
+            END AS unscored_reason
         FROM matched AS m LEFT JOIN factors AS f USING (subject_kind, subject_id, horizon_sessions))
     SELECT subject_kind, subject_id, symbol, session, entry_price, notional,
-        CAST(horizon_sessions AS INTEGER) AS horizon_sessions, horizon_session,
+        CAST(horizon_sessions AS INTEGER) AS horizon_sessions,
+        CASE WHEN in_calendar THEN horizon_session END AS horizon_session,
+        CAST(tolerance AS INTEGER) AS quote_tolerance_sessions,
         CASE WHEN unscored_reason IS NULL THEN quote_date END AS quote_date,
         CASE WHEN unscored_reason IS NULL THEN q_close END AS close_raw,
         CASE WHEN unscored_reason IS NULL THEN pf END AS price_factor,
@@ -515,14 +542,23 @@ class LedgerStore:
         run_id: str,
         as_of: datetime,
         horizons: Sequence[int] = OUTCOME_HORIZONS_SESSIONS,
+        quote_tolerance_sessions: int = OUTCOME_QUOTE_TOLERANCE_SESSIONS,
     ) -> int:
         """Score every fill and baseline row at ``horizons`` as known at ``known_at`` and append
         the results. Unscorable rows are appended as ``unscored`` with a reason, never as zero.
         Identical results to an earlier scoring are dropped by their content hash."""
         if not horizons or not all(isinstance(h, int) and not isinstance(h, bool) and h > 0 for h in horizons):
             raise LedgerValidationError("horizons must be positive integers")
+        tol = quote_tolerance_sessions
+        if not isinstance(tol, int) or isinstance(tol, bool) or tol < 0:
+            raise LedgerValidationError("quote_tolerance_sessions must be a non-negative int")
+        # A score stamped earlier than the information it used would be visible to readers
+        # asking about a moment before that information existed (review of #2101). Fail closed.
+        if to_utc_naive(as_of) < to_utc_naive(known_at):
+            raise LedgerValidationError("as_of must not be earlier than known_at")
         hashed = (
             "sha256(concat_ws('|', subject_kind, subject_id, CAST(horizon_sessions AS VARCHAR), "
+            "CAST(quote_tolerance_sessions AS VARCHAR), "
             + ", ".join(
                 f"coalesce(CAST({c} AS VARCHAR), '-')"
                 for c in ("entry_price", "notional", "horizon_session", "quote_date", "close_raw", "price_factor",
@@ -533,6 +569,7 @@ class LedgerStore:
         params = {
             "known_at": self._known(known_at),
             "horizons": list(horizons),
+            "tolerance": tol,
             "source": OUTCOME_SOURCE,
             "as_of": to_utc_naive(as_of),
             "ingested_at": to_utc_naive(self._clock()),
@@ -543,10 +580,11 @@ class LedgerStore:
             before = self.row_count("outcomes")
             self.con.execute(
                 "INSERT INTO outcomes SELECT subject_kind, subject_id, symbol, session, entry_price, notional, "
-                "horizon_sessions, horizon_session, quote_date, close_raw, price_factor, close_fill_basis, "
+                "horizon_sessions, horizon_session, quote_tolerance_sessions, quote_date, close_raw, price_factor, "
+                "close_fill_basis, "
                 "return_pct, status, unscored_reason, $known_at, "
                 f"{hashed}, $source, $as_of, $ingested_at, $run_id "
-                "FROM outcome_candidates($known_at, $horizons::INTEGER[]) ON CONFLICT DO NOTHING",
+                "FROM outcome_candidates($known_at, $horizons::INTEGER[], $tolerance::INTEGER) ON CONFLICT DO NOTHING",
                 params,
             )
             inserted = self.row_count("outcomes") - before
