@@ -15,7 +15,7 @@ type system and a CI test, not by convention alone:
 | --- | --- |
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
-| `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Not wired into any live path. |
+| `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -80,6 +80,28 @@ pipeline against a small real fixture of split-adjusted Robinhood daily closes.
 
 ```bash
 python -m pytest tests/comovement -q
+```
+
+### Signals 3 to 5 (shadow and log only)
+
+These are not `SizingSuggester`s and cannot influence sizing. Each returns a `ShadowResult`
+(records plus a reason for every pair or day it refused), and `ShadowWriter(directory)`
+appends records to that signal's own file. The writer refuses any other file name
+(including `ml_sizing_adjustment.json` and the two `*_suggestions.json` files), any
+directory with a `config` path component, and any record whose `inputs_known_at` is after
+its `as_of`. Each line has `as_of`, `inputs_known_at`, `signal`, `payload`, `live_effect: "none"`
+and a SHA-256 `content_hash`; an identical line is not appended twice.
+
+| Signal | Function | Default | Shadow file |
+|---|---|---|---|
+| 3 Pair breakdown | `pair_breakdown_shadow(close_rows, as_of)`: pairs with 2-year correlation >= 0.70; flag when the 60-session rolling correlation is strictly below the pair's 2-year 10th percentile (of the earlier rolling values) for 5 sessions; suggests `hold_1x` for both | 504-session lookback, 252 shared returns, 100 reference values | `comovement_pair_breakdown_shadow.jsonl` |
+| 4 Cheaper-leg tilt (speculative) | `cheaper_leg_tilt_shadow(close_rows, as_of, pairs=None, pair_dollars=None)`: pairs with formation correlation >= 0.75; OLS of log A on log B over the 252 closes before the evaluation close only; weight A = clip(0.5 - 0.15 z, 0.2, 0.8) | leg A = alphabetically first | `comovement_tilt_shadow.jsonl` |
+| 5 Rotation log | `rotation_log_shadow(close_rows, as_of, staples, semis)`: mean log return of the caller's staples group minus the semis group, plus its 20-session rolling mean | every group member must have a return | `comovement_rotation_log.jsonl` |
+
+```python
+from comovement_signals import ShadowWriter, pair_breakdown_shadow, write_shadow_result
+result = pair_breakdown_shadow(close_rows, as_of)
+write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
 ```
 
 ## Price source (Massive + Alpaca)
