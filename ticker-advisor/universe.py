@@ -130,6 +130,10 @@ class UniverseConfig:
     bench_max_rank: int = 250
     min_pool_coverage: float = 0.95
     max_quote_age_sessions: int = 3
+    # Calendar-day ceiling on the quote date itself (PR #2100 review: a
+    # caller-supplied session count of 0 on a months-old quote passed). 7
+    # days covers 3 sessions across a weekend plus a holiday or two.
+    max_quote_age_calendar_days: int = 7
     max_edgar_age_days: int = 7
     max_factor_missing_fraction: float = 0.10
     winsor_limit: float = 3.0
@@ -143,7 +147,8 @@ class UniverseConfig:
     def __post_init__(self) -> None:
         positive_ints = (
             "max_active", "min_active", "entry_rank", "incumbent_keep_rank", "sector_cap", "industry_cap",
-            "bench_min_rank", "bench_max_rank", "max_quote_age_sessions", "max_edgar_age_days",
+            "bench_min_rank", "bench_max_rank", "max_quote_age_sessions", "max_quote_age_calendar_days",
+            "max_edgar_age_days",
             "hard_fail_low_price_sessions",
         )
         for name in positive_ints:
@@ -205,11 +210,18 @@ def _candidate_rejections(candidate: Candidate, thresholds: PoolThresholds) -> l
     reasons: list[str] = []
     if not isinstance(candidate.ticker, str) or not TICKER_SYMBOL_PATTERN.match(candidate.ticker):
         reasons.append("invalid_symbol")
-    # `is not True` rather than truthiness: an unknown (None) listing or
-    # eligibility flag is not evidence of eligibility.
-    if candidate.nms_listed is not True:
+    # An unknown (None) flag is never evidence of eligibility, but it is
+    # reported as missing:* rather than as a failed check, so
+    # ineligible_tickers() can tell "the data did not arrive" (an incumbent
+    # holds) apart from "the ticker fails the floor" (an incumbent leaves the
+    # pool) -- PR #2100 review round 1.
+    if candidate.nms_listed is None:
+        reasons.append("missing:nms_listed")
+    elif candidate.nms_listed is not True:
         reasons.append("not_nms_listed")
-    if candidate.security_type != thresholds.required_security_type:
+    if candidate.security_type is None:
+        reasons.append("missing:security_type")
+    elif candidate.security_type != thresholds.required_security_type:
         reasons.append("not_common_stock")
     numeric_floors = (
         ("price", thresholds.min_price, "price_at_or_below_min"),
@@ -227,7 +239,9 @@ def _candidate_rejections(candidate: Candidate, thresholds: PoolThresholds) -> l
         reasons.append("missing:history_sessions")
     elif history < thresholds.min_history_sessions:
         reasons.append("history_too_short")
-    if candidate.fractional_eligible is not True:
+    if candidate.fractional_eligible is None:
+        reasons.append("missing:fractional_eligible")
+    elif candidate.fractional_eligible is not True:
         reasons.append("not_fractional_eligible")
     return reasons
 
@@ -257,6 +271,23 @@ def filter_pool(candidates: Iterable[Candidate], thresholds: PoolThresholds) -> 
         else:
             eligible.append(candidate)
     return PoolResult(eligible=tuple(sorted(eligible, key=lambda c: c.ticker)), rejections=rejections)
+
+
+def ineligible_tickers(pool: PoolResult) -> dict[str, str]:
+    """``{ticker: reasons}`` for tickers that genuinely FAIL a pool floor.
+
+    Only non-``missing:*`` reasons count, and ``duplicate_ticker`` does not
+    count either (ambiguous rows are a data problem, not a verdict). The
+    result is what ``select_universe(..., ineligible=...)`` expects: an
+    incumbent listed here exits, while an incumbent that is merely absent or
+    unscored holds. Reasons are joined with "," in filter order.
+    """
+    out: dict[str, str] = {}
+    for ticker, reasons in pool.rejections.items():
+        failed = [r for r in reasons if not r.startswith("missing:") and r != "duplicate_ticker"]
+        if failed:
+            out[ticker] = ",".join(failed)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -524,6 +555,13 @@ class Proposal:
     reasons: Mapping[str, str]
     pool_stats: PoolStats | None
     config: UniverseConfig
+    # Evidence validate_proposal re-checks per add (PR #2100 review: a
+    # tampered add of a never-ranked symbol passed). ``prior_ranks`` holds
+    # each add's prior-review rank; ``classification`` holds sector/industry
+    # for every active ticker whose classification is known.
+    ineligible_drops: tuple[str, ...] = ()
+    prior_ranks: Mapping[str, int] = field(default_factory=dict)
+    classification: Mapping[str, Mapping[str, str | None]] = field(default_factory=dict)
     status: str = "unvalidated"
     safeguard_failures: tuple[SafeguardFailure, ...] = ()
     recommended_active: tuple[str, ...] = ()
@@ -566,26 +604,42 @@ def select_universe(
     as_of_date: date,
     generated_at: datetime,
     pool_stats: PoolStats | None = None,
+    ineligible: Mapping[str, str] | None = None,
 ) -> Proposal:
     """Apply the spec's selection rule and return an unvalidated Proposal.
 
+    ``ineligible`` maps tickers that genuinely fail a pool floor to the
+    reason (see ``ineligible_tickers``). It is deliberately separate from
+    "absent from ``scores_now``": absent means missing data (hold), listed
+    here means the ticker left the pool (exit).
+
     Order of operations (each step's reason code lands in ``reasons``):
 
+    0. Hard-failed and pool-ineligible tickers are removed BEFORE ranking,
+       so they never occupy a rank slot and shift the 75/150 edges.
     1. Hard-fail incumbents exit unconditionally -- rank and tenure do not
        protect them, and these exits do not use the swap budget.
-    2. Incumbents with no score this review are held (missing data never
-       demotes).
+    2. Pool-ineligible incumbents become exit candidates ahead of any
+       rank-based one. Leaving the pool is a rule exit, not a rank-based
+       one, so the min-tenure protection does not apply; it is not a hard
+       fail either, so it does use the swap budget.
+    3. Incumbents with no score this review (and not ineligible) are held
+       (missing data never demotes).
     3. Remaining incumbents are walked best rank first: inside the keep band
        and within caps -> hold; outside the band or over a cap -> exit
        candidate, unless tenure is below ``min_tenure_quarters`` (hold).
-    4. Exit candidates leave worst rank first, at most ``max_swaps``; the
-       rest are deferred (held) to a later review.
+    4. Exit candidates leave (pool exits in ticker order, then worst rank
+       first), at most ``max_swaps``; the rest are deferred to a later review.
     5. Non-members ranked inside the entry band now AND at the prior review
        enter in rank order while there is room, swap budget (hard-fail
        vacancies + ``max_swaps``) and sector/industry headroom.
     6. Bench = scored non-members ranked ``bench_min_rank..bench_max_rank``.
     """
-    ranks = rank_tickers(scores_now)
+    ineligible = dict(ineligible or {})
+    # Excluded before ranking (PR #2100 review round 1: a hard-failed #1 kept
+    # the true #2 out of a 2-wide entry band and pushed an incumbent out of
+    # the keep band, because it still occupied rank 1).
+    ranks = rank_tickers({t: s for t, s in scores_now.items() if t not in hard_fails and t not in ineligible})
     reasons: dict[str, str] = {}
     caps = _CapCounter(config)
     prior_active = tuple(sorted(incumbents_with_tenure))
@@ -601,9 +655,17 @@ def select_universe(
     for ticker in hard_fail_drops:
         reasons[ticker] = f"drop:hard_fail:{hard_fails[ticker]}"
 
+    for ticker in sorted(scores_now):
+        if ticker in hard_fails and ticker not in incumbents_with_tenure:
+            reasons[ticker] = "skip:hard_fail"
+
+    pool_exit_candidates = [
+        (t, f"drop:left_pool:{ineligible[t]}") for t in prior_active if t not in hard_fails and t in ineligible
+    ]
+
     holds: list[str] = []
     for ticker in prior_active:
-        if ticker not in hard_fails and ticker not in ranks:
+        if ticker not in hard_fails and ticker not in ineligible and ticker not in ranks:
             holds.append(ticker)
             reasons[ticker] = "hold:missing_data"
             caps.add(*sector_of(ticker))
@@ -640,7 +702,7 @@ def select_universe(
     # cap-excess name can only block entrants, never a better incumbent.
     exit_candidates.sort(key=lambda tr: -ranks[tr[0]])
     rank_drops: list[str] = []
-    for ticker, exit_reason in exit_candidates:
+    for ticker, exit_reason in [*pool_exit_candidates, *exit_candidates]:
         if len(rank_drops) < config.max_swaps:
             rank_drops.append(ticker)
             reasons[ticker] = exit_reason
@@ -658,9 +720,6 @@ def select_universe(
         if ranks[ticker] > config.entry_rank:
             break
         if ticker in incumbents_with_tenure:
-            continue
-        if ticker in hard_fails:
-            reasons[ticker] = "skip:hard_fail"
             continue
         prior_rank = _strict_int(ranks_prior_review.get(ticker))
         if prior_rank is None or prior_rank < 1 or prior_rank > config.entry_rank:
@@ -688,6 +747,11 @@ def select_universe(
         for t in sorted(ranks, key=lambda t: ranks[t])
         if config.bench_min_rank <= ranks[t] <= config.bench_max_rank and t not in active_set and t not in hard_fails
     )
+    classification = {}
+    for ticker in active:
+        sector, industry = sector_of(ticker)
+        if sector is not None or industry is not None:
+            classification[ticker] = {"sector": sector, "industry": industry}
     return Proposal(
         review_id=review_id,
         as_of_date=as_of_date,
@@ -703,6 +767,9 @@ def select_universe(
         reasons=reasons,
         pool_stats=pool_stats,
         config=config,
+        ineligible_drops=tuple(sorted(t for t in rank_drops if t in ineligible)),
+        prior_ranks={t: ranks_prior_review[t] for t in adds},
+        classification=classification,
     )
 
 
@@ -749,6 +816,10 @@ def _membership_failures(proposal: Proposal) -> list[SafeguardFailure]:
         problems.append("adds overlap prior members")
     if not drops <= prior or not set(proposal.hard_fail_drops) <= drops:
         problems.append("drops not drawn from prior members")
+    # A pool exit is exempt from the missing-data check below, so it must be
+    # a real drop and never double as a hard fail.
+    if not set(proposal.ineligible_drops) <= drops - set(proposal.hard_fail_drops):
+        problems.append("ineligible_drops not a subset of non-hard-fail drops")
     if holds != prior - drops:
         problems.append("holds != prior - drops")
     if active != holds | adds:
@@ -786,9 +857,12 @@ def validate_proposal(
     # Missing data must hold, never demote: a rank-based drop of a ticker
     # with no rank this review can only come from a tampered or buggy
     # proposal.
-    unranked = sorted(t for t in set(proposal.drops) - set(proposal.hard_fail_drops) if t not in proposal.ranks)
+    rule_drops = set(proposal.hard_fail_drops) | set(proposal.ineligible_drops)
+    unranked = sorted(t for t in set(proposal.drops) - rule_drops if t not in proposal.ranks)
     if unranked:
         failures.append(SafeguardFailure("demoted_on_missing_data", ",".join(unranked)))
+
+    failures.extend(_add_failures(proposal, config))
 
     pool = proposal.pool_stats
     pool_size = None if pool is None else _strict_int(pool.pool_size)
@@ -824,6 +898,46 @@ def validate_proposal(
     return failures
 
 
+def _add_failures(proposal: Proposal, config: UniverseConfig) -> list[SafeguardFailure]:
+    """Re-check every add against the entry rule instead of trusting it.
+
+    PR #2100 review round 1: membership consistency alone let a tampered
+    proposal add an unscored, never-ranked symbol. Each add must be ranked
+    inside the entry band now, have been inside it at the prior review,
+    carry a known sector and industry, and leave both within their caps.
+    Caps are counted over the whole active list: select_universe only adds
+    into a bucket below its cap, so a genuine add never sits in an over-cap
+    bucket even when tenure-protected incumbents push that bucket over.
+    """
+    sector_counts: dict[str, int] = {}
+    industry_counts: dict[str, int] = {}
+    for ticker in proposal.active:
+        info = proposal.classification.get(ticker) or {}
+        if info.get("sector") is not None:
+            sector_counts[info["sector"]] = sector_counts.get(info["sector"], 0) + 1
+        if info.get("industry") is not None:
+            industry_counts[info["industry"]] = industry_counts.get(info["industry"], 0) + 1
+    problems = []
+    for ticker in proposal.adds:
+        rank = _strict_int(proposal.ranks.get(ticker))
+        prior = _strict_int(proposal.prior_ranks.get(ticker))
+        info = proposal.classification.get(ticker) or {}
+        sector, industry = info.get("sector"), info.get("industry")
+        if rank is None or not 1 <= rank <= config.entry_rank:
+            problems.append(f"{ticker}: rank {rank!r} outside entry band {config.entry_rank}")
+        elif prior is None or not 1 <= prior <= config.entry_rank:
+            problems.append(f"{ticker}: prior-review rank {prior!r} outside entry band {config.entry_rank}")
+        elif sector is None or industry is None:
+            problems.append(f"{ticker}: sector/industry unknown")
+        elif sector_counts.get(sector, 0) > config.sector_cap:
+            problems.append(f"{ticker}: sector {sector} has {sector_counts[sector]} > cap {config.sector_cap}")
+        elif industry_counts.get(industry, 0) > config.industry_cap:
+            problems.append(
+                f"{ticker}: industry {industry} has {industry_counts[industry]} > cap {config.industry_cap}"
+            )
+    return [SafeguardFailure("add_not_qualified", "; ".join(problems))] if problems else []
+
+
 def _freshness_failures(
     as_of: date, freshness: InputFreshness | None, config: UniverseConfig
 ) -> list[SafeguardFailure]:
@@ -845,6 +959,20 @@ def _freshness_failures(
         failures.append(SafeguardFailure("edgar_date_after_as_of", f"{freshness.edgar_refreshed_date} > {as_of}"))
     if age > config.max_quote_age_sessions:
         failures.append(SafeguardFailure("stale_quotes", f"{age} sessions > {config.max_quote_age_sessions}"))
+    quote_days = (as_of - freshness.quote_date).days
+    # The session count is caller-supplied (no holiday calendar here), so it
+    # is cross-checked against the dates it claims to describe: more
+    # sessions than calendar days is impossible, and the quote date itself
+    # has a calendar ceiling (PR #2100 review: age 0 on a 10-month-old quote
+    # passed).
+    if 0 <= quote_days < age:
+        failures.append(SafeguardFailure("freshness_inconsistent", f"{age} sessions in {quote_days} calendar days"))
+    if quote_days > config.max_quote_age_calendar_days:
+        failures.append(
+            SafeguardFailure(
+                "stale_quotes_calendar", f"quote {quote_days} days old > {config.max_quote_age_calendar_days}"
+            )
+        )
     edgar_age = (as_of - freshness.edgar_refreshed_date).days
     if edgar_age > config.max_edgar_age_days:
         failures.append(SafeguardFailure("stale_edgar", f"{edgar_age} days > {config.max_edgar_age_days}"))
@@ -862,13 +990,21 @@ def apply_safeguards(
     Pass -> ``status="pending_approval"`` (still only a proposal; the
     operator approves or nothing changes). Any failure ->
     ``status="rejected"`` with ``recommended_active`` = the last approved
-    list, so a consumer that reads only that field cannot pick up a
-    rejected membership by accident.
+    list MINUS its hard-fail drops, so a consumer that reads only that field
+    cannot pick up a rejected membership by accident -- and cannot keep
+    buying a delisted, fractional-ineligible, sub-$5 or being-acquired name
+    either (PR #2100 review round 1: hard fails pushing the list below
+    ``min_active`` made the fallback restore them). Pool-floor exits are NOT
+    applied on rejection: they are rule exits that the rejected proposal
+    did not get approval for, unlike hard fails, which are never safe to
+    keep buying.
     """
     failures = tuple(validate_proposal(proposal, prior_run_stats, input_freshness, config))
     if failures:
+        hard = set(proposal.hard_fail_drops)
+        fallback = tuple(t for t in proposal.prior_active if t not in hard)
         return dataclasses.replace(
-            proposal, status="rejected", safeguard_failures=failures, recommended_active=proposal.prior_active
+            proposal, status="rejected", safeguard_failures=failures, recommended_active=fallback
         )
     return dataclasses.replace(
         proposal, status="pending_approval", safeguard_failures=(), recommended_active=proposal.active
@@ -909,6 +1045,9 @@ def proposal_to_dict(proposal: Proposal) -> dict:
         "adds": list(proposal.adds),
         "drops": list(proposal.drops),
         "hard_fail_drops": list(proposal.hard_fail_drops),
+        "ineligible_drops": list(proposal.ineligible_drops),
+        "prior_ranks": dict(proposal.prior_ranks),
+        "classification": {t: dict(c) for t, c in proposal.classification.items()},
         "holds": list(proposal.holds),
         "bench": list(proposal.bench),
         "rank_based_swaps": rank_based_swap_count(proposal),

@@ -134,7 +134,9 @@ Nothing in the repo imports it, and it is not wired into live sizing or any sche
 | Output | `proposal_to_dict`, `write_proposal` | `universe_proposal.json` with `review_id`, `as_of_date`, `generated_at`, per-ticker reasons, safeguard results, and a `content_sha256` that excludes `generated_at` |
 
 Every threshold is a `UniverseConfig` / `PoolThresholds` field defaulting to the spec value. One
-ticker with missing data is **held**, never demoted. Ties break by ticker symbol, so output is
+ticker with missing data is **held**, never demoted; an incumbent that genuinely fails a pool floor
+(pass `ineligible=ineligible_tickers(pool)`) exits, using the swap budget. Hard-failed names are
+removed before ranking, and stay removed even when a proposal is rejected. Ties break by ticker symbol, so output is
 deterministic. A passing proposal is `pending_approval`, not approved; operator approval and any
 executor wiring (reading an approved list instead of `config/tickers.json`) need their own ADR.
 Tests: `python -m pytest tests/test_universe.py -q` (synthetic, hand-computed inputs only).
