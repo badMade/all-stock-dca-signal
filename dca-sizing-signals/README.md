@@ -231,6 +231,28 @@ with LedgerStore("data/backfill.duckdb") as ledger:
 
 Tests: `python -m pytest tests/ledger` (offline, synthetic hand-computed fixtures).
 
+### Cash-secured put shadow log (research only, never trades)
+
+`market_data_ingest/ledger/csp_shadow.py` implements the **proposed** ADR
+`docs/adr-csp-shadow-log.md` (PR #2103). It records "would sell this put at the bid" rows and
+settles them later. It cannot trade: it names no broker order tool, makes no network call, and
+`tests/ledger/test_csp_shadow_no_orders.py` fails the build if that changes. It keeps its own
+append-only tables (`csp_shadow_entries`, `csp_shadow_settlements`) via
+`ensure_csp_schema(con)`, under the same rules as the ledger.
+
+| Function | Does |
+|---|---|
+| `select_candidates(...)` | At most one put per active ticker per session: 25-45 days, delta -0.30 to -0.15, spread <= 10% of mid, strike <= ladder buy price, collateral <= 10% of the account per contract and <= 25% in total, none in a sector above 30%, none in a tax-loss pause. Stale, future or non-finite data drops the row with a reason |
+| `record_shadow_entries(con, ...)` | Entries at the **bid** (`entry_price = bid` is also a schema check) |
+| `settle(...)` | OTM expires (premium kept); ITM assigned at strike (cost = strike - premium); early close at the **ask**; unknown price = `unscored`; ex-dividend and deep-ITM flags |
+| `scorecard(...)` | Return on locked collateral vs the 3.60% sweep and plain DCA, worst loss vs 12 months of premium, early-assignment risk counts, pass bar (never before 6 months and 20 settled trades, never with an expired trade still unscored; only trades settled by `as_of` count) |
+| `open_short_puts(con, as_of)`, `tax_loss_blocked_tickers` | Open shadow puts, for the tax-loss eligibility check |
+
+A scored settlement is never superseded by a later unscored one. Sector exposure counts
+holdings, open shadow puts and earlier picks in the same run; a sector missing from the
+holdings map, or `paused_tickers=None` (pause list unknown), yields no candidates. The
+thresholds are proposed defaults in `CspShadowConfig`, not operator-approved.
+
 ## Status
 
 Architecture and boundary tests are real and passing. `edgar_fundamentals.py` and
