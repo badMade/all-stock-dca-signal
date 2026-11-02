@@ -9,7 +9,9 @@ from comovement_signals import ComovementConfig, ComovementInputs
 
 from ._toy import day, three_block_rows
 
-AS_OF = day(8)
+# The last toy close is day(8); as_of is the next day, so every close is final by date
+# (a bar dated ON as_of counts only when marked final, review round 1).
+AS_OF = day(9)
 # The toy history is 8 returns long, so the 120-session production minimum is lowered to 8
 # here. Every other threshold is the ADR default.
 TOY_CONFIG = ComovementConfig(min_sessions=8, min_overlap_sessions=8)

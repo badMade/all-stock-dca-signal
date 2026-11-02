@@ -138,7 +138,7 @@ def test_too_few_clusterable_tickers_fails_closed():
 
 
 def test_selloff_stale_day_returns_fail_closed():
-    _assert_fail_closed(_selloff(toy_inputs(day_returns_session=day(7))), "stale_day_returns")
+    _assert_fail_closed(_selloff(toy_inputs(day_returns_session=day(8))), "stale_day_returns")
 
 
 def test_selloff_missing_day_returns_fail_closed():
@@ -158,6 +158,80 @@ def test_cluster_cap_does_not_need_day_returns():
 def test_lookahead_row_changes_no_suggestion():
     # A row dated after as_of (a crash in A1) must not change a single suggestion.
     base = _cap().evaluate(AS_OF)
-    rows = toy_inputs().close_rows + [{"ticker": "A1", "date": day(9), "close": 1.0}]
+    # day(9) is ON as_of and not marked final (a forming bar); day(10) is after it.
+    rows = toy_inputs().close_rows + [{"ticker": "A1", "date": day(9), "close": 1.0},
+                                      {"ticker": "A2", "date": day(10), "close": 1.0, "final": True}]
     after = _cap(toy_inputs(close_rows=rows)).evaluate(AS_OF)
     assert after.ok and after.suggestions == base.suggestions and after.clusters == base.clusters
+
+
+# ---------------------------------------------------------------- review round 1 (PR #2106)
+
+
+def test_same_day_new_inputs_are_not_served_from_cache():
+    # Item 1: a later call on the same as-of date with different proposed buys must be
+    # recomputed. First call: block A spends $100 > $70 cap (0.7). Second: block A spends
+    # 30 + 20 + 20 = $70, exactly the cap, so no scale-down.
+    state = {"inputs": toy_inputs()}
+    s = ClusterCapSuggester(lambda a: state["inputs"], config=TOY_CONFIG, clock=clock)
+    assert s.suggest("A1", AS_OF).multiplier_adjustment_pct == pytest.approx(-30.0)
+    state["inputs"] = toy_inputs(proposed_buys_usd_by_ticker={"A1": 30.0, "A2": 20.0, "A3": 20.0})
+    assert s.suggest("A1", AS_OF).multiplier_adjustment_pct == 0.0
+
+
+def test_failure_is_never_cached():
+    # Item 1: a transient loader failure must not stick for the rest of the day.
+    calls = {"n": 0}
+
+    def flaky(asof):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+        return toy_inputs()
+
+    s = ClusterCapSuggester(flaky, config=TOY_CONFIG, clock=clock)
+    assert s.evaluate(AS_OF).reason == "input_load_failed"
+    assert s.evaluate(AS_OF).ok
+
+
+def test_unscored_sentinel_can_never_win_an_mae_gate():
+    # Item 2: no in-memory "perfect" MAE. The metric is +inf (worse than any real MAE) and
+    # the suggestion says scored=False; the shared base publisher's own gate refuses it.
+    import math
+
+    from comovement_signals import ComovementSuggestion
+    from dca_shared_interfaces.publishing import SuggestionPublisher
+
+    s = _cap().suggest("A1", AS_OF)
+    assert isinstance(s, ComovementSuggestion)
+    assert s.scored is False
+    assert math.isinf(s.eval_metric_mae) and s.eval_metric_mae > 0
+    assert sorted([s.eval_metric_mae, 0.5, 3.0])[0] == 0.5  # any real MAE ranks ahead
+
+    class _MaeGated(SuggestionPublisher):
+        def validate_bounds(self, suggestion):
+            return True
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        res = _MaeGated(Path(d) / "x.json").publish(s)
+        assert (res.published, res.status) == (False, "blocked_missing_eval_metric")
+        assert not (Path(d) / "x.json").exists()
+
+
+@pytest.mark.parametrize("bad", [None, {"close_rows": []}, "inputs", 42])
+def test_loader_returning_wrong_type_fails_closed(bad):
+    # Item 4: never an AttributeError; a fail-closed outcome instead.
+    _assert_fail_closed(ClusterCapSuggester(lambda a: bad, config=TOY_CONFIG, clock=clock), "invalid_input")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("proposed_buys_usd_by_ticker", [("A1", 40.0)]),
+    ("close_rows", "not rows"),
+    ("day_returns_by_ticker", [0.01]),
+    ("escalation_usd_by_ticker", 5),
+])
+def test_wrongly_typed_input_field_fails_closed(field, value):
+    _assert_fail_closed(_selloff(toy_inputs(**{field: value})), "invalid_input")
