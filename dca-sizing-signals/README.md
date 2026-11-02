@@ -8,13 +8,14 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Three packages that only depend on each other in one direction, enforced by both the
+Four packages that only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
 | --- | --- |
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
+| `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -51,6 +52,56 @@ cd dca-sizing-signals
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest tests/
+```
+
+## Co-movement signals (research only)
+
+`comovement_signals/` implements signals 1 and 2 of `docs/adr-comovement-signals.md`
+(operator decision 2026-11-01: pairs and co-movement as signals, not a pairs strategy).
+
+| Step | Function | Default |
+|---|---|---|
+| Returns | `returns_matrix(close_rows, as_of)`: daily log returns. Rows after `as_of`, rows on `as_of` not marked `final: True` (a forming intraday bar), and `interpolated` rows are ignored; a date counts as a session only when half the listed tickers have a close on it | 252-session window; fewer than 120 returns = singleton |
+| Clusters | `build_clusters(matrix)`: average linkage on 1 - correlation, ties broken by ticker | cut 0.5; pairs need 120 shared sessions |
+| Signal 1 | `cluster_cap_suggestions(...)`: scale an over-cap cluster (2+ members) to the cap | 35% of the day's budget; multiplier floor 0.25 |
+| Signal 2 | `correlated_selloff(...)`: mark clusters with 60% of 3+ scored members down 2% or more; their escalations share one budget equal to the largest member's; plus a universe-wide flag | 60%, -2%, 3 members |
+
+`ClusterCapSuggester` and `CorrelatedSelloffSuggester` take a `load_inputs(asof)` callable
+and fail closed: any missing, stale (newest close more than 4 days old, day returns not
+for `asof`) or malformed input, or a failed clustering check, gives `ok=False` with a
+reason and publishes nothing. `publish_outcome()` writes only
+`comovement_cluster_cap_suggestions.json` or `comovement_correlated_selloff_suggestions.json`
+to a directory the caller picks; the publisher refuses any other file name. Multipliers
+are bounded to [0.25, 1.0]. These rules are not yet scored by the Phase 0 ledger, so each
+`ComovementSuggestion` has `scored=False` and an `eval_metric_mae` of `+inf` (it can never
+win an MAE comparison, and the shared MAE-gated publisher refuses it), and the files record
+`"mae": null, "scored": false`. `tests/comovement/test_real_fixture.py` checks the
+pipeline against a small real fixture of split-adjusted Robinhood daily closes.
+
+```bash
+python -m pytest tests/comovement -q
+```
+
+### Signals 3 to 5 (shadow and log only)
+
+These are not `SizingSuggester`s and cannot influence sizing. Each returns a `ShadowResult`
+(records plus a reason for every pair or day it refused), and `ShadowWriter(directory)`
+appends records to that signal's own file. The writer refuses any other file name
+(including `ml_sizing_adjustment.json` and the two `*_suggestions.json` files), any
+directory with a `config` path component, and any record whose `inputs_known_at` is after
+its `as_of`. Each line has `as_of`, `inputs_known_at`, `signal`, `payload`, `live_effect: "none"`
+and a SHA-256 `content_hash`; an identical line is not appended twice.
+
+| Signal | Function | Default | Shadow file |
+|---|---|---|---|
+| 3 Pair breakdown | `pair_breakdown_shadow(close_rows, as_of)`: pairs with 2-year correlation >= 0.70; flag when the 60-session rolling correlation is strictly below the pair's 2-year 10th percentile (of the earlier rolling values) for 5 sessions; suggests `hold_1x` for both | 504-session lookback, 252 shared returns, 100 reference values | `comovement_pair_breakdown_shadow.jsonl` |
+| 4 Cheaper-leg tilt (speculative) | `cheaper_leg_tilt_shadow(close_rows, as_of, pairs=None, pair_dollars=None)`: pairs with formation correlation >= 0.75; OLS of log A on log B over the 252 closes before the evaluation close only; weight A = clip(0.5 - 0.15 z, 0.2, 0.8) | leg A = alphabetically first | `comovement_tilt_shadow.jsonl` |
+| 5 Rotation log | `rotation_log_shadow(close_rows, as_of, staples, semis)`: mean log return of the caller's staples group minus the semis group, plus its 20-session rolling mean | every group member must have a return | `comovement_rotation_log.jsonl` |
+
+```python
+from comovement_signals import ShadowWriter, pair_breakdown_shadow, write_shadow_result
+result = pair_breakdown_shadow(close_rows, as_of)
+write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
 ```
 
 ## Price source (Massive + Alpaca)

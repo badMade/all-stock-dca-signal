@@ -15,7 +15,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["dca_shared_interfaces*", "connector_signals*", "market_data_ingest*"]
+include = ["dca_shared_interfaces*", "connector_signals*", "market_data_ingest*", "comovement_signals*"]
 
 [tool.pytest.ini_options]
 markers = [
