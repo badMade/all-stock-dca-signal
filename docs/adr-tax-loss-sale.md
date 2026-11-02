@@ -24,6 +24,10 @@ tickers almost every trading day, so:
 - a buy pause that starts **at** the sale is not enough: lots bought in the 30 days before the
   sale also trigger the rule for the matching shares;
 - buys in the operator's other accounts, dividend reinvestment, and manual orders count too.
+- the operator's Robinhood login also holds managed accounts (Robinhood-managed individual and
+  Roth IRA portfolios, read-only to this system) and self-directed IRAs. A managed portfolio can
+  buy the same ticker on its own schedule, and an IRA purchase makes the loss permanently
+  disallowed, so the lookback must read every account, not only the agentic one.
 
 ## Decision (proposed)
 
