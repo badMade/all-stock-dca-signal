@@ -28,6 +28,11 @@ tickers almost every trading day, so:
   Roth IRA portfolios, read-only to this system) and self-directed IRAs. A managed portfolio can
   buy the same ticker on its own schedule, and an IRA purchase makes the loss permanently
   disallowed, so the lookback must read every account, not only the agentic one.
+- precision notes (independent review, 2026-11-02): in a taxable account a washed loss is
+  deferred into the replacement shares' basis, not lost; shares bought in the prior 30 days do
+  not wash a loss when those same shares are part of the sale, so the pre-sale pause is
+  conservative rather than strictly required when every lot is sold; recurring investments,
+  dividend reinvestment and a spouse's purchases also count.
 
 ## Decision (proposed)
 
@@ -63,7 +68,7 @@ tickers almost every trading day, so:
 | 3 | Lot selection | Highest-cost lots first; confirm Robinhood supports specific-lot sells before relying on it |
 | 4 | How the executor enforces the pause | Interim: operator adds the ticker to the existing exclusion list for the pause period. Later: a dedicated pause file read by all three entry points, in its own ADR |
 | 5 | Should the bench or universe rules buy a substitute during the pause? | No |
-| 6 | Year-end timing | Proposals in November and December need the pre-sale pause started by early November to sell before December 31 |
+| 6 | Year-end timing | For a December 31 trade-date sale, the pre-sale pause must start by about December 1; start in November for margin |
 
 ## Consequences
 
