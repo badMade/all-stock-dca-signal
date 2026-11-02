@@ -8,13 +8,14 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Three packages that only depend on each other in one direction, enforced by both the
+Four packages that only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
 | --- | --- |
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
+| `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -51,6 +52,31 @@ cd dca-sizing-signals
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest tests/
+```
+
+## Co-movement signals (research only)
+
+`comovement_signals/` implements signals 1 and 2 of `docs/adr-comovement-signals.md`
+(operator decision 2026-11-01: pairs and co-movement as signals, not a pairs strategy).
+
+| Step | Function | Default |
+|---|---|---|
+| Returns | `returns_matrix(close_rows, as_of)`: daily log returns, rows dated after `as_of` and `interpolated` rows ignored | 252-session window; fewer than 120 returns = singleton |
+| Clusters | `build_clusters(matrix)`: average linkage on 1 - correlation, ties broken by ticker | cut 0.5; pairs need 120 shared sessions |
+| Signal 1 | `cluster_cap_suggestions(...)`: scale an over-cap cluster (2+ members) to the cap | 35% of the day's budget; multiplier floor 0.25 |
+| Signal 2 | `correlated_selloff(...)`: mark clusters with 60% of 3+ scored members down 2% or more; their escalations share one budget equal to the largest member's; plus a universe-wide flag | 60%, -2%, 3 members |
+
+`ClusterCapSuggester` and `CorrelatedSelloffSuggester` take a `load_inputs(asof)` callable
+and fail closed: any missing, stale (newest close more than 4 days old, day returns not
+for `asof`) or malformed input, or a failed clustering check, gives `ok=False` with a
+reason and publishes nothing. `publish_outcome()` writes only
+`comovement_cluster_cap_suggestions.json` or `comovement_correlated_selloff_suggestions.json`
+to a directory the caller picks; the publisher refuses any other file name. Multipliers
+are bounded to [0.25, 1.0]. The files record `"mae": null` because these rules are not
+yet scored by the Phase 0 ledger.
+
+```bash
+python -m pytest tests/comovement -q
 ```
 
 ## Price source (Massive + Alpaca)
