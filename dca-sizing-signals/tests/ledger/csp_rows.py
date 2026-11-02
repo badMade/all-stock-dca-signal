@@ -87,7 +87,10 @@ def account(*, value: float = ACCOUNT_VALUE, sectors: dict | None = None, holdin
         sector_by_ticker=sectors if sectors is not None else {"ZZZA": "synthetic-a", "ZZZB": "synthetic-b",
                                                               "ZZZC": "synthetic-c"},
         sector_value_by_sector=holdings if holdings is not None else {"synthetic-a": 10_000.0,
-                                                                      "synthetic-b": 10_000.0},
+                                                                      "synthetic-b": 10_000.0,
+                                                                      # Held nothing, said explicitly: a sector
+                                                                      # MISSING from this map fails closed.
+                                                                      "synthetic-c": 0.0},
     )
 
 
@@ -102,7 +105,7 @@ def select(rows, *, quotes=None, ladder=None, active=("ZZZA", "ZZZB", "ZZZC"), p
         # The graded ladder would buy each name at $48.00 today, so strikes up to 48 qualify.
         ladder if ladder is not None else {"ZZZA": 48.0, "ZZZB": 48.0, "ZZZC": 48.0},
         frozenset(active),
-        frozenset(paused),
+        None if paused is None else frozenset(paused),
         as_of,
         config or DEFAULT_CONFIG,
         account=account() if acct == "default" else acct,

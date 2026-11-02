@@ -233,7 +233,7 @@ def test_total_open_shadow_collateral_cap_is_twenty_five_percent():
     for name in ("ZZZD", "ZZZE", "ZZZF", "ZZZG"):
         s = select([chain_row(name, strike=50.0, bid=1.00, ask=1.08)], active=(name,),
                    quotes={name: underlying(price=55.0)}, ladder={name: 52.0},
-                   acct=account(sectors={name: "synthetic-z"}, holdings={})).suggestions[0]
+                   acct=account(sectors={name: "synthetic-z"}, holdings={"synthetic-z": 0.0})).suggestions[0]
         opens.append(entry_from_suggestion(s))
     assert sum(o.collateral for o in opens) == pytest.approx(20_000.0)
     # Cap is $25,000. ZZZA (yield 0.95/45, higher) is taken first: 20,000 + 4,500 = 24,500 <= 25,000.
@@ -248,7 +248,8 @@ def test_open_positions_that_have_expired_do_not_count_toward_the_total_cap():
     from market_data_ingest.ledger.csp_shadow import entry_from_suggestion
 
     old = select([chain_row("ZZZD", strike=48.0)], active=("ZZZD",), ladder={"ZZZD": 48.0},
-                 quotes={"ZZZD": underlying()}, acct=account(sectors={"ZZZD": "synthetic-z"}, holdings={}))
+                 quotes={"ZZZD": underlying()},
+                 acct=account(sectors={"ZZZD": "synthetic-z"}, holdings={"synthetic-z": 0.0}))
     entry = entry_from_suggestion(old.suggestions[0])
     expired = dataclasses.replace(entry, expiration_date=date(2026, 2, 27))
     # Expired before the session: neither blocks ZZZD by "open put" nor locks collateral.
