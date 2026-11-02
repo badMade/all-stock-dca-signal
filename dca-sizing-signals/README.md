@@ -61,7 +61,7 @@ python -m pytest tests/
 
 | Step | Function | Default |
 |---|---|---|
-| Returns | `returns_matrix(close_rows, as_of)`: daily log returns, rows dated after `as_of` and `interpolated` rows ignored | 252-session window; fewer than 120 returns = singleton |
+| Returns | `returns_matrix(close_rows, as_of)`: daily log returns. Rows after `as_of`, rows on `as_of` not marked `final: True` (a forming intraday bar), and `interpolated` rows are ignored; a date counts as a session only when half the listed tickers have a close on it | 252-session window; fewer than 120 returns = singleton |
 | Clusters | `build_clusters(matrix)`: average linkage on 1 - correlation, ties broken by ticker | cut 0.5; pairs need 120 shared sessions |
 | Signal 1 | `cluster_cap_suggestions(...)`: scale an over-cap cluster (2+ members) to the cap | 35% of the day's budget; multiplier floor 0.25 |
 | Signal 2 | `correlated_selloff(...)`: mark clusters with 60% of 3+ scored members down 2% or more; their escalations share one budget equal to the largest member's; plus a universe-wide flag | 60%, -2%, 3 members |
@@ -72,8 +72,11 @@ for `asof`) or malformed input, or a failed clustering check, gives `ok=False` w
 reason and publishes nothing. `publish_outcome()` writes only
 `comovement_cluster_cap_suggestions.json` or `comovement_correlated_selloff_suggestions.json`
 to a directory the caller picks; the publisher refuses any other file name. Multipliers
-are bounded to [0.25, 1.0]. The files record `"mae": null` because these rules are not
-yet scored by the Phase 0 ledger.
+are bounded to [0.25, 1.0]. These rules are not yet scored by the Phase 0 ledger, so each
+`ComovementSuggestion` has `scored=False` and an `eval_metric_mae` of `+inf` (it can never
+win an MAE comparison, and the shared MAE-gated publisher refuses it), and the files record
+`"mae": null, "scored": false`. `tests/comovement/test_real_fixture.py` checks the
+pipeline against a small real fixture of split-adjusted Robinhood daily closes.
 
 ```bash
 python -m pytest tests/comovement -q

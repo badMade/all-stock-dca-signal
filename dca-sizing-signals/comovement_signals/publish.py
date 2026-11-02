@@ -11,7 +11,11 @@ the PublishResult shape. What differs, and why:
     never writes into another suggester's).
   * No MAE regression gate. These are unscored rules, so there is no metric to beat; the
     gate is replaced by a stale-date guard (an older as-of never overwrites a newer one)
-    and the file states ``"mae": null``.
+    and the file states ``"mae": null, "scored": false``. Every row must be an unscored
+    ComovementSuggestion carrying the +inf UNSCORED_MAE sentinel (review round 1 on
+    PR #2106); a row with a finite MAE would be claiming a score nobody computed, so it is
+    refused. The sentinel also means the base class's own publish() refuses these rows,
+    keeping them out of every MAE-gated path.
   * A failed (fail-closed) outcome never reaches the write path at all (publish_outcome).
 
 The output directory is always the caller's choice. Nothing here defaults to the repo's
@@ -27,7 +31,14 @@ from datetime import date
 from pathlib import Path
 
 from comovement_signals.signals import DEFAULT_FLOOR
-from comovement_signals.suggester import SIGNAL_CLUSTER_CAP, SIGNAL_SELLOFF, SOURCE_PREFIX, ComovementOutcome
+from comovement_signals.suggester import (
+    SIGNAL_CLUSTER_CAP,
+    SIGNAL_SELLOFF,
+    SOURCE_PREFIX,
+    UNSCORED_MAE,
+    ComovementOutcome,
+    ComovementSuggestion,
+)
 from dca_shared_interfaces.forecasting import SizingSuggestion
 
 # Reusing the shared lock keeps one locking strategy for every suggestion file.
@@ -88,8 +99,8 @@ class ComovementSuggestionPublisher(SuggestionPublisher):
         """Validate the whole batch, then atomically replace this signal's file.
 
         Nothing is written unless every row passes: a bounded multiplier in
-        [floor, 1.0], this signal's source, the batch's as-of date, a unique ticker and a
-        finite (placeholder) metric.
+        [floor, 1.0], this signal's source, the batch's as-of date, a unique ticker, and
+        an unscored ComovementSuggestion carrying the UNSCORED_MAE sentinel.
         """
         if not suggestions:
             return PublishResult(False, "blocked_invalid_bounds", "empty batch")
@@ -97,8 +108,10 @@ class ComovementSuggestionPublisher(SuggestionPublisher):
         if len(set(tickers)) != len(tickers):
             return PublishResult(False, "blocked_invalid_bounds", "duplicate ticker in batch")
         for s in suggestions:
-            if not math.isfinite(s.eval_metric_mae):
-                return PublishResult(False, "blocked_missing_eval_metric", f"{s.ticker}: non-finite metric")
+            if not (isinstance(s, ComovementSuggestion) and s.scored is False
+                    and s.eval_metric_mae == UNSCORED_MAE):
+                return PublishResult(False, "blocked_invalid_bounds",
+                                     f"{s.ticker}: not an unscored co-movement suggestion")
             if s.asof != as_of:
                 return PublishResult(False, "blocked_invalid_bounds", f"{s.ticker}: asof {s.asof} != {as_of}")
             if not self.validate_bounds(s):
@@ -139,7 +152,7 @@ class ComovementSuggestionPublisher(SuggestionPublisher):
             "generated_at": max(s.generated_at for s in rows).isoformat(),
             "source": self._source,
             "model_version": rows[0].model_version,
-            "eval_metric": {"mae": None, "status": "unscored_rule_based"},
+            "eval_metric": {"mae": None, "scored": False, "status": "unscored_rule_based"},
             "bounds": {"min_multiplier": self._floor, "max_multiplier": 1.0},
             "suggestions": [
                 {"ticker": s.ticker,

@@ -33,8 +33,10 @@ from comovement_signals.suggester import (
     ComovementConfig,
     ComovementInputs,
     ComovementOutcome,
+    ComovementSuggestion,
     ComovementUnavailable,
     CorrelatedSelloffSuggester,
+    UNSCORED_MAE,
 )
 
 __all__ = [
@@ -47,12 +49,14 @@ __all__ = [
     "ComovementInputError",
     "ComovementInputs",
     "ComovementOutcome",
+    "ComovementSuggestion",
     "ComovementSuggestionPublisher",
     "ComovementUnavailable",
     "CorrelatedSelloffSuggester",
     "ReturnsMatrix",
     "SelloffCluster",
     "SelloffResult",
+    "UNSCORED_MAE",
     "average_linkage_clusters",
     "build_clusters",
     "cluster_cap_publisher",
