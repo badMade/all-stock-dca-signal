@@ -19,13 +19,15 @@ review, but there is no standing pool, ranking rule, turnover control or bench.
 
 Evidence that shapes the decision:
 
-- Momentum, profitability, low volatility and value replicate out of sample (Hou, Xue and Zhang
+- Momentum, profitability and value replicate out of sample, with low volatility supported but more
+  mixed across replication studies (Hou, Xue and Zhang
   2020; Novy-Marx 2013; Blitz and van Vliet 2007). Size is weak. Systematic buy-the-dip rules
   underperformed holding in AQR's 196-variant test.
 - Published factor returns fall about 26% out of sample and 58% after publication (McLean and
   Pontiff), so backtest edges get a 50% haircut here.
 - A buy/hold spread is the most effective simple turnover control (Novy-Marx and Velikov 2016).
-  The Nasdaq-100 75/100/125 rank rule and MSCI and Russell buffers apply the same idea.
+  Nasdaq-100 retention of ranks 101 to 125, MSCI buffer zones and Russell banding apply the same
+  idea. The 75/150 rule below is this ADR's own design in that style, not an index's rule.
 
 ## Decision (proposed)
 
