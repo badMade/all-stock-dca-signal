@@ -452,27 +452,52 @@ _SNDK_SPLIT_DAY_QUOTES = {
         ]
     }
 }
-_SNDK_ADJUSTED_DAILY = {"data": {"results": [{"symbol": "SNDK", "bars": [
-    {"begins_at": "2026-07-01T13:30:00Z", "open_price": "142.00", "close_price": "143.86", "high_price": "145.00", "low_price": "141.50", "volume": 1},
-]}]}}
+def _historicals_honoring_adjustment(raw_close: str, split_close: str, calls: list):
+    """Fake get_equity_historicals that, like the real MCP tool, returns raw prices for
+    adjustment_type="none" and split-adjusted ones for "split" (the tool's own default).
+    Review of PR #2098: a fake that ignores adjustment_type hid that the provider's
+    fallback asks for raw bars by default."""
+    def fake(**kwargs):
+        calls.append(kwargs.get("adjustment_type"))
+        close = split_close if kwargs.get("adjustment_type", "split") == "split" else raw_close
+        return {"data": {"results": [{"symbol": "SNDK", "bars": [
+            {"begins_at": "2026-07-01T13:30:00Z", "open_price": close, "close_price": close,
+             "high_price": close, "low_price": close, "volume": 1},
+        ]}]}}
+    return fake
 
 
-def test_previous_close_ignores_quote_close_that_disagrees_with_adjusted_close():
+def test_previous_close_uses_adjusted_close_when_official_close_is_pre_split():
     # A split-sized gap between the official close and adjusted_previous_close means the
-    # quote's close is not on the same share basis as today's price. Fail closed for the
-    # quote path and use the split-adjusted daily bar instead (the existing fallback).
-    prov = RobinhoodDataProvider(historicals_fn=lambda **k: _SNDK_ADJUSTED_DAILY, quotes_fn=lambda **k: _SNDK_SPLIT_DAY_QUOTES)
+    # official close is on the pre-split share basis. adjusted_previous_close comes from
+    # the same quote and is on today's basis, so it is the reference. The daily-bar
+    # fallback is NOT used: the provider requests adjustment_type="none" by default,
+    # which would return the raw pre-split close again.
+    calls: list = []
+    prov = RobinhoodDataProvider(
+        historicals_fn=_historicals_honoring_adjustment("1150.89", "143.86", calls),
+        quotes_fn=lambda **k: _SNDK_SPLIT_DAY_QUOTES,
+    )
     bar = prov.get_previous_close_bar("SNDK", _decision_dt())
     assert bar is not None
-    assert bar.close == pytest.approx(143.86)
+    assert bar.close == pytest.approx(143.86125)
+    assert bar.low == 0.0  # still no fabricated prior-session low
+    assert calls == []
 
 
-def test_previous_close_returns_none_when_quote_disagrees_and_no_daily_bar():
-    # No usable fallback either: no prior close at all (NO_DATA downstream), never the
-    # raw pre-split close.
-    empty = {"data": {"results": [{"symbol": "SNDK", "bars": []}]}}
-    prov = RobinhoodDataProvider(historicals_fn=lambda **k: empty, quotes_fn=lambda **k: _SNDK_SPLIT_DAY_QUOTES)
-    assert prov.get_previous_close_bar("SNDK", _decision_dt()) is None
+def test_previous_close_catches_a_five_for_four_split():
+    # 5-for-4 is exactly a 20% gap; review of PR #2098 showed a strict 20% threshold
+    # missed it and kept a fake -20% drop.
+    quotes = {"data": {"results": [{
+        "quote": {"symbol": "SNDK", "last_trade_price": "80.10", "venue_last_trade_time": "2026-07-02T19:40:00Z",
+                  "previous_close": "100.00", "adjusted_previous_close": "80.00", "previous_close_date": "2026-07-01",
+                  "has_traded": True, "state": "active"},
+        "close": {"symbol": "SNDK", "date": "2026-07-01", "price": "100.00"},
+    }]}}
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    bar = prov.get_previous_close_bar("SNDK", _decision_dt())
+    assert bar is not None
+    assert bar.close == pytest.approx(80.0)
 
 
 def test_previous_close_keeps_quote_close_when_adjusted_close_differs_by_a_dividend():
