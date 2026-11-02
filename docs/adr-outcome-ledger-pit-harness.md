@@ -1,6 +1,7 @@
 # ADR: Outcome ledger, tax-lot ledger and point-in-time harness on DuckDB (Phase 0)
 
-- **Status:** Proposed (2026-11-01). Open questions below must be answered before any code.
+- **Status:** Proposed (2026-11-01). Open questions carry proposed defaults; the operator
+  authorized implementation in draft PRs on those defaults, which stay overridable until accepted.
 - **Scope:** research and reporting only. The stdlib-only core, the ladder, `config/`, and all
   three entry points (`run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy,
   `dca_runner.py`) are untouched. Nothing here writes live sizing or places orders.
@@ -66,15 +67,18 @@ store; it does not add a dependency or a second engine.
 
 ## Open questions
 
-1. Historical index-membership source, with delisted price data, for survivorship-free
-   backtests.
-2. Location: extend `dca-sizing-signals/` (shares the price store and its boundary test), or a
-   new sibling subproject with its own `requirements.txt`.
-3. Account alias scheme: operator-chosen labels, or a salted hash with the salt kept outside
-   the repo.
-4. Baseline definition: a flat 1x buy at the same slot, or the plain no-signal schedule.
-5. Outcome horizons (proposed t+5 and t+20 sessions) and the promotion threshold.
-6. Where the Friday review publishes: Notion page, draft PR, or both.
+Each question carries a **proposed default** (2026-11-01, written during operator-authorized
+overnight work). Defaults are not operator decisions; the operator can override any of them, and
+implementation PRs that use them say so.
+
+| # | Question | Proposed default | Why |
+|---|---|---|---|
+| 1 | Historical index-membership source, with delisted prices | Community point-in-time S&P 500 lists (GitHub `fja05680/sp500`, `shardul0701/SP500-Survivorship-bias-data-2004-2026`), spot-checked against EDGAR filings; delisted prices via Tiingo free tier only if the operator adds a key. Results labelled "large-cap only" | Free and point-in-time; unaudited, so spot checks are required |
+| 2 | Location | Extend `dca-sizing-signals/` beside `market_data_ingest/prices/` | Shares the store, the macros and the boundary test; no second engine |
+| 3 | Account alias scheme | Salted SHA-256 of the account identifier; the salt comes from an environment variable at runtime and is never committed. Only the alias is stored | No account-shaped literal can reach a table or a file |
+| 4 | Baseline | A flat 1x buy at the same slot timestamp and price | Isolates the effect of the sizing rule from slot timing |
+| 5 | Horizons and promotion bar | t+5 and t+20 sessions. Promotion needs deflated Sharpe >= 0.95 counting every registered trial, after a 50% haircut on backtest excess return | Matches the research evidence on out-of-sample decay |
+| 6 | Friday review output | Both: summary to the Notion dashboard, proposed config diffs as a draft PR | Notion for reading, the repo for changes |
 
 ## Consequences
 
