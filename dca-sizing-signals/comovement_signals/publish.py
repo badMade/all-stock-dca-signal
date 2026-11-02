@@ -77,7 +77,9 @@ class ComovementSuggestionPublisher(SuggestionPublisher):
 
     def validate_bounds(self, suggestion: SizingSuggestion) -> bool:
         pct = suggestion.multiplier_adjustment_pct
-        if not (isinstance(pct, (int, float)) and math.isfinite(pct)):
+        # Copilot review on PR #2106: bool subclasses int, so False would pass as a 0%
+        # adjustment and land in the file as a JSON boolean. Reject it like the inputs do.
+        if isinstance(pct, bool) or not (isinstance(pct, (int, float)) and math.isfinite(pct)):
             return False
         m = 1.0 + pct / 100.0
         return (

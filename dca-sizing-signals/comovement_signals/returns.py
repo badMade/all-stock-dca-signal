@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 # ADR question 1: a 252-session (about one trading year) trailing window.
@@ -54,6 +54,9 @@ class ReturnsMatrix:
             its own cluster.
         latest_price_date: the newest close date used, or None if there was none. The
             suggesters compare it with ``as_of`` for the staleness check.
+        latest_close_by_ticker: each ticker's newest usable close date (Copilot review on
+            PR #2106): ``returns`` keeps a key even for a ticker whose closes all predate
+            the window, so the global ``latest_price_date`` alone cannot show it is stale.
     """
 
     as_of: date
@@ -62,6 +65,7 @@ class ReturnsMatrix:
     eligible: tuple[str, ...]
     singletons: tuple[str, ...]
     latest_price_date: date | None
+    latest_close_by_ticker: Mapping[str, date] = field(default_factory=dict)
 
 
 def _parse_date(value: object) -> date:
@@ -210,4 +214,5 @@ def returns_matrix(
         eligible=eligible,
         singletons=singletons,
         latest_price_date=calendar[-1] if calendar else None,
+        latest_close_by_ticker={t: max(closes[t]) for t in sorted(closes) if closes[t]},
     )

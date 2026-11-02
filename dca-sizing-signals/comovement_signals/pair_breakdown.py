@@ -192,6 +192,15 @@ def pair_breakdown_shadow(
             skipped[pair_key(a, b)] = "stale_pair"
             continue
         rolling = rolling_correlations(ra, rb, config.rolling_sessions)
+        # Copilot review on PR #2106: rolling_correlations skips sessions with no shared
+        # return or an undefined correlation, so its last N values can span a gap. The
+        # "N consecutive sessions" trigger needs a value for each of the last N matrix
+        # sessions; anything else is skipped with a reason, never flagged across the gap.
+        recent_dates = [d for d, _ in rolling[-config.consecutive_sessions:]]
+        if len(rolling) >= config.consecutive_sessions and recent_dates != list(
+                matrix.sessions[-config.consecutive_sessions:]):
+            skipped[pair_key(a, b)] = "gap_in_recent_sessions"
+            continue
         check = breakdown_run([r for _, r in rolling], config.consecutive_sessions, config.percentile,
                               config.min_reference_values)
         if check is None or rolling[-1][0] != newest:

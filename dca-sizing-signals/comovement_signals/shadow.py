@@ -152,6 +152,7 @@ class ShadowWriter:
 
         self.directory.mkdir(parents=True, exist_ok=True)
         with _acquire_lock(path.with_name(path.name + ".lock")):
+            _refuse_unterminated_tail(path)
             if digest in _existing_hashes(path):
                 return WriteResult(False, "duplicate", path, digest)
             # "a" never truncates: earlier lines stay byte-for-byte as they were.
@@ -160,6 +161,21 @@ class ShadowWriter:
                 fh.flush()
                 os.fsync(fh.fileno())
         return WriteResult(True, "written", path, digest)
+
+
+def _refuse_unterminated_tail(path: Path) -> None:
+    """Copilot review on PR #2106: a last line with no newline (an interrupted write that
+    lost only its "\\n") would have the next record glued onto it. Refuse rather than
+    repair: the log is append-only, so fixing it is an operator decision."""
+    if not path.exists():
+        return
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            return
+        fh.seek(-1, os.SEEK_END)
+        if fh.read(1) != b"\n":
+            raise ValueError(f"{path.name} has an unterminated last line; refusing to append")
 
 
 def _existing_hashes(path: Path) -> set[str]:

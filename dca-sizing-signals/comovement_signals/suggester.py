@@ -257,6 +257,13 @@ class _ComovementSuggester:
         missing = sorted(t for t in buys if t not in matrix.returns)
         if missing:
             raise _Failed("missing_ticker_history", f"no usable closes for {missing}")
+        # Copilot review on PR #2106: a proposed ticker whose closes all predate the window
+        # still has a (possibly empty) returns key and would get a neutral singleton
+        # suggestion. Check each proposed ticker's own newest close; a fresh short-history
+        # singleton passes because its newest close is recent.
+        stale = sorted(t for t in buys if self._ticker_is_stale(matrix, t, asof))
+        if stale:
+            raise _Failed("stale_ticker_history", f"newest close too old for {stale}")
 
         try:
             multipliers, detail = self._signal(clusters, buys, budget, inputs, asof)
@@ -310,8 +317,16 @@ class _ComovementSuggester:
         if age > self._config.max_price_staleness_days:
             raise _Failed("stale_prices", f"newest close {matrix.latest_price_date.isoformat()} is {age} days old")
 
+    def _ticker_is_stale(self, matrix: ReturnsMatrix, ticker: str, asof: date) -> bool:
+        latest = matrix.latest_close_by_ticker.get(ticker)
+        return latest is None or (asof - latest).days > self._config.max_price_staleness_days
+
     def _cluster(self, matrix: ReturnsMatrix) -> tuple[Cluster, ...]:
         cfg = self._config
+        # Copilot review on PR #2106: with cut=NaN, "avg > cut" is always False, so every
+        # ticker merges and the partition check still passes. A bool is not a distance.
+        if isinstance(cfg.cut, bool) or not isinstance(cfg.cut, (int, float)) or not math.isfinite(cfg.cut):
+            raise _Failed("invalid_input", f"cut must be a finite number, got {cfg.cut!r}")
         if len(matrix.eligible) < cfg.min_clustered_tickers:
             raise _Failed("failed_check", f"only {len(matrix.eligible)} tickers have {cfg.min_sessions}+ returns")
         clusters = build_clusters(matrix, cut=cfg.cut, min_overlap=cfg.min_overlap_sessions)
