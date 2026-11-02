@@ -38,7 +38,7 @@ from market_data_ingest.ledger.csp_capture import (
     record_capture,
     underlying_quote,
 )
-from market_data_ingest.ledger.csp_shadow import AccountContext, select_candidates
+from market_data_ingest.ledger.csp_shadow import DEFAULT_CONFIG, AccountContext, select_candidates
 
 from .conftest import TEST_SALT
 from .test_csp_shadow_no_orders import _BROKER_TOOL, _MCP
@@ -98,13 +98,24 @@ def test_bundle_rejects_a_naive_capture_time(tmp_path):
 # --- which expirations to fetch -------------------------------------------------------------
 
 
+# The ADR's original 25..45 day window. The operator approved widening it to 18..46 on
+# 2026-11-02 (ADR amendment PR); the capture's default follows csp_shadow's config either way.
+ADR_ORIGINAL = CaptureConfig(min_dte=25, max_dte=45)
+
+
+def test_capture_window_defaults_follow_the_shadow_config():
+    # One source of truth: the capture must never fetch a different window than the
+    # selector will accept.
+    assert (CaptureConfig().min_dte, CaptureConfig().max_dte) == (DEFAULT_CONFIG.min_dte, DEFAULT_CONFIG.max_dte)
+
+
 def test_expirations_in_the_25_to_45_day_window(bundle):
     # Session 2026-11-02: 11-27 is 25 days out, 12-04 is 32, 12-11 is 39, 12-18 is 46 (out).
-    glw = expirations_in_window(bundle["chains"]["GLW"], SESSION)
+    glw = expirations_in_window(bundle["chains"]["GLW"], SESSION, ADR_ORIGINAL)
     assert glw == (date(2026, 11, 27), date(2026, 12, 4), date(2026, 12, 11))
-    assert expirations_in_window(bundle["chains"]["KR"], SESSION) == glw
+    assert expirations_in_window(bundle["chains"]["KR"], SESSION, ADR_ORIGINAL) == glw
     # QQQ also lists 11-30 (28 days).
-    assert expirations_in_window(bundle["chains"]["QQQ"], SESSION) == (
+    assert expirations_in_window(bundle["chains"]["QQQ"], SESSION, ADR_ORIGINAL) == (
         date(2026, 11, 27), date(2026, 11, 30), date(2026, 12, 4), date(2026, 12, 11))
 
 
@@ -112,7 +123,7 @@ def test_window_misses_both_monthly_expirations_today(bundle):
     # A real finding pinned as a test: the 2026-11-20 (18 days) and 2026-12-18 (46 days)
     # monthlies both fall outside 25..45, so on this session only weeklies qualify.
     for ticker in ("GLW", "KR", "QQQ"):
-        window = expirations_in_window(bundle["chains"][ticker], SESSION)
+        window = expirations_in_window(bundle["chains"][ticker], SESSION, ADR_ORIGINAL)
         assert date(2026, 11, 20) not in window and date(2026, 12, 18) not in window
 
 
@@ -124,7 +135,7 @@ def test_window_follows_the_config(bundle):
 
 def test_a_chain_that_cannot_open_positions_has_no_window(bundle):
     chain = dict(bundle["chains"]["GLW"], can_open_position=False)
-    assert expirations_in_window(chain, SESSION) == ()
+    assert expirations_in_window(chain, SESSION, ADR_ORIGINAL) == ()
 
 
 # --- the underlying price -------------------------------------------------------------------
@@ -136,7 +147,7 @@ def test_underlying_uses_the_regular_session_last_trade(bundle):
     # 123.27 at 20:59:58Z (3:59 PM ET), NOT the 124.1777 after-hours print at 22:54Z: the
     # option quotes are regular-session closes, so the stock must be too.
     assert quote["price"] == pytest.approx(123.27)
-    assert quote["quote_at"] == datetime(2026, 11, 2, 20, 59, 58, 177914, tzinfo=timezone.utc)
+    assert quote["quote_at"] == datetime.fromisoformat("2026-11-02T20:59:58.177914+00:00")
 
 
 @pytest.mark.parametrize("patch", [{"state": "halted"}, {"has_traded": False}, {"last_trade_price": "0.000000"},
@@ -198,7 +209,7 @@ def test_normalize_produces_the_select_candidates_row_shape(bundle):
         "delta": -0.185454,
         "implied_volatility": 0.70028,
         # Robinhood sends nanoseconds; microseconds are kept, the rest truncated.
-        "quote_at": datetime(2026, 11, 2, 20, 59, 59, 973228, tzinfo=timezone.utc),
+        "quote_at": datetime.fromisoformat("2026-11-02T20:59:59.973228+00:00"),
         "contract_multiplier": 100,
     }
 
@@ -277,6 +288,24 @@ def test_capture_refuses_quotes_from_after_the_capture_time(bundle):
     result = capture_from_bundle(b)
     assert GLW_105 not in _by_id(result.chain_rows)
     assert ("GLW", GLW_105, "future_quote") in result.dropped
+
+
+def test_capture_refuses_quotes_from_an_earlier_session(bundle):
+    # Stamped 2026-10-30 (Friday): a leftover quote, not this session's close.
+    b = _mutate(bundle, GLW_105, quote={"updated_at": "2026-10-30T20:59:59Z"})
+    result = capture_from_bundle(b)
+    assert GLW_105 not in _by_id(result.chain_rows)
+    assert ("GLW", GLW_105, "stale_quote") in result.dropped
+
+
+def test_two_different_underlying_quotes_drop_the_underlying(bundle):
+    b = copy.deepcopy(bundle)
+    twin = copy.deepcopy(next(r for r in b["equity_quotes"] if r["quote"]["symbol"] == "KR"))
+    twin["quote"]["last_trade_price"] = "68.400000"
+    b["equity_quotes"].append(twin)
+    result = capture_from_bundle(b)
+    assert "KR" not in result.underlying_quotes
+    assert ("KR", "*", "ambiguous_underlying") in result.dropped
 
 
 def _account(value: float) -> AccountContext:
