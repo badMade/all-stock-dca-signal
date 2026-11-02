@@ -160,6 +160,55 @@ works too: `SELECT * FROM adjusted_bars(DATE '2024-06-01', TIMESTAMP '9999-12-31
 | `SpliceNotValidatedError` | Yahoo and vendor history are joined only after a passing reconciliation that ends at the splice date |
 | DuckDB "Could not set lock" | Another process has the database open. DuckDB allows one writer |
 
+## Outcome ledger and universe tables (Phase 0, research only)
+
+`market_data_ingest/ledger/` implements the **proposed** ADR
+`docs/adr-outcome-ledger-pit-harness.md` (PR #2096) on the same DuckDB file as the price
+store. It is not wired into live sizing, makes no network or broker calls, and nothing in the
+live DCA paths imports it. Callers pass already-fetched plain dicts to `LedgerStore.ingest_*`.
+
+| Table | Holds |
+|---|---|
+| `market_sessions` | The trading calendar that horizons count in |
+| `fills`, `baseline_fills` | Live fills (`run_kind` = `scheduled` / `manual`) and the 1x counterfactual per slot decision |
+| `outcomes` | Price at t+N sessions per fill and baseline row, `scored` or `unscored` (never zero) |
+| `accounts`, `tax_lots` | Accounts by salted alias only; lot snapshots with a hashed `lot_key` |
+| `trials` | Every evaluated configuration with its metrics and the recorded promotion threshold |
+| `universe_scores`, `universe_proposals`, `universe_membership` | Factor scores, membership proposals, dated `[effective_from, effective_to)` membership |
+
+Same rules as the price store: append-only, `content_hash` keys, `ON CONFLICT DO NOTHING`,
+`source, as_of, ingested_at, run_id` on every row, latest version wins at `known_at`. Table
+macros (`outcome_candidates`, `outcomes_known_at`, `scheduled_outcomes`, `trial_counts`,
+`universe_members_as_of`, ...) live in the database file. Outcomes use an `ASOF LEFT JOIN` on
+`quote_date <= horizon_session`, so no later quote can leak in, and the quote must be the
+horizon session's own bar (`OUTCOME_QUOTE_TOLERANCE_SESSIONS = 0`; an older one is
+`stale_quote`). A fill whose session is missing from `market_sessions` is
+`session_not_in_calendar`. `record_outcomes` refuses `as_of` earlier than `known_at`, and the
+reader prefers the row built from the newest `inputs_known_at`. `market_sessions` is
+append-only with no retraction row yet, so a session wrongly ingested as open stays counted.
+`scheduled_outcomes` drops manual runs and every manual order id (`docs/run_classification.md`).
+
+The answers to the ADR's open questions are **proposed defaults, not operator-approved**, kept
+as constants in `market_data_ingest/ledger/defaults.py`: location here; alias =
+HMAC-SHA256 of the raw identifier with the salt from `$DCA_LEDGER_ACCOUNT_SALT` (required, never
+stored); baseline = flat 1x at the same slot timestamp and price; horizons t+5 and t+20
+sessions; promotion threshold 0.95 (field only, no promotion logic).
+
+```python
+from market_data_ingest.ledger.accounts import account_alias
+from market_data_ingest.ledger.store import LedgerStore
+
+with LedgerStore("data/backfill.duckdb") as ledger:
+    ledger.ingest_fills(rows, source="run_artifact", run_id="ingest-1", as_of=now)
+    ledger.record_outcomes(known_at=now, run_id="score-1", as_of=now)
+    ledger.scheduled_outcome_summary(known_at=now)
+    ledger.ingest_accounts([{"account_alias": account_alias(raw), "account_kind": "agentic"}],
+                           source="broker_accounts", run_id="ingest-1", as_of=now)
+    ledger.members_as_of(date(2026, 4, 1))
+```
+
+Tests: `python -m pytest tests/ledger` (offline, synthetic hand-computed fixtures).
+
 ## Status
 
 Architecture and boundary tests are real and passing. `edgar_fundamentals.py` and
