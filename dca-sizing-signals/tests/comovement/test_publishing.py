@@ -115,9 +115,11 @@ def test_same_asof_rerun_replaces(tmp_path):
     assert publish_outcome(_cap_outcome(), pub).published
 
 
-@pytest.mark.parametrize("pct", [5.0, -80.0, float("nan")])
+@pytest.mark.parametrize("pct", [5.0, -80.0, float("nan"), False, True])
 def test_out_of_bounds_suggestion_refused(tmp_path, pct):
-    # +5% would be a multiplier above 1.0; -80% is below the 0.25 floor.
+    # +5% would be a multiplier above 1.0; -80% is below the 0.25 floor. A bool is not a
+    # number even though it subclasses int (Copilot review on PR #2106): False would
+    # otherwise pass as a neutral 0% and write a JSON boolean into a numeric field.
     out = _cap_outcome()
     bad = replace(out, suggestions=(replace(out.suggestions[0], multiplier_adjustment_pct=pct),) + out.suggestions[1:])
     res = publish_outcome(bad, cluster_cap_publisher(tmp_path))

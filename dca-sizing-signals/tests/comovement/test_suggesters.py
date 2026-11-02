@@ -235,3 +235,49 @@ def test_loader_returning_wrong_type_fails_closed(bad):
 ])
 def test_wrongly_typed_input_field_fails_closed(field, value):
     _assert_fail_closed(_selloff(toy_inputs(**{field: value})), "invalid_input")
+
+
+# --- Copilot review on PR #2106 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("cut", [float("nan"), float("inf"), True])
+def test_non_finite_or_boolean_cut_fails_closed(cut):
+    # avg > nan is always False, so a NaN cut would merge every ticker into one cluster
+    # and still pass the partition check. A bool is not a distance.
+    from dataclasses import replace
+
+    from ._inputs import TOY_CONFIG as base
+
+    for make in (ClusterCapSuggester, CorrelatedSelloffSuggester):
+        out = make(lambda asof: toy_inputs(), config=replace(base, cut=cut), clock=clock).evaluate(AS_OF)
+        assert not out.ok and out.reason == "invalid_input" and out.suggestions == ()
+
+
+def _with_stale_ticker():
+    from ._toy import rows_from_closes
+
+    # D1's only closes are day(-5)..day(-1): 10 days before as_of. The other tickers keep
+    # the matrix fresh, so only a per-ticker check can catch it.
+    rows = list(toy_inputs().close_rows) + rows_from_closes("D1", [10.0, 10.5, 10.2, 10.4, 10.3], start=-5)
+    buys = dict(toy_inputs().proposed_buys_usd_by_ticker, D1=5.0)
+    return toy_inputs(close_rows=rows, proposed_buys_usd_by_ticker=buys)
+
+
+def test_stale_proposed_ticker_fails_closed():
+    for make in (ClusterCapSuggester, CorrelatedSelloffSuggester):
+        out = make(lambda asof: _with_stale_ticker(), config=TOY_CONFIG, clock=clock).evaluate(AS_OF)
+        assert not out.ok and out.reason == "stale_ticker_history" and out.suggestions == ()
+
+
+def test_fresh_short_history_singleton_still_gets_a_suggestion():
+    from ._toy import rows_from_closes
+
+    # E1 listed on day(6): only 2 returns, so it is a singleton, but its newest close is
+    # day(8), as fresh as everyone else's. The per-ticker staleness check must not drop it.
+    rows = list(toy_inputs().close_rows) + rows_from_closes("E1", [20.0, 20.4, 20.2], start=6)
+    buys = dict(toy_inputs().proposed_buys_usd_by_ticker, E1=5.0)
+    inputs = toy_inputs(close_rows=rows, proposed_buys_usd_by_ticker=buys)
+    out = ClusterCapSuggester(lambda asof: inputs, config=TOY_CONFIG, clock=clock).evaluate(AS_OF)
+    assert out.ok, out.reason
+    assert ("E1",) in out.clusters
+    assert {s.ticker: s.multiplier_adjustment_pct for s in out.suggestions}["E1"] == 0.0

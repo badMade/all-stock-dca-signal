@@ -216,6 +216,18 @@ def test_pair_with_a_stale_leg_is_skipped():
     assert result.skipped == {"A1|B1": "stale_pair"}
 
 
+def test_gap_in_the_recent_run_is_skipped_not_flagged():
+    # Copilot review on PR #2106: B1 has no close on day(40), so it has no return on
+    # day(40) or day(41). The pair's newest shared return is still day(42), but the last
+    # two rolling windows end on day(39) and day(42): they are not the last two sessions
+    # (day 41 and day 42), so the "2 consecutive sessions" run has no evidence for day(41).
+    # The pair is skipped with a reason, never flagged across the gap.
+    rows = [r for r in _pair_rows(flip_last=2) if not (r["ticker"] == "B1" and r["date"] == day(40))]
+    result = pair_breakdown_shadow(rows, as_of=AS_OF, config=TOY)
+    assert result.ok and result.records == ()
+    assert result.skipped == {"A1|B1": "gap_in_recent_sessions"}
+
+
 def test_malformed_rows_fail_closed():
     rows = _pair_rows(flip_last=2) + [{"ticker": "A1", "date": day(10), "close": 1.0}]  # duplicate
     result = pair_breakdown_shadow(rows, as_of=AS_OF, config=TOY)

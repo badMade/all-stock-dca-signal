@@ -127,6 +127,20 @@ def test_identical_record_is_not_appended_twice(tmp_path):
     assert len(_lines(tmp_path / SHADOW_FILENAMES[SIGNAL_PAIR_BREAKDOWN])) == 1
 
 
+def test_unterminated_tail_refuses_the_append(tmp_path):
+    # Copilot review on PR #2106: a last line holding complete JSON but no newline (an
+    # interrupted write that lost only its "\n") must not be appended to, or the next
+    # record is glued onto it and the log stops being one JSON object per line.
+    writer = ShadowWriter(tmp_path)
+    path = tmp_path / SHADOW_FILENAMES[SIGNAL_PAIR_BREAKDOWN]
+    writer.append(_record(payload={"n": 1}))
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="unterminated"):
+        writer.append(_record(payload={"n": 2}, as_of=date(2026, 1, 10), known=date(2026, 1, 9)))
+    assert path.read_bytes() == before
+
+
 def test_each_signal_writes_only_its_own_file(tmp_path):
     writer = ShadowWriter(tmp_path)
     writer.append(_record(signal=SIGNAL_CHEAPER_LEG_TILT))
