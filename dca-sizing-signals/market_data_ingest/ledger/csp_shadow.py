@@ -45,7 +45,7 @@ import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -72,6 +72,7 @@ SETTLEMENT_STATUSES = SCORED_STATUSES | {"unscored"}
 # Any of these on a settled trade fails the ADR's "zero shadow assignments would have breached
 # concentration or wash-sale rules" bar. ``concentration_unchecked`` is in the set on purpose:
 # an assignment nobody could check is not evidence of no breach (fail closed).
+EARLY_ASSIGNMENT_FLAGS = frozenset({"ex_dividend_in_window", "deep_itm"})
 BREACH_FLAGS = frozenset({"assignment_breaches_sector_cap", "assigned_in_tax_loss_pause", "concentration_unchecked"})
 
 
@@ -235,6 +236,12 @@ class Scorecard:
     no_breaches: bool
     has_min_months: bool
     has_min_trades: bool
+    # Review of #2105: any expired-but-unscored trade blocks a pass.
+    no_unscored: bool
+    # Risk notes (not pass gates): settled trades flagged for early-assignment risk.
+    n_ex_dividend_risk: int
+    n_deep_itm_risk: int
+    n_early_assignment_risk: int
     passes: bool
     breach_flags: tuple[str, ...] = field(default=())
 
@@ -356,22 +363,40 @@ def _parse_contract(raw: Mapping[str, Any]) -> _Contract | None:
     return _Contract(ticker, option_id.strip(), expiry, strike, bid, ask, delta, iv, quote_at)  # type: ignore[arg-type]
 
 
-def _open_book(open_positions: Iterable[object], session: date) -> tuple[set[str], float]:
-    """Tickers with an open shadow put on ``session``, and the collateral those puts lock.
-    A position whose expiry or collateral cannot be read is counted as blocking its ticker
-    and, if its collateral is unknown, the whole book is treated as full (fail closed)."""
-    tickers: set[str] = set()
-    locked = 0.0
+@dataclass
+class _OpenBook:
+    tickers: set[str]
+    locked: float
+    # Collateral of open shadow puts per sector: an assignment would land in that sector, so it
+    # counts toward the sector's exposure (review of #2105).
+    sector_load: dict[str, float]
+    unknown_sector: bool
+
+
+def _open_book(open_positions: Iterable[object], session: date, account: AccountContext) -> _OpenBook:
+    """Tickers with an open shadow put on ``session``, the collateral those puts lock, and that
+    collateral by sector. A position whose expiry or collateral cannot be read blocks its ticker
+    and fills the whole book (fail closed); one whose sector cannot be known is reported so the
+    caller can refuse to judge sector exposure at all."""
+    book = _OpenBook(set(), 0.0, {}, False)
     for pos in open_positions:
         expiry = _day(_get(pos, "expiration_date"))
         ticker = _ticker(_get(pos, "ticker"))
         if expiry is not None and expiry < session:
             continue  # expired before today's session: neither open nor locking cash
         if ticker:
-            tickers.add(ticker)
+            book.tickers.add(ticker)
         collateral = _num(_get(pos, "collateral"))
-        locked += math.inf if collateral is None or expiry is None else collateral
-    return tickers, locked
+        amount = math.inf if collateral is None or expiry is None else collateral
+        book.locked += amount
+        sector = _get(pos, "sector")
+        if not isinstance(sector, str) or not sector.strip():
+            sector = account.sector_by_ticker.get(ticker) if ticker else None
+        if not isinstance(sector, str) or not sector.strip():
+            book.unknown_sector = True
+            continue
+        book.sector_load[sector] = book.sector_load.get(sector, 0.0) + amount
+    return book
 
 
 def select_candidates(
@@ -379,7 +404,7 @@ def select_candidates(
     underlying_quotes: Mapping[str, Mapping[str, Any]],
     ladder_buy_price_by_ticker: Mapping[str, object],
     active_tickers: Iterable[str],
-    paused_tickers: Iterable[str],
+    paused_tickers: Iterable[str] | None,
     as_of: datetime,
     config: CspShadowConfig = DEFAULT_CONFIG,
     *,
@@ -395,8 +420,11 @@ def select_candidates(
     ``ShadowEntry``) -- they lock collateral and, by default, block a second put on the name.
 
     Fail closed: no account context, a quote from an earlier session or after ``as_of``, a
-    non-finite number, a missing ladder price or sector -> no record, with a reason in
-    ``dropped``. Never an estimate, and data problems never raise.
+    non-finite number, a missing ladder price, sector or sector holding -> no record, with a
+    reason in ``dropped``. ``paused_tickers=None`` means the tax-loss pause list is UNKNOWN,
+    so nothing is suggested (a put on a paused name would rehearse a wash sale). Sector
+    exposure is holdings + open shadow collateral + earlier picks in this run. Never an
+    estimate, and data problems never raise.
     """
     as_of = _require_aware(as_of, "as_of")
     session = _session_of(as_of)
@@ -409,9 +437,16 @@ def select_candidates(
     if account is None or value is None or value <= 0:
         return SelectionResult((), (("*", "no_account_context"),))
 
+    if paused_tickers is None:
+        # Review of #2105: an unknown pause list is not an empty one (fail closed).
+        return SelectionResult((), (("*", "no_pause_list"),))
     active = {t for t in (_ticker(x) for x in active_tickers) if t}
     paused = {t for t in (_ticker(x) for x in paused_tickers) if t}
-    open_tickers, open_collateral = _open_book(open_positions, session)
+    book = _open_book(open_positions, session, account)
+    if book.unknown_sector:
+        return SelectionResult((), (("*", "open_position_without_sector"),))
+    open_tickers, open_collateral = book.tickers, book.locked
+    held_by_sector: dict[str, float] = {}
 
     # Parse and de-duplicate contracts. Two rows for one contract that DISAGREE are ambiguous
     # (which one did the broker show?), so that contract is dropped rather than guessed.
@@ -470,12 +505,16 @@ def select_candidates(
         if not isinstance(sector, str) or not sector.strip():
             drop(ticker, "no_sector")
             continue
-        held_raw = account.sector_value_by_sector.get(sector, 0.0)
-        held = _num(held_raw)
+        if sector not in account.sector_value_by_sector:
+            # Review of #2105: a sector absent from the holdings map is unknown, not $0.
+            drop(ticker, "no_sector_value")
+            continue
+        held = _num(account.sector_value_by_sector[sector])
         if held is None or held < 0:
             drop(ticker, "invalid_account_context")
             continue
-        if held / value > config.max_sector_pct + _EPS:
+        held_by_sector[sector] = held
+        if (held + book.sector_load.get(sector, 0.0)) / value > config.max_sector_pct + _EPS:
             drop(ticker, "sector_cap")
             continue
 
@@ -494,16 +533,23 @@ def select_candidates(
         eligible.sort(key=lambda s: (-s.annualised_bid_yield, s.expiration_date, s.strike, s.option_id))
         picks.append(eligible[0])
 
-    # Total collateral cap, highest yield first. Open shadow puts count against it.
+    # Total collateral cap and the running sector check, highest yield first. Open shadow
+    # puts count against both; each accepted pick then adds its collateral to its sector, so a
+    # second name in a sector the first pick pushed above 30% is refused (review of #2105).
     picks.sort(key=lambda s: (-s.annualised_bid_yield, s.ticker))
     cap = config.max_total_collateral_pct * value
     locked = open_collateral
+    sector_load = dict(book.sector_load)
     kept: list[ShadowSuggestion] = []
     for s in picks:
+        if (held_by_sector[s.sector] + sector_load.get(s.sector, 0.0)) / value > config.max_sector_pct + _EPS:
+            drop(s.ticker, "sector_cap")
+            continue
         if locked + s.collateral > cap + _EPS:
             drop(s.ticker, "total_collateral_cap")
             continue
         locked += s.collateral
+        sector_load[s.sector] = sector_load.get(s.sector, 0.0) + s.collateral
         kept.append(s)
     kept.sort(key=lambda s: s.ticker)
     return SelectionResult(tuple(kept), tuple(sorted(dropped)))
@@ -587,16 +633,23 @@ def entry_from_suggestion(s: ShadowSuggestion) -> ShadowEntry:
 _INVALID = object()  # a later price row that exists but cannot be used
 
 
-def _price_index(later_prices: Iterable[object], session: date) -> dict[tuple[str, date], object]:
-    """(ticker, quote_date) -> close, for rows dated on or before ``session`` only: a bar from
-    after the as_of session is invisible (lookahead). An unusable or conflicting row maps to
-    ``_INVALID`` so it is unscored rather than skipped in favour of a guess."""
+def _last_closed_session(as_of: datetime, config: CspShadowConfig) -> date:
+    """The latest date whose daily close can exist at ``as_of``: the as_of session itself only
+    once its 16:00 ET close has happened (review of #2105), otherwise the day before."""
+    local = as_of.astimezone(ET)
+    return local.date() if local.time() >= config.market_close_et else local.date() - timedelta(days=1)
+
+
+def _price_index(later_prices: Iterable[object], last_closed: date) -> dict[tuple[str, date], object]:
+    """(ticker, quote_date) -> close, for rows dated on or before ``last_closed`` only: a bar
+    whose close had not happened by as_of is invisible (lookahead). An unusable or conflicting
+    row maps to ``_INVALID`` so it is unscored rather than skipped in favour of a guess."""
     out: dict[tuple[str, date], object] = {}
     for raw in later_prices:
         if not isinstance(raw, Mapping):
             continue
         ticker, quote_date = _ticker(raw.get("ticker")), _day(raw.get("quote_date"))
-        if ticker is None or quote_date is None or quote_date > session:
+        if ticker is None or quote_date is None or quote_date > last_closed:
             continue
         close = _num(raw.get("close"))
         value: object = close if close is not None and close > 0 else _INVALID
@@ -607,9 +660,10 @@ def _price_index(later_prices: Iterable[object], session: date) -> dict[tuple[st
     return out
 
 
-def _early_close_index(early_closes: Iterable[object], as_of: datetime) -> dict[str, tuple[object, datetime]]:
-    """entry_id -> (ask or _INVALID, quote_at), only for buy-back quotes known by ``as_of``."""
-    out: dict[str, tuple[object, datetime]] = {}
+def _early_close_index(early_closes: Iterable[object], as_of: datetime) -> dict[str, list[tuple[datetime, object]]]:
+    """entry_id -> [(quote_at, ask or _INVALID)], only buy-back quotes known by ``as_of``. All
+    are kept: ``_pick_early_close`` chooses among them per entry, so row order never matters."""
+    out: dict[str, list[tuple[datetime, object]]] = {}
     for raw in early_closes:
         if not isinstance(raw, Mapping):
             continue
@@ -617,8 +671,23 @@ def _early_close_index(early_closes: Iterable[object], as_of: datetime) -> dict[
         if not isinstance(entry_id, str) or quote_at is None or quote_at > as_of:
             continue
         ask = _num(raw.get("ask"))
-        out[entry_id] = (ask if ask is not None and ask >= 0 else _INVALID, quote_at)
+        out.setdefault(entry_id, []).append((quote_at, ask if ask is not None and ask >= 0 else _INVALID))
     return out
+
+
+def _pick_early_close(
+    quotes: Sequence[tuple[datetime, object]], start: date, expiry: date, entered_at: datetime | None
+) -> tuple[datetime, object] | None:
+    """The EARLIEST buy-back quote inside the holding window (review of #2105: with several
+    rows the last one in iteration order used to win, so a 3.00 or a 0.10 ask depended on row
+    order). Two quotes at that same moment that disagree are ambiguous -> ``_INVALID``."""
+    usable = [(at, ask) for at, ask in quotes
+              if start <= _session_of(at) <= expiry and (entered_at is None or at >= entered_at)]
+    if not usable:
+        return None
+    first = min(at for at, _ in usable)
+    asks = {ask for at, ask in usable if at == first}  # floats and the _INVALID sentinel hash fine
+    return (first, asks.pop()) if len(asks) == 1 else (first, _INVALID)
 
 
 def _settled_after_close(as_of: datetime, expiry: date, config: CspShadowConfig) -> bool:
@@ -639,7 +708,8 @@ def settle(
 ) -> tuple[Settlement, ...]:
     """Settle shadow entries as known at ``as_of``, one ``Settlement`` per entry.
 
-    * An early close (``early_closes`` row: entry_id, ask, quote_at) is costed at the ASK.
+    * An early close (``early_closes`` row: entry_id, ask, quote_at) is costed at the ASK; with
+      several quotes for one entry the earliest inside the holding window is used.
     * After the expiry session's close: underlying close on the expiry date >= strike ->
       ``expired_otm`` (premium kept); below the strike -> ``assigned`` at the strike, effective
       cost basis strike - premium, marked at that close.
@@ -652,7 +722,7 @@ def settle(
     """
     as_of = _require_aware(as_of, "as_of")
     session = _session_of(as_of)
-    prices = _price_index(later_prices, session)
+    prices = _price_index(later_prices, _last_closed_session(as_of, config))
     closes = _early_close_index(early_closes, as_of)
     paused = {t for t in (_ticker(x) for x in paused_tickers) if t}
     ex_divs = {
@@ -667,7 +737,7 @@ def _settle_one(
     session: date,
     as_of: datetime,
     prices: Mapping[tuple[str, date], object],
-    closes: Mapping[str, tuple[object, datetime]],
+    closes: Mapping[str, list[tuple[datetime, object]]],
     paused: set[str],
     ex_divs: Mapping[str, set[date]],
     account: AccountContext | None,
@@ -700,20 +770,20 @@ def _settle_one(
            for (t, d), v in prices.items()):
         flags.append("deep_itm")
 
-    early = closes.get(base["entry_id"])
+    entered_at = _moment(_get(entry, "inputs_known_at"))
+    early = _pick_early_close(closes.get(base["entry_id"], ()), start, expiry, entered_at)
     if early is not None:
-        ask, quote_at = early
+        quote_at, ask = early
         closed_on = _session_of(quote_at)
-        if start <= closed_on <= expiry:
-            if ask is _INVALID:
-                return Settlement(**{**base, "unscored_reason": "invalid_early_close_quote"}, status="unscored",
-                                  flags=tuple(flags))
-            assert isinstance(ask, float)
-            pnl = (price_in - ask) * mult  # buy back at the ASK, never the mid
-            return Settlement(**{**base, "settled_on": closed_on, "exit_ask": ask, "pnl": pnl,
-                                 "return_on_collateral": pnl / collateral,
-                                 "days_held": max(1, (closed_on - start).days)},
-                              status="closed_early", flags=tuple(flags))
+        if ask is _INVALID:
+            return Settlement(**{**base, "unscored_reason": "invalid_early_close_quote"}, status="unscored",
+                              flags=tuple(flags))
+        assert isinstance(ask, float)
+        pnl = (price_in - ask) * mult  # buy back at the ASK, never the mid
+        return Settlement(**{**base, "settled_on": closed_on, "exit_ask": ask, "pnl": pnl,
+                             "return_on_collateral": pnl / collateral,
+                             "days_held": max(1, (closed_on - start).days)},
+                          status="closed_early", flags=tuple(flags))
 
     if not _settled_after_close(as_of, expiry, config):
         return Settlement(**base, status="open", flags=tuple(flags))
@@ -778,7 +848,9 @@ def scorecard(
     dollars would have made in plain DCA of that ticker over the same holding period (computed
     by the caller from the Phase 0 outcome ledger). If any settled trade lacks one, the DCA
     comparison is None and the drawdown bar fails closed. ``passes`` is never True before
-    ``pass_min_months`` AND ``pass_min_settled_trades`` are both met.
+    ``pass_min_months`` AND ``pass_min_settled_trades`` are both met, and never while any trade
+    that has expired is still unscored. Only trades settled on or before the as_of session count.
+    Early-assignment flags are reported as counts (risk notes), not as a pass gate.
 
     The ADR's "every data failure dropped the suggestion" bar is structural (selection never
     raises and records its drops), so it is covered by tests rather than computed here.
@@ -791,13 +863,26 @@ def scorecard(
         status = _get(r, "status")
         pnl, collateral, days = _num(_get(r, "pnl")), _num(_get(r, "collateral")), _num(_get(r, "days_held"))
         start, done = _day(_get(r, "entry_session")), _day(_get(r, "settled_on"))
-        if status in SCORED_STATUSES and None not in (pnl, collateral, days, start, done):
+        # Review of #2105: a trade settled after the as_of session is not known yet (lookahead).
+        if status in SCORED_STATUSES and None not in (pnl, collateral, days, start, done) and done <= session:
             scored.append({"entry_id": _get(r, "entry_id"), "status": status, "pnl": pnl, "collateral": collateral,
                            "days": days, "start": start, "done": done,
                            "premium": _num(_get(r, "premium_dollars")) or 0.0,
                            "flags": tuple(_get(r, "flags") or ())})
     scored.sort(key=lambda r: (r["done"], str(r["entry_id"])))
-    n_unscored = sum(1 for r in rows if _get(r, "status") == "unscored")
+    # Unscored trades whose expiry has passed are counted and block a pass (review of #2105):
+    # missing-price trades are often the losers, so letting them drop out biases toward a pass.
+    # An unscored row with an unreadable expiry counts too (fail closed).
+    n_unscored = 0
+    for r in rows:
+        if _get(r, "status") == "unscored":
+            expiry = _day(_get(r, "expiration_date"))
+            if expiry is None or expiry <= session:
+                n_unscored += 1
+    # Early-assignment risk is flagged, not simulated; the counts are reported as risk notes.
+    n_ex_div = sum(1 for r in scored if "ex_dividend_in_window" in r["flags"])
+    n_deep = sum(1 for r in scored if "deep_itm" in r["flags"])
+    n_risk = sum(1 for r in scored if EARLY_ASSIGNMENT_FLAGS & set(r["flags"]))
 
     net = sum(r["pnl"] for r in scored)
     years = sum(r["collateral"] * r["days"] / 365.0 for r in scored)
@@ -851,7 +936,12 @@ def scorecard(
         no_breaches=no_breaches,
         has_min_months=has_months,
         has_min_trades=has_trades,
-        passes=has_trades and has_months and beats_sweep and worst_ok and drawdown_ok and no_breaches,
+        no_unscored=n_unscored == 0,
+        n_ex_dividend_risk=n_ex_div,
+        n_deep_itm_risk=n_deep,
+        n_early_assignment_risk=n_risk,
+        passes=(has_trades and has_months and beats_sweep and worst_ok and drawdown_ok and no_breaches
+                and n_unscored == 0),
         breach_flags=breaches,
     )
 
@@ -1006,10 +1096,14 @@ _LATEST_ENTRIES = (
     "WHERE rn = 1"
 )
 # Like the ledger's outcomes: visible only if both written and built from data known by the
-# reader's moment; among those, the one built from the newest information wins.
+# reader's moment. A SCORED row always beats an unscored one (review of #2105: a re-run during
+# a price-feed outage wrote a newer "unscored" row that hid an assigned loser from the
+# scorecard). Among scored rows the one built from the newest information wins, so a real
+# correction (better data, new hash) still lands; an unscored row only ever replaces another
+# unscored row.
 _LATEST_SETTLEMENTS = (
     "SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER (PARTITION BY entry_id "
-    "ORDER BY inputs_known_at DESC, as_of DESC, ingested_at DESC, content_hash) AS rn "
+    "ORDER BY (status <> 'unscored') DESC, inputs_known_at DESC, as_of DESC, ingested_at DESC, content_hash) AS rn "
     "FROM csp_shadow_settlements WHERE as_of <= ? AND inputs_known_at <= ?) WHERE rn = 1"
 )
 
