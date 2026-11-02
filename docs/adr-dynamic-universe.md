@@ -70,7 +70,7 @@ Evidence that shapes the decision:
 | 6 | Market-cap floor | $2B |
 | 7 | Dollar allocation within the 100 | Existing graded ladder, unchanged |
 | 8 | Approval owner and window; what if nobody approves? | Operator only; no approval means keep the old list |
-| 9 | Will selling ever be added? | No; buy-only. If that changes, wash-sale and lot rules come first |
+| 9 | Will selling ever be added? | Only the operator-approved tax-loss sale in `docs/adr-tax-loss-sale.md` (PR #2099). Demotion from this list never sells |
 
 ## Consequences
 
