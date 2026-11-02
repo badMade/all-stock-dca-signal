@@ -425,6 +425,71 @@ def test_provider_previous_close_fallback_to_daily_bars():
     assert bar.close == pytest.approx(306.0)  # last day strictly before 2026-07-02
 
 
+# -- split-day prior close ---------------------------------------------------------
+# Shape copied from a real read-only Robinhood get_equity_quotes response for SNDK
+# (2026-11-02, prior session 2026-10-30: close.price == previous_close ==
+# adjusted_previous_close == 1150.89). The split-day variant applies SNDK's announced
+# 8-for-1 ratio to adjusted_previous_close only (1150.89 / 8 = 143.86125), which is how
+# an ex-date quote looks when the official close is still the raw pre-split print.
+# Without a guard, every slot that day reads the stock as ~87.5% below its prior
+# close and picks the top multiplier tier.
+_SNDK_SPLIT_DAY_QUOTES = {
+    "data": {
+        "results": [
+            {
+                "quote": {
+                    "symbol": "SNDK",
+                    "last_trade_price": "144.10",
+                    "venue_last_trade_time": "2026-07-02T19:40:00Z",
+                    "previous_close": "1150.890000",
+                    "adjusted_previous_close": "143.861250",
+                    "previous_close_date": "2026-07-01",
+                    "has_traded": True,
+                    "state": "active",
+                },
+                "close": {"symbol": "SNDK", "date": "2026-07-01", "price": "1150.89", "source": "sip-list-exchange-close"},
+            }
+        ]
+    }
+}
+_SNDK_ADJUSTED_DAILY = {"data": {"results": [{"symbol": "SNDK", "bars": [
+    {"begins_at": "2026-07-01T13:30:00Z", "open_price": "142.00", "close_price": "143.86", "high_price": "145.00", "low_price": "141.50", "volume": 1},
+]}]}}
+
+
+def test_previous_close_ignores_quote_close_that_disagrees_with_adjusted_close():
+    # A split-sized gap between the official close and adjusted_previous_close means the
+    # quote's close is not on the same share basis as today's price. Fail closed for the
+    # quote path and use the split-adjusted daily bar instead (the existing fallback).
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: _SNDK_ADJUSTED_DAILY, quotes_fn=lambda **k: _SNDK_SPLIT_DAY_QUOTES)
+    bar = prov.get_previous_close_bar("SNDK", _decision_dt())
+    assert bar is not None
+    assert bar.close == pytest.approx(143.86)
+
+
+def test_previous_close_returns_none_when_quote_disagrees_and_no_daily_bar():
+    # No usable fallback either: no prior close at all (NO_DATA downstream), never the
+    # raw pre-split close.
+    empty = {"data": {"results": [{"symbol": "SNDK", "bars": []}]}}
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: empty, quotes_fn=lambda **k: _SNDK_SPLIT_DAY_QUOTES)
+    assert prov.get_previous_close_bar("SNDK", _decision_dt()) is None
+
+
+def test_previous_close_keeps_quote_close_when_adjusted_close_differs_by_a_dividend():
+    # An ordinary cash dividend moves adjusted_previous_close by well under 20%; that
+    # must not knock every ex-dividend ticker off the quote path.
+    quotes = {"data": {"results": [{
+        "quote": {"symbol": "AAPL", "last_trade_price": "313.33", "venue_last_trade_time": "2026-07-02T19:40:00Z",
+                  "previous_close": "308.63", "adjusted_previous_close": "308.37", "previous_close_date": "2026-07-01",
+                  "has_traded": True, "state": "active"},
+        "close": {"symbol": "AAPL", "date": "2026-07-01", "price": "308.63"},
+    }]}}
+    prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: quotes)
+    bar = prov.get_previous_close_bar("AAPL", _decision_dt())
+    assert bar is not None
+    assert bar.close == pytest.approx(308.63)
+
+
 # -- signal-time quote dedupe (⚡ Bolt) ------------------------------------------
 # One quote payload carrying everything the three consumers read: previous-close
 # (get_previous_close_bar), last trade (get_quote), and a two-sided NBBO (get_bid_ask).
