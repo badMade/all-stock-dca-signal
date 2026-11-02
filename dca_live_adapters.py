@@ -4829,6 +4829,15 @@ PrevCloseFn = Callable[..., Any]                # generic finance previous close
 QuoteFn = Callable[..., Any]                    # generic finance quote -> price or mapping
 
 
+# Largest relative gap between a quote's official prior close and its
+# adjusted_previous_close that is still treated as "same share basis". A cash
+# dividend moves the adjusted close by a few percent at most; the smallest common
+# forward split (3-for-2) moves it by 33%. 20% sits between the two, so ordinary
+# ex-dividend days keep the quote path and split ex-dates fall back to the
+# split-adjusted daily bar (see RobinhoodDataProvider._previous_close_from_quote).
+_SPLIT_BASIS_MISMATCH_FRACTION = 0.20
+
+
 class RobinhoodDataProvider:
     """``MarketDataProvider`` backed by the Robinhood ``get_equity_historicals`` /
     ``get_equity_quotes`` MCP tools via injected callables.
@@ -5149,6 +5158,17 @@ class RobinhoodDataProvider:
         official = quote.get("_close") or {}
         price = _to_float(official.get("price")) or _to_float(quote.get("previous_close"))
         if price <= 0:
+            return None
+        # On a split's ex-date the official close is still the raw pre-split print
+        # while today's trades are post-split, so an 8-for-1 split (SNDK, announced
+        # 2026-10-29) would read as an ~87.5% drop and pick the top multiplier tier in
+        # every slot. adjusted_previous_close is on today's share basis. A gap beyond
+        # what a cash dividend can produce means the two closes are on different share
+        # bases: refuse the quote path and let get_previous_close_bar use the
+        # split-adjusted daily bar (or return None, which is NO_DATA downstream) --
+        # never the raw close. Dividend-sized gaps keep the official close.
+        adjusted = _to_float(quote.get("adjusted_previous_close"))
+        if adjusted > 0 and abs(price - adjusted) / max(price, adjusted) > _SPLIT_BASIS_MISMATCH_FRACTION:
             return None
         close_date_str = official.get("date") or quote.get("previous_close_date")
         close_date = _parse_iso_date(close_date_str) or (as_of.astimezone(EASTERN).date() - timedelta(days=1))
