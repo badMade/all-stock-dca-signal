@@ -66,8 +66,10 @@ from comovement_signals.suggester import (
     ComovementConfig,
     ComovementInputs,
     ComovementOutcome,
+    ComovementSuggestion,
     ComovementUnavailable,
     CorrelatedSelloffSuggester,
+    UNSCORED_MAE,
 )
 
 __all__ = [
@@ -80,6 +82,7 @@ __all__ = [
     "ComovementInputError",
     "ComovementInputs",
     "ComovementOutcome",
+    "ComovementSuggestion",
     "ComovementSuggestionPublisher",
     "ComovementUnavailable",
     "CorrelatedSelloffSuggester",
@@ -99,6 +102,7 @@ __all__ = [
     "ShadowWriter",
     "TiltConfig",
     "WriteResult",
+    "UNSCORED_MAE",
     "average_linkage_clusters",
     "breakdown_run",
     "build_clusters",

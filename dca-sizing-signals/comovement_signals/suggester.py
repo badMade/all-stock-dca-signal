@@ -18,6 +18,7 @@ Neither ever reads the other's output.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -48,10 +49,25 @@ SIGNAL_SELLOFF = "correlated_selloff"
 SOURCE_PREFIX = "comovement_signals."
 
 # These signals are rules, not fitted models, and the Phase 0 ledger has not scored them
-# yet, so there is no real error metric. SizingSuggestion requires a float, so 0.0 is a
-# placeholder that is NEVER written as a claim: the published file records mae = null
-# with status "unscored_rule_based" (see publish.py).
-UNSCORED_MAE = 0.0
+# yet, so there is no real error metric. SizingSuggestion requires a float.
+# Review round 1 (PR #2106): this used to be 0.0, which reads as a PERFECT MAE in memory,
+# so any MAE-ranking reader or the shared publisher's must-beat-incumbent gate would have
+# preferred these unscored rows over every real model. +inf can never win a lower-is-
+# better comparison, and the shared SuggestionPublisher refuses it outright as non-finite
+# ("blocked_missing_eval_metric"), which keeps these rows out of MAE-gated paths. The
+# explicit ComovementSuggestion.scored = False says the same thing by type, and the
+# published file records mae = null, scored = false (see publish.py).
+UNSCORED_MAE = math.inf
+
+
+@dataclass(frozen=True, slots=True)
+class ComovementSuggestion(SizingSuggestion):
+    """A SizingSuggestion that says, by type, that nobody has scored it yet.
+
+    Still satisfies every SizingSuggestion consumer; ``eval_metric_mae`` is UNSCORED_MAE.
+    """
+
+    scored: bool = False
 
 
 class ComovementUnavailable(RuntimeError):
@@ -137,6 +153,31 @@ def _number(name: str, value: object) -> float:
     return float(value)
 
 
+def _fingerprint(close_rows: Sequence[Mapping[str, object]], cfg: ComovementConfig) -> str:
+    """Stable digest of the price rows and config the clusters depend on. repr() of each
+    row's relevant values is enough: it only has to tell two inputs apart, and a false
+    "different" merely costs one recomputation."""
+    h = hashlib.sha256(repr(sorted(asdict(cfg).items())).encode())
+    for row in close_rows:
+        values = tuple(row.get(k) for k in ("ticker", "date", "close", "interpolated", "final"))
+        h.update(repr(values).encode())
+    return h.hexdigest()
+
+
+def _check_input_types(inputs: object) -> None:
+    """Review round 1 (PR #2106): a loader returning the wrong type, or a field of the
+    wrong shape, must fail closed with a reason, never escape as an AttributeError."""
+    if not isinstance(inputs, ComovementInputs):
+        raise _Failed("invalid_input", f"loader returned {type(inputs).__name__}, not ComovementInputs")
+    if isinstance(inputs.close_rows, (str, bytes)) or not isinstance(inputs.close_rows, Sequence):
+        raise _Failed("invalid_input", "close_rows must be a sequence of row mappings")
+    for name in ("proposed_buys_usd_by_ticker", "day_returns_by_ticker", "escalation_usd_by_ticker"):
+        if not isinstance(getattr(inputs, name), Mapping):
+            raise _Failed("invalid_input", f"{name} must be a mapping")
+    if any(not isinstance(r, Mapping) for r in inputs.close_rows):
+        raise _Failed("invalid_input", "every close row must be a mapping")
+
+
 class _ComovementSuggester:
     """Shared fail-closed pipeline. Subclasses add only their signal's own step."""
 
@@ -154,8 +195,14 @@ class _ComovementSuggester:
         self._config = config or ComovementConfig()
         self._model_version = model_version or self.default_model_version
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        # suggest() is called once per ticker; clustering once per as-of date is enough.
-        self._cache: tuple[date, ComovementOutcome] | None = None
+        # suggest() is called once per ticker, and clustering is the only expensive step,
+        # so only the clusters are cached. Review round 1 (PR #2106): the whole outcome used
+        # to be cached per date, so a later same-day call with different proposed buys got
+        # the stale result and a transient loader failure stuck all day. Now the inputs are
+        # reloaded on every call, the cheap signal step always reruns, the clusters are
+        # reused only for the same as-of date AND the same price rows and config
+        # (fingerprinted), and a failure is never cached.
+        self._cluster_cache: tuple[tuple[date, str], ReturnsMatrix, tuple[Cluster, ...]] | None = None
 
     @property
     def source(self) -> str:
@@ -180,15 +227,10 @@ class _ComovementSuggester:
 
     def evaluate(self, asof: date) -> ComovementOutcome:
         """Run the whole pipeline for ``asof``. Never raises for bad inputs."""
-        if self._cache is not None and self._cache[0] == asof:
-            return self._cache[1]
         try:
-            outcome = self._evaluate(asof)
+            return self._evaluate(asof)
         except _Failed as failed:
-            outcome = ComovementOutcome(self.signal, asof, False, failed.reason,
-                                        detail={"message": str(failed)})
-        self._cache = (asof, outcome)
-        return outcome
+            return ComovementOutcome(self.signal, asof, False, failed.reason, detail={"message": str(failed)})
 
     # ------------------------------------------------------------------ pipeline
 
@@ -198,6 +240,7 @@ class _ComovementSuggester:
             inputs = self._load_inputs(asof)
         except Exception as exc:  # noqa: BLE001 -- any loader failure must fail closed, not crash
             raise _Failed("input_load_failed", f"{type(exc).__name__}: {exc}") from exc
+        _check_input_types(inputs)
 
         buys = {t: _number(f"proposed buy for {t}", v) for t, v in inputs.proposed_buys_usd_by_ticker.items()}
         if not buys:
@@ -210,15 +253,10 @@ class _ComovementSuggester:
         if not inputs.close_rows:
             raise _Failed("missing_prices", "no close rows supplied")
 
-        try:
-            matrix = returns_matrix(inputs.close_rows, asof, cfg.window_sessions, cfg.min_sessions)
-        except ComovementInputError as exc:
-            raise _Failed("invalid_input", str(exc)) from exc
-        self._check_freshness(matrix, asof)
-        missing = sorted(t for t in buys if not matrix.returns.get(t) and t not in matrix.singletons)
+        matrix, clusters = self._matrix_and_clusters(inputs.close_rows, asof)
+        missing = sorted(t for t in buys if t not in matrix.returns)
         if missing:
             raise _Failed("missing_ticker_history", f"no usable closes for {missing}")
-        clusters = self._cluster(matrix)
 
         try:
             multipliers, detail = self._signal(clusters, buys, budget, inputs, asof)
@@ -231,7 +269,7 @@ class _ComovementSuggester:
             m = multipliers.get(t, 1.0)
             if not (math.isfinite(m) and cfg.floor <= m <= 1.0):
                 raise _Failed("failed_check", f"multiplier {m!r} for {t} outside [{cfg.floor}, 1.0]")
-            suggestions.append(SizingSuggestion(
+            suggestions.append(ComovementSuggestion(
                 ticker=t,
                 asof=asof,
                 multiplier_adjustment_pct=0.0 if m == 1.0 else (m - 1.0) * 100.0,
@@ -249,6 +287,21 @@ class _ComovementSuggester:
             **detail,
         }
         return ComovementOutcome(self.signal, asof, True, "ok", tuple(suggestions), clusters, detail)
+
+    def _matrix_and_clusters(self, close_rows, asof: date) -> tuple[ReturnsMatrix, tuple[Cluster, ...]]:
+        cfg = self._config
+        key = (asof, _fingerprint(close_rows, cfg))
+        if self._cluster_cache is not None and self._cluster_cache[0] == key:
+            return self._cluster_cache[1], self._cluster_cache[2]
+        try:
+            matrix = returns_matrix(close_rows, asof, cfg.window_sessions, cfg.min_sessions)
+        except ComovementInputError as exc:
+            raise _Failed("invalid_input", str(exc)) from exc
+        self._check_freshness(matrix, asof)
+        clusters = self._cluster(matrix)
+        # Stored only after every check above passed: a failure is never cached.
+        self._cluster_cache = (key, matrix, clusters)
+        return matrix, clusters
 
     def _check_freshness(self, matrix: ReturnsMatrix, asof: date) -> None:
         if matrix.latest_price_date is None:

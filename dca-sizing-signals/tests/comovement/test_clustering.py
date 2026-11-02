@@ -77,6 +77,6 @@ def test_build_clusters_from_three_block_returns_plus_singleton():
     # blocks come back exactly. N1 lists on day(6) (2 returns < the 8-return minimum), so
     # it is a singleton cluster appended in ticker order.
     rows = three_block_rows() + rows_from_returns("N1", [0.01, -0.01], start=6)
-    m = returns_matrix(rows, as_of=day(8), window_sessions=252, min_sessions=8)
+    m = returns_matrix(rows, as_of=day(9), window_sessions=252, min_sessions=8)
     clusters = build_clusters(m, cut=0.5, min_overlap=8)
     assert clusters == THREE_BLOCKS + (("N1",),)

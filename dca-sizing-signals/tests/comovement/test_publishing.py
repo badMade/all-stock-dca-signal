@@ -103,10 +103,10 @@ def test_outcome_for_other_signal_refused(tmp_path):
 
 def test_older_asof_never_overwrites_newer(tmp_path):
     pub = cluster_cap_publisher(tmp_path)
-    assert publish_outcome(_cap_outcome(asof=day(9)), pub).published
-    res = publish_outcome(_cap_outcome(asof=day(8)), pub)
+    assert publish_outcome(_cap_outcome(asof=day(10)), pub).published
+    res = publish_outcome(_cap_outcome(asof=day(9)), pub)
     assert (res.published, res.status) == (False, "blocked_stale_asof")
-    assert json.loads((tmp_path / CLUSTER_CAP_FILENAME).read_text())["asof"] == day(9).isoformat()
+    assert json.loads((tmp_path / CLUSTER_CAP_FILENAME).read_text())["asof"] == day(10).isoformat()
 
 
 def test_same_asof_rerun_replaces(tmp_path):
@@ -127,7 +127,7 @@ def test_out_of_bounds_suggestion_refused(tmp_path, pct):
 
 def test_mixed_asof_batch_refused(tmp_path):
     out = _cap_outcome()
-    bad = replace(out, suggestions=(replace(out.suggestions[0], asof=day(7)),) + out.suggestions[1:])
+    bad = replace(out, suggestions=(replace(out.suggestions[0], asof=day(8)),) + out.suggestions[1:])
     res = publish_outcome(bad, cluster_cap_publisher(tmp_path))
     assert (res.published, res.status) == (False, "blocked_invalid_bounds")
 
@@ -138,3 +138,19 @@ def test_single_publish_writes_one_row(tmp_path):
     assert res.published
     data = json.loads((tmp_path / CLUSTER_CAP_FILENAME).read_text())
     assert [s["ticker"] for s in data["suggestions"]] == ["A1"]
+
+
+def test_payload_marks_unscored(tmp_path):
+    # Review round 1 item 2: the file says scored false and claims no MAE.
+    publish_outcome(_cap_outcome(), cluster_cap_publisher(tmp_path))
+    data = json.loads((tmp_path / CLUSTER_CAP_FILENAME).read_text())
+    assert data["eval_metric"] == {"mae": None, "scored": False, "status": "unscored_rule_based"}
+
+
+def test_scored_looking_suggestion_refused(tmp_path):
+    # A finite MAE would claim a score these rules do not have.
+    out = _cap_outcome()
+    bad = replace(out, suggestions=(replace(out.suggestions[0], eval_metric_mae=0.0),) + out.suggestions[1:])
+    res = publish_outcome(bad, cluster_cap_publisher(tmp_path))
+    assert res.published is False
+    assert list(tmp_path.iterdir()) == []
