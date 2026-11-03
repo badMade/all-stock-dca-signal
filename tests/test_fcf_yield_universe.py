@@ -10,8 +10,12 @@ import near_close_dca
 
 CONFIG = Path(__file__).resolve().parent.parent / "config"
 NEW = (
-    "TSN RPRX CVS SJM KR CAH HCA HRL PFGC SYY KVUE HSY USFD MRK RMD DGX CHE ABT MDLZ MCK CHD CL"
+    "TSN RPRX CVS SJM KR CAH HCA HRL PFGC SYY HSY USFD MRK RMD DGX CHE ABT MDLZ MCK CHD CL"
 ).split()
+
+
+# KVUE was part of the 2026-10-19 request; it was excluded 2026-11-02 (not-found on every live run), see
+# test_kvue_is_excluded below.
 
 
 def _load(name):
@@ -46,3 +50,9 @@ def test_new_tickers_have_calibrated_sizing_entries():
 def test_new_tickers_are_in_the_history_fetch_list():
     listed = set((CONFIG.parent / "tickers.txt").read_text().split())
     assert set(NEW) <= listed
+
+
+def test_kvue_is_excluded_not_active():
+    tickers = _load("tickers.json")
+    assert "KVUE" not in tickers["active"] and "KVUE" in tickers["excluded"]
+    assert "KVUE" not in near_close_dca.ACTIVE_TICKERS and "KVUE" in near_close_dca.EXCLUDED_TICKERS
