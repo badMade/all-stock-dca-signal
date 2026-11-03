@@ -1,0 +1,9 @@
+Reading additional input from stdin...
+2026-11-03T01:00:03.864123Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp\", scope=\"read write\"" })
+2026-11-03T01:00:22.865060Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to find expected lines in /Users/geoffreyplymale/Documents/Git/all-stock-dca/.claude/worktrees/gracious-kalam-111ba6/docs/triage_routine.md:
+1. **Logs.** The run files live only on the operator's Mac (`cron_tracking/`, gitignored), so the routine first
+   finds a shell that can read them: a local checkout (the routine runs as a Mac task with the repo folder), else
+   the `remote-devices` bridge at `$HOME/mnt/all-stock-dca`, as the live slot prompts do. There it runs
+   `python -m scripts.triage_log_summary --json`, then `scripts.schedule_watchdog` and `scripts.alert_digest` (both
+   `--json`), and reads the newest `attempt_log` file. With neither shell the digest opens with `LOGS UNAVAILABLE in
+   this container` and carries on with GitHub and Notion only. That is not a clean bill of health.
