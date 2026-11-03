@@ -96,3 +96,8 @@
 **Vulnerability:** Unbounded numeric parsing missed an explicit `bool` check before checking `isinstance(value, (int, float))`.
 **Learning:** In Python, `isinstance(True, int)` evaluates to `True`, which can bypass safety invariants (like `pending_usd`).
 **Prevention:** Always guard against booleans explicitly (`not isinstance(v, bool)`) before evaluating `isinstance(v, (int, float))`.
+
+## 2024-11-20 - Boolean Coercion Bypass in Validation
+**Vulnerability:** Unbounded numeric parsing missed an explicit `bool` check before checking `isinstance(value, (int, float))`.
+**Learning:** In Python, `isinstance(True, int)` evaluates to `True`, which can bypass safety invariants (like `pending_usd`).
+**Prevention:** Always guard against booleans explicitly (`isinstance(v, bool) or not isinstance(v, (int, float))`) before evaluating `isinstance(v, (int, float))`.

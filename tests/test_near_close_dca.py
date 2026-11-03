@@ -51621,3 +51621,10 @@ def test_bool_amounts_in_a_legacy_attribution_are_never_summed_as_numbers():
     assert result["submitted_amount_usd"] == 10.0
     assert result["planned_amount_usd"] == 10.0
     assert result["whole_share_quantity"] == 2.0
+
+
+def test_is_usable_reconciled_order_id_rejects_boolean_ids():
+    """Ensure booleans are rejected and do not duck-type as valid ints/floats."""
+    from near_close_dca import _is_usable_reconciled_order_id
+    assert _is_usable_reconciled_order_id(True) is False
+    assert _is_usable_reconciled_order_id(False) is False

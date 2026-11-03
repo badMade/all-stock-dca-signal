@@ -15153,3 +15153,10 @@ def test_overflow_amount_usd_returns_refused_invalid_amount():
     assert plan.to_place == []
     assert len(plan.refused) == 1
     assert plan.refused[0] == ("AAPL", dca_runner.REFUSED_INVALID_AMOUNT)
+
+
+def test_usable_order_id_rejects_boolean_ids():
+    """Ensure booleans are rejected and do not duck-type as valid ints/floats."""
+    import dca_runner
+    assert dca_runner._is_usable_order_id(True) is False
+    assert dca_runner._is_usable_order_id(False) is False

@@ -25686,7 +25686,7 @@ def _is_usable_reconciled_order_id(value: object) -> bool:
     """
     if value is None or isinstance(value, bool):
         return False
-    if not isinstance(value, (str, int, float)):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return False
     if isinstance(value, str):
         return bool(value.strip())

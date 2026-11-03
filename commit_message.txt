@@ -1,0 +1,9 @@
+🛡️ Sentinel: [HIGH] Fix Boolean Coercion Bypass in Order ID Validation
+
+🚨 **Severity:** HIGH
+💡 **Vulnerability & Impact:** Unbounded numeric parsing missed an explicit `bool` check before checking `isinstance(value, (str, int, float))`. In Python, `isinstance(True, int)` evaluates to `True`, which can bypass safety invariants.
+🔧 **Fix:** Added an explicit `isinstance(order_id, bool)` check before checking `isinstance(order_id, (str, int, float))` in `dca_runner._is_usable_order_id` (lines 3076, 4663) and `near_close_dca._is_usable_reconciled_order_id` (line 25689). This prevents boolean values from duck-typing as valid numeric order IDs.
+✅ **Verification:** Added failing tests `test_usable_order_id_rejects_boolean_ids` that passes `True` and `False` to `dca_runner._is_usable_order_id` and `test_is_usable_reconciled_order_id_rejects_boolean_ids` to `near_close_dca._is_usable_reconciled_order_id`, and verified they are rejected.
+⚠️ **Known Limitations:** None.
+🔒 **Secrets Confirmation:** Verified no hardcoded secrets or account numbers were introduced.
+🎯 **Entry-Point Coverage:** Covers the `dca_runner.py` and `near_close_dca.py` entry points.
