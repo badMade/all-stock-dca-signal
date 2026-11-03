@@ -201,3 +201,17 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   answered, so the rescue now also re-asks any empty ticker whose prior session traded at least
   `LIQUID_PRIOR_VOLUME` (1,000,000) shares (`rescue_targets` in `scripts/robinhood_payload.py`); see the rescue list
   above. Quiet, freshness and coverage checks are unchanged.
+
+## 2026-11-02: the worker prompt named a `span` the tool does not have
+
+Every slot refused on 2026-11-02. The Robinhood MCP `get_equity_historicals` schema is `additionalProperties: false`
+with `symbols` and `start_time` required and only `interval`, `end_time`, `bounds` and `adjustment_type` optional; there
+is no `span`. The prompt told the worker "span day" / "span week", so calls were rejected with
+`unexpected additional properties ["span"]` (15:30 chunk logs) or the worker retried without it and pulled a full-day,
+auto-interval series that blew its output limit ("exceeds the available response limit", 12:30). `build_prompt` now
+passes explicit RFC3339 UTC `start_time`/`end_time` for the slot window and a 7-day `start_time` for the previous daily
+bar. Launchd was not late: the 15:30 build started at 15:31:04 ET (the chunk logs stamp UTC) and `caffeinate`
+assertions held the Mac awake all day. The 13:30 refusal stamped 20:23 ET is a later manual replay, so its "quote too
+long after the decision" reasons are an artifact of that replay. What was actually late is build duration: the 14:30
+build took 1583 s (rescue waves, single chunks of 54-76 s) against the ~25-minute slot window, consistent with workers
+pulling oversized series after the `span` rejection.

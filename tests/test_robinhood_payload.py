@@ -194,6 +194,22 @@ def test_prompt_window_follows_the_dst_offset(tmp_path):
     assert "15:30:00Z" in est and "16:30:00Z" in est
 
 
+def test_prompt_never_names_the_rejected_span_parameter(tmp_path):
+    # 2026-11-02 15:30: get_equity_historicals is `additionalProperties: false` with `start_time` required and no `span`;
+    # the worker obeyed "span day"/"span week" and the tool answered `unexpected additional properties ["span"]`.
+    plan = plan_for(tmp_path, [])
+    text = rp.build_prompt(plan, ["AAA"])
+    assert "span" not in text
+    # The range is handed over as explicit RFC3339 UTC start_time/end_time (13:30-14:30 ET on 2026-10-15 is EDT).
+    assert "start_time" in text and "2026-10-15T17:30:00Z" in text and "2026-10-15T18:30:00Z" in text
+
+
+def test_prompt_daily_lookback_is_a_start_time_before_the_trading_day(tmp_path):
+    plan = plan_for(tmp_path, [])
+    text = rp.build_prompt(plan, ["AAA"])
+    assert "interval day" in text and "2026-10-08T00:00:00Z" in text  # 7 calendar days back: covers a long weekend
+
+
 # -- compact worker replies (2026-11-02: 5 of 7 slots refused) ----------------------------------------------------------
 # Every worker fetched its bars and quotes, then answered most tickers with "full response exceeds output capacity" or
 # "could not be reliably reproduced" instead of the data, so 3:30 published 15/84 and 0935, 1130, 1230 and 1330 refused
