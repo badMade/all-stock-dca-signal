@@ -188,7 +188,7 @@ def test_the_canonical_schedule_table_precedes_the_expired_override_records():
     the first schedule table in the section that calls itself authoritative.
     """
     text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
-    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (ET) | Trades | Status |")
     expired_records = text.index("### Expired temporary live scheduler overrides")
     assert canonical < expired_records, (
         "the canonical schedule table must appear before the expired override records, "
@@ -230,7 +230,7 @@ def _active_schedule_preamble() -> str:
     """Everything in the Active schedule section before its canonical table."""
     text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
     section = text.index("## Active schedule (canonical, verified 2026-07-27)")
-    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (ET) | Trades | Status |")
     assert section < canonical, "the canonical table must live inside the Active schedule section"
     return text[section:canonical]
 
@@ -2824,9 +2824,12 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
     backup_ids = {v["backup_task_id"] for v in slots.values()}
     for backup_id in backup_ids:
         assert backup_id in task_ids, f"{backup_id} has no tasks[] entry"
+    # 2026-10-31 (credit plan step 5): the operator paused the 10:50, 11:50, 13:50 and 14:50 backup fires
+    # (tests/test_backup_fire_reduction.py). Paused, not removed: every slot still names its backup task, the task
+    # keeps its trading contract, and its status is active or paused, never disabled.
     for task in data["tasks"]:
         if task["id"] in backup_ids:
-            assert task["status"] == "active", task["id"]
+            assert task["status"] in ("active", "paused"), task["id"]
             assert task["trades"] is True, task["id"]
 
     # The now-superseded week-limited override must say so, not silently

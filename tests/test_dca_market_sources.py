@@ -89,3 +89,34 @@ def test_quote_sides_accepts_aliases_and_rejects_bad_values():
         None,
     ]}]) == {"SPY": [1.0, 2.0], "QQQ": [3.0, 4.0], "BAD": None, "NAN": None,
             "CROSS": None, "ZERO": None, "BOOL": None}
+
+def test_agent_fetch_invalid_shape_types(monkeypatch, tmp_path):
+
+    path = tmp_path / "raw.json"
+
+    # Missing daily check - if key is missing, it should be defaulted to [] and pass the type check if it was missing.
+    # However we want to hit the second shape check:
+    # if not all(isinstance(raw.get(key), list) for key in ("historicals", "quotes")):
+    #     raise SourceUnavailable("agent market file has an invalid shape")
+    path.write_text('{"historicals": "not-a-list", "quotes": [], "daily": []}', encoding="utf-8")
+    os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    with pytest.raises(SourceUnavailable, match="shape"):
+        AgentFetchSource(path).fetch(DAY, NOW, ["SPY"])
+
+    path.write_text('{"historicals": [], "quotes": "not-a-list", "daily": []}', encoding="utf-8")
+    os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    with pytest.raises(SourceUnavailable, match="shape"):
+        AgentFetchSource(path).fetch(DAY, NOW, ["SPY"])
+
+    # Check invalid daily type
+    path.write_text('{"historicals": [], "quotes": [], "daily": "not-a-list"}', encoding="utf-8")
+    os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    with pytest.raises(SourceUnavailable, match="shape"):
+        AgentFetchSource(path).fetch(DAY, NOW, ["SPY"])
+
+
+def test_quote_sides_skips_non_string_symbols():
+    assert _quote_sides([{"results": [
+        {"symbol": 123, "quote": {"bid_price": "1", "ask_price": "2"}},
+        {"symbol": None, "quote": {"bid_price": "1", "ask_price": "2"}},
+    ]}]) == {}

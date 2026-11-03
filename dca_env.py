@@ -45,10 +45,18 @@ ALLOWED_KEYS = (
     "DCA_CONFIG_DIR",
     "DCA_CRON_TRACKING_ROOT",
     "DCA_DRIFT_SLACK_WEBHOOK",
+    # scripts/backup_dispatch.py (2026-10-31): the event-triggered Perplexity backup's sender, mail server and
+    # prompts. DCA_SMTP_PASSWORD is a mail app password; like every value here it is never printed.
+    "DCA_FILLED_PROMPTS_DIR",
     "DCA_HEARTBEAT_URL",
     "DCA_INTRADAY_ARCHIVE_DIR",
     "DCA_INTRADAY_LIVE_STATE_ROOT",
     "DCA_MARKET_OPEN_LIVE_STATE_ROOT",
+    "DCA_PERPLEXITY_SENDER",
+    "DCA_PPLX_STATE_FOLDERS",
+    "DCA_SMTP_HOST",
+    "DCA_SMTP_PASSWORD",
+    "DCA_SMTP_USER",
     "DCA_TICKER_DAILY_UPDATE_SCRIPT",
     "DCA_TICKER_HISTORY_DIR",
     "DCA_VIZ_DIR",

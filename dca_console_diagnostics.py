@@ -44,7 +44,8 @@ _LAYER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     )),
     ("backup_executor", (
         "dca_execution_router", "dca_order_plan", "dca_number_check", "scripts.backup_planner", "scripts.backup_stream_specs",
-        "scripts.local_heartbeat", "scripts.assemble_market_data", "scripts.build_backup_planner",
+        "scripts.local_heartbeat", "scripts.slot_status", "scripts.backup_cost_ledger", "scripts.backup_dispatch", "scripts.assemble_market_data",
+        "scripts.build_backup_planner",
         "scripts.stream_candidates", "scripts.generate_",
     )),
     ("entry_points", (
@@ -78,7 +79,9 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "dca_config", "dca_env", "dca_paths", "dca_ticker_paths", "dca_fileio", "dca_provenance", "dca_intraday_archive",
         "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
-        "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "scripts.backup_strategy",
+        "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "sizing_suggestion_history",
+        "sizing_suggestion_compare",
+        "scripts.backup_strategy",
     )),
     ("reporting_ops", "Reporting & monitoring", (
         "dca_alerts", "dca_average_cost_snapshot", "dca_notion_sync", "dca_reporting", "dca_weekly_dashboard",
@@ -86,9 +89,9 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
         "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
         "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
-        "scripts.sync_live_prompts", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
+        "scripts.sync_live_prompts", "scripts.triage_log_summary", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
         "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.planner_repaste_notice", "scripts.slot_attribution",
-        "scripts.abort_markers",
+        "scripts.abort_markers", "scripts.local_ci_sweep",
     )),
     ("broker_market", "Broker, orders & market data", (
         "dca_live_adapters", "dca_slot_guard", "build_raw_data", "run_market_open_signals",

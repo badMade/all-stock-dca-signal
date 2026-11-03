@@ -35,6 +35,13 @@ from scripts.verify_schedule import (  # noqa: E402
     verify_day,
 )
 
+# chmod 0o555 cannot make a directory unwritable for root, which ignores permission bits, so these tests cannot
+# set up their condition under uid 0 (a root container or act run). CI runs them as a non-root runner user, where
+# they still gate the unwritable-root exit code (2026-10-31 local check of main: 4 false failures as root).
+needs_permission_bits = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores directory permission bits; run as a non-root user"
+)
+
 SCRIPT = REPO / "scripts" / "record_evidence_free_abort.sh"
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 28)
@@ -177,6 +184,7 @@ def test_bad_arguments_exit_2_and_write_nothing(root, args):
     assert list(root.iterdir()) == []
 
 
+@needs_permission_bits
 def test_an_unwritable_root_exits_1(root):
     root.chmod(0o555)
     try:

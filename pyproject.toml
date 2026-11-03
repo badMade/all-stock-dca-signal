@@ -143,6 +143,12 @@ py-modules = [
     "market_open_dca",
     "intraday_dca",
     "dca_cumulative",
+    # Append-only per-suggester recommendation history (ml_forecaster, octopus); imported by
+    # ml-forecaster/publish.py and scripts/publish_octopus_sizing.py, so an installed wheel
+    # needs it or both publishers ImportError.
+    "sizing_suggestion_history",
+    # Read-only scorecard over that history (python -m sizing_suggestion_compare).
+    "sizing_suggestion_compare",
     # Imported by scripts/run_tickers_daily_update.py, scripts/run_ticker_maintenance.py,
     # and scripts/refresh_active_ticker_histories.py to resolve the ticker-history
     # directory; without it those jobs fail with ModuleNotFoundError outside a
@@ -266,6 +272,12 @@ scripts = ["*.sh"]
     # Read by the plan-first recommendation store; without this the installed
     # courier has no freshness or publish policy and must fail closed.
     "config/recommendations.json",
+    # Read by scripts/slot_status.py (2026-10-30): without it an installed local_heartbeat cannot find the branch
+    # the Perplexity backups read, and the slot-status signal is never published.
+    "config/slot_status.json",
+    # Read by scripts/backup_dispatch.py (2026-10-31): the event-triggered backup's mode (shadow or live), so an
+    # installed copy cannot fall back to sending.
+    "config/backup_dispatch.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by

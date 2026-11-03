@@ -183,6 +183,72 @@ def test_prompt_names_window_and_forbids_orders(tmp_path):
     text = rp.build_prompt(plan, ["AAA", "BBB"])
     assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
     assert "Never call any order" in text
+    # 2026-11-02 (first Monday after fall-back): the window is handed over in UTC, computed in code, so the worker never
+    # has to know ET's offset. 13:30 ET on 2026-10-15 is EDT (17:30Z); 10:30 ET on 2026-11-02 is EST (15:30Z).
+    assert "17:30:00Z" in text and "18:30:00Z" in text
+
+
+def test_prompt_window_follows_the_dst_offset(tmp_path):
+    plan = plan_for(tmp_path, [])
+    est = rp.build_prompt({**plan, "trading_day": "2026-11-02", "bar_start_et": "10:30", "decision_time_et": "11:30"}, ["AAA"])
+    assert "15:30:00Z" in est and "16:30:00Z" in est
+
+
+def test_prompt_never_names_the_rejected_span_parameter(tmp_path):
+    # 2026-11-02 15:30: get_equity_historicals is `additionalProperties: false` with `start_time` required and no `span`;
+    # the worker obeyed "span day"/"span week" and the tool answered `unexpected additional properties ["span"]`.
+    plan = plan_for(tmp_path, [])
+    text = rp.build_prompt(plan, ["AAA"])
+    assert "span" not in text
+    # The range is handed over as explicit RFC3339 UTC start_time/end_time (13:30-14:30 ET on 2026-10-15 is EDT).
+    assert "start_time" in text and "2026-10-15T17:30:00Z" in text and "2026-10-15T18:30:00Z" in text
+
+
+def test_prompt_daily_lookback_is_a_start_time_before_the_trading_day(tmp_path):
+    plan = plan_for(tmp_path, [])
+    text = rp.build_prompt(plan, ["AAA"])
+    assert "interval day" in text and "2026-10-08T00:00:00Z" in text  # 7 calendar days back: covers a long weekend
+
+
+# -- compact worker replies (2026-11-02: 5 of 7 slots refused) ----------------------------------------------------------
+# Every worker fetched its bars and quotes, then answered most tickers with "full response exceeds output capacity" or
+# "could not be reliably reproduced" instead of the data, so 3:30 published 15/84 and 0935, 1130, 1230 and 1330 refused
+# too. Nothing on the Mac changed since the 10-30 builds that published 91/91; the reply is what no longer fits. A bar
+# written as a 6-element list carries the same numbers in about a third of the characters, and a smaller chunk halves
+# what one worker has to write back. Object bars stay accepted, so a worker that ignores the format still validates.
+
+
+def compact(raw):
+    """``raw`` with every bar rewritten as ``[timestamp, open, high, low, close, volume]``."""
+    as_list = lambda b: [b["timestamp"], b["open"], b["high"], b["low"], b["close"], b["volume"]]  # noqa: E731
+    return {**raw, "previous_close_bar": as_list(raw["previous_close_bar"]),
+            "intraday_bars": [as_list(b) for b in raw["intraday_bars"]]}
+
+
+def test_prompt_asks_for_compact_list_bars(tmp_path):
+    text = rp.build_prompt(plan_for(tmp_path, []), ["AAA", "BBB"])
+    assert '[timestamp, open, high, low, close, volume]' in text
+    # The object-per-bar shape is what overflowed the replies; the prompt must no longer ask for it.
+    assert '{"timestamp": "<iso with offset>", "open": n' not in text
+
+
+def test_a_compact_list_bar_validates_to_the_same_bars_as_an_object_bar():
+    raw = good_ticker()
+    assert rp.validate_ticker(compact(raw), **kw()) == rp.validate_ticker(raw, **kw())
+
+
+@pytest.mark.parametrize("bad", [
+    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1],  # five fields: volume missing
+    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1, 100, 7],  # seven fields
+    ["2026-10-15T17:30:00Z", 10.0, 9.0, 9.9, 10.1, 100],  # high below open: the range check still applies
+])
+def test_a_malformed_compact_bar_is_rejected(bad):
+    with pytest.raises(rp.PayloadError):
+        rp.validate_bar(bad)
+
+
+def test_chunks_are_four_tickers_so_one_reply_stays_short():
+    assert rp.DEFAULT_CHUNK_SIZE == 4
 
 
 def test_live_mirror_prompts_use_the_prebuilt_payload():
@@ -775,7 +841,7 @@ def test_launcher_keeps_a_dead_chunks_worker_log_beside_the_refusal(tmp_path):
 # empty, so all eight were filed as "quiet" (no trade in the window) and the payload published 83/91. NVDA, GOOGL, GOOG
 # and AMZN trade every minute of the session: a whole chunk with no bars is a worker that dropped the series, not eight
 # names that all stopped trading at once. A chunk whose every ticker has no bars is re-asked for like a dead chunk; a
-# chunk where only some names are empty (the thin names of 2026-10-26/27 13:30) is left alone, so it costs no rescue.
+# chunk where only some names are empty (a genuinely thin name) is left alone, so it costs no rescue.
 
 #: Stub ``codex``: valid data for every requested ticker, except that a request for a whole BLANK chunk answers every
 #: ticker with ``intraday_bars: []``, and a request naming a THIN ticker answers that one ticker with no bars.
@@ -793,16 +859,23 @@ for chunk in json.loads({blank!r}):
 for t in json.loads({thin!r}):
     if t in reply:
         reply[t]["intraday_bars"] = []
+for t in json.loads({liquid!r}):
+    reply.get(t, {{}}).setdefault("previous_close_bar", {{}})["volume"] = 77568070.0  # NVDA's 10-28 session
+    if t in reply and len(tickers) > {rescue_size}:  # dropped in the whole-chunk request, served in a small re-ask
+        reply[t]["intraday_bars"] = []
 open(out, "w").write(json.dumps(reply))
 """
 
 
-def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=()):
+def _run_with_blank_chunks(tmp_path, *, blank_chunks=_DEAD, thin=(), liquid=()):
     import sys
 
     plan = _plan_0935(tmp_path)
     blank = [plan["chunks"][i] for i in blank_chunks]
-    stub = _BLANK_STUB.format(python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)))
+    stub = _BLANK_STUB.format(
+        python=sys.executable, blank=json.dumps(blank), thin=json.dumps(list(thin)), liquid=json.dumps(list(liquid)),
+        rescue_size=2,  # the launcher's default DCA_RESCUE_CHUNK_SIZE
+    )
     done, _ = _run_launcher(tmp_path, fake_script=stub)
     return done, plan, blank
 
@@ -837,6 +910,55 @@ def test_launcher_leaves_a_genuinely_quiet_name_in_a_replying_chunk_alone(tmp_pa
     assert done.returncode == 0 and out.exists(), log
     assert json.loads(out.with_suffix(".meta.json").read_text())["quiet"] == [thin]
     assert "0" not in {i for i, _ in re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log)}, log
+
+
+# -- liquid names dropped from a chunk that still answered others (2026-10-31, the 10-29 follow-up) --------------------
+# The whole-chunk rule above needs EVERY answered ticker empty: had one ticker of 10-29's chunk 3 kept its bars, NVDA,
+# GOOGL, GOOG and AMZN would have been filed quiet again. An empty name whose prior session traded LIQUID_PRIOR_VOLUME
+# shares or more is now re-asked for alone; a thin empty name in the same chunk is still left alone and stays quiet.
+
+
+def test_rescue_targets_reasks_an_empty_liquid_name_but_not_an_empty_thin_one():
+    from scripts.robinhood_payload import LIQUID_PRIOR_VOLUME, rescue_targets
+
+    def entry(volume, bars):
+        return {"previous_close_bar": {"volume": volume}, "intraday_bars": bars, "quote": {}}
+
+    bar = [{"timestamp": "x"}]
+    reply = {
+        "NVDA": entry(77568070.0, []),  # 10-29 15:31: no bar in the hour, ~78M shares the session before
+        "AMZN": entry(LIQUID_PRIOR_VOLUME, []),  # the threshold itself is liquid
+        "QTOP": entry(87085.0, []),  # a genuinely thin name: still quiet, never re-asked
+        "AAPL": entry(35714331.0, bar),  # answered with bars: never re-fetched
+        "ODD": {"previous_close_bar": "garbage", "intraday_bars": []},  # unreadable volume reads as not liquid
+        "BOOL": entry(True, []),
+        "ERR": {"error": "no data"},
+    }
+    tickers = ["NVDA", "AMZN", "QTOP", "AAPL", "ODD", "BOOL", "ERR", "GONE"]
+    assert rescue_targets(reply, tickers) == ["NVDA", "AMZN", "ERR", "GONE"]
+    # Unchanged rules: a dead chunk, and a chunk whose every answered ticker is empty, are re-asked in full.
+    assert rescue_targets({}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, []), "B": entry(10.0, [])}, ["A", "B"]) == ["A", "B"]
+    assert rescue_targets({"A": entry(10.0, bar), "B": entry(10.0, [])}, ["A", "B"]) == []
+
+
+def test_launcher_rescues_an_empty_liquid_name_in_a_chunk_that_answered_others(tmp_path):
+    import re
+    from pathlib import Path
+
+    # Chunk 0 answers in full, but its first two tickers come back with no bars and a ~78M-share prior session (the
+    # 10-29 shape, minus the "whole chunk empty" that the earlier rule needed), and its third is a genuinely thin name.
+    # The two liquid names are re-asked for and recovered; the thin one is not re-asked for and is still filed quiet.
+    plan = _plan_0935(tmp_path)
+    liquid, thin = plan["chunks"][0][:2], plan["chunks"][0][2]
+    done, plan, _ = _run_with_blank_chunks(tmp_path, blank_chunks=(), thin=[thin], liquid=liquid)
+    log = done.stdout + done.stderr
+    out = Path(plan["out"])
+    assert done.returncode == 0 and out.exists(), log
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["quiet"] == [thin] and set(meta["failed"]) == {thin}, meta
+    assert set(liquid) <= set(json.loads(out.read_text())["sources"]["robinhood"])
+    assert re.findall(r"robinhood_payload: rescue chunk=(\d+) tickers=(\d+)", log) == [("0", "2")], log
 
 
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
@@ -877,6 +999,36 @@ def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
     assert done.returncode == 2 and "must be whole numbers" in done.stderr
 
 
+def test_launcher_et_cutoff_that_already_passed_fetches_nothing_and_refuses(tmp_path):
+    import re
+
+    # 2026-10-30: a relative deadline counts from whenever launchd started the build, so a late 15:31 job could fetch
+    # past the 3:30 session's 12-minute re-check. The ET cutoff is absolute on the plan's trading day (2026-10-20 here,
+    # long past), so every chunk is skipped, the launcher says why, and the merge refuses instead of publishing late.
+    done, chunks = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40"})
+    log = done.stdout + done.stderr
+    assert "deadline 15:40 ET had already passed when the build started; fetching nothing" in log, log
+    assert set(range(chunks)) <= {int(i) for i in re.findall(r"deadline chunk=(\d+) attempt=1 skipped", log)}, log
+    assert "timing chunk=" not in log and re.search(r"timing total .* deadline_et=15:40\b", log), log
+    assert "is below 95%" in log and done.returncode == 2, log
+
+
+def test_launcher_et_cutoff_still_ahead_does_not_skip_any_chunk(tmp_path):
+    import re
+
+    # A future trading day's 15:40 is hours away, so no chunk is skipped: the cutoff binds only when the clock reaches it.
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": "15:40", "DCA_TRADING_DAY": "2027-01-04"})
+    log = done.stdout + done.stderr
+    assert "deadline chunk=" not in log and "already passed" not in log, log
+    assert re.search(r"timing chunk=0 attempt=1", log) and re.search(r"deadline=0 deadline_et=15:40\b", log), log
+
+
+@pytest.mark.parametrize("cutoff", ["3:40", "15:4", "25:00", "15:40:00", "soon"])
+def test_launcher_rejects_a_malformed_et_cutoff(tmp_path, cutoff):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_ET": cutoff})
+    assert done.returncode == 2 and "must be HH:MM" in done.stderr and "timing chunk=" not in done.stderr, done.stderr
+
+
 @pytest.mark.parametrize("size, needle", [("two", "must be whole numbers"), ("0", "must be at least 1")])
 def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
     # 0 would make the rescue loop's step zero; refuse it before any chunk is fetched.
@@ -906,7 +1058,7 @@ def final_buy_ticker(bars):
 
 
 def final_buy_kw(**over):
-    return kw(bar_start=time(14, 30), decision=time(15, 30), **over)
+    return kw(bar_start=time(14, 25), decision=time(15, 30), **over)
 
 
 def test_1530_is_plannable_but_the_scheduled_slots_stay_the_six_prompt_wired_ones():
@@ -934,7 +1086,7 @@ def test_1530_plan_scores_the_universe_and_interval_the_final_buy_generator_uses
     assert plan["tickers"] == [t for t in config.tickers if t not in config.excluded_tickers]
     assert plan["decision_time_et"] == SLOT_SPECS["1530ET"]["decision_time_et"].strftime("%H:%M") == "15:30"
     assert plan["interval_minutes"] == config.robinhood_interval_minutes == 5
-    assert plan["bar_start_et"] == "14:30" and plan["shadow"] is True
+    assert plan["bar_start_et"] == "14:25" and plan["shadow"] is True
     assert plan["out"].endswith("robinhood_payload_2026-10-15_1530.json")
     assert rp.build_plan("1230", DAY)["shadow"] is False
 
@@ -967,19 +1119,25 @@ def test_1530_plan_refuses_an_early_close_and_an_unapproved_day(monkeypatch):
 
 
 def test_1530_window_needs_the_lookback_bar_and_the_bar_before_the_decision():
-    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
-    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:30") and len(ok["intraday_bars"]) == 12
-    # the generator's 60-minutes-back lookback bar (14:30) is missing: bars that start late must not pass
+    ok = rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 30)), **final_buy_kw())
+    assert ok["intraday_bars"][0]["timestamp"].startswith("2026-10-15T14:25") and len(ok["intraday_bars"]) == 13
+    # the generator's 60-minutes-back lookback bar (14:25) is missing: bars that start late must not pass
     with pytest.raises(rp.PayloadError, match="do not cover"):
         rp.validate_ticker(final_buy_ticker(bars_from(14, 45, 15, 30)), **final_buy_kw())
+    # 2026-10-30 regression: one interval late used to pass (the old `> start + interval` slack), and a 14:30-first
+    # series is exactly what the generator then scored NO_DATA/provider_error for all 91 tickers
+    with pytest.raises(rp.PayloadError, match=r"do not cover the 14:25 .*first bar 14:30"):
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 30)), **final_buy_kw())
     # the series stopped early: no completed decision bar
     with pytest.raises(rp.PayloadError, match="far before"):
-        rp.validate_ticker(final_buy_ticker(bars_from(14, 30, 15, 10)), **final_buy_kw())
+        rp.validate_ticker(final_buy_ticker(bars_from(14, 25, 15, 10)), **final_buy_kw())
 
 
 # -- quiet tickers (2026-10-26 and 2026-10-27 13:30 refusals) ----------------------------------------------------
-# The same eight thinly traded names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between
-# 12:30 and 13:30, so 82/90 (91%) refused the slot on both days. A name that did not trade is not a failed fetch:
+# Eight names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed no 5-minute bar between 12:30 and 13:30 on
+# 10-27, so 82/90 (91%) refused the slot (on 10-26 the same eight were left out of the reply instead). 2026-10-31: they
+# are exactly plan chunk 0 and include names trading 1-68M shares a day, so this was a dropped chunk, now re-asked by
+# the launcher's rescue; the quiet rule below still holds for names that really did not trade. A name that did not trade is not a failed fetch:
 # it is reported as "quiet" (Gate 5 scores it NO_DATA, never a BUY), kept out of the coverage denominator, and
 # capped so a real feed outage, which also yields empty series, still refuses.
 
@@ -995,12 +1153,23 @@ def stale_ticker():
     return good_ticker(minutes=range(30, 40, 5)) | {"intraday_bars": [bar("2026-10-15T17:30:00Z")]}
 
 
-def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, total=90):
+def liquid_empty_ticker(volume=5_000_000):
+    # 2026-11-02 10:30: AMZN, GOOG and GOOGL printed no bars in the window although each traded millions of shares the
+    # session before. That is a dropped series, not a quiet hour.
+    raw = good_ticker()
+    raw["intraday_bars"] = []
+    raw["previous_close_bar"]["volume"] = volume
+    return raw
+
+
+def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, liquid=0, total=90):
     tickers = [f"T{i}" for i in range(total)]
     plan = plan_for(tmp_path, tickers)
     replies = {t: good_ticker() for t in tickers}
     cursor = 0
-    for count, make in ((quiet, quiet_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"})):
+    for count, make in (
+        (quiet, quiet_ticker), (liquid, liquid_empty_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"}),
+    ):
         for t in tickers[cursor : cursor + count]:
             replies[t] = make()
         cursor += count
@@ -1041,10 +1210,11 @@ def test_eight_quiet_tickers_of_ninety_still_publish(tmp_path):
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0  # re-validation must not read them as misses
 
 
-def test_more_quiet_tickers_than_the_cap_still_refuse(tmp_path):
-    # An outage that returns empty series looks the same as a quiet market; the cap keeps it a refusal.
-    plan, _, chunk = universe_plan(tmp_path, quiet=10)
-    assert rp.MAX_QUIET_SHARE == 0.10
+def test_more_quiet_tickers_than_the_ceiling_still_refuse(tmp_path):
+    # A feed that drops most of the universe can still look thin; the ceiling keeps that a refusal.
+    # 23 of 90 is 25.6%, just over the 25% ceiling.
+    plan, _, chunk = universe_plan(tmp_path, quiet=23)
+    assert rp.MAX_QUIET_SHARE == 0.25
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
     assert not (tmp_path / "out" / "payload.json").exists()
@@ -1097,3 +1267,157 @@ def test_live_mirror_prompts_leave_quiet_tickers_out_of_the_errored_count():
         (path,) = mirror.glob(f"{slot}ET-*.txt")
         _, rule = _errored_ticker_rule(path)
         assert '"quiet"' in rule and ".meta.json" in rule, path.name
+
+
+# -- 3:30 PM: the payload window must reach the generator's own lookback bar (2026-10-30 Gate 5 abort) -----------------
+# The first live 3:30 run on the prebuilt payload passed `check` 91/91 and still scored every ticker NO_DATA with
+# provider_error: generate_buy_candidates anchors 15:30 on the COMPLETED 15:25 bar, so its 60-minute lookback is 14:25,
+# but the plan fetched bars from 14:30. The shadow week only ran `check`, never the generator, so nothing caught it.
+# These tests feed a payload built to the plan's own window through the generator, and derive the window from the
+# generator's anchor so the two cannot drift apart again.
+
+
+def _plan_window_entry(plan: dict, ticker_close_start: float = 100.0) -> dict:
+    """One Robinhood entry covering exactly the plan's window: bars from bar_start_et up to the open decision bar."""
+    from datetime import datetime, time, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    day = date.fromisoformat(plan["trading_day"])
+    start = datetime.combine(day, time.fromisoformat(plan["bar_start_et"]), et)
+    decision = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), et)
+    step = timedelta(minutes=int(plan["interval_minutes"]))
+
+    def bar(stamp, price):
+        return {"timestamp": stamp.isoformat(), "open": price, "high": price * 1.01, "low": price * 0.99,
+                "close": price, "volume": 100}
+
+    bars, stamp, price = [], start, ticker_close_start
+    while stamp < decision:
+        bars.append(bar(stamp, price))
+        stamp, price = stamp + step, price - 0.05  # a steady intraday dip below the previous close
+    # Robinhood stamps a daily bar at 00:00Z of its own session (scripts/ingest_market_data._session_date).
+    previous = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    return {
+        "previous_close_bar": bar(previous, ticker_close_start),
+        "intraday_bars": bars,
+        "quote": {"price": bars[-1]["close"], "as_of": (decision + timedelta(minutes=1)).isoformat()},
+    }
+
+
+def test_1530_plan_window_starts_at_or_before_the_generators_lookback_bar():
+    from datetime import datetime, time
+
+    from near_close_dca import StrategyConfig, _compute_signal_timestamps
+
+    plan = rp.build_plan("1530", date(2026, 10, 30))
+    decision = datetime.combine(date(2026, 10, 30), time.fromisoformat(plan["decision_time_et"]), rp.ET)
+    *_, lookback_anchor = _compute_signal_timestamps(decision, StrategyConfig(), int(plan["interval_minutes"]))
+    assert time.fromisoformat(plan["bar_start_et"]) <= lookback_anchor.time(), (plan["bar_start_et"], lookback_anchor)
+
+
+def test_a_payload_built_to_the_1530_plan_window_scores_in_the_generator():
+    from datetime import datetime, time
+
+    from near_close_dca import StrategyConfig
+    from scripts import generate_buy_candidates as gbc
+
+    day = date(2026, 10, 30)
+    plan = rp.build_plan("1530", day)
+    ticker = plan["tickers"][0]
+    entry = _plan_window_entry(plan)
+    decision = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), rp.ET)
+    # The entry is exactly what `check` accepts for this plan...
+    rp.validate_ticker(entry, day=day, bar_start=time.fromisoformat(plan["bar_start_et"]), decision=decision.time(),
+                       interval=int(plan["interval_minutes"]), now=decision)
+    # ...and the 3:30 generator, on the Robinhood-only payload (1530ET finance_outage_fallback), must be able to score it.
+    candidates = gbc.generate_candidates(
+        slot="1530ET", now=decision, config=StrategyConfig(), market_data_by_source={"robinhood": {ticker: entry}},
+        finance_outage_robinhood_only=True, source_errors=(), ticker_errors={"robinhood": []},
+        already_covered_tickers=(),
+    )
+    (row,) = [c for c in candidates if c["ticker"] == ticker]
+    assert row["provider_error"] is False, row
+    assert row["action"] == "BUY", row
+
+
+# -- quiet means thin, not merely empty (2026-11-02) -------------------------------------------------------------
+# One 10% cap treated every empty series alike. On 2026-11-02 it published a payload whose AMZN, GOOG and GOOGL had no
+# bars (all liquid) while a healthy fetch with ten genuinely thin names (11%) would have been refused. An empty series
+# is quiet only when the prior session was thin (< LIQUID_PRIOR_VOLUME shares); a liquid name that is empty after the
+# launcher's re-ask is a real failure against the 95% floor. Thin quiet names are bounded only by a higher ceiling.
+
+
+@pytest.mark.parametrize("volume, quiet", [
+    (rp.LIQUID_PRIOR_VOLUME - 1, True),   # just under the threshold: thin
+    (rp.LIQUID_PRIOR_VOLUME, False),      # the threshold itself is liquid (as in rescue_targets)
+    (5_000_000, False),
+    (0, True),
+])
+def test_an_empty_series_is_quiet_only_when_the_prior_session_was_thin(volume, quiet):
+    if quiet:
+        with pytest.raises(rp.QuietTickerError):
+            rp.validate_ticker(liquid_empty_ticker(volume), **kw())
+        return
+    with pytest.raises(rp.PayloadError) as excinfo:
+        rp.validate_ticker(liquid_empty_ticker(volume), **kw())
+    assert not isinstance(excinfo.value, rp.QuietTickerError)
+    assert "liquid" in str(excinfo.value)  # the recorded reason says why it is not filed quiet
+
+
+def test_a_prior_session_without_a_volume_reads_as_thin():
+    # Same rule as rescue_targets: an unreadable prior session never turns an empty series into a failure by itself.
+    raw = liquid_empty_ticker()
+    del raw["previous_close_bar"]["volume"]  # validate_bar reads a missing volume as 0
+    with pytest.raises(rp.QuietTickerError):
+        rp.validate_ticker(raw, **kw())
+
+
+def test_ten_thin_quiet_names_of_ninety_no_longer_refuse_a_healthy_fetch(tmp_path):
+    # 2026-11-02 probe: ten names with no 12:30-13:30 bars (11%) refused the slot although nothing else was wrong.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=10)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
+    assert meta["quiet"] == sorted(tickers[:10])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+def test_liquid_empty_names_are_real_failures_in_the_published_error_list(tmp_path):
+    # 4 of 90 may miss (86/90 = 95.6%); they stay in ticker_errors.robinhood and are not listed as quiet.
+    plan, tickers, chunk = universe_plan(tmp_path, liquid=4)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"] == {"robinhood": sorted(tickers[:4])}  # no "quiet" key: none of them is thin
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
+    assert meta["quiet"] == []
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+def test_five_liquid_empty_names_of_ninety_refuse(tmp_path):
+    # 85/90 = 94.4%, under the floor: a degraded fetch no longer hides behind the quiet classification.
+    plan, _, chunk = universe_plan(tmp_path, liquid=5)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+    assert not (tmp_path / "out" / "payload.json").exists()
+
+
+def test_monday_10_30_replay_a_degraded_payload_is_refused(tmp_path):
+    # 2026-11-02 10:30: AMZN, GOOG, GOOGL and GLW empty (liquid) plus four other failures, of 91 tickers. It published
+    # because the four liquid empties were filed quiet and left the denominator (83/87 = 95.4%). They now count:
+    # 83/91 = 91.2%, under the floor.
+    plan, _, chunk = universe_plan(tmp_path, liquid=4, errored=4, total=91)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+
+
+def test_thin_quiet_names_leave_the_denominator_while_liquid_empties_count(tmp_path):
+    # 10 thin quiet leave 80; 3 liquid empties give 77/80 = 96.3%, over the floor.
+    plan, tickers, chunk = universe_plan(tmp_path, quiet=10, liquid=3)
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["ticker_errors"]["quiet"] == sorted(tickers[:10])
+    assert payload["ticker_errors"]["robinhood"] == sorted(tickers[10:13])  # the liquid empties, not the thin names
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:13])}  # every name stays listed for Gate 5
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0

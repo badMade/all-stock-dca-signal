@@ -77,7 +77,8 @@ def require_supported_python(version_info) -> None:
     if tuple(version_info[:2]) >= MIN_PYTHON:
         return
     detail = "python>=%d.%d required, found %d.%d" % (MIN_PYTHON + tuple(version_info[:2]))
-    print(json.dumps({"status": "ABORT", "plan": None, "errors": [{"code": "python_too_old", "detail": detail}]}, indent=2))
+    print(json.dumps({"status": "ABORT", "plan": None, "errors": [{"code": "python_too_old", "detail": detail}]},
+                     separators=(",", ":")))
     sys.exit(2)
 
 
@@ -176,7 +177,9 @@ def _skipped_dicts(skipped: Any) -> list[dict[str, str]]:
 
 
 def _emit(report: dict[str, Any], code: int) -> int:
-    print(json.dumps(report, indent=2))
+    # One compact line (2026-10-31, credit plan step 4): the Perplexity agent re-reads every tool output on each later
+    # turn, and indent=2 roughly doubled the 91-symbol universe list.
+    print(json.dumps(report, separators=(",", ":")))
     return code
 
 
@@ -973,11 +976,11 @@ def _decisions_stream(slot: str, payload: dict[str, Any], directory: Path, tradi
 
 
 def _cmd_procedure(args: argparse.Namespace) -> int:
-    """Print one part of this task's step-by-step procedure (steps 1-9) as plain text.
+    """Print one part of this task's backup instructions as plain text.
 
-    The pasted Perplexity prompt cannot hold it (the Instructions box keeps 20,000 characters), so it ships inside
-    this build and is covered by the same content_sha256 stamp. Plain text, not JSON: the agent follows it
-    verbatim. Any failure is one JSON document and exit 2, which the prompt treats as place-nothing.
+    Part 0 carries the rules and preflight; parts 1-3 carry steps 1-9. They ship inside this build and are covered
+    by the same content_sha256 stamp. Any failure is one JSON document and exit 2, which the prompt treats as
+    place-nothing.
     """
     from scripts import backup_procedure  # lazy: it imports this module for GATED_SLOTS
 
@@ -1248,10 +1251,11 @@ def _build_parser() -> argparse.ArgumentParser:
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
-    procedure = sub.add_parser("procedure", help="Print one part (1-3) of a backup task's steps 1-9, stamped with this build.")
+    procedure = sub.add_parser("procedure", help="Print one stamped part (0-3) of a backup task's instructions.")
     procedure.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
-    procedure.add_argument("--part", required=True, type=int, help="1 = steps 1-3, 2 = steps 4-6, 3 = steps 7-9.")
-    procedure.add_argument("--token", default=None, help="Parts 2 and 3: the token the previous part printed at its end.")
+    procedure.add_argument("--part", required=True, type=int,
+                           help="0 = rules and preflight, 1 = steps 1-3, 2 = steps 4-6, 3 = steps 7-9.")
+    procedure.add_argument("--token", default=None, help="Parts 1-3: the token the previous part printed at its end.")
     gates = sub.add_parser("gates", help="Step 1 as code: slot, market day and window from the real clock.")
     gates.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
     gates.add_argument("--now", default=None, help="TESTS ONLY: an offset-aware ISO instant instead of the clock.")

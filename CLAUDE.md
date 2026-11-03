@@ -30,7 +30,7 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~8,300 tests, ~5 min for the whole suite. Tests live under tests/ (2026-08-23:
+# Tests — ~13,300 tests (the coverage-gated run took ~14 min on the operator's Mac, 2026-10-31). Tests live under tests/ (2026-08-23:
 # moved out of the repo root, which used to hold one test_<module>.py flat beside every
 # module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
 # and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
@@ -42,14 +42,22 @@ ruff check .
 # The coverage gate CI enforces
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 
+# Every CI job, run locally (core by default; --all adds both audits and every sibling
+# suite in its own venv under ~/.cache; --changed runs only the siblings CI would run;
+# --pr N posts the summary on a PR). Use it when Actions cannot run (2026-10-31: billing block)
+scripts/local_ci.sh --all --keep-going
+
 # Dry-run smoke test (the third standard pre-handoff check)
-python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo
+python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo/scheduled_runs/demo
 
 # Checkout-only local console; remote-access rules: docs/local_console.md#remote-access
 python3 from.py --local --no-browser
 
 # 3D market graph -- emits one self-contained HTML file, no network (docs/market_graph.md)
 python -m scripts.generate_market_graph --source csv --out /tmp/ocean.html
+
+# Run .github/workflows/ci.yml locally with act + Colima, not billed (docs/local_ci.md)
+scripts/run_ci_locally.sh -j test
 ```
 
 Two suites sit outside the root `pytest` sweep and must be run separately:
@@ -71,6 +79,12 @@ ruff check --isolated --select=E,F,B --line-length=120 llm-providers
 (cd yfinance-prefetch && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ```
+
+**Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
+`docs/local_ci.md`). It mirrors every CI job locally; since the 2026-10-31 Actions billing block,
+draft PRs skip CI, push CI runs only Python 3.12 and path-filtered siblings, and the 3.11 leg runs
+on a weekday schedule. `scripts/local_ci_status.sh <flags>` posts the result to
+the tested commit as a `local-ci` status. Set the `CI_RUNS_ON` repo variable to move CI onto a self-hosted runner.
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
 demo smoke test, `pip-audit` on pinned dev tooling and the resolved transitive dependencies
@@ -240,6 +254,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
 | `docs/adr-plan-first-backup-executor.md` | Proposed ADR for the plan-first backup executor: order-plan files (`dca_order_plan.py`, `schemas/order_plan.schema.json`), Mac-first backup, compute fallbacks, fail-closed re-validation |
 | `docs/plan_first_recommendations.md` | Plan-first recommendation courier, freshness, slot reader, placement evidence and rollout |
+| `docs/local_ci.md` | Running CI locally: `scripts/local_ci.sh` (fast copy of the gates) and `scripts/local_ci_status.sh` (posts the result as a `local-ci` commit status), `scripts/run_ci_locally.sh` (the real `ci.yml` under act + Colima, `deploy/act/Dockerfile`); the measured Actions-minute breakdown, the 2026-10-31 trigger cuts, and the opt-in self-hosted-runner switch (`CI_RUNS_ON`) |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |
@@ -254,6 +269,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/inverse_martingale.md` | Opt-in deferred-accumulation sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
 | `docs/whole_share_accumulation.md` | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
 | `docs/market_graph.md` | The 3D market graph: axis mapping, Pulse/Wave modes, the four data-source loaders, and the two tiers of behavioural ticker grouping |
+| `docs/sizing_suggestion_history.md` | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 | `docs/morning_dca.md`, `docs/midday_dca.md` | The two executor-class stream references: modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
 | `docs/market_open_signal_entry.md`, `docs/morning_signal_entry.md`, `docs/midday_signal_entry.md`, `docs/intraday_signal_entry.md` | The per-slot Gate 5 signal-generation contracts behind the seven candidate generators (payload shape, flags, output document) |

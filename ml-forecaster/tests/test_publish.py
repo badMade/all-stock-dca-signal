@@ -1563,14 +1563,13 @@ def test_guarded_publish_fails_closed_when_the_scorer_returns_a_malformed_result
     assert any("shared out-of-sample holdout" in reason for reason in result["reasons"])
 
 
-def test_default_config_path_honors_dca_config_dir():
-    """Regression test for "Honor the active config directory in forecaster
-    defaults". publish.DEFAULT_CONFIG_PATH must be DERIVED from
-    dca_config.get_config_dir() (honouring $DCA_CONFIG_DIR, the same
-    resolution order every other config/*.json consumer in this repo uses),
-    not hardcoded to a REPO_ROOT-relative literal -- which ignores the
-    override entirely and can silently diverge from the config directory the
-    live strategy's own load_strategy_config() actually reads.
+def test_default_config_path_is_shadow_under_cron_tracking_root():
+    """publish.DEFAULT_CONFIG_PATH must NOT be the live config/ml_sizing_adjustment.json:
+    sizing is still being determined by comparing independent suggesters, so
+    ml-forecaster's default publish target is its own shadow incumbent file under
+    the suggestion-history root, derived from $DCA_CRON_TRACKING_ROOT (never a
+    REPO_ROOT-relative or absolute literal), and never anything under
+    $DCA_CONFIG_DIR.
 
     A fresh subprocess is used (not importlib.reload()) so this exercises
     exactly what a real invocation sees: DEFAULT_CONFIG_PATH is a
@@ -1581,7 +1580,7 @@ def test_default_config_path_honors_dca_config_dir():
     import tempfile
 
     with tempfile.TemporaryDirectory() as alt_config_dir:
-        env = dict(os.environ, DCA_CONFIG_DIR=alt_config_dir)
+        env = dict(os.environ, DCA_CONFIG_DIR=alt_config_dir, DCA_CRON_TRACKING_ROOT=alt_config_dir)
         result = subprocess.run(
             [sys.executable, "-c", "import publish; print(publish.DEFAULT_CONFIG_PATH)"],
             cwd=str(ML_FORECASTER_DIR),
@@ -1592,4 +1591,42 @@ def test_default_config_path_honors_dca_config_dir():
         )
         assert result.returncode == 0, result.stderr
         printed_path = Path(result.stdout.strip())
-        assert printed_path == Path(alt_config_dir) / "ml_sizing_adjustment.json"
+        assert printed_path == Path(alt_config_dir) / "sizing_suggestions" / "ml_forecaster" / "incumbent.json"
+        assert printed_path.name != "ml_sizing_adjustment.json"
+
+
+def test_guarded_publish_records_published_and_blocked_runs_in_history(tmp_path):
+    """Every run past input validation is appended to the shared suggestion history --
+    blocked runs included -- and the live config file is never created by default paths."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from sizing_suggestion_history import read_history
+
+    history = tmp_path / "history"
+    config_path = tmp_path / "incumbent.json"
+    good = {"overall": {"model_mae": 0.01, "baseline_zero_mae": 0.02, "baseline_mean_mae": 0.02}}
+    bad = {"overall": {"model_mae": 0.05, "baseline_zero_mae": 0.02, "baseline_mean_mae": 0.02}}
+    first = publish.guarded_publish(
+        adjustments={"aapl": 1.1}, eval_summary=good, model_version="v1", config_path=config_path, history_dir=history
+    )
+    second = publish.guarded_publish(
+        adjustments={"aapl": 1.15}, eval_summary=bad, model_version="v2", config_path=config_path, history_dir=history
+    )
+    assert (first["status"], second["status"]) == ("published", "blocked_regression")
+    rows = read_history("ml_forecaster", root=history)
+    assert [(r["model_version"], r["status"]) for r in rows] == [("v1", "published"), ("v2", "blocked_regression")]
+    assert rows[1]["adjustments"] == {"AAPL": 1.15}  # the rejected model's suggestion is still on record
+
+
+def test_guarded_publish_invalid_input_records_nothing(tmp_path):
+    history = tmp_path / "history"
+    result = publish.guarded_publish(
+        adjustments={"AAPL": 9.9},
+        eval_summary={"overall": {"model_mae": 0.01}},
+        model_version="v1",
+        config_path=tmp_path / "incumbent.json",
+        history_dir=history,
+    )
+    assert result["status"] == "blocked_invalid_adjustments"
+    assert not history.exists()

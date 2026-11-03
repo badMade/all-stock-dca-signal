@@ -1,0 +1,75 @@
+name: Backup dispatch watch
+
+# Credit plan step 6 (2026-10-31): Perplexity runs ONLY when a Claude slot fails. The Mac's own dispatcher
+# (scripts/backup_dispatch.py run, launchd) decides 15 minutes after each slot. This workflow covers the day the Mac is
+# DOWN: 20 minutes after each slot it reads the public slot-status document and emails Perplexity Computer only when
+# today's document has no entry for the slot, or there is no document for today. Any entry means the Mac is alive and
+# owns the decision. After a send it marks the slot backup_requested on the slot-status branch of the PUBLIC signal
+# repository badMade/all-stock-dca-signal (this repository is private, so Perplexity cannot read a file here), so a
+# later run (a manual workflow_dispatch, or a second schedule landing in the same window) does not send again.
+#
+# The script decides from the America/New_York clock and its own windows, so the schedule only has to land once inside
+# each slot's cloud window (20 minutes after the slot up to its latest placement time). GitHub cron is UTC, so it covers
+# both EDT and EST with 8 runs a weekday, exactly one inside each slot's window in either season (2026-10-31: it was every
+# 5 minutes, ~108 runs a day, just after Actions stopped on a spending limit):
+#   55 13-18  -> EDT 09:55-14:55 ET (0935 ... 1430); EST 08:55 (no slot) then 09:55-13:55 ET (0935 ... 1330)
+#   50 19,20  -> EDT 15:50 ET (1530) and 16:50 (no slot); EST 14:50 ET (1430) and 15:50 (1530)
+# A run outside every window prints no_slot_due and exits. GitHub can start a scheduled run late; the 1530 window is
+# only 15:50-16:00 ET, so a late run can miss it. The Mac dispatcher is the primary trigger; this is Mac-down cover.
+# scripts/tests/test_backup_dispatch_cloud.py replays these crons through due_slot for an EDT and an EST day.
+#
+# config/backup_dispatch.json mode "shadow" makes every run report would_send and send nothing; it starts there.
+#
+# TRUST BOUNDARY: both triggers run main only. workflow_dispatch exists for the operator's forced-failure test; the
+# job refuses any other ref, and the checkout pins main, so a dispatch cannot run another branch's code with this
+# job's mail secrets or the signal-repository token.
+on:
+  schedule:
+    - cron: "55 13-18 * * 1-5"
+    - cron: "50 19,20 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: backup-dispatch-watch
+  cancel-in-progress: false
+
+permissions:
+  # This repository is only read. The backup_requested mark goes to the signal repository through
+  # DCA_SIGNAL_PUSH_TOKEN (a fine-grained token with contents write on badMade/all-stock-dca-signal only), because the
+  # job's own token cannot push to another repository.
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check the due slot and trigger a backup if the Mac never handled it
+        env:
+          DCA_DISABLE_DOTENV: "1"
+          DCA_PERPLEXITY_SENDER: ${{ secrets.DCA_PERPLEXITY_SENDER }}
+          DCA_SMTP_HOST: ${{ secrets.DCA_SMTP_HOST }}
+          DCA_SMTP_USER: ${{ secrets.DCA_SMTP_USER }}
+          DCA_SMTP_PASSWORD: ${{ secrets.DCA_SMTP_PASSWORD }}
+          DCA_ALERT_EMAIL_ADDRESS: ${{ secrets.DCA_ALERT_EMAIL_ADDRESS }}
+          ROBINHOOD_AGENTIC_ACCOUNT_LAST4: ${{ secrets.ROBINHOOD_AGENTIC_ACCOUNT_LAST4 }}
+          DCA_PPLX_STATE_FOLDERS: ${{ secrets.DCA_PPLX_STATE_FOLDERS }}
+          SIGNAL_TOKEN: ${{ secrets.DCA_SIGNAL_PUSH_TOKEN }}
+        run: |
+          # The remote "signal" (config/slot_status.json) exists only for this step. The publisher reports a failed git
+          # step by name only, never the remote URL that carries the token.
+          git remote add signal "https://x-access-token:${SIGNAL_TOKEN}@github.com/badMade/all-stock-dca-signal.git"
+          python -m scripts.backup_dispatch cloud

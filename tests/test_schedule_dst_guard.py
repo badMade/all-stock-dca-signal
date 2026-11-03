@@ -33,4 +33,4 @@ def test_prompts_do_not_hardcode_utc_windows():
 
 def test_manifest_documents_dst_rule():
     text = (ROOT / "docs" / "schedule_manifest.md").read_text(encoding="utf-8")
-    assert "DST rule for the Cron (UTC) column" in text
+    assert "DST rule for the Cron (ET) column" in text

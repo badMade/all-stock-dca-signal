@@ -405,10 +405,8 @@ ACTIVE_TICKERS = [
 # all" category -- e.g. a delisting/wind-down, or QBUT's not-found status --
 # distinct from WHOLE_SHARE_TICKERS' "different mechanism, still actively
 # bought" category.
-# KVUE joined it 2026-11-02: Robinhood reports it as an inactive instrument
-# (get_equity_quotes -> {"inactive_instruments": ["KVUE"]}), found by the 9:35 AM
-# payload publisher's refusal that day. See config/tickers.json's
-# exclusion_reasons.KVUE.
+# KVUE joined QBUT here on 2026-11-02 (owner request): Robinhood returns not-found for it on every live payload run, so it
+# has no buying mechanism; see config/tickers.json's exclusion_reasons.KVUE.
 EXCLUDED_TICKERS: frozenset[str] = frozenset({"QBUT", "KVUE"})
 
 # Tickers not tradable for fractional/notional buys on Robinhood. Evaluated

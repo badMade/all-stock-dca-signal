@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.backup-dispatch</string>
+  <!-- Event-triggered Perplexity backup (scripts/backup_dispatch.py, credit plan step 6, 2026-10-31). Every 5
+       minutes it checks whether a slot's 15-minute mark has passed; outside every slot window it prints no_slot_due
+       and exits in well under a second. It emails Perplexity Computer only when a slot failed or never started, and
+       at most once per slot per day. config/backup_dispatch.json "mode": "shadow" sends nothing. Started through
+       the checkout's venv Python, like the other agents, because macOS privacy protection (TCC) grants ~/Documents
+       access per binary. Mail settings come from the checkout's gitignored .env (docs/local_env_file.md). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.backup_dispatch</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Must match what the Claude sessions use, or the heartbeat read finds no slot. -->
+    <key>DCA_CRON_TRACKING_ROOT</key><string>REPLACE_WITH_CRON_TRACKING_ROOT</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- Every 300 seconds. The script reads the America/New_York clock itself, so the Mac's time zone does not
+       matter here; weekends and holidays end at the market-closed check before anything is read. -->
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/tmp/dca-backup-dispatch.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-backup-dispatch.log</string>
+</dict>
+</plist>

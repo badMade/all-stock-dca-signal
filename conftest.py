@@ -39,6 +39,10 @@ os.environ["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = FIXTURE_ACCOUNT_NUMBER
 # never leak a live account number or alert address into a test.
 os.environ["DCA_DISABLE_DOTENV"] = "1"
 
+# local_heartbeat start/finish publish the public slot-status signal by git push (scripts/slot_status.py). Keep every
+# test local, before any module is imported, so the suite can never push to the real remote.
+os.environ["DCA_DISABLE_SLOT_STATUS_PUBLISH"] = "1"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_ticker_history_and_intraday_archive(monkeypatch, tmp_path):

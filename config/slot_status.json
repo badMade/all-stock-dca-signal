@@ -1,0 +1,9 @@
+{
+  "$schema": "../schemas/slot_status.schema.json",
+  "version": "2026-10-31",
+  "description": "The public slot-status signal (scripts/slot_status.py). The Gate 9 finalizer (scripts/finalize_run_evidence.py, every live prompt, every outcome; 2026-11-03) and local_heartbeat start/finish publish one small document per trading day (day, market open or closed, each slot's status and time; never tickers, amounts, accounts or orders) to a data-only branch of a separate PUBLIC repository (this one is private, so Perplexity cannot read it; 2026-10-31), through the git remote named here, and each Perplexity backup reads it first: a slot marked succeeded today, or a closed market, ends the fire before any other call. Anything else falls through to the full check. The branch must not be recommendations (the publisher force-pushes a one-file tree), main or claude/** (CI).",
+  "enabled": true,
+  "repository": "badMade/all-stock-dca-signal",
+  "branch": "slot-status",
+  "remote": "signal"
+}

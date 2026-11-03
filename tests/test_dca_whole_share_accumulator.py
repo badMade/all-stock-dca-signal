@@ -6174,3 +6174,14 @@ def test_compute_virtual_contribution_usd_keeps_its_strategy_config_annotation()
     assert annotation == "StrategyConfig", (
         f"config must be annotated as StrategyConfig behind a TYPE_CHECKING import, got {annotation!r}"
     )
+
+
+def test_read_state_rejects_boolean_pending_usd_as_corrupt(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "state.json"
+    state_path.parent.mkdir()
+
+    state_path.write_text('{"version": 1, "ticker": "BYDDY", "pending_usd": true, "events": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
+        ledger._read_state(state_path, "BYDDY")

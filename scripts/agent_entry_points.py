@@ -227,6 +227,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Summarize a trading day's slot outcomes (aborts, caps, errors, gate9 notes) for the triage routine, redacted",
+        command="python -m scripts.triage_log_summary [--date YYYY-MM-DD] [--root <cron-tracking root>] [--json]",
+        exists_path="scripts/triage_log_summary.py",
+        doc_ref="docs/triage_routine.md",
+        symbols=("main", "summarize_day", "summarize_slot", "redact", "latest_trading_day"),
+        notes=(
+            "Read-only. Joins verify_schedule with each slot's own run_state status, error and "
+            "gate9 notes, which verify_schedule's ok does not judge (2026-10-30: ok true while "
+            "9:35 and 3:30 aborted). Defaults to the latest trading day on/before today ET. "
+            "Strips the account number and account-shaped digits; emits relative paths only. "
+            "Exits 1 when a slot needs attention, 2 with LOGS UNAVAILABLE when the root is unreadable."
+        ),
+    ),
+    EntryPoint(
         need="Check after a slot that no order was platform-refused and every eligible buy was submitted or accounted for",
         command="python -m scripts.check_slot_fills --slot <HHMM> --date YYYY-MM-DD [--root <cron-tracking root>] [--json]",
         exists_path="scripts/check_slot_fills.py",
@@ -377,14 +391,15 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
-        need="Publish Wondrous Octopus Tier C sizing adjustments to ml_sizing_adjustment.json",
-        command="python3 scripts/publish_octopus_sizing.py [--status active|inactive] [--dry-run]",
+        need="Record Wondrous Octopus Tier C sizing suggestions to the append-only suggestion history",
+        command="python3 scripts/publish_octopus_sizing.py [--dry-run]",
         exists_path="scripts/publish_octopus_sizing.py",
         doc_ref="docs/README.md",
         symbols=("main", "publish_octopus_sizing"),
         notes=(
             "Translates next-day Octopus multi-quantile forecasts into bounded Tier C recovery "
-            "sizing adjustments in config/ml_sizing_adjustment.json."
+            "suggestions appended to <cron root>/sizing_suggestions/octopus/; never writes live "
+            "config/ml_sizing_adjustment.json (docs/sizing_suggestion_history.md)."
         ),
     ),
     EntryPoint(

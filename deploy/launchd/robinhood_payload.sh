@@ -35,6 +35,19 @@ PARALLEL="${DCA_CODEX_PARALLEL:-3}"
 # than DCA_MIN_ATTEMPT_SECONDS left, and the merge then sees the missing tickers and enforces its coverage floor,
 # so a late build fails fast at Gate 5 instead of arriving too late to be read.
 BUILD_DEADLINE_SECONDS="${DCA_BUILD_DEADLINE_SECONDS:-0}"
+# Opt-in wall-clock cutoff, HH:MM America/New_York on the plan's trading day (2026-10-30). DCA_BUILD_DEADLINE_SECONDS
+# counts from whenever the build happened to start, so a 15:31 job that launchd fires late (the Mac woke at 15:36) would
+# still fetch until 15:44, after the 3:30 session's 12-minute re-check of `check` has already given up and aborted. The
+# cutoff bounds the fetch in ET whatever the start time; when both are set the earlier one wins. A build that starts
+# after it fetches nothing, and the merge refuses with its marker, so the session's `check` names the refusal.
+BUILD_DEADLINE_ET="${DCA_BUILD_DEADLINE_ET:-}"
+if [ -n "$BUILD_DEADLINE_ET" ] && ! [[ "$BUILD_DEADLINE_ET" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+  echo "robinhood_payload: DCA_BUILD_DEADLINE_ET must be HH:MM (24-hour, America/New_York)" >&2; exit 2
+fi
+# A refused build raises a macOS notification (2026-11-03: five of seven builds were refused on 11-02 and each surfaced
+# only in this log and at the slot's Gate 5 abort). On by default here; the variable is opt-in inside the publisher so
+# tests and direct callers stay silent. Set DCA_NOTIFY_REFUSAL=0 to turn it off.
+export DCA_NOTIFY_REFUSAL="${DCA_NOTIFY_REFUSAL:-1}"
 MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
 # Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
 # costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).
@@ -83,10 +96,10 @@ fi
 
 # One codex call per chunk of tickers, a few at a time. A chunk that times out or errors simply leaves its
 # tickers without data; the merge records them in ticker_errors and enforces the coverage floor.
-# Seconds left before the opt-in build deadline; empty when none is set. BUILD_STARTED is assigned before the first
-# chunk starts, and each chunk worker is a subshell that reads it, so every worker measures from the same instant.
+# Seconds left before the opt-in build deadline; empty when none is set. DEADLINE_EPOCH is assigned before the first
+# chunk starts, and each chunk worker is a subshell that reads it, so every worker measures against the same instant.
 seconds_left() {
-  if [ "$BUILD_DEADLINE_SECONDS" -gt 0 ]; then echo $(( BUILD_DEADLINE_SECONDS - ( $(date +%s) - BUILD_STARTED ) )); fi
+  if [ -n "$DEADLINE_EPOCH" ]; then echo $(( DEADLINE_EPOCH - $(date +%s) )); fi
 }
 
 run_chunk() {
@@ -134,6 +147,20 @@ run_chunk() {
 }
 
 BUILD_STARTED="$(date +%s)"
+DEADLINE_EPOCH=""
+[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( BUILD_STARTED + BUILD_DEADLINE_SECONDS ))
+if [ -n "$BUILD_DEADLINE_ET" ]; then
+  # zoneinfo, not the Mac's own clock zone: the cutoff is ET even on a Mac that is not pinned to New York.
+  CUTOFF_EPOCH="$("$PY" -c '
+import datetime as dt, json, sys
+from zoneinfo import ZoneInfo
+day = dt.date.fromisoformat(json.load(open(sys.argv[1]))["trading_day"])
+print(int(dt.datetime.combine(day, dt.time.fromisoformat(sys.argv[2]), ZoneInfo("America/New_York")).timestamp()))
+' "$WORK/plan.json" "$BUILD_DEADLINE_ET")"
+  if [ -z "$DEADLINE_EPOCH" ] || [ "$CUTOFF_EPOCH" -lt "$DEADLINE_EPOCH" ]; then DEADLINE_EPOCH="$CUTOFF_EPOCH"; fi
+  [ "$CUTOFF_EPOCH" -le "$BUILD_STARTED" ] \
+    && echo "robinhood_payload: deadline $BUILD_DEADLINE_ET ET had already passed when the build started; fetching nothing" >&2
+fi
 "$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json" >"$WORK/chunks.txt"
 idx=0
 while IFS= read -r tickers; do
@@ -157,23 +184,21 @@ wait
 # Extended 2026-10-30 (10-29 15:31 shadow build): chunk 3 (NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW) replied with
 # every ticker's intraday_bars empty, so all eight were filed "quiet" and published as NO_DATA although NVDA, GOOGL, GOOG
 # and AMZN trade every minute. A whole chunk with no bars is a worker that dropped the series, so it is re-asked like a
-# dead chunk. A chunk where only some names are empty (the thin names of 10-26/27 13:30) is left alone: those are quiet.
+# dead chunk (as was chunk 0 at 10-27 13:30, once read as eight thin names). A chunk where only some names are empty
+# is left alone: those are quiet.
+# Narrowed 2026-10-31: in a partly-empty chunk, an empty name whose prior session traded LIQUID_PRIOR_VOLUME shares or
+# more is re-asked for too, so one answered ticker no longer hides a dropped NVDA. The rule lives in rescue_targets.
 targets=()
 for ((i = 0; i < idx; i++)); do
   # A crash here only means this chunk is not rescued (set -e must not end the launcher before the merge).
   need="$("$PY" -c '
 import sys
-from scripts.robinhood_payload import _load_chunk
+from scripts.robinhood_payload import _load_chunk, rescue_targets
 try:
     reply = _load_chunk(sys.argv[1])
 except (OSError, ValueError):  # no file, or one that holds no usable object: every ticker of the chunk is missing
     reply = {}
-tickers = [t for t in sys.argv[2].split(",") if t]
-need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
-answered = [reply[t] for t in tickers if t not in need]
-if answered and all(isinstance(e, dict) and not e.get("intraday_bars") for e in answered):
-    need = tickers  # every answered ticker came back with no bars: the worker dropped the series
-print(",".join(need))
+print(",".join(rescue_targets(reply, [t for t in sys.argv[2].split(",") if t])))
 ' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
   if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
 done
@@ -237,7 +262,7 @@ shopt -s nullglob
 # The total covers the fetch and the merge; the merge's exit status still decides the launcher's.
 MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
-echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS" >&2
+echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS deadline_et=${BUILD_DEADLINE_ET:-none}" >&2
 
 # Plan-first half (2026-10-26): the retired 5-minute Claude courier's order-history and buying-power read, now a second
 # `codex exec` after the payload is published, followed by `ingest`, which writes the recommendation files. Opt-in

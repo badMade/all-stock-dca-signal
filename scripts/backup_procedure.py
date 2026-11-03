@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""The Perplexity backup-executor PROCEDURE (steps 1-9), served by the stamped planner instead of pasted.
+"""The Perplexity backup-executor preflight and procedure, served by the stamped planner.
 
 WHY THIS EXISTS (2026-10-18): Perplexity's Instructions box keeps only the first 20,000 characters. The full
 generated prompts were 27,2xx-27,4xx characters, so every one was cut inside step 6 and the agent never saw the
 finalize arguments, the order-placement step (7), the state record or the notifications.
 
-The pasted prompt now holds the hard rules, the calendar, the build-stamp check (step 0) and a pointer. The
-rest -- steps 1-9, text unchanged -- lives HERE and is printed on demand by
+The pasted prompt is now a short signal check. Part 0 holds the hard rules, calendar, universe check and stand-down
+gate; parts 1-3 hold steps 1-9. All four are printed on demand by
 
-    python3 backup_planner.pyz procedure --task <task id> --part <1|2|3>
+    python3 backup_planner.pyz procedure --task <task id> --part <0|1|2|3>
 
 Because this module ships inside ``backup_planner.pyz`` (it is in the planner's static import closure), the
 procedure is covered by the same ``content_sha256`` stamp the prompt checks in step 0: a procedure that does
 not match the prompt's build cannot be served by a build that passes that check.
 
-``scripts/generate_perplexity_backup_prompts.py`` renders the same text into the full reference prompt the
-tests assert against; ``render_parts`` is the single source for both.
+``scripts/generate_perplexity_backup_prompts.py`` renders the short pasted prompt and the full reference prompt.
 """
 
 from __future__ import annotations
@@ -57,6 +56,47 @@ BACKUPS = (
     Backup("1350-1450ET-1330-1430-backup.txt", "54ab24d2", ("13:50", "14:50"), ("1330", "1430")),
     Backup("1545ET-1530-backup.txt", "f83b8d62", ("15:45",), ("1530",)),
 )
+
+HARD_RULES_TEMPLATE = """\
+1. BUY-ONLY, regular hours only. Market orders sized by dollar amount (notional dollar_amount), time_in_force gfd, regular_hours. No sells, no cancels, no modifications, no options, no crypto, no margin or account changes, no review_equity_order, no per-order confirmation prompts.
+2. ACCOUNT: never use a stored account number. At the start of the run (after the step 1 gates) call the Robinhood account list, keep only the accounts this agent is allowed to trade, and continue ONLY if exactly one account qualifies and its number ends in ${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}. Otherwise end the run before reading any orders or buying, record status failed_unexpected_error, and notify. Use that one account for the rest of the run. Never print the full account number in any message, alert, plan, file, or state record; state records carry only the last 4 digits (account_last4). The one exception is the planner's order-evidence envelope: orders_pages_poll1.json and orders_pages_poll2.json carry the resolved account number because the planner pins the pages to it. The raw placement responses step 7 saves (placement_<SYMBOL>.json) can carry it too. Keep all of these only in this run's working directory, delete them before the run ends (every status, including failures), and never sync, attach, submit, or copy them anywhere.
+3. UNIVERSE: only the symbols printed by the planner's `universe` command (step 0). That list already leaves out the do-not-buy and whole-share symbols, and the planner refuses any other symbol even if a plan, a file, or a quote names it. Never order, quote, or scan a symbol the command did not list.
+4. CAPS (a backup is Normal-only, like the Claude slots: the planner never escalates the budget tier whatever the count of 3x-or-greater signals, and you never choose or escalate a tier yourself. You place only what the planner's finalize returns in to_place). Per order at most $@@PER_ORDER@@. Per day at most @@NORMAL_DAILY@@ across ALL orders on the account (every slot plus manual buying). Per ISO week at most @@NORMAL_WEEKLY@@. Per day at most @@MAX_ORDERS@@ buy attempts. Caps are read from a FRESH full-day and full-week order pull, never from a plan, a file, or memory. If the batch would breach a cap, the planner trims it for you: finalize returns in to_place only the longest prefix, in allocation order, that fits, and lists every order it left out in skipped with the cap that stopped it. Place exactly to_place, never more: do not add an order the planner left out, do not resize one, and do not back-fill a smaller order past the first one that did not fit. An empty to_place is a normal result: place nothing and record the skipped orders.
+5. ONE ORDER PER TICKER PER SLOT. Never buy a ticker that already has a buy attempt (filled, open, cancelled, or rejected) inside this slot's window, whoever placed it. A ticker bought in an earlier slot may still receive this slot's resized top-up when the Claude or plan-first plan lists it, because the repo allows repeats across slots; a computed plan never tops up and excludes any ticker bought earlier today.
+6. PRICE AND SPREAD: each order requires a fresh quote strictly below that ticker's prior regular-session close at the moment of the order, and a fresh bid and ask that are both present, positive, uncrossed, and within a spread of @@MAX_SPREAD@@% of the mid price (the primaries' Gate 6.7 hard circuit breaker). A missing, unreadable, crossed, or wide quote means skip that ticker only.
+7. BROKER ORDER HISTORY IS THE ONLY EVIDENCE of what was bought. Mac Studio files, logs, plans, published recommendations, and anything a sub-agent says are INPUTS only. Mac content is never purchase evidence (rule 7).
+8. FAIL CLOSED. Any missing, stale, malformed, unverifiable, or contradictory input, any planner error, any incomplete pagination: place NOTHING, record status failed_unexpected_error, notify (step 9), and stop.
+9. TIME: never submit an order at or after the latest placement time above, and never outside regular hours.
+10. Never resize an amount the planner returned. NEVER compute ladder multipliers, base amounts, caps, or priorities by hand; only the planner does. Nor sum, filter, reshape, or convert any data by hand: raw broker responses go to files untouched, and the planner reads them.
+11. NO UNPRESCRIBED RETRIES OR LOOPS. Make each call at most once for the same purpose, EXCEPT where this prompt or the served procedure prescribes repeating it: following every pagination cursor, the second evidence poll and its classify, the late-start heartbeat recheck, the per-order tradability, history, quote and check-placement steps, and one pass per order in the planner's list. A documented fallback outcome is not an error: NO_VALID_PLAN (exit 2) moves on to the next plan source as step 3 says. Never repeat an identical or near-identical call to double-check a result, never re-run a check that passed unless the procedure says to, and never investigate an unexpected result: go straight to the state record and notification (steps 8 and 9) with failed_unexpected_error. A batch is not capped by a call count; if you find yourself repeating calls the procedure did not prescribe, stop BETWEEN orders (never after a submission and before its check-placement), and keep enough calls in reserve for steps 8 and 9."""
+
+PART0_TEMPLATE = """\
+STANDING BACKUP EXECUTOR @@TITLE@@
+Task @@TASK_ID@@. Fires @@FIRES@@ ET on trading days. Backs up the Claude @@SLOT_LINE@@.
+Latest placement: @@LATEST@@ ET.
+@@LIMITATION@@
+Sizing version @@LADDER@@. Universe hash @@UNIVERSE_HASH@@ (@@N@@ symbols). Market calendar retrieved @@CAL_RETRIEVED@@.
+
+HARD RULES. @@HARD_RULES@@
+
+MARKET CALENDAR (America/New_York). Closed: @@CLOSED@@. Early close at @@EARLY_TIME@@ ET: @@EARLY@@.
+
+STEP 0 - SETUP
+Run `python3 backup_planner.pyz universe` (Mac: `python3 -m scripts.backup_planner universe`). It prints {"status", "symbols", "count", "universe_hash"}. The symbols it lists are the only ones this task fetches data for or orders; if status is not OK, or its universe_hash is not @@UNIVERSE_HASH@@, place NOTHING, record failed_unexpected_error, and notify. No symbol is named anywhere else in this prompt, by design: the stocks live in the planner's configuration.
+
+STAND-DOWN GATE (operator directive 2026-10-25). On a normal day the Claude slot has already bought, so the run ends here, before the account lookup, any broker call, and any procedure part:
+a. Run `python3 backup_planner.pyz gates --task @@TASK_ID@@` (Mac: `python3 -m scripts.backup_planner gates --task @@TASK_ID@@`) and keep its JSON; it is the procedure's step 1 command. Status PROCEED: go on to (b); its slot is this run's slot. Status skipped_market_closed or skipped_outside_window: stop with exactly that status, here (2026-10-31: a skipped fire used to fetch all three parts just to write this record). Make no account lookup and no broker call, make no device listing, request no procedure part, and send no notification. Write one JSON state record to ${PPLX_RUN_STATE_DIR}/run_state_<YYYYMMDD>_<HHMM>ET.json (create directories as needed) with: trading_day, slot (null when the gates JSON has none), task_id, fired_at_et, planner_build (STEP B's build-info), universe_hash (step 0's), sizing_version (@@LADDER@@), status, run_origin scheduled_backup, mac_status, account_last4 and plan_source null, and executor_orders, orders_planned, orders_placed, skipped and errors as []. Never include the account number. Then end the run. Any other gates status, a non-zero exit, or output that is not that JSON document: place NOTHING, record failed_unexpected_error, notify, and stop.
+b. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds and find an online device whose name contains "Mac Studio". Record mac_status as one of online, not_found, offline, timeout, device_error (no device-listing tool at all is not_found) and set mac_path_abandoned to false. The 3 minute Mac budget starts now; if it is spent, mac_path_abandoned becomes true.
+c. Only when mac_status is online and mac_path_abandoned is false: use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
+   python3 -m scripts.local_heartbeat status --trading-day <YYYY-MM-DD> --slot <slot>
+   Keep its {"local_status", "backup_may_act"}.
+d. If local_status is in_progress or succeeded: stop with status stood_down_local_active. Make no account lookup and no get_equity_orders call, read no published plan, and request no procedure part. Write one JSON state record to ${PPLX_RUN_STATE_DIR}/run_state_<YYYYMMDD>_<HHMM>ET.json (create directories as needed) with: trading_day, slot, task_id, fired_at_et, mac_status, mac_path_abandoned, mac_elapsed_seconds, routing {path none, local_status, reason, timestamp_et}, planner_build (step 0's build-info), universe_hash (step 0's), sizing_version (the header's), status stood_down_local_active, run_origin scheduled_backup, account_last4 and plan_source null, and executor_orders, orders_planned, orders_placed, skipped and errors as []. Never include the account number. Then send no notification and end the run.
+e. Any other result (mac_status not online, local_status off or errored, any other probe value or an unparseable result, a non-zero exit, or a spent Mac budget): continue with the PROCEDURE below. Its step 1 and step 3 reuse what this gate recorded, so nothing here is repeated.
+
+PROCEDURE (steps 1-9). The rest of this task is served below. Follow it in order and do exactly what each part says. If any requested part fails, has the wrong task id or part number, or is missing its end line, place NOTHING, record failed_unexpected_error, notify, and stop.
+The later requests, only after each preceding part's steps are complete, are:
+   python3 backup_planner.pyz procedure --task @@TASK_ID@@ --part 2 --token <the token printed at the end of part 1>
+   python3 backup_planner.pyz procedure --task @@TASK_ID@@ --part 3 --token <the token printed at the end of part 2>."""
 
 
 PROCEDURE_TEMPLATE = """\
@@ -127,7 +167,7 @@ Write one JSON state record to ${PPLX_RUN_STATE_DIR}/run_state_<YYYYMMDD>_<HHMM>
 Append every placed order (symbol, notional_usd, ref_id, order_id, state; never the account number) to ${PPLX_RUN_STATE_DIR}/submitted_orders.csv, creating it with headers if absent. If the project-files checkout needs syncing before writes, run pplx project files sync first and pplx project files submit -m "<trading day> <slot> state" after writing, so records persist for future runs.
 
 STEP 9 - NOTIFY
-Send a notification through this task's existing alert channels (email to ${DCA_ALERT_EMAIL_ADDRESS}, never a hardcoded address) for every status except placed, nothing_to_place, shadow_only, stood_down_local_active, and skipped_market_closed. Include the slot, status, plan_source, mac_status, the reasons, and the tickers placed and skipped. Never include the account number.
+Send a notification through this task's existing alert channels (email to ${DCA_ALERT_EMAIL_ADDRESS}, never a hardcoded address) for every status except placed, nothing_to_place, shadow_only, stood_down_local_active, skipped_market_closed, and skipped_outside_window. Include the slot, status, plan_source, mac_status, the reasons, and the tickers placed and skipped. Never include the account number.
 If NO order was placed and NO notification-worthy status occurred, call pplx automation suppress-run-notification before finishing so no routine completion push is sent.
 NEVER post to Slack or Notion, run no reports, slippage analysis, or monitor-only or watchdog work.
 @@LIMITATION@@"""
@@ -246,6 +286,7 @@ def backup_values(backup: Backup, common: dict[str, str]) -> dict[str, str]:
     gated = all(slot in backup_planner.GATED_SLOTS for slot in backup.slots)
     return {
         **common,
+        "@@HARD_RULES@@": substitute(HARD_RULES_TEMPLATE, common),
         "@@TITLE@@": "- " + " / ".join(f"slot {s} ({_SLOT_LABEL[s]})" for s in backup.slots),
         "@@TASK_ID@@": backup.task_id,
         "@@FIRES@@": " and ".join(backup.fires),
@@ -266,10 +307,17 @@ def substitute(template: str, values: dict[str, str]) -> str:
     return template
 
 
-# Where each part starts: part 1 = steps 1-3, part 2 = steps 4-6, part 3 = steps 7-9. Split on the rendered
-# headings so the gated and quotes variants of steps 4-5 need no separate handling.
+# Part 0 is the stamped preflight. Parts 1-3 are cut on rendered step headings, so the gated and quotes variants
+# of steps 4-5 need no separate handling.
 PART_STARTS = ("STEP 1 - ", "STEP 4 - ", "STEP 7 - ")
 PARTS = (1, 2, 3)
+
+
+def _render_part_body(backup: Backup, part: int, directory: Path | None = None) -> str:
+    common = common_values(directory)
+    if part == 0:
+        return substitute(PART0_TEMPLATE, backup_values(backup, common))
+    return split_parts(render_procedure(backup, common))[part]
 
 
 def render_procedure(backup: Backup, common: dict[str, str]) -> str:
@@ -296,33 +344,32 @@ def find_backup(task_id: str) -> Backup | None:
 def part_token(task_id: str, part: int, directory: Path | None = None) -> str:
     """Eight hex digits the agent must present to get the NEXT part (bound to the task, the part and its text).
 
-    A guard against skipping or reordering, not a secret: it makes "request part 3 first" fail instead of silently
-    serving placement instructions before the gates, evidence and finalize steps have been read (Codex adversarial
-    review of #1786, 2026-10-18). An agent that ignores the prompt can still copy a token, but it cannot guess one.
+    A guard against skipping or reordering, not a secret: it makes later parts fail instead of silently serving
+    placement instructions before the preflight, gates, evidence and finalize steps have been read. An agent that
+    ignores the prompt can still copy a token, but it cannot guess one.
     """
     backup = find_backup(task_id)
     if backup is None:
         raise KeyError(f"unknown task id {task_id!r}")
-    if part not in PARTS:
-        raise ValueError(f"part must be one of {list(PARTS)}")
-    body = split_parts(render_procedure(backup, common_values(directory)))[part]
+    if part not in (0, 1, 2):
+        raise ValueError("token part must be one of [0, 1, 2]")
+    body = _render_part_body(backup, part, directory)
     return hashlib.sha256(f"{task_id}:{part}:{body}".encode("utf-8")).hexdigest()[:8]
 
 
 def render_part(task_id: str, part: int, directory: Path | None = None, token: str | None = None) -> str:
     """One part of one task's procedure, framed so a wrong task or a skipped part is visible.
 
-    ``KeyError``/``ValueError`` for an unknown task, an unknown part, or (for parts 2 and 3) a missing or wrong
-    ``token`` (the one the previous part printed).
+    ``KeyError``/``ValueError`` for an unknown task, an unknown part, or a missing or wrong ``token`` for parts 1-3.
     """
     backup = find_backup(task_id)
     if backup is None:
         raise KeyError(f"unknown task id {task_id!r}")
-    if part not in PARTS:
-        raise ValueError(f"part must be one of {list(PARTS)}")
-    if part > 1 and token != part_token(task_id, part - 1, directory):
+    if part not in (0, *PARTS):
+        raise ValueError(f"part must be one of {[0, *PARTS]}")
+    if part > 0 and token != part_token(task_id, part - 1, directory):
         raise ValueError(f"part {part} needs the --token printed at the end of part {part - 1}")
-    body = split_parts(render_procedure(backup, common_values(directory)))[part]
+    body = _render_part_body(backup, part, directory)
     footer = f"END OF PART {part} OF {len(PARTS)} FOR TASK {task_id}\n"
     if part < len(PARTS):
         footer += (f"NEXT, only when this part's steps are done: python3 backup_planner.pyz procedure --task {task_id} "
