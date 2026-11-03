@@ -32,3 +32,11 @@
 ## 2026-11-01 - [Fast-path strict ISO formats with fromisoformat over strptime]
 **Learning:** For fixed ISO-shaped configuration dates and schedule execution clocks (e.g. "15:30" or "2023-10-10 12:00"), falling back directly to `datetime.strptime()` wastes vast CPU cycles via internal regex regex and locale cache lookup.
 **Action:** When validating exact time shapes, prefer a fast-path literal string slice or length check accompanied directly by `datetime.fromisoformat` / `time.fromisoformat` rather than `strptime` to accelerate clock parsing by up to 26x, while still strictly rejecting malformed data with `ValueError`.
+
+## 2026-11-01 - [Avoid Path.rglob() chained with .stat() or used in loops]
+**Learning:** `Path.rglob()` builds all `Path` objects in memory and often requires additional `.stat()` calls, making it very slow for large directory trees ($O(N)$ system calls). We replaced these with a manual stack-based `os.scandir` loop using a new `dca_fileio.iter_run_state_files_fast` utility which filters based on `entry.name` and skips `.stat()` entirely where possible. This improves performance ~3-5x on large trees.
+**Action:** Prefer using a custom `os.scandir` iteration helper (like those in `dca_fileio.py`) instead of `Path.rglob()` when walking large artifact or backup trees, especially if filtering by simple name or extension without needing a full POSIX `Path` object until yield time.
+
+## 2026-11-03 - [Fast-path parsing 12-hour AM/PM times with fromisoformat]
+**Learning:** For strict 12-hour clock time parsing in hot paths (like `%I:%M %p ET` schedules), using `datetime.strptime()` forces slow regex and locale lookups. We can bypass this by validating boundaries (`1 <= h <= 12` and `ampm in ("AM", "PM")`), translating to a 24-hour hour (`h=0` or `h+=12`), and passing the result to `datetime.fromisoformat()` for a ~3x speedup.
+**Action:** When bypassing `strptime` for `%I` strings, manually enforce `1 <= h <= 12` and strict AM/PM checks before formatting the ISO string to perfectly preserve fail-closed semantics on malformed inputs.

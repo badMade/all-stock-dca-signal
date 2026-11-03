@@ -43,9 +43,20 @@ Anything that is not exactly `Approved` counts as not approved.
    `python -m scripts.triage_log_summary --json`, then `scripts.schedule_watchdog` and `scripts.alert_digest` (both
    `--json`), and reads the newest `attempt_log` file. With neither shell the digest opens with `LOGS UNAVAILABLE in
    this container` and carries on with GitHub and Notion only. That is not a clean bill of health.
+   From the readable shell, the routine also gathers the resolved root using `dca_paths.cron_tracking_root()` and
+   checks whether it is an existing directory and which stream subdirectories it contains. It passes those facts to
+   the pure `tr.blind_run_reason(resolved_root, root_exists, stream_dirs)` helper, which does no I/O. If a reason is
+   returned, the digest opens with `BLIND RUN: <reason>` and states that no task passed. Keep applicable
+   `LOGS UNAVAILABLE` wording intact. An unset `DCA_CRON_TRACKING_ROOT` alone does not mean the run is blind: the
+   resolved fallback root may be readable.
 2. **GitHub.** Issues, branches, PRs and the last 50 commits on the default branch. Commits need a full 40-char
    SHA plus URL, or `match_git_evidence` raises `EvidenceError`. The PR list can report `merged=false` for every PR,
    so each PR matched to a Key is fetched directly for its real merged state and check status.
+   The caller also gets `shallow` from `git rev-parse --is-shallow-repository` and checks each row's recorded commit
+   SHA with `git cat-file -e <sha>^{commit}`. Pass the resulting per-SHA booleans as `commit_present` and `shallow`
+   keyword arguments to `match_git_evidence`; never infer commit absence from the last-50 list. A false result for a
+   recorded SHA in a shallow clone sets `GitEvidence.commit_status` to `unverifiable_shallow`. Missing SHAs in a
+   non-shallow clone retain the existing no-match, no-error behavior.
 3. **Notion.** All rows with their tracking columns.
 4. **Reconcile.** `match_git_evidence` then `derive_progress` for **every** Key, with no sampling. A Key that cannot be
    checked is listed under Skipped and its row left untouched.
