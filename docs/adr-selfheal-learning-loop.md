@@ -1,6 +1,6 @@
 # ADR: A learning loop for self-healing, scored in its own DuckDB file
 
-- **Status:** Proposed (2026-11-02). Operator request, 2026-11-01: put the self-healing part of
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Operator request, 2026-11-01: put the self-healing part of
   the program on its own learning and improvement loop, as its own function, using DuckDB.
   Open questions carry labeled proposed defaults.
 - **Scope:** design only. The stdlib decision core in `selfheal/`, `state.json`, the

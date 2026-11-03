@@ -1,6 +1,6 @@
 # ADR: Outcome ledger, tax-lot ledger and point-in-time harness on DuckDB (Phase 0)
 
-- **Status:** Proposed (2026-11-01). Open questions carry proposed defaults; the operator
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Open questions carry proposed defaults; the operator
   authorized implementation in draft PRs on those defaults, which stay overridable until accepted.
 - **Scope:** research and reporting only. The stdlib-only core, the ladder, `config/`, and all
   three entry points (`run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy,
