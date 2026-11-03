@@ -80,6 +80,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
         "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "sizing_suggestion_history",
+        "sizing_suggestion_compare",
         "scripts.backup_strategy",
     )),
     ("reporting_ops", "Reporting & monitoring", (
