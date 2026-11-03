@@ -352,9 +352,11 @@ def build_prompt(plan: dict[str, Any], tickers: list[str]) -> str:
 Trading day: {plan['trading_day']} (America/New_York). Tickers: {', '.join(tickers)}
 
 For EACH ticker fetch:
-1. {plan['interval_minutes']}-minute bars for today (historicals, interval {plan['interval_minutes']}minute, span day), covering
-   {plan['bar_start_et']} ET through {plan['decision_time_et']} ET. Keep only bars whose START timestamp is at or after
-   {plan['bar_start_et']} ET and strictly before {plan['decision_time_et']} ET (omit the still-open bar).
+1. {plan['interval_minutes']}-minute bars for today (historicals, interval {plan['interval_minutes']}minute, span day). The window the
+   caller scores is {plan['bar_start_et']} ET through {plan['decision_time_et']} ET, but do NOT filter by time yourself:
+   return EVERY bar the tool gave for today, in the tool's order, with its timestamps untouched. The caller converts to
+   America/New_York and applies the window; a bar you drop for looking "outside" the window (the tool stamps in UTC,
+   so "15:30Z" is 10:30 ET) arrives as an empty series for a ticker that traded all hour.
 2. The previous completed regular session's daily bar (historicals, interval day, span week -- request ONLY
    the last few sessions, never a long history, so the reply is not truncated; use the newest completed session).
 3. A current quote, with its best bid and best ask.
@@ -369,6 +371,10 @@ if the tool gives a UTC time ("Z" or +00:00), write it back with that same UTC o
 own timestamp for that quote, copied verbatim. If a ticker's data cannot be fetched, give {{"error": "<short reason>"}} for that ticker and keep going.
 Every requested ticker must appear exactly once. Do not write files; your final message is the whole output."""
 
+
+# 2026-11-02 11:30 refusal (31/91 quiet, rescue replies empty too, every chunk errors=0): the prompt had the worker keep
+# only bars inside the ET window while forbidding timezone conversion, so a worker comparing UTC stamps to "10:30-11:30"
+# dropped every bar. The window is now applied only by validate_ticker, in code.
 
 # --------------------------------------------------------------------------- broker state (plan-first)
 

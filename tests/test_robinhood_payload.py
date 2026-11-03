@@ -183,6 +183,8 @@ def test_prompt_names_window_and_forbids_orders(tmp_path):
     text = rp.build_prompt(plan, ["AAA", "BBB"])
     assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
     assert "Never call any order" in text
+    # 2026-11-02: the worker must not filter by the ET window itself (UTC stamps read as outside it); the merge does.
+    assert "do NOT filter by time yourself" in text and "omit the still-open bar" not in text
 
 
 def test_live_mirror_prompts_use_the_prebuilt_payload():
