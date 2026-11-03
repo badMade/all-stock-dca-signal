@@ -1830,10 +1830,10 @@ def test_shipped_budgets_json_clears_the_whole_share_universe_share_prices():
 def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     """The checked-in config/tickers.json's "whole_share" array enrolls
     BYDDY -- the ticker this category was built for -- and, per the AUG 24
-    2026 update recorded in that file's own "notes", RVII too (neither is
-    tradable for fractional/notional buys). "excluded" carries QBUT and KVUE;
-    both lack a buying mechanism on this account (see config/tickers.json's
-    exclusion_reasons)."""
+    2026 update recorded in that file's own "notes", RVII too (not tradable
+    for fractional/notional buys either). "excluded" carries QBUT, excluded
+    2026-09-18 after Robinhood returned not-found for it on every live run
+    (see config/tickers.json's exclusion_reasons.QBUT)."""
     loaded = load_tickers(get_config_dir())
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
     assert loaded["excluded_tickers"] == frozenset({"QBUT", "KVUE"})
