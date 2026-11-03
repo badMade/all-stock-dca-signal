@@ -183,6 +183,56 @@ def test_prompt_names_window_and_forbids_orders(tmp_path):
     text = rp.build_prompt(plan, ["AAA", "BBB"])
     assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
     assert "Never call any order" in text
+    # 2026-11-02 (first Monday after fall-back): the window is handed over in UTC, computed in code, so the worker never
+    # has to know ET's offset. 13:30 ET on 2026-10-15 is EDT (17:30Z); 10:30 ET on 2026-11-02 is EST (15:30Z).
+    assert "17:30:00Z" in text and "18:30:00Z" in text
+
+
+def test_prompt_window_follows_the_dst_offset(tmp_path):
+    plan = plan_for(tmp_path, [])
+    est = rp.build_prompt({**plan, "trading_day": "2026-11-02", "bar_start_et": "10:30", "decision_time_et": "11:30"}, ["AAA"])
+    assert "15:30:00Z" in est and "16:30:00Z" in est
+
+
+# -- compact worker replies (2026-11-02: 5 of 7 slots refused) ----------------------------------------------------------
+# Every worker fetched its bars and quotes, then answered most tickers with "full response exceeds output capacity" or
+# "could not be reliably reproduced" instead of the data, so 3:30 published 15/84 and 0935, 1130, 1230 and 1330 refused
+# too. Nothing on the Mac changed since the 10-30 builds that published 91/91; the reply is what no longer fits. A bar
+# written as a 6-element list carries the same numbers in about a third of the characters, and a smaller chunk halves
+# what one worker has to write back. Object bars stay accepted, so a worker that ignores the format still validates.
+
+
+def compact(raw):
+    """``raw`` with every bar rewritten as ``[timestamp, open, high, low, close, volume]``."""
+    as_list = lambda b: [b["timestamp"], b["open"], b["high"], b["low"], b["close"], b["volume"]]  # noqa: E731
+    return {**raw, "previous_close_bar": as_list(raw["previous_close_bar"]),
+            "intraday_bars": [as_list(b) for b in raw["intraday_bars"]]}
+
+
+def test_prompt_asks_for_compact_list_bars(tmp_path):
+    text = rp.build_prompt(plan_for(tmp_path, []), ["AAA", "BBB"])
+    assert '[timestamp, open, high, low, close, volume]' in text
+    # The object-per-bar shape is what overflowed the replies; the prompt must no longer ask for it.
+    assert '{"timestamp": "<iso with offset>", "open": n' not in text
+
+
+def test_a_compact_list_bar_validates_to_the_same_bars_as_an_object_bar():
+    raw = good_ticker()
+    assert rp.validate_ticker(compact(raw), **kw()) == rp.validate_ticker(raw, **kw())
+
+
+@pytest.mark.parametrize("bad", [
+    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1],  # five fields: volume missing
+    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1, 100, 7],  # seven fields
+    ["2026-10-15T17:30:00Z", 10.0, 9.0, 9.9, 10.1, 100],  # high below open: the range check still applies
+])
+def test_a_malformed_compact_bar_is_rejected(bad):
+    with pytest.raises(rp.PayloadError):
+        rp.validate_bar(bad)
+
+
+def test_chunks_are_four_tickers_so_one_reply_stays_short():
+    assert rp.DEFAULT_CHUNK_SIZE == 4
 
 
 def test_live_mirror_prompts_use_the_prebuilt_payload():

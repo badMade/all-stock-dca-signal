@@ -2304,9 +2304,8 @@ def write_run_artifacts(
 # --- Manual order exclusion --------------------------------------------------
 
 def _iter_run_state_files(root: Path) -> Iterable[Path]:
-    if not root.exists():
-        return []
-    return sorted(root.rglob("run_state*.json"))
+    from dca_fileio import iter_run_state_files_fast
+    return iter_run_state_files_fast(root)
 
 
 def _order_ids_from_state(state: Mapping[str, Any]) -> Set[str]:
