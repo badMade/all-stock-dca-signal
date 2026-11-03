@@ -210,5 +210,8 @@ is no `span`. The prompt told the worker "span day" / "span week", so calls were
 `unexpected additional properties ["span"]` (15:30 chunk logs) or the worker retried without it and pulled a full-day,
 auto-interval series that blew its output limit ("exceeds the available response limit", 12:30). `build_prompt` now
 passes explicit RFC3339 UTC `start_time`/`end_time` for the slot window and a 7-day `start_time` for the previous daily
-bar. The 13:30 and 15:30 builds also ran at about 20:19-20:38 ET (launchd fired hours late), so their quotes failed the
-freshness check regardless; that is a scheduling issue, not fixed here.
+bar. Launchd was not late: the 15:30 build started at 15:31:04 ET (the chunk logs stamp UTC) and `caffeinate`
+assertions held the Mac awake all day. The 13:30 refusal stamped 20:23 ET is a later manual replay, so its "quote too
+long after the decision" reasons are an artifact of that replay. What was actually late is build duration: the 14:30
+build took 1583 s (rescue waves, single chunks of 54-76 s) against the ~25-minute slot window, consistent with workers
+pulling oversized series after the `span` rejection.
