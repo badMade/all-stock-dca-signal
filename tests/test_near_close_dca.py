@@ -2445,7 +2445,7 @@ def test_ticker_universe():
     assert "GLW" in ACTIVE_TICKERS
     assert "IRDMI" not in ACTIVE_TICKERS
     assert "GLWR" not in ACTIVE_TICKERS
-    # QBUT is the one ticker categorically excluded (no buying mechanism at
+    # QBUT (and KVUE, 2026-11-02) is categorically excluded (no buying mechanism at
     # all) today: Robinhood returned not-found for it on every live run,
     # confirmed 2026-09-18 (see config/tickers.json's exclusion_reasons.QBUT).
     assert EXCLUDED_TICKERS == frozenset({"QBUT", "KVUE"})
