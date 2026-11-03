@@ -18,7 +18,7 @@ import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Dict, NamedTuple, Sequence
+from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
 from uuid import uuid4
 
 
@@ -390,3 +390,48 @@ def order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> boo
     except (OSError, UnicodeDecodeError, csv.Error):
         return False
     return expected.issubset(present)
+
+def iter_run_state_files_fast(root: Path) -> Iterator[Path]:
+    """
+    Optimized equivalent of root.rglob("run_state*.json").
+    Uses os.scandir to avoid the O(N) stat overhead of Path.rglob().
+    Returns paths to ensure deterministic traversal order.
+    Symlinks are not followed to prevent infinite recursion.
+    """
+    if not root.is_dir():
+        return
+    stack = [root]
+    result = []
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.name.startswith("run_state") and entry.name.endswith(".json"):
+                        result.append(Path(entry.path))
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+        except OSError:
+            pass
+    yield from sorted(result)
+
+def iter_files_by_suffix_fast(root: Path, suffix: str) -> Iterator[Path]:
+    """
+    Optimized equivalent of root.rglob(f"*{suffix}").
+    """
+    if not root.is_dir():
+        return
+    stack = [root]
+    result = []
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.name.endswith(suffix):
+                        result.append(Path(entry.path))
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+        except OSError:
+            pass
+    yield from sorted(result)

@@ -49,7 +49,8 @@ logger = logging.getLogger("backfill_intraday_archive")
 
 def iter_run_states(root: Path) -> Iterator[Path]:
     """Yield every ``run_state.json`` under ``root``, deepest paths last."""
-    yield from sorted(root.rglob("run_state.json"))
+    from dca_fileio import iter_run_state_files_fast
+    yield from (p for p in iter_run_state_files_fast(root) if p.name == "run_state.json")
 
 
 def load_run_state(path: Path) -> Optional[Dict[str, Any]]:
