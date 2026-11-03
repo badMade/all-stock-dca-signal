@@ -82,6 +82,7 @@ environment (see the repository README).
 | [adr-tax-loss-sale.md](adr-tax-loss-sale.md) | ADR (proposed): the only allowed sell type, an operator-approved tax-loss sale of specific lots with a 31-day buy pause before and after the sale; never automatic, fail closed on any lookback doubt; design only |
 | [price_source_poc_report.md](price_source_poc_report.md) | The opt-in live PoC report for that price source (20 tickers x 60 sessions vs Yahoo) |
 | [verified_sizing_and_backup_facts.md](verified_sizing_and_backup_facts.md) | Re-checkable repo facts found during the backup-executor work: live per-ticker sizing and the $16 cap, stale "$10"/"5x" prose, same-day repeats, where sources disagree |
+| [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 
 ## Machine-readable backup
