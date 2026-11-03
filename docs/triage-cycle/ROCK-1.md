@@ -1,6 +1,0 @@
-ROCK 1 CONTRACT. Repo root is the cwd. Read docs/triage-cycle/PLAN.md (Rock 1) and selfheal/triage_reconcile.py first.
-Task: add `audit_unsupported_fixes(rows, evidence)` to selfheal/triage_reconcile.py (export in __all__), following the module's validation style (EvidenceError, same comment voice). It returns a deterministic, sorted structure naming Keys where (a) Approval == "Approved" and Fix state in {"Repaired","In review"} but the matched evidence has no PR, commit or issue; (b) Status == "Monitoring" and Progress/notes contain "brief acceptance not demonstrated"; (c) a recorded PR number has no matching PR in evidence. Inspect how rows and evidence are represented in this module and its tests, and reuse those shapes; do not invent new Notion field names beyond those already used in the module.
-Non-goals: no Notion writes, no change to existing function behaviour, no edits outside selfheal/triage_reconcile.py and tests/selfheal/test_triage_reconcile.py, no new dependencies.
-Add regression tests for each of (a), (b), (c) plus an empty-input case.
-Proof command: .venv/bin/python -m pytest tests/selfheal/test_triage_reconcile.py -q && ruff check selfheal tests/selfheal
-Report the proof output verbatim.
