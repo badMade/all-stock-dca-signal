@@ -77,14 +77,14 @@ DEFAULT_CHUNK_SIZE = 8
 #: At 90 tickers this tolerates 4 misses; a stale-feed slot (2026-10-20 13:30: 8 of 90) still publishes nothing.
 DEFAULT_MIN_COVERAGE = 0.95
 #: Share of the universe that may be "quiet" (no bar in the slot window) before the payload is refused anyway.
-#: Introduced for 2026-10-27 13:30, where eight names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed
-#: nothing between 12:30 and 13:30 and 82/90 refused the slot. Corrected 2026-10-31: those eight are exactly plan
-#: chunk 0, which on 10-26 13:30 had left them all out ("no data returned"), and SPCX, LUNR and DFTX traded 1-68M
-#: shares the session before, so that was one worker dropping one chunk, not eight thin names; the launcher's rescue
-#: now re-asks such a chunk (``rescue_targets``). Real quiet names exist all the same (QTOP, GFUZ, CHE under 100k). A quiet name is reported under
-#: ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the coverage denominator. A feed outage
-#: also returns empty series, so more than this share still refuses.
-MAX_QUIET_SHARE = 0.10
+#: History: introduced for 2026-10-27 13:30, where eight names printed nothing between 12:30 and 13:30; corrected
+#: 2026-10-31, when SPCX, LUNR and DFTX (1-68M shares the session before) showed that was a dropped chunk, not thin
+#: names (see ``rescue_targets``). Since 2026-11-03 "quiet" also requires a thin prior session
+#: (< ``LIQUID_PRIOR_VOLUME``): a liquid name with no bars is a real failure counted against the coverage floor, so
+#: this ceiling only bounds genuinely thin names and was raised from 10% to 25% (the 11-02 probe had 10 of 90 empty).
+#: A quiet name is reported under ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the
+#: coverage denominator. A feed outage also returns empty series, so more than this share still refuses.
+MAX_QUIET_SHARE = 0.25
 #: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
 #: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
 #: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
@@ -193,7 +193,13 @@ def validate_ticker(
                 raise PayloadError(f"duplicate intraday timestamp {stamp.isoformat()}")
             by_stamp[stamp] = bar
     if not by_stamp:
-        raise QuietTickerError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
+        gap = f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET"
+        # 2026-11-03: quiet means thin. A name that traded LIQUID_PRIOR_VOLUME or more the session before and prints
+        # nothing for the window is a dropped series (10-30 AMZN, GOOG, GOOGL; 11-02 10:30 the same), so it is a real
+        # failure that counts against the coverage floor, never filed quiet. A missing prior volume reads as 0 (thin).
+        if prev["volume"] >= LIQUID_PRIOR_VOLUME:
+            raise PayloadError(f"{gap}, although the prior session was liquid ({prev['volume']:,.0f} shares)")
+        raise QuietTickerError(gap)
     # The bar AT the window start is required, not one interval after it (2026-10-30). The old `> start + interval`
     # slack let a 3:30 series beginning at 14:30 pass `merge` and `check` against a 14:25 start, but the generator's
     # 60-minute lookback bar is exactly 14:25 (bars before `start` are dropped above, so nothing else can stand in):
@@ -579,7 +585,7 @@ def rescue_targets(reply: dict[str, Any], tickers: list[str]) -> list[str]:
     whole-chunk case of 10-29 15:31); otherwise also any answered ticker with no bars whose prior session was liquid
     (2026-10-31: the same 10-29 failure with one ticker of the chunk still answered would have filed NVDA, GOOGL, GOOG
     and AMZN quiet again). Only *which tickers are asked for again* changes here: the merge still validates whatever
-    comes back, and a liquid name that is empty again is still filed quiet and counted against ``MAX_QUIET_SHARE``.
+    comes back, and a liquid name that is empty again is a real failure (``validate_ticker``) counted against the coverage floor.
     """
     need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
     answered = [reply[t] for t in tickers if t not in need]

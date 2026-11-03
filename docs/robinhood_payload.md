@@ -27,10 +27,10 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is b
    **Quiet tickers (2026-10-28).** A ticker that printed no bar at all in the slot window did not trade; it is not a failed
    fetch. (It was added for 10-27 13:30, where eight empty names refused the slot at 82/90; 2026-10-31: those eight were
    exactly plan chunk 0, left out of the reply on 10-26 too, and include SPCX, LUNR and DFTX at 1-68M shares a day, so
-   that was a dropped chunk, which the rescue below now re-asks. Real quiet names exist: QTOP, GFUZ, CHE under 100k.) `publish` leaves it in
+   that was a dropped chunk, which the rescue below now re-asks. Real quiet names exist: QTOP, GFUZ, CHE under 100k. Since 2026-11-03 "quiet" also needs a thin prior session, under `LIQUID_PRIOR_VOLUME`: a liquid name with no bars is a real failure counted against the coverage floor.) `publish` leaves it in
    `ticker_errors.robinhood` (NO_DATA, never a BUY; omitting it would read as "not covered" and allow a single-source BUY),
    lists it under `quiet` in the `.meta.json` sidecar, and takes it out of the coverage denominator. More than
-   `MAX_QUIET_SHARE` (10%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
+   `MAX_QUIET_SHARE` (25%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
    traded but whose newest bar is far before the anchor stays a real failure. The prompts leave the sidecar's quiet names
    out of their ">5% errored" count.
    Each worker's reply counts only for the tickers its own chunk was assigned (`chunk_<i>.json` is
@@ -91,7 +91,7 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   chunk 3), and in a chunk that answered others, an empty ticker whose `previous_close_bar.volume` is at least
   `LIQUID_PRIOR_VOLUME` (1,000,000 shares) is re-asked alone (2026-10-31): an hour with no bar cannot be real for a
   name that traded that much the session before. Thinner empty names are left alone and filed quiet. A liquid name
-  that comes back empty again is still filed quiet and still counts toward `MAX_QUIET_SHARE`; the rule only decides
+  that comes back empty again is a real failure (it counts against the coverage floor, not the quiet share); the rule only decides
   what is asked for again. The rule is `rescue_targets` in `scripts/robinhood_payload.py`.
 - Every attempt that returns no reply keeps its worker output in
   `robinhood_payload_<day>_<slot>.chunk_logs/chunk_<i>.attempt<k>.<build epoch>.log` beside the payload (the
