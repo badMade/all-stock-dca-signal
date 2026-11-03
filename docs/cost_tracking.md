@@ -299,8 +299,14 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
    python3 -m scripts.backup_cost_ledger report --split 2026-11-02   # before vs from that day on
    ```
 
-2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the primary's own
-   `local_heartbeat start` and `finish`.
+2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the Gate 9 finalizer
+   (`scripts/finalize_run_evidence.py`), which every live prompt calls on every outcome. Until 2026-11-03 only
+   `local_heartbeat start` and `finish` wrote it, and no live prompt calls either, so on 2026-11-02 it never updated.
+   - Succeeded: orders placed, no orders (a safety check said do not buy), nothing to buy, or budget used up.
+   - Failed: an error, unreachable placement, or a confirmation request (no order went in).
+   - Nothing posted: a dry run, or a call the finalizer refused.
+   - The Mac dispatcher reads the same local document before its heartbeat probe: a slot marked `succeeded` today
+     sends no backup.
    - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch of
      the separate PUBLIC repository `badMade/all-stock-dca-signal` (`config/slot_status.json`). This repository is
      private, so Perplexity cannot read a file here (found 2026-10-31). One-time Mac setup: create that repository,

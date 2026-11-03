@@ -135,6 +135,8 @@ def decide(*, day: str, slot: str, now: datetime, calendar: Mapping[str, Any], p
         return {"action": "skip", "reason": reason}
     if already_sent:
         return {"action": "skip", "reason": "already_sent"}
+    if _primary_succeeded(day, slot):
+        return {"action": "skip", "reason": "primary_succeeded"}
     result = probe(day, slot)
     local_status = str(result.get("local_status"))
     if result.get("backup_may_act") is True:
@@ -143,6 +145,24 @@ def decide(*, day: str, slot: str, now: datetime, calendar: Mapping[str, Any], p
         # The heartbeat could not be read: never trigger on that (the old backups stood down on it too), but say so.
         return {"action": "skip", "reason": "unknown", "notify": True}
     return {"action": "skip", "reason": local_status}
+
+
+def _primary_succeeded(day: str, slot: str) -> bool:
+    """True when today's local slot-status document says the primary finished this slot (2026-11-03).
+
+    No live prompt calls local_heartbeat start/finish, so the heartbeat probe alone sees every slot as never started.
+    The Gate 9 finalizer records each accepted run here instead. Only "succeeded" for this slot today counts; an
+    unreadable, foreign or older document falls through to the probe, as before.
+    """
+    try:
+        document = json.loads(slot_status.state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not (isinstance(document, dict) and document.get("schema") == slot_status.SCHEMA
+            and document.get("trading_day") == day and isinstance(document.get("slots"), dict)):
+        return False
+    entry = document["slots"].get(slot)
+    return isinstance(entry, dict) and entry.get("status") == "succeeded"
 
 
 def cloud_decide(document: Any, *, day: str, slot: str, now: datetime, calendar: Mapping[str, Any]) -> dict[str, Any]:
