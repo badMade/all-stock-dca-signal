@@ -58,7 +58,20 @@ from .errors import LedgerValidationError
 ET = ZoneInfo("America/New_York")
 SOURCE = "csp_shadow"
 CSP_TABLES: tuple[str, ...] = ("csp_shadow_entries", "csp_shadow_settlements")
-PROPOSED_DEFAULTS_STATUS = "proposed, not operator-approved (ADR PR #2103 open questions 3, 4, 6)"
+
+# ADR Amendment 1 (operator, 2026-11-02): a second, CAP-WAIVED track of shadow trades kept in
+# its OWN tables. Separate tables, not a flag column: entry_id and content_hash do not include
+# the track, so one shared table would let ON CONFLICT DO NOTHING silently swallow the second
+# track's copy of a contract both tracks picked.
+REAL_TRACK = "real"
+CAP_WAIVED_TRACK = "cap_waived"
+CAP_WAIVED_TABLES: tuple[str, ...] = ("csp_shadow_cap_waived_entries", "csp_shadow_cap_waived_settlements")
+_TRACK_TABLES: dict[str, tuple[str, str]] = {
+    REAL_TRACK: (CSP_TABLES[0], CSP_TABLES[1]),
+    CAP_WAIVED_TRACK: (CAP_WAIVED_TABLES[0], CAP_WAIVED_TABLES[1]),
+}
+PROPOSED_DEFAULTS_STATUS = ("proposed, not operator-approved (ADR PR #2103 open questions 3, 4, 6); "
+                            "DTE window and cap-waived track operator-approved 2026-11-02 (Amendment 1)")
 
 # Cash sweep APY the ADR benchmarks against (High-Yield Cash, Sept 2026, per the operator).
 SWEEP_APY = 0.036
@@ -80,8 +93,10 @@ BREACH_FLAGS = frozenset({"assignment_breaches_sector_cap", "assigned_in_tax_los
 class CspShadowConfig:
     """Proposed defaults (ADR decision 2 and open questions 3/4). One-line diffs to change."""
 
-    min_dte: int = 25
-    max_dte: int = 45
+    # ADR Amendment 1 (operator, 2026-11-02): 18..46 days, was 25..45. On 2026-11-02 the old
+    # window missed both monthlies (Nov 20 at 18 days, Dec 18 at 46), leaving only weeklies.
+    min_dte: int = 18
+    max_dte: int = 46
     # Put deltas are negative: -0.30 is further in the money than -0.15.
     min_delta: float = -0.30
     max_delta: float = -0.15
@@ -104,6 +119,16 @@ class CspShadowConfig:
 
 
 DEFAULT_CONFIG = CspShadowConfig()
+
+# The cap-waived track (ADR Amendment 1): every filter of DEFAULT_CONFIG except the three
+# account-size caps. It answers "would this beat the sweep if the account were big enough" and
+# is never presented as tradable. A1 (proposed default): still one open put per ticker.
+CAP_WAIVED_CONFIG = dataclasses.replace(
+    DEFAULT_CONFIG,
+    max_collateral_pct_per_contract=math.inf,
+    max_total_collateral_pct=math.inf,
+    max_sector_pct=math.inf,
+)
 
 
 @dataclass(frozen=True)
@@ -951,8 +976,8 @@ def scorecard(
 _PROV = ("inputs_known_at TIMESTAMP NOT NULL, content_hash VARCHAR NOT NULL, source VARCHAR NOT NULL, "
          "as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL")
 
-_SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS csp_shadow_entries (
+_SCHEMA_TEMPLATE = f"""
+CREATE TABLE IF NOT EXISTS {{entries}} (
     entry_id VARCHAR NOT NULL, account_alias VARCHAR NOT NULL, session DATE NOT NULL, ticker VARCHAR NOT NULL,
     option_id VARCHAR NOT NULL, expiration_date DATE NOT NULL, dte INTEGER NOT NULL,
     strike DOUBLE NOT NULL, bid DOUBLE NOT NULL, ask DOUBLE NOT NULL, mid DOUBLE NOT NULL, spread_pct DOUBLE NOT NULL,
@@ -964,7 +989,7 @@ CREATE TABLE IF NOT EXISTS csp_shadow_entries (
     {_PROV},
     PRIMARY KEY (entry_id, content_hash)
 );
-CREATE TABLE IF NOT EXISTS csp_shadow_settlements (
+CREATE TABLE IF NOT EXISTS {{settlements}} (
     entry_id VARCHAR NOT NULL, ticker VARCHAR NOT NULL, entry_session DATE, expiration_date DATE,
     status VARCHAR NOT NULL CHECK (status IN ('expired_otm', 'assigned', 'closed_early', 'unscored')),
     settled_on DATE, underlying_close DOUBLE, exit_ask DOUBLE, assigned BOOLEAN NOT NULL,
@@ -974,6 +999,15 @@ CREATE TABLE IF NOT EXISTS csp_shadow_settlements (
     PRIMARY KEY (entry_id, content_hash)
 );
 """
+_SCHEMA = "".join(_SCHEMA_TEMPLATE.format(entries=e, settlements=t) for e, t in _TRACK_TABLES.values())
+
+
+def _tables(track: object) -> tuple[str, str]:
+    """(entries table, settlements table) for a track name; anything else is refused before any
+    SQL runs, so a typo can never create or read a third, unscored table."""
+    if not isinstance(track, str) or track not in _TRACK_TABLES:
+        raise LedgerValidationError(f"unknown shadow-log track (expected one of {sorted(_TRACK_TABLES)})")
+    return _TRACK_TABLES[track]
 
 
 def _utc_now() -> datetime:
@@ -1026,10 +1060,13 @@ def record_shadow_entries(
     run_id: str,
     as_of: datetime,
     source: str = SOURCE,
+    track: str = REAL_TRACK,
     clock: Callable[[], datetime] = _utc_now,
 ) -> int:
     """Append one shadow entry (at the BID) per suggestion; returns rows actually inserted.
-    Identical re-records are dropped by content hash. The whole batch is validated first."""
+    Identical re-records are dropped by content hash. The whole batch is validated first.
+    ``track``: REAL_TRACK (default) or CAP_WAIVED_TRACK (ADR Amendment 1), each its own table."""
+    entries_table, _ = _tables(track)
     as_of = _require_aware(as_of, "as_of")
     items = list(suggestions)
     if not all(isinstance(s, ShadowSuggestion) for s in items):
@@ -1045,7 +1082,7 @@ def record_shadow_entries(
         entry = dataclasses.asdict(entry_from_suggestion(s))
         entry["content_hash"] = _hash([entry[k] for k in sorted(entry)])
         rows.append({**entry, **prov})
-    return _insert(con, "csp_shadow_entries", rows)
+    return _insert(con, entries_table, rows)
 
 
 def record_settlements(
@@ -1055,10 +1092,13 @@ def record_settlements(
     run_id: str,
     as_of: datetime,
     source: str = SOURCE,
+    track: str = REAL_TRACK,
     clock: Callable[[], datetime] = _utc_now,
 ) -> int:
     """Append settled and unscored results (``open`` rows are not results and are skipped).
-    A later, better-informed settlement of the same entry is a new row; readers take it."""
+    A later, better-informed settlement of the same entry is a new row; readers take it.
+    ``track``: as record_shadow_entries; a settlement goes in its own track's table."""
+    _, settlements_table = _tables(track)
     as_of = _require_aware(as_of, "as_of")
     items = [s for s in settlements if isinstance(s, Settlement) and s.status in SETTLEMENT_STATUSES]
     if any(as_of < s.inputs_known_at for s in items):
@@ -1073,7 +1113,7 @@ def record_settlements(
         row["flags"] = list(s.flags)
         row["content_hash"] = _hash([row[k] for k in sorted(row) if k != "inputs_known_at"])
         rows.append({**row, **prov})
-    return _insert(con, "csp_shadow_settlements", rows)
+    return _insert(con, settlements_table, rows)
 
 
 def _from_db(value: Any) -> Any:
@@ -1090,33 +1130,45 @@ def _known(known_at: datetime | None) -> datetime:
     return FAR_FUTURE if known_at is None else to_utc_naive(known_at)
 
 
-_LATEST_ENTRIES = (
+_LATEST_ENTRIES_TEMPLATE = (
     "SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER (PARTITION BY entry_id "
-    "ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn FROM csp_shadow_entries WHERE as_of <= ?) "
+    "ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn FROM {table} WHERE as_of <= ?) "
     "WHERE rn = 1"
 )
+_LATEST_ENTRIES = _LATEST_ENTRIES_TEMPLATE.format(table=CSP_TABLES[0])
 # Like the ledger's outcomes: visible only if both written and built from data known by the
 # reader's moment. A SCORED row always beats an unscored one (review of #2105: a re-run during
 # a price-feed outage wrote a newer "unscored" row that hid an assigned loser from the
 # scorecard). Among scored rows the one built from the newest information wins, so a real
 # correction (better data, new hash) still lands; an unscored row only ever replaces another
 # unscored row.
-_LATEST_SETTLEMENTS = (
+_LATEST_SETTLEMENTS_TEMPLATE = (
     "SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER (PARTITION BY entry_id "
     "ORDER BY (status <> 'unscored') DESC, inputs_known_at DESC, as_of DESC, ingested_at DESC, content_hash) AS rn "
-    "FROM csp_shadow_settlements WHERE as_of <= ? AND inputs_known_at <= ?) WHERE rn = 1"
+    "FROM {table} WHERE as_of <= ? AND inputs_known_at <= ?) WHERE rn = 1"
 )
+# open_short_puts reads these REAL-track forms only: a cap-waived put could not have been held
+# by the account, so it never blocks tax-loss eligibility (ADR Amendment 1).
+_LATEST_SETTLEMENTS = _LATEST_SETTLEMENTS_TEMPLATE.format(table=CSP_TABLES[1])
 
 
-def shadow_entries(con: duckdb.DuckDBPyConnection, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
+def shadow_entries(
+    con: duckdb.DuckDBPyConnection, *, known_at: datetime | None = None, track: str = REAL_TRACK
+) -> list[dict[str, Any]]:
+    entries_table, _ = _tables(track)
     ensure_csp_schema(con)
-    return _rows(con, _LATEST_ENTRIES + " ORDER BY session, ticker, entry_id", [_known(known_at)])
+    sql = _LATEST_ENTRIES_TEMPLATE.format(table=entries_table)
+    return _rows(con, sql + " ORDER BY session, ticker, entry_id", [_known(known_at)])
 
 
-def shadow_settlements(con: duckdb.DuckDBPyConnection, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
+def shadow_settlements(
+    con: duckdb.DuckDBPyConnection, *, known_at: datetime | None = None, track: str = REAL_TRACK
+) -> list[dict[str, Any]]:
+    _, settlements_table = _tables(track)
     ensure_csp_schema(con)
     k = _known(known_at)
-    rows = _rows(con, _LATEST_SETTLEMENTS + " ORDER BY settled_on NULLS LAST, entry_id", [k, k])
+    sql = _LATEST_SETTLEMENTS_TEMPLATE.format(table=settlements_table)
+    rows = _rows(con, sql + " ORDER BY settled_on NULLS LAST, entry_id", [k, k])
     for r in rows:
         r["flags"] = tuple(r["flags"] or ())
     return rows
