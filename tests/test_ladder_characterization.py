@@ -40,7 +40,9 @@ def configs():
 
 def test_the_fixture_covers_every_active_ticker_and_every_scenario(configs):
     assert set(GOLDEN["multipliers"]) == set(configs)
-    assert set(GOLDEN["multipliers"]["live"]) == set(configs["live"].tickers)
+    # Keep frozen characterization rows for symbols later removed from the
+    # active universe; every current active ticker must still be represented.
+    assert set(configs["live"].tickers) <= set(GOLDEN["multipliers"]["live"])
     assert len(GOLDEN["drops"]) >= 25 and len(GOLDEN["bases"]) >= 40
 
 
