@@ -1,6 +1,6 @@
 # ADR: One allowed sell type, an operator-approved tax-loss sale with a buy pause
 
-- **Status:** Proposed (2026-11-02). Operator asked for this on 2026-11-01: "allow just one kind:
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Operator asked for this on 2026-11-01: "allow just one kind:
   an operator-approved tax-loss sale, with a 31-day buy pause on that ticker." Open questions
   carry labeled proposed defaults.
 - **Scope:** design only. No code in this PR places, previews or reviews a sell order. The live

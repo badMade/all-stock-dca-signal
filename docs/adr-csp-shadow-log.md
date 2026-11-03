@@ -1,6 +1,6 @@
 # ADR: A suggest-only shadow log of cash-secured puts
 
-- **Status:** Proposed (2026-11-02). Operator approved this plan on 2026-11-01 after the research
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Operator approved this plan on 2026-11-01 after the research
   report "Options overlay for DCA portfolio" (2026-11-02). Open questions carry labeled proposed
   defaults.
   **Amended 2026-11-02:** Amendment 1 below (18 to 46 day window, a cap-waived track, 4:20 PM ET

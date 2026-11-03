@@ -1,6 +1,6 @@
 # ADR: Co-movement signals for the DCA system (pairs as signals, not a strategy)
 
-- **Status:** Proposed (2026-11-02). Operator decision 2026-11-01: use pairs and co-movement as
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Operator decision 2026-11-01: use pairs and co-movement as
   **signals** inside the existing DCA system, and do **not** implement pairs trading as a
   strategy. Operator asked to build signals 1 and 2 first, then continue on 3 to 5.
 - **Scope:** research-only suggesters in `dca-sizing-signals/`. They publish bounded suggestions

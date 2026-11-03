@@ -1,6 +1,6 @@
 # ADR: Dynamic, rules-based universe capped at 100 active tickers
 
-- **Status:** Proposed (2026-11-01). Open questions carry labeled proposed defaults. Research
+- **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Open questions carry labeled proposed defaults. Research
   and shadow work may proceed on them; executor wiring needs its own later ADR.
 - **Scope:** a research-only scorer and selection rule (`ticker-advisor/`), plus append-only
   DuckDB tables beside the Phase 0 ledger (`docs/adr-outcome-ledger-pit-harness.md`). The
