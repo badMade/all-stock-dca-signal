@@ -201,3 +201,14 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   answered, so the rescue now also re-asks any empty ticker whose prior session traded at least
   `LIQUID_PRIOR_VOLUME` (1,000,000) shares (`rescue_targets` in `scripts/robinhood_payload.py`); see the rescue list
   above. Quiet, freshness and coverage checks are unchanged.
+
+## 2026-11-02: the worker prompt named a `span` the tool does not have
+
+Every slot refused on 2026-11-02. The Robinhood MCP `get_equity_historicals` schema is `additionalProperties: false`
+with `symbols` and `start_time` required and only `interval`, `end_time`, `bounds` and `adjustment_type` optional; there
+is no `span`. The prompt told the worker "span day" / "span week", so calls were rejected with
+`unexpected additional properties ["span"]` (15:30 chunk logs) or the worker retried without it and pulled a full-day,
+auto-interval series that blew its output limit ("exceeds the available response limit", 12:30). `build_prompt` now
+passes explicit RFC3339 UTC `start_time`/`end_time` for the slot window and a 7-day `start_time` for the previous daily
+bar. The 13:30 and 15:30 builds also ran at about 20:19-20:38 ET (launchd fired hours late), so their quotes failed the
+freshness check regardless; that is a scheduling issue, not fixed here.

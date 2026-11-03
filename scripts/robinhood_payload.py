@@ -346,34 +346,47 @@ def build_plan(slot: str, day: date) -> dict[str, Any]:
 
 
 def _utc_window(plan: dict[str, Any]) -> tuple[str, str]:
-    """The plan's ET window as ``HH:MM:SSZ`` stamps for the worker to compare the tool's UTC bar stamps against.
+    """The plan's ET window as RFC3339 UTC stamps (``YYYY-MM-DDTHH:MM:SSZ``) for the tool's ``start_time``/``end_time``.
 
     2026-11-02: the clocks went back on 11-01 and every worker kept filtering "10:30-11:30 ET" against UTC stamps as if
-    ET were UTC-4, so it returned 09:30-10:25 ET bars and 31/91 tickers read as quiet (a full-day unfiltered reply
-    overflows the worker's output limit, so the window must still be applied worker-side). The offset is computed here
-    with zoneinfo, never left to the model.
+    ET were UTC-4, so it returned 09:30-10:25 ET bars and 31/91 tickers read as quiet. The offset is computed here
+    with zoneinfo, never left to the model. The same day's 15:30 chunk logs showed the Robinhood MCP
+    ``get_equity_historicals`` schema is ``additionalProperties: false`` with a required ``start_time`` and no ``span``,
+    so the range is passed as explicit stamps rather than a span name the tool rejects.
     """
     day = date.fromisoformat(plan["trading_day"])
     start = datetime.combine(day, time.fromisoformat(plan["bar_start_et"]), ET).astimezone(timezone.utc)
     end = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), ET).astimezone(timezone.utc)
-    return start.strftime("%H:%M:%SZ"), end.strftime("%H:%M:%SZ")
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+#: Calendar days back the previous-session daily bar is requested from: covers a long weekend plus a holiday while
+#: staying a handful of bars, so the reply is not truncated.
+DAILY_LOOKBACK_DAYS = 7
+
+
+def _daily_start(plan: dict[str, Any]) -> str:
+    day = date.fromisoformat(plan["trading_day"]) - timedelta(days=DAILY_LOOKBACK_DAYS)
+    return f"{day.isoformat()}T00:00:00Z"
 
 
 def build_prompt(plan: dict[str, Any], tickers: list[str]) -> str:
     utc_start, utc_end = _utc_window(plan)
+    daily_start = _daily_start(plan)
     return f"""You are a data-retrieval worker. Use ONLY the Robinhood MCP tools that read market data
 (historicals and quotes). Never call any order, cancel, watchlist or alert tool.
 
 Trading day: {plan['trading_day']} (America/New_York). Tickers: {', '.join(tickers)}
 
 For EACH ticker fetch:
-1. {plan['interval_minutes']}-minute bars for today (historicals, interval {plan['interval_minutes']}minute, span day), covering
-   {plan['bar_start_et']} ET through {plan['decision_time_et']} ET. The tool stamps bars in UTC, and that window is
-   {utc_start} through {utc_end} UTC on {plan['trading_day']} (computed for today's UTC offset; do NOT work the offset out
-   yourself). Keep only bars whose START timestamp is at or after {utc_start} and strictly before {utc_end} (omit the
-   still-open bar). Copy each kept bar's timestamp exactly as returned.
-2. The previous completed regular session's daily bar (historicals, interval day, span week -- request ONLY
-   the last few sessions, never a long history, so the reply is not truncated; use the newest completed session).
+1. {plan['interval_minutes']}-minute bars (historicals, interval {plan['interval_minutes']}minute) for the window {plan['bar_start_et']} ET
+   through {plan['decision_time_et']} ET. Pass exactly start_time {utc_start} and end_time {utc_end} (UTC, computed for today's
+   offset; do NOT work the offset out yourself) and no other parameter beyond symbols, interval, start_time and end_time.
+   Keep only bars whose START timestamp is at or after {utc_start} and strictly before {utc_end} (omit the still-open
+   bar). Copy each kept bar's timestamp exactly as returned.
+2. The previous completed regular session's daily bar (historicals, interval day, start_time {daily_start} and no end_time
+   -- a handful of sessions only, never a long history, so the reply is not truncated; use the newest completed
+   session before {plan['trading_day']}).
 3. A current quote, with its best bid and best ask.
 
 Reply with ONE JSON object and nothing else (no prose, no code fence). Keys are the tickers above:
