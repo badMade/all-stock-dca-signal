@@ -295,6 +295,8 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
 
    ```bash
    python3 -m scripts.backup_cost_ledger add --day 2026-10-29 --task 4412c3c4 --credits 312 --status stood_down_local_active
+   # STEP A of the short signal-first prompt stood down on slot_status.json (no state record is written):
+   python3 -m scripts.backup_cost_ledger add --day 2026-11-03 --task 4412c3c4 --credits 10 --status stood_down_signal
    python3 -m scripts.backup_cost_ledger report --since 2026-10-27
    python3 -m scripts.backup_cost_ledger report --split 2026-11-02   # before vs from that day on
    ```
