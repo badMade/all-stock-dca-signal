@@ -771,6 +771,40 @@ def _record_refusal(
         path.write_text(json.dumps(marker, indent=1), encoding="utf-8")
     except OSError as exc:
         print(f"robinhood_payload: could not write refusal marker {path.name}: {exc.__class__.__name__}", file=sys.stderr)
+    # After the marker, so a notifier that hangs or fails can never cost the durable record.
+    _notify_refusal(plan, reason, ok=ok, universe=universe, failed=failed)
+
+
+#: Failed tickers named in the refusal notification before "+N more"; the log and the marker carry the full list.
+NOTIFY_TICKER_LIMIT = 5
+#: macOS truncates a long notification body anyway; keep the useful part (reason and counts) well inside it.
+NOTIFY_MESSAGE_LIMIT = 250
+
+
+def _notify_refusal(plan: dict[str, Any], reason: str, *, ok: int, universe: int, failed: dict[str, str]) -> None:
+    """Raise a macOS notification that this slot's payload build was refused (2026-11-03).
+
+    2026-11-02: five of seven builds were refused and each only surfaced in a launchd log and at the slot's Gate 5
+    abort. Opt-in (``DCA_NOTIFY_REFUSAL=1``, which the launcher exports by default) so the test suite and direct
+    callers stay silent. Best-effort like the marker: a missing, failing or hung notifier changes neither the exit
+    status nor the marker, and the log note names only the exception class, never the message text. Reuses
+    ``schedule_watchdog.notify_macos`` (text as argv, not interpolated into AppleScript) instead of a second notifier.
+    """
+    if os.environ.get("DCA_NOTIFY_REFUSAL") != "1":
+        return
+    import subprocess
+
+    from scripts import schedule_watchdog
+
+    names = sorted(failed)
+    listed = ", ".join(names[:NOTIFY_TICKER_LIMIT]) or "none"
+    if len(names) > NOTIFY_TICKER_LIMIT:
+        listed += f" +{len(names) - NOTIFY_TICKER_LIMIT} more"
+    message = f"{reason} [{ok}/{universe} valid; failed: {listed}]"[:NOTIFY_MESSAGE_LIMIT]
+    try:
+        schedule_watchdog.notify_macos(f"Payload refused: slot {plan['slot']} {plan['trading_day']}", message)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"robinhood_payload: could not raise the refusal notification: {exc.__class__.__name__}", file=sys.stderr)
 
 
 def _refusal_note(plan: dict[str, Any]) -> str | None:
