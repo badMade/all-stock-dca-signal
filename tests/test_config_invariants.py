@@ -1122,6 +1122,17 @@ def test_excluded_tickers_match_config_tickers_json():
     )
 
 
+def test_owner_decided_universe_membership():
+    """Pins the owner's recorded decisions (config/tickers.json notes,
+    TICKER UNIVERSE UPDATE AUG 16 2026, SECOND UPDATE): TRLV is active, and
+    BYDDY and RVII are whole_share, never active."""
+    documented = _load("tickers.json")
+    assert "TRLV" in documented["active"], "TRLV was reinstated to active by the owner on 2026-08-16"
+    assert "BYDDY" not in documented["active"]
+    assert "RVII" not in documented["active"]
+    assert set(documented["whole_share"]) == {"BYDDY", "RVII"}
+
+
 def test_no_ticker_is_both_active_and_excluded():
     assert not (set(ACTIVE_TICKERS) & set(EXCLUDED_TICKERS))
 
