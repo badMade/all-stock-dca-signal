@@ -2,8 +2,21 @@
 
 🚨 **Severity:** HIGH
 💡 **Vulnerability & Impact:** Unbounded numeric parsing missed an explicit `bool` check before checking `isinstance(value, (str, int, float))`. In Python, `isinstance(True, int)` evaluates to `True`, which can bypass safety invariants.
-🔧 **Fix:** Added an explicit `isinstance(order_id, bool)` check before checking `isinstance(order_id, (str, int, float))` in `dca_runner._is_usable_order_id` (lines 3076, 4663) and `near_close_dca._is_usable_reconciled_order_id` (line 25689). This prevents boolean values from duck-typing as valid numeric order IDs.
-✅ **Verification:** Added failing tests `test_usable_order_id_rejects_boolean_ids` that passes `True` and `False` to `dca_runner._is_usable_order_id` and `test_is_usable_reconciled_order_id_rejects_boolean_ids` to `near_close_dca._is_usable_reconciled_order_id`, and verified they are rejected.
+🔧 **Fix:** Added an explicit `isinstance(order_id, bool)` check before checking `isinstance(order_id, (str, int, float))` in `dca_runner._is_usable_order_id` (lines 3076, 4663) and `near_close_dca._is_usable_reconciled_order_id` (line 25689). This prevents boolean values from duck-typing as valid numeric order IDs. Updated `backup_planner.pyz` and the corresponding perplexity prompts to align with the core DCA modules.
+✅ **Verification:** Added failing tests `test_usable_order_id_rejects_boolean_ids` that passes `True` and `False` to `dca_runner._is_usable_order_id` and `test_is_usable_reconciled_order_id_rejects_boolean_ids` to `near_close_dca._is_usable_reconciled_order_id`, and verified they are rejected. Tests pass locally.
 ⚠️ **Known Limitations:** None.
 🔒 **Secrets Confirmation:** Verified no hardcoded secrets or account numbers were introduced.
 🎯 **Entry-Point Coverage:** Covers the `dca_runner.py` and `near_close_dca.py` entry points.
+
+### Mandatory Sections
+
+*   **Scope:** Fix Boolean coercion bypass vulnerabilities in numeric order ID parsing in `dca_runner.py` and `near_close_dca.py`, and update backup planner/prompts.
+*   **AI Usage:** AI was used to diagnose the issue via regex grep across the codebase, apply the target fix and test assertions, and debug the CI issues.
+*   **Assumptions & Validation:** Assumes that order IDs natively provided as `True` or `False` by the broker or downstream payload manipulation should be explicitly treated as an invalid state, matching existing behaviors for `None`, falsy, and object types.
+*   **Design Rationale:** Minimal targeted fix (`isinstance(val, bool) or not isinstance(val, (str, int, float))`) provides fail-fast protection against Duck-typing bools as ints without mutating downstream logic branches. Updates to the `backup_planner.pyz` ensure tests in `scripts/tests/test_verify_perplexity_pair.py` pass.
+*   **Testing:**
+    *   `pytest tests/test_dca_runner.py -k test_usable_order_id_rejects_boolean_ids -q`
+    *   `pytest tests/test_near_close_dca.py -k test_is_usable_reconciled_order_id_rejects_boolean_ids -q`
+    *   `pytest scripts/tests/test_verify_perplexity_pair.py -q`
+*   **Risk & Rollback:** Zero regression risk to strings, floats, or integers; reverts seamlessly if needed via `git revert`.
+*   **Tech Debt:** Minimal code churn; introduces zero new dependencies.

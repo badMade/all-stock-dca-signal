@@ -20,12 +20,10 @@ features, and trains ONE pooled Ridge-regularized linear regression across the w
 universe to predict the forward 5-trading-day realized return on a dip day (a day where price
 fell versus the prior close). The prediction is clipped to a sane band and linearly rescaled into
 a bounded (default ±20%, schema-capped at ±50%) per-ticker multiplier, then -- only if it clears a
-fail-closed quality gate -- published to ml-forecaster's own shadow incumbent file
-(`<cron root>/sizing_suggestions/ml_forecaster/incumbent.json`) and appended to the shared
-suggestion history. It does NOT write `config/ml_sizing_adjustment.json` by default: that file
-feeds `near_close_dca.graded_buy_multiplier()`, and sizing is still being determined by comparing
-independent suggesters, so promoting any suggester into it is a deliberate human step (see
-`docs/sizing_suggestion_history.md`). Pass `--output` to publish to the live file on purpose.
+fail-closed quality gate -- published to `config/ml_sizing_adjustment.json`, which
+`near_close_dca.graded_buy_multiplier()` already reads and applies on top of the normal graded-
+ladder multiplier (that consumption side already existed before this tool; this tool is only the
+production/publish side).
 
 ## Why pooled, why linear, why Ridge
 

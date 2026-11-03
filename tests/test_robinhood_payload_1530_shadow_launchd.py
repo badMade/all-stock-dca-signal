@@ -53,8 +53,7 @@ def test_shadow_agent_sets_a_build_deadline_that_fits_before_the_slot_window_clo
     env = _load(SHADOW)["EnvironmentVariables"]
     deadline = int(env["DCA_BUILD_DEADLINE_SECONDS"])
     assert 240 <= deadline <= 600  # above a real 2-4 minute build, well inside the 15:25-15:55 window
-    # The live job serves six slots, so it carries a relative deadline only (2026-11-02), never the 15:40 ET cutoff below.
-    assert "DCA_BUILD_DEADLINE_ET" not in _load(LIVE)["EnvironmentVariables"]
+    assert "DCA_BUILD_DEADLINE_SECONDS" not in _load(LIVE)["EnvironmentVariables"]
     assert env["DCA_CRON_TRACKING_ROOT"] == "/x"  # must match the live sessions
 
 

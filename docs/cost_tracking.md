@@ -295,20 +295,12 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
 
    ```bash
    python3 -m scripts.backup_cost_ledger add --day 2026-10-29 --task 4412c3c4 --credits 312 --status stood_down_local_active
-   # STEP A of the short signal-first prompt stood down on slot_status.json (no state record is written):
-   python3 -m scripts.backup_cost_ledger add --day 2026-11-03 --task 4412c3c4 --credits 10 --status stood_down_signal
    python3 -m scripts.backup_cost_ledger report --since 2026-10-27
    python3 -m scripts.backup_cost_ledger report --split 2026-11-02   # before vs from that day on
    ```
 
-2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the Gate 9 finalizer
-   (`scripts/finalize_run_evidence.py`), which every live prompt calls on every outcome. Until 2026-11-03 only
-   `local_heartbeat start` and `finish` wrote it, and no live prompt calls either, so on 2026-11-02 it never updated.
-   - Succeeded: orders placed, no orders (a safety check said do not buy), nothing to buy, or budget used up.
-   - Failed: an error, unreachable placement, or a confirmation request (no order went in).
-   - Nothing posted: a dry run, or a call the finalizer refused.
-   - The Mac dispatcher reads the same local document before its heartbeat probe: a slot marked `succeeded` today
-     sends no backup.
+2. **Publish a "slot finished" signal.** `scripts/slot_status.py` is written by the primary's own
+   `local_heartbeat start` and `finish`.
    - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch of
      the separate PUBLIC repository `badMade/all-stock-dca-signal` (`config/slot_status.json`). This repository is
      private, so Perplexity cannot read a file here (found 2026-10-31). One-time Mac setup: create that repository,

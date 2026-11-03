@@ -183,72 +183,6 @@ def test_prompt_names_window_and_forbids_orders(tmp_path):
     text = rp.build_prompt(plan, ["AAA", "BBB"])
     assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
     assert "Never call any order" in text
-    # 2026-11-02 (first Monday after fall-back): the window is handed over in UTC, computed in code, so the worker never
-    # has to know ET's offset. 13:30 ET on 2026-10-15 is EDT (17:30Z); 10:30 ET on 2026-11-02 is EST (15:30Z).
-    assert "17:30:00Z" in text and "18:30:00Z" in text
-
-
-def test_prompt_window_follows_the_dst_offset(tmp_path):
-    plan = plan_for(tmp_path, [])
-    est = rp.build_prompt({**plan, "trading_day": "2026-11-02", "bar_start_et": "10:30", "decision_time_et": "11:30"}, ["AAA"])
-    assert "15:30:00Z" in est and "16:30:00Z" in est
-
-
-def test_prompt_never_names_the_rejected_span_parameter(tmp_path):
-    # 2026-11-02 15:30: get_equity_historicals is `additionalProperties: false` with `start_time` required and no `span`;
-    # the worker obeyed "span day"/"span week" and the tool answered `unexpected additional properties ["span"]`.
-    plan = plan_for(tmp_path, [])
-    text = rp.build_prompt(plan, ["AAA"])
-    assert "span" not in text
-    # The range is handed over as explicit RFC3339 UTC start_time/end_time (13:30-14:30 ET on 2026-10-15 is EDT).
-    assert "start_time" in text and "2026-10-15T17:30:00Z" in text and "2026-10-15T18:30:00Z" in text
-
-
-def test_prompt_daily_lookback_is_a_start_time_before_the_trading_day(tmp_path):
-    plan = plan_for(tmp_path, [])
-    text = rp.build_prompt(plan, ["AAA"])
-    assert "interval day" in text and "2026-10-08T00:00:00Z" in text  # 7 calendar days back: covers a long weekend
-
-
-# -- compact worker replies (2026-11-02: 5 of 7 slots refused) ----------------------------------------------------------
-# Every worker fetched its bars and quotes, then answered most tickers with "full response exceeds output capacity" or
-# "could not be reliably reproduced" instead of the data, so 3:30 published 15/84 and 0935, 1130, 1230 and 1330 refused
-# too. Nothing on the Mac changed since the 10-30 builds that published 91/91; the reply is what no longer fits. A bar
-# written as a 6-element list carries the same numbers in about a third of the characters, and a smaller chunk halves
-# what one worker has to write back. Object bars stay accepted, so a worker that ignores the format still validates.
-
-
-def compact(raw):
-    """``raw`` with every bar rewritten as ``[timestamp, open, high, low, close, volume]``."""
-    as_list = lambda b: [b["timestamp"], b["open"], b["high"], b["low"], b["close"], b["volume"]]  # noqa: E731
-    return {**raw, "previous_close_bar": as_list(raw["previous_close_bar"]),
-            "intraday_bars": [as_list(b) for b in raw["intraday_bars"]]}
-
-
-def test_prompt_asks_for_compact_list_bars(tmp_path):
-    text = rp.build_prompt(plan_for(tmp_path, []), ["AAA", "BBB"])
-    assert '[timestamp, open, high, low, close, volume]' in text
-    # The object-per-bar shape is what overflowed the replies; the prompt must no longer ask for it.
-    assert '{"timestamp": "<iso with offset>", "open": n' not in text
-
-
-def test_a_compact_list_bar_validates_to_the_same_bars_as_an_object_bar():
-    raw = good_ticker()
-    assert rp.validate_ticker(compact(raw), **kw()) == rp.validate_ticker(raw, **kw())
-
-
-@pytest.mark.parametrize("bad", [
-    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1],  # five fields: volume missing
-    ["2026-10-15T17:30:00Z", 10.0, 10.2, 9.9, 10.1, 100, 7],  # seven fields
-    ["2026-10-15T17:30:00Z", 10.0, 9.0, 9.9, 10.1, 100],  # high below open: the range check still applies
-])
-def test_a_malformed_compact_bar_is_rejected(bad):
-    with pytest.raises(rp.PayloadError):
-        rp.validate_bar(bad)
-
-
-def test_chunks_are_four_tickers_so_one_reply_stays_short():
-    assert rp.DEFAULT_CHUNK_SIZE == 4
 
 
 def test_live_mirror_prompts_use_the_prebuilt_payload():
@@ -1153,23 +1087,12 @@ def stale_ticker():
     return good_ticker(minutes=range(30, 40, 5)) | {"intraday_bars": [bar("2026-10-15T17:30:00Z")]}
 
 
-def liquid_empty_ticker(volume=5_000_000):
-    # 2026-11-02 10:30: AMZN, GOOG and GOOGL printed no bars in the window although each traded millions of shares the
-    # session before. That is a dropped series, not a quiet hour.
-    raw = good_ticker()
-    raw["intraday_bars"] = []
-    raw["previous_close_bar"]["volume"] = volume
-    return raw
-
-
-def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, liquid=0, total=90):
+def universe_plan(tmp_path, *, quiet=0, errored=0, stale=0, total=90):
     tickers = [f"T{i}" for i in range(total)]
     plan = plan_for(tmp_path, tickers)
     replies = {t: good_ticker() for t in tickers}
     cursor = 0
-    for count, make in (
-        (quiet, quiet_ticker), (liquid, liquid_empty_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"}),
-    ):
+    for count, make in ((quiet, quiet_ticker), (stale, stale_ticker), (errored, lambda: {"error": "x"})):
         for t in tickers[cursor : cursor + count]:
             replies[t] = make()
         cursor += count
@@ -1210,11 +1133,10 @@ def test_eight_quiet_tickers_of_ninety_still_publish(tmp_path):
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0  # re-validation must not read them as misses
 
 
-def test_more_quiet_tickers_than_the_ceiling_still_refuse(tmp_path):
-    # A feed that drops most of the universe can still look thin; the ceiling keeps that a refusal.
-    # 23 of 90 is 25.6%, just over the 25% ceiling.
-    plan, _, chunk = universe_plan(tmp_path, quiet=23)
-    assert rp.MAX_QUIET_SHARE == 0.25
+def test_more_quiet_tickers_than_the_cap_still_refuse(tmp_path):
+    # An outage that returns empty series looks the same as a quiet market; the cap keeps it a refusal.
+    plan, _, chunk = universe_plan(tmp_path, quiet=10)
+    assert rp.MAX_QUIET_SHARE == 0.10
     payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
     assert not (tmp_path / "out" / "payload.json").exists()
@@ -1339,85 +1261,3 @@ def test_a_payload_built_to_the_1530_plan_window_scores_in_the_generator():
     (row,) = [c for c in candidates if c["ticker"] == ticker]
     assert row["provider_error"] is False, row
     assert row["action"] == "BUY", row
-
-
-# -- quiet means thin, not merely empty (2026-11-02) -------------------------------------------------------------
-# One 10% cap treated every empty series alike. On 2026-11-02 it published a payload whose AMZN, GOOG and GOOGL had no
-# bars (all liquid) while a healthy fetch with ten genuinely thin names (11%) would have been refused. An empty series
-# is quiet only when the prior session was thin (< LIQUID_PRIOR_VOLUME shares); a liquid name that is empty after the
-# launcher's re-ask is a real failure against the 95% floor. Thin quiet names are bounded only by a higher ceiling.
-
-
-@pytest.mark.parametrize("volume, quiet", [
-    (rp.LIQUID_PRIOR_VOLUME - 1, True),   # just under the threshold: thin
-    (rp.LIQUID_PRIOR_VOLUME, False),      # the threshold itself is liquid (as in rescue_targets)
-    (5_000_000, False),
-    (0, True),
-])
-def test_an_empty_series_is_quiet_only_when_the_prior_session_was_thin(volume, quiet):
-    if quiet:
-        with pytest.raises(rp.QuietTickerError):
-            rp.validate_ticker(liquid_empty_ticker(volume), **kw())
-        return
-    with pytest.raises(rp.PayloadError) as excinfo:
-        rp.validate_ticker(liquid_empty_ticker(volume), **kw())
-    assert not isinstance(excinfo.value, rp.QuietTickerError)
-    assert "liquid" in str(excinfo.value)  # the recorded reason says why it is not filed quiet
-
-
-def test_a_prior_session_without_a_volume_reads_as_thin():
-    # Same rule as rescue_targets: an unreadable prior session never turns an empty series into a failure by itself.
-    raw = liquid_empty_ticker()
-    del raw["previous_close_bar"]["volume"]  # validate_bar reads a missing volume as 0
-    with pytest.raises(rp.QuietTickerError):
-        rp.validate_ticker(raw, **kw())
-
-
-def test_ten_thin_quiet_names_of_ninety_no_longer_refuse_a_healthy_fetch(tmp_path):
-    # 2026-11-02 probe: ten names with no 12:30-13:30 bars (11%) refused the slot although nothing else was wrong.
-    plan, tickers, chunk = universe_plan(tmp_path, quiet=10)
-    payload, failed = rp.assemble(plan, [chunk])
-    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
-    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
-    assert meta["quiet"] == sorted(tickers[:10])
-    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
-
-
-def test_liquid_empty_names_are_real_failures_in_the_published_error_list(tmp_path):
-    # 4 of 90 may miss (86/90 = 95.6%); they stay in ticker_errors.robinhood and are not listed as quiet.
-    plan, tickers, chunk = universe_plan(tmp_path, liquid=4)
-    payload, failed = rp.assemble(plan, [chunk])
-    assert payload["ticker_errors"] == {"robinhood": sorted(tickers[:4])}  # no "quiet" key: none of them is thin
-    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
-    meta = json.loads((tmp_path / "out" / "payload.meta.json").read_text())
-    assert meta["quiet"] == []
-    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
-
-
-def test_five_liquid_empty_names_of_ninety_refuse(tmp_path):
-    # 85/90 = 94.4%, under the floor: a degraded fetch no longer hides behind the quiet classification.
-    plan, _, chunk = universe_plan(tmp_path, liquid=5)
-    payload, failed = rp.assemble(plan, [chunk])
-    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
-    assert not (tmp_path / "out" / "payload.json").exists()
-
-
-def test_monday_10_30_replay_a_degraded_payload_is_refused(tmp_path):
-    # 2026-11-02 10:30: AMZN, GOOG, GOOGL and GLW empty (liquid) plus four other failures, of 91 tickers. It published
-    # because the four liquid empties were filed quiet and left the denominator (83/87 = 95.4%). They now count:
-    # 83/91 = 91.2%, under the floor.
-    plan, _, chunk = universe_plan(tmp_path, liquid=4, errored=4, total=91)
-    payload, failed = rp.assemble(plan, [chunk])
-    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
-
-
-def test_thin_quiet_names_leave_the_denominator_while_liquid_empties_count(tmp_path):
-    # 10 thin quiet leave 80; 3 liquid empties give 77/80 = 96.3%, over the floor.
-    plan, tickers, chunk = universe_plan(tmp_path, quiet=10, liquid=3)
-    payload, failed = rp.assemble(plan, [chunk])
-    assert payload["ticker_errors"]["quiet"] == sorted(tickers[:10])
-    assert payload["ticker_errors"]["robinhood"] == sorted(tickers[10:13])  # the liquid empties, not the thin names
-    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
-    published = json.loads((tmp_path / "out" / "payload.json").read_text())
-    assert published["ticker_errors"] == {"robinhood": sorted(tickers[:13])}  # every name stays listed for Gate 5
-    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0

@@ -199,8 +199,9 @@ def _iter_run_state_paths(root: Path) -> Iterator[Path]:
     yields each one; any fill duplicated between them is still deduplicated
     downstream by order_id exactly as a fill duplicated across directories is.
     """
-    from dca_fileio import iter_run_state_files_fast
-    yield from iter_run_state_files_fast(root)
+    if not root.is_dir():
+        return
+    yield from sorted(root.rglob("run_state*.json"))
 
 
 def _dedup_rank(run_origin: Optional[str]) -> int:

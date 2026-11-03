@@ -529,8 +529,7 @@ def load_scheduled_run_states(base: str | Path) -> List[Dict[str, Any]]:
     cost-basis, reliability, and order-count metrics.
     """
     root = Path(base) / "scheduled_runs"
-    from dca_fileio import iter_run_state_files_fast
-    paths = list(iter_run_state_files_fast(root))
+    paths = sorted(root.rglob("run_state*.json")) if root.exists() else []
     return load_json_files(paths)
 
 

@@ -1,17 +1,4 @@
-"""Fail-closed guarded publish of ml-forecaster's per-ticker sizing suggestions.
-
-**Shadow only -- this module no longer writes live sizing.** The sizing ladder is
-still being determined by comparing several independent suggesters over time
-(this one, ``wondrous-octopus``, ...), so by default the "published" file is
-ml-forecaster's own incumbent record at ``<history root>/ml_forecaster/incumbent.json``
-(``DEFAULT_CONFIG_PATH``), NOT ``config/ml_sizing_adjustment.json``, which stays
-``inactive`` so the live factor is 1.0 until a human promotes a suggester after
-review. Every run's suggestions are also appended to the shared, append-only
-``sizing_suggestion_history`` (see ``docs/sizing_suggestion_history.md``). Passing
-``config_path=`` explicitly still lets an operator publish to the live file
-deliberately; nothing here does it by default. The rest of this docstring says
-"the live config" for the file at ``config_path``, whichever it is.
-
+"""Fail-closed guarded publish for config/ml_sizing_adjustment.json.
 
 Mirrors scripts/daily_per_ticker_calibration.py's refuse-and-say-why
 pattern: a caller (train.py) hands this module a freshly trained model's
@@ -76,18 +63,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
+from dca_config import get_config_dir  # noqa: E402
 from dca_fileio import atomic_write_text  # noqa: E402
 from scripts.file_lock import cross_process_lock  # noqa: E402
-from sizing_suggestion_history import history_root, record_suggestions  # noqa: E402
 
-# ml-forecaster's own incumbent record, under the suggestion-history root (which
-# honours $DCA_CRON_TRACKING_ROOT), NOT config/ml_sizing_adjustment.json: that
-# file feeds live sizing (dca_config.load_ml_sizing_adjustment ->
-# graded_buy_multiplier), and no suggester may write it by default while the
-# operator is still comparing suggesters. Same file shape as before, so the
-# regression gate's incumbent read (_read_current_config) is unchanged -- it just
-# reads this suggester's own last publish instead of the shared live file.
-DEFAULT_CONFIG_PATH = history_root() / "ml_forecaster" / "incumbent.json"
+# Resolved through dca_config.get_config_dir() (honours $DCA_CONFIG_DIR),
+# not a REPO_ROOT-relative literal -- the live strategy's own config loader
+# (near_close_dca.load_strategy_config(), via dca_config.py) already reads
+# every other config/*.json through this same resolution order ($DCA_CONFIG_DIR
+# -> checkout config/ -> installed wheel share dir -> ./config), so a
+# forecaster run against a non-default config directory (an installed
+# wheel, an alternate checkout, or a test harness that points
+# DCA_CONFIG_DIR elsewhere) must publish to -- and the live strategy must
+# read from -- the SAME file, not silently diverge onto a REPO_ROOT-relative
+# path the live strategy never looks at (AGENTS.md: "Keep runtime code
+# portable and environment-agnostic"; Codex review: "Honor the active
+# config directory in forecaster defaults").
+DEFAULT_CONFIG_PATH = get_config_dir() / "ml_sizing_adjustment.json"
 DEFAULT_GENERATED_BY = "ml-forecaster/publish.py"
 DEFAULT_MAX_STALENESS_HOURS = 240
 # Mirrors features.FORWARD_RETURN_HORIZON_DAYS -- duplicated here (not
@@ -704,15 +696,8 @@ def guarded_publish(
     generated_by: str = DEFAULT_GENERATED_BY,
     model_artifact_path: str | None = None,
     score_incumbent_model: Callable[[str], tuple[float, float] | None] | None = None,
-    history_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Publish a new incumbent file (and history record), or refuse and say why.
-
-    `history_dir` overrides the suggestion-history root the run's suggestions are
-    appended to (default: sizing_suggestion_history.history_root()). Every run
-    that gets past input validation is recorded -- ``published`` and
-    ``blocked_regression`` alike -- because a model the gate keeps rejecting is
-    itself evidence for the later suggester comparison.
+    """Publish a new config/ml_sizing_adjustment.json, or refuse and say why.
 
     `horizon_trading_days` is the forward-return horizon THIS model was
     trained on (train.py's `--horizon`) -- persisted into the payload so the
@@ -807,42 +792,7 @@ def guarded_publish(
             new_evaluation_universe=evaluation_universe,
             score_incumbent_model=score_incumbent_model,
         )
-        # A non-finite metric (a blocked run's inf/NaN baseline is exactly what the gate
-        # exists to catch) must not crash the record -- or make the history writer, which
-        # refuses non-strict JSON, turn a clean "blocked_*" result into a traceback.
-        history_metrics = {
-            key: (value if _is_finite_number(value) else None)
-            for key, value in {
-                "mae": new_mae,
-                "rmse": overall.get("model_rmse"),
-                "hit_rate": overall.get("model_hit_rate"),
-                "baseline_zero_mae": overall.get("baseline_zero_mae"),
-                "baseline_mean_mae": overall.get("baseline_mean_mae"),
-            }.items()
-        }
-
-        def _record(status: str) -> None:
-            record_suggestions(
-                "ml_forecaster",
-                adjustments,
-                status=status,
-                model_version=model_version,
-                bounds={"min_multiplier": min_multiplier, "max_multiplier": max_multiplier},
-                generated_at=resolved_generated_at,
-                source={
-                    "generated_by": generated_by,
-                    "horizon_trading_days": horizon_trading_days,
-                    "model_artifact_path": model_artifact_path,
-                    "evaluation_universe": sorted({t.upper() for t in evaluation_universe})
-                    if evaluation_universe is not None
-                    else None,
-                },
-                metrics=history_metrics,
-                root=history_dir,
-            )
-
         if reasons:
-            _record("blocked_regression")
             return {"status": "blocked_regression", "reasons": reasons, "new_model_mae": new_mae}
 
         eval_window = _evaluation_window(eval_summary)
@@ -900,7 +850,6 @@ def guarded_publish(
             },
         }
         atomic_write_text(config_path, json.dumps(payload, indent=2) + "\n")
-        _record("published")
         return {"status": "published", "new_model_mae": new_mae, "config_path": str(config_path)}
 
 

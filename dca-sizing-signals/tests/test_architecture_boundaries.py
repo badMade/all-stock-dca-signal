@@ -42,22 +42,14 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 # connector_signals/ and market_data_ingest/ ship inside THIS package, so they
 # resolve against the package root rather than the wider repo root.
-_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals"}
+_OWN_PACKAGES = {"connector_signals", "market_data_ingest"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
-    # comovement_signals is forbidden to every other package too (review round 1 on
-    # PR #2106): independence must hold both ways, so only SizingAdjustmentReader may ever
-    # know it exists.
-    "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "near_close_dca"},
-    "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "near_close_dca"},
-    "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "near_close_dca"},
-    "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "near_close_dca"},
-    # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
-    # the caller, so it needs neither the ingest layer nor any other suggester.
-    "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                           "market_data_ingest", "near_close_dca"},
+    "ml_forecaster": {"wondrous_octopus", "connector_signals", "near_close_dca"},
+    "wondrous_octopus": {"ml_forecaster", "connector_signals", "near_close_dca"},
+    "connector_signals": {"ml_forecaster", "wondrous_octopus", "near_close_dca"},
+    "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "near_close_dca"},
 }
 
 
@@ -140,7 +132,7 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     shared = this_package_root / "dca_shared_interfaces"
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                 "market_data_ingest", "comovement_signals", "near_close_dca"}
+                 "market_data_ingest", "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden

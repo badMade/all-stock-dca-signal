@@ -79,9 +79,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "dca_config", "dca_env", "dca_paths", "dca_ticker_paths", "dca_fileio", "dca_provenance", "dca_intraday_archive",
         "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
-        "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "sizing_suggestion_history",
-        "sizing_suggestion_compare",
-        "scripts.backup_strategy",
+        "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "scripts.backup_strategy",
     )),
     ("reporting_ops", "Reporting & monitoring", (
         "dca_alerts", "dca_average_cost_snapshot", "dca_notion_sync", "dca_reporting", "dca_weekly_dashboard",
