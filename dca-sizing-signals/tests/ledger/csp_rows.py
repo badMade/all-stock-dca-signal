@@ -57,7 +57,7 @@ def chain_row(
     """One synthetic put quote. Default contract, worked once here and reused everywhere:
 
     mid = (0.95 + 1.03) / 2 = 0.99; spread = 0.08 / 0.99 = 8.08% of mid (<= 10%, passes);
-    delta -0.22 is inside [-0.30, -0.15]; days to expiry 31 is inside [25, 45];
+    delta -0.22 is inside [-0.30, -0.15]; days to expiry 31 is inside [18, 46];
     collateral = 45 * 100 = $4,500 = 4.5% of the $100,000 account (<= 10%, passes).
     """
     return {
