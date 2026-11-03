@@ -2445,10 +2445,10 @@ def test_ticker_universe():
     assert "GLW" in ACTIVE_TICKERS
     assert "IRDMI" not in ACTIVE_TICKERS
     assert "GLWR" not in ACTIVE_TICKERS
-    # QBUT is the one ticker categorically excluded (no buying mechanism at
-    # all) today: Robinhood returned not-found for it on every live run,
-    # confirmed 2026-09-18 (see config/tickers.json's exclusion_reasons.QBUT).
-    assert EXCLUDED_TICKERS == frozenset({"QBUT"})
+    # QBUT and KVUE have no buying mechanism on this account; see
+    # config/tickers.json's exclusion_reasons.
+    assert EXCLUDED_TICKERS == frozenset({"QBUT", "KVUE"})
+    assert "KVUE" not in ACTIVE_TICKERS
     # BYDDY is not tradable for fractional/notional buys on Robinhood, so it
     # lives in its own WHOLE_SHARE_TICKERS category (see
     # config/tickers.json's exclusion_reasons/whole_share and
