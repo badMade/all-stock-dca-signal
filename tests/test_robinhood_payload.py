@@ -183,6 +183,15 @@ def test_prompt_names_window_and_forbids_orders(tmp_path):
     text = rp.build_prompt(plan, ["AAA", "BBB"])
     assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
     assert "Never call any order" in text
+    # 2026-11-02 (first Monday after fall-back): the window is handed over in UTC, computed in code, so the worker never
+    # has to know ET's offset. 13:30 ET on 2026-10-15 is EDT (17:30Z); 10:30 ET on 2026-11-02 is EST (15:30Z).
+    assert "17:30:00Z" in text and "18:30:00Z" in text
+
+
+def test_prompt_window_follows_the_dst_offset(tmp_path):
+    plan = plan_for(tmp_path, [])
+    est = rp.build_prompt({**plan, "trading_day": "2026-11-02", "bar_start_et": "10:30", "decision_time_et": "11:30"}, ["AAA"])
+    assert "15:30:00Z" in est and "16:30:00Z" in est
 
 
 def test_live_mirror_prompts_use_the_prebuilt_payload():

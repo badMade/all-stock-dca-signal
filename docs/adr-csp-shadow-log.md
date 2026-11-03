@@ -3,6 +3,8 @@
 - **Status:** Proposed (2026-11-02). Operator approved this plan on 2026-11-01 after the research
   report "Options overlay for DCA portfolio" (2026-11-02). Open questions carry labeled proposed
   defaults.
+  **Amended 2026-11-02:** Amendment 1 below (18 to 46 day window, a cap-waived track, 4:20 PM ET
+  capture).
 - **Scope:** research only. No code places, previews or reviews an options order. The live
   prompts, `config/` and all three entry points are untouched. Shadow records live in the Phase 0
   DuckDB ledger (`docs/adr-outcome-ledger-pit-harness.md`).
@@ -66,6 +68,40 @@ Cash sweep (3.60% APY, Sept 2026) or in plain DCA?
 | 7 | Who settles trades | The weekly review job, from point-in-time prices |
 | 8 | Writing a put inside a wash-sale window | Treated as blocking until a tax professional confirms |
 | 9 | Options level in each account | Operator confirms in the app (Level 2 cash-secured put permission is unverified) |
+
+## Amendment 1 (2026-11-02): window, cap-waived track, capture time
+
+Operator approved on 2026-11-02, after the first real chain capture (PR #2111, fixture
+`dca-sizing-signals/tests/ledger/fixtures/rh_option_chains_2026-11-02.json`) showed that with
+the original defaults no contract qualified for a $50,000 account:
+
+- single-name put spreads were 22% to 181% of mid (GLW, KR), far above the 10% cap;
+- the 25 to 45 day window missed both monthly expirations (Nov 20 at 18 days, Dec 18 at 46);
+- the one liquid name, QQQ (spread 2.5%), needs $64,000 or more of collateral per contract.
+
+Six months of "zero trades" would not answer the ADR's question, so:
+
+1. **Window 18 to 46 days.** Decision 2's "25 to 45 days" becomes **18 to 46 days**, so the
+   standard monthly expiration falls inside the window in most weeks. The chain capture
+   follows the selector's window automatically.
+2. **A separate cap-waived track.** Alongside the real track, the shadow log keeps a second
+   set of shadow trades selected with **no collateral or sector caps** (every other filter,
+   the tax-loss pause and fail-closed data rules unchanged). It answers "would the strategy
+   beat the sweep if the account were large enough", and is never presented as tradable.
+   It lives in its own tables (`csp_shadow_cap_waived_entries`,
+   `csp_shadow_cap_waived_settlements`) and gets its own scorecard, so it can never mix into
+   the real track's pass bar. Its open puts do **not** block tax-loss eligibility (decision 6),
+   because the account could not have held them.
+3. **Capture time 4:20 PM ET** on the Mac Studio, after the 4:15 PM option close (QQQ quotes
+   updated until 4:14:59 PM). This is a research job, not part of the afternoon DCA chain; it
+   is a second exception to the 3:40 PM rule, beside the Friday 5:00 PM Notion refresh.
+
+Amendment open questions:
+
+| # | Question | Proposed default |
+|---|---|---|
+| A1 | Does the cap-waived track still allow only one open put per ticker? | Yes |
+| A2 | Should the real track's pass bar ever look at the cap-waived results? | No, report them side by side only |
 
 ## Consequences
 

@@ -38,7 +38,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -345,7 +345,22 @@ def build_plan(slot: str, day: date) -> dict[str, Any]:
 # --------------------------------------------------------------------------- prompt
 
 
+def _utc_window(plan: dict[str, Any]) -> tuple[str, str]:
+    """The plan's ET window as ``HH:MM:SSZ`` stamps for the worker to compare the tool's UTC bar stamps against.
+
+    2026-11-02: the clocks went back on 11-01 and every worker kept filtering "10:30-11:30 ET" against UTC stamps as if
+    ET were UTC-4, so it returned 09:30-10:25 ET bars and 31/91 tickers read as quiet (a full-day unfiltered reply
+    overflows the worker's output limit, so the window must still be applied worker-side). The offset is computed here
+    with zoneinfo, never left to the model.
+    """
+    day = date.fromisoformat(plan["trading_day"])
+    start = datetime.combine(day, time.fromisoformat(plan["bar_start_et"]), ET).astimezone(timezone.utc)
+    end = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), ET).astimezone(timezone.utc)
+    return start.strftime("%H:%M:%SZ"), end.strftime("%H:%M:%SZ")
+
+
 def build_prompt(plan: dict[str, Any], tickers: list[str]) -> str:
+    utc_start, utc_end = _utc_window(plan)
     return f"""You are a data-retrieval worker. Use ONLY the Robinhood MCP tools that read market data
 (historicals and quotes). Never call any order, cancel, watchlist or alert tool.
 
@@ -353,8 +368,10 @@ Trading day: {plan['trading_day']} (America/New_York). Tickers: {', '.join(ticke
 
 For EACH ticker fetch:
 1. {plan['interval_minutes']}-minute bars for today (historicals, interval {plan['interval_minutes']}minute, span day), covering
-   {plan['bar_start_et']} ET through {plan['decision_time_et']} ET. Keep only bars whose START timestamp is at or after
-   {plan['bar_start_et']} ET and strictly before {plan['decision_time_et']} ET (omit the still-open bar).
+   {plan['bar_start_et']} ET through {plan['decision_time_et']} ET. The tool stamps bars in UTC, and that window is
+   {utc_start} through {utc_end} UTC on {plan['trading_day']} (computed for today's UTC offset; do NOT work the offset out
+   yourself). Keep only bars whose START timestamp is at or after {utc_start} and strictly before {utc_end} (omit the
+   still-open bar). Copy each kept bar's timestamp exactly as returned.
 2. The previous completed regular session's daily bar (historicals, interval day, span week -- request ONLY
    the last few sessions, never a long history, so the reply is not truncated; use the newest completed session).
 3. A current quote, with its best bid and best ask.
