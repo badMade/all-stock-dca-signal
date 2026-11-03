@@ -45,8 +45,31 @@ SELECT suggester, recorded_at, unnest(map_entries(adjustments)) FROM read_json_a
   `train.py --output` can still point at the live file for a deliberate promotion.
 - `config/ml_sizing_adjustment.json` stays `inactive`: the live factor is 1.0.
 
+## Comparing the suggesters
+
+`sizing_suggestion_compare.py` (stdlib only, read-only) scores the streams against what the market did next:
+
+```bash
+python -m sizing_suggestion_compare --horizon 5            # print the scorecard
+python -m sizing_suggestion_compare --horizon 5 --write    # also write <history root>/comparisons/<date>_h5.{json,md}
+```
+
+- **Tilt** = `multiplier - 1`; a ticker a run does not mention has tilt 0.
+- **Outcome** = forward return of the adjusted close `--horizon` trading days after the last close on or
+  before the run's date (`--as-of recorded_at|generated_at`). Runs whose horizon has not elapsed are
+  *pending* and never scored. Prices come from the ticker archive; bad dates and non-positive prices are dropped.
+- **Baseline** = the mean forward return of the active universe that day, so an up-only suggester must beat the
+  average ticker, not zero.
+- Per suggester: `tilt_weighted_excess` (sum of tilt x excess return over sum of |tilt|), `hit_rate` (share of
+  non-zero tilts whose sign matched the sign of excess return) and `mean_ic` (per-run correlation of the tilt
+  vector with excess return across the universe). Two runs in one day count once (the latest wins).
+- `blend_equal` is the equal-weight mean tilt of the real suggesters, with no tuning, so it can't overfit. It
+  appears only when at least two streams have data.
+
+Read the run counts next to every number: a handful of matured runs is noise. The comparison never writes live
+sizing; promoting any suggester or blend stays a manual edit after the review period.
+
 ## Not built yet
 
-The read-only comparison (join each suggestion to the realized outcome N days later, score
-suggesters and blends side by side) and any freshness gate on the octopus forecast CSV. Neither
-writes sizing; promotion into live sizing stays a manual edit after the review period.
+A freshness gate on the octopus forecast CSV (`origin_date` is recorded as provenance only), and any DuckDB view
+over the JSONL (the files are plain JSONL, so `read_json_auto` already works).
