@@ -44,10 +44,6 @@ BUILD_DEADLINE_ET="${DCA_BUILD_DEADLINE_ET:-}"
 if [ -n "$BUILD_DEADLINE_ET" ] && ! [[ "$BUILD_DEADLINE_ET" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
   echo "robinhood_payload: DCA_BUILD_DEADLINE_ET must be HH:MM (24-hour, America/New_York)" >&2; exit 2
 fi
-# A refused build raises a macOS notification (2026-11-03: five of seven builds were refused on 11-02 and each surfaced
-# only in this log and at the slot's Gate 5 abort). On by default here; the variable is opt-in inside the publisher so
-# tests and direct callers stay silent. Set DCA_NOTIFY_REFUSAL=0 to turn it off.
-export DCA_NOTIFY_REFUSAL="${DCA_NOTIFY_REFUSAL:-1}"
 MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
 # Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
 # costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).

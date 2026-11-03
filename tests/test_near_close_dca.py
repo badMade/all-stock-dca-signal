@@ -2445,10 +2445,10 @@ def test_ticker_universe():
     assert "GLW" in ACTIVE_TICKERS
     assert "IRDMI" not in ACTIVE_TICKERS
     assert "GLWR" not in ACTIVE_TICKERS
-    # QBUT (and KVUE, 2026-11-02) is categorically excluded (no buying mechanism at
+    # QBUT is the one ticker categorically excluded (no buying mechanism at
     # all) today: Robinhood returned not-found for it on every live run,
     # confirmed 2026-09-18 (see config/tickers.json's exclusion_reasons.QBUT).
-    assert EXCLUDED_TICKERS == frozenset({"QBUT", "KVUE"})
+    assert EXCLUDED_TICKERS == frozenset({"QBUT"})
     # BYDDY is not tradable for fractional/notional buys on Robinhood, so it
     # lives in its own WHOLE_SHARE_TICKERS category (see
     # config/tickers.json's exclusion_reasons/whole_share and
@@ -51621,3 +51621,10 @@ def test_bool_amounts_in_a_legacy_attribution_are_never_summed_as_numbers():
     assert result["submitted_amount_usd"] == 10.0
     assert result["planned_amount_usd"] == 10.0
     assert result["whole_share_quantity"] == 2.0
+
+
+def test_is_usable_reconciled_order_id_rejects_boolean_ids():
+    """Ensure booleans are rejected and do not duck-type as valid ints/floats."""
+    from near_close_dca import _is_usable_reconciled_order_id
+    assert _is_usable_reconciled_order_id(True) is False
+    assert _is_usable_reconciled_order_id(False) is False

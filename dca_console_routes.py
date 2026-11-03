@@ -421,10 +421,7 @@ def _route_config_ladder_point(app, request: RouteRequest) -> Response:
     from dca_console_config import ladder_point
 
     fields = query(request.url.query, ("drop", "ticker"), max_fields=2)
-    try:
-        drop = float(fields.get("drop", ""))
-    except (ValueError, TypeError, OverflowError):
-        drop = math.nan
+    drop = float(fields.get("drop", ""))
     if not math.isfinite(drop) or not 0 <= drop <= 50:
         raise ValueError("drop must be a percentage between 0 and 50")
     return Response.json(200, ladder_point(app.settings.config_dir, drop, fields.get("ticker", "")[:16]))

@@ -80,14 +80,6 @@ def test_friday_flags_the_two_aborts_verify_schedule_called_ok(friday):
     assert by_slot["1230"]["gate9_notes"] == ["Gate 6: day_notional_usd 243.69 above cap 180.00"]
 
 
-def test_window_insufficient_abort_is_flagged_for_attention(friday):
-    summary = tls.summarize_day(DAY, NOW, root=friday)
-    slot = next(slot for slot in summary["slots"] if slot["slot_id"] == "0935")
-    assert slot["error_class"] == "window_insufficient"
-    assert slot["outcome"] == "ABORT_GATE7_WINDOW_INSUFFICIENT"
-    assert slot["attention"] is True
-
-
 def test_summary_emits_only_listed_fields_and_relative_paths(friday):
     summary = tls.summarize_day(DAY, NOW, root=friday)
     text = json.dumps(summary)

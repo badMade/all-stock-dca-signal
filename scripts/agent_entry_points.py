@@ -391,15 +391,14 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
-        need="Record Wondrous Octopus Tier C sizing suggestions to the append-only suggestion history",
-        command="python3 scripts/publish_octopus_sizing.py [--dry-run]",
+        need="Publish Wondrous Octopus Tier C sizing adjustments to ml_sizing_adjustment.json",
+        command="python3 scripts/publish_octopus_sizing.py [--status active|inactive] [--dry-run]",
         exists_path="scripts/publish_octopus_sizing.py",
         doc_ref="docs/README.md",
         symbols=("main", "publish_octopus_sizing"),
         notes=(
             "Translates next-day Octopus multi-quantile forecasts into bounded Tier C recovery "
-            "suggestions appended to <cron root>/sizing_suggestions/octopus/; never writes live "
-            "config/ml_sizing_adjustment.json (docs/sizing_suggestion_history.md)."
+            "sizing adjustments in config/ml_sizing_adjustment.json."
         ),
     ),
     EntryPoint(

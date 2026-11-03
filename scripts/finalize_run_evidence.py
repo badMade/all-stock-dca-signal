@@ -63,7 +63,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w
 from dca_paths import cron_tracking_root
-from scripts import reason_codes, slot_status
+from scripts import reason_codes
 from scripts.file_lock import cross_process_lock
 from scripts.run_classification import (
     ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
@@ -137,23 +137,6 @@ SIGNALS_FILENAMES = {
 
 
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-
-
-# The public slot-status signal this finalizer posts after a run it accepted (operator decision 2026-11-03). No live
-# prompt calls local_heartbeat start/finish, so on 2026-11-02 the signal never updated; every live prompt calls this
-# finalizer on every outcome instead. A run that finished as designed is "succeeded", whether it placed orders, found
-# nothing to buy, ran out of budget or stopped on a safety check (END_SILENTLY): a backup could only repeat that.
-# Only a real error or an abort is "failed", which is what lets a backup act. confirmation_required counts as failed:
-# no order went in. Every live status is mapped here on purpose; the test fails if a new one is left out.
-SLOT_SIGNAL_FOR_ORDER_SUBMIT_STATUS: Dict[str, str] = {
-    ORDER_SUBMIT_STATUS_SUBMITTED: "succeeded",
-    ORDER_SUBMIT_STATUS_NO_ORDERS: "succeeded",
-    ORDER_SUBMIT_STATUS_NO_CANDIDATES: "succeeded",
-    ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED: "succeeded",
-    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED: "failed",
-    ORDER_SUBMIT_STATUS_ERROR: "failed",
-    ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE: "failed",
-}
 
 
 class FinalizeRefused(ValueError):
@@ -1177,24 +1160,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except FinalizeRefused as exc:
         print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))
         return 2
-    if not args.dry_run:
-        _post_slot_signal(args.slot, args.started_at, args.order_submit_status)
     print(json.dumps(result, indent=2))
     return 0 if result["verified"] else 1
-
-
-def _post_slot_signal(slot: str, started_at: str, order_submit_status: str) -> None:
-    """Best-effort: record and publish this slot's status for the backups. Never raises; stdout is untouched.
-
-    Only a call finalize() accepted reaches here (a refused one may not be this slot's real fire, and a dry run is
-    never scheduled evidence). Whatever happens, the exit code and printed result stay exactly what they were.
-    """
-    try:
-        day = parse_started_at(started_at).date().isoformat()  # ET trading day, same parse finalize() used
-        slot_status.update(day, normalize_slot(slot), SLOT_SIGNAL_FOR_ORDER_SUBMIT_STATUS[order_submit_status])
-    except Exception as exc:  # noqa: BLE001 - a git or file error must never fail Gate 9
-        # The type only: a git error message can carry the remote URL and its token.
-        print(f"slot-status signal not posted: {type(exc).__name__}", file=sys.stderr)
 
 
 if __name__ == "__main__":  # pragma: no cover

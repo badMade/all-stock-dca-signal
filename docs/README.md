@@ -74,15 +74,8 @@ environment (see the repository README).
 | [adr-incremental-order-history.md](adr-incremental-order-history.md) | ADR: incremental order history, batched tradability and an audited per-order record for the 9:35 slot (`scripts/merge_order_pages.py`, `scripts/check_per_order_record.py`) |
 | [adr-plan-first-backup-executor.md](adr-plan-first-backup-executor.md) | ADR (proposed): plan files, Mac-first backup with compute fallbacks, fail-closed re-validation; `dca_order_plan.py` and `schemas/order_plan.schema.json` |
 | [adr-price-source-massive-alpaca.md](adr-price-source-massive-alpaca.md) | ADR (proposed): Massive (primary) + Alpaca (failover, intraday IEX) replace Yahoo as the ongoing price source; append-only point-in-time DuckDB store under `dca-sizing-signals/market_data_ingest/prices/`, Yahoo kept as `yahoo_legacy`; not wired into live sizing |
-| [adr-selfheal-learning-loop.md](adr-selfheal-learning-loop.md) | ADR (proposed): a learning loop for self-healing in its own append-only `selfheal.duckdb`; scores each repair adapter (held, regressed, time to repair), shadow-first adapters with operator-approved promotion and demotion; `selfheal/` stays stdlib-only |
-| [adr-dynamic-universe.md](adr-dynamic-universe.md) | ADR (proposed): rules-based universe capped at 100 active tickers; sector-neutral four-factor score, 75/150 entry and exit buffers, 8 swaps per quarter, a 150-name shadow bench, fail-closed proposals; research only, never edits `config/tickers.json` |
-| [adr-outcome-ledger-pit-harness.md](adr-outcome-ledger-pit-harness.md) | ADR (proposed): Phase 0 outcome ledger, read-only tax-lot ledger across all Robinhood accounts, point-in-time harness and trial registry on the existing `dca-sizing-signals` DuckDB store; suggestions only, six open questions block implementation |
-| [adr-comovement-signals.md](adr-comovement-signals.md) | ADR (proposed): pairs and co-movement as suggest-only signals, not a strategy: cluster concentration cap, correlated-selloff detector, pair-breakdown warning, cheaper-leg tilt (shadow), staples-vs-semis regime log |
-| [adr-csp-shadow-log.md](adr-csp-shadow-log.md) | ADR (proposed): a 6-month suggest-only shadow log of cash-secured puts on DCA tickers, entered at the bid, scored against the cash sweep and plain DCA; no options order path; respects the tax-loss buy pause |
-| [adr-tax-loss-sale.md](adr-tax-loss-sale.md) | ADR (proposed): the only allowed sell type, an operator-approved tax-loss sale of specific lots with a 31-day buy pause before and after the sale; never automatic, fail closed on any lookback doubt; design only |
 | [price_source_poc_report.md](price_source_poc_report.md) | The opt-in live PoC report for that price source (20 tickers x 60 sessions vs Yahoo) |
 | [verified_sizing_and_backup_facts.md](verified_sizing_and_backup_facts.md) | Re-checkable repo facts found during the backup-executor work: live per-ticker sizing and the $16 cap, stale "$10"/"5x" prose, same-day repeats, where sources disagree |
-| [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 
 ## Machine-readable backup
@@ -94,14 +87,14 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 90 tickers (includes `CCI` added 2026-10-23, and `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 91 tickers (includes `CCI` added 2026-10-23, and `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
   2026-08-04 addition `VT`, the 2026-08-16 additions `QBUT`,
   `RVI`, `VCX`, `TRLV`, the 2026-09-05 additions `LLY`, `TSLA`, and the
   2026-09-11 additions `VIAV`, `CIEN`, `ANET`, `CSCO`, `FFIV`, `COHR`, the 2026-10-12 additions `APH`, `TEL`, the 2026-10-14 addition `GFS`, and the 22 free-cash-flow-yield names added 2026-10-19 (`TSN`, `RPRX`, `CVS`, `SJM`, `KR`, `CAH`, `HCA`, `HRL`, `PFGC`, `SYY`, `KVUE`, `HSY`, `USFD`, `MRK`, `RMD`, `DGX`, `CHE`, `ABT`, `MDLZ`, `MCK`, `CHD`, `CL`) — all
   whitelisted without a broker instrument search, so unverified until their
   first live run — plus `QUBT`, added 2026-09-24 as the corrected spelling of
-  `QBUT` after Robinhood resolved it; `QBUT` itself stays excluded, as does `KVUE` (moved out 2026-11-02: Robinhood reports it as an inactive instrument); `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
+  `QBUT` after Robinhood resolved it; `QBUT` itself stays excluded; `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
   are the count of record and `tests/test_config_invariants.py` pins them);
   `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
   out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`, `QBUT→QUBT`; `GFUZ` uses

@@ -22,11 +22,6 @@
     <key>DCA_CRON_TRACKING_ROOT</key><string>REPLACE_WITH_CRON_TRACKING_ROOT</string>
     <!-- Absolute path from `command -v codex`; launchd's PATH does not include ~/.local/bin. -->
     <key>DCA_CODEX_BIN</key><string>REPLACE_WITH_CODEX_PATH</string>
-    <!-- Overall build deadline, seconds from the start of the fetch (2026-11-02). A healthy build takes 3-6 minutes; the
-         11-02 14:30 build took 1,583 s and would have landed after its slot. A late build now fails at the build, not at
-         Gate 5. Seconds, not DCA_BUILD_DEADLINE_ET: this one job serves six slots, and a single wall-clock cutoff fits
-         only one of them. -->
-    <key>DCA_BUILD_DEADLINE_SECONDS</key><string>600</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- One minute after each Robinhood-primary slot's decision time (09:35 10:30 11:30 12:30 13:30 14:30),

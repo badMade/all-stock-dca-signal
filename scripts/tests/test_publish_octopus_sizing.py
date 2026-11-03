@@ -11,11 +11,11 @@ import pytest
 
 from dca_config import load_ml_sizing_adjustment
 from scripts.publish_octopus_sizing import (
+    build_sizing_payload,
     evaluate_tier_c_candidates,
     load_active_universe,
     publish_octopus_sizing,
 )
-from sizing_suggestion_history import read_history
 
 
 @pytest.fixture
@@ -109,57 +109,34 @@ def test_evaluate_tier_c_candidates(sample_forecasts_csv: Path):
     assert adjustments["NVDA"] > adjustments["AAPL"]  # Higher p90 gives higher recovery bonus
 
 
-def test_publish_records_to_history_and_never_writes_live_config(
+def test_build_sizing_payload():
+    now = datetime(2026, 9, 21, 15, 30, tzinfo=timezone.utc)
+    adjustments = {"AAPL": 1.25, "NVDA": 1.30}
+    payload = build_sizing_payload(adjustments, status="active", now=now)
+    assert payload["status"] == "active"
+    assert payload["bounds"]["min_multiplier"] == 0.8
+    assert payload["bounds"]["max_multiplier"] == 1.4
+    assert payload["adjustments"] == {"AAPL": 1.25, "NVDA": 1.30}
+    assert payload["generated_at"] == now.isoformat()
+
+
+def test_publish_octopus_sizing_end_to_end(
     tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path
 ):
-    live_config_dir = tmp_path / "config"
-    live_config_dir.mkdir()
-    history = tmp_path / "history"
-    now = datetime(2026, 9, 21, 15, 30, tzinfo=timezone.utc)
+    output_path = tmp_path / "ml_sizing_adjustment.json"
     result = publish_octopus_sizing(
-        sample_forecasts_csv, sample_tickers_json, history_root=history, now=now
+        sample_forecasts_csv,
+        sample_tickers_json,
+        output_path,
+        status="active",
     )
     assert result["status"] == "published"
-    assert Path(result["history_file"]) == history / "octopus" / "2026.jsonl"
-    # Nothing that feeds live sizing was created: no ml_sizing_adjustment.json anywhere,
-    # and the loader sees an empty (no-op) adjustment.
-    assert list(tmp_path.rglob("ml_sizing_adjustment.json")) == []
-    assert load_ml_sizing_adjustment(live_config_dir).get("ml_sizing_adjustment", {}) == {}
+    assert output_path.exists()
 
-    (record,) = read_history("octopus", root=history)
-    assert set(record["adjustments"]) == {"AAPL", "NVDA"}
-    assert record["bounds"] == {"min_multiplier": 0.8, "max_multiplier": 1.4}
-    assert record["source"]["origin_date"] == "2026-09-18"
-    assert record["source"]["forecasts_csv"] == sample_forecasts_csv.name
-
-
-def test_repeated_publishes_accumulate_history(
-    tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path
-):
-    history = tmp_path / "history"
-    for day in (21, 22, 23):
-        publish_octopus_sizing(
-            sample_forecasts_csv,
-            sample_tickers_json,
-            history_root=history,
-            now=datetime(2026, 9, day, 15, 30, tzinfo=timezone.utc),
-        )
-    assert [r["recorded_at"][:10] for r in read_history("octopus", root=history)] == [
-        "2026-09-21",
-        "2026-09-22",
-        "2026-09-23",
-    ]
-
-
-def test_dry_run_records_nothing(tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path):
-    history = tmp_path / "history"
-    result = publish_octopus_sizing(sample_forecasts_csv, sample_tickers_json, history_root=history, dry_run=True)
-    assert result["status"] == "dry_run"
-    assert not history.exists()
-
-
-def test_cli_has_no_flag_that_targets_live_config():
-    import scripts.publish_octopus_sizing as module
-
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    assert "--output" not in source and "atomic_write_text" not in source
+    # Verify that dca_config.load_ml_sizing_adjustment accepts the published output
+    loaded = load_ml_sizing_adjustment(tmp_path)
+    assert "ml_sizing_adjustment" in loaded
+    adj = loaded["ml_sizing_adjustment"]
+    assert adj["AAPL"] >= 1.25
+    assert adj["NVDA"] >= 1.25
+    assert "MSFT" not in adj

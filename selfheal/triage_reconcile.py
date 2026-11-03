@@ -46,8 +46,6 @@ __all__ = [
     "IssueRef",
     "PullRequestRef",
     "approved_keys",
-    "audit_unsupported_fixes",
-    "blind_run_reason",
     "derive_progress",
     "match_git_evidence",
 ]
@@ -86,19 +84,6 @@ class EvidenceError(ValueError):
     """An input record is malformed, or points outside the repository."""
 
 
-def blind_run_reason(resolved_root: str, root_exists: bool, stream_dirs: Iterable[str]) -> str | None:
-    """Explain why the cron tracking root cannot support a trustworthy triage run.
-
-    The caller supplies facts gathered from the resolved root; this helper does
-    no filesystem access. ``root_exists`` means the root exists as a directory.
-    """
-    if not root_exists:
-        return f"cron tracking root is not an existing directory: {resolved_root}"
-    if not any(stream_dirs):
-        return f"cron tracking root has no stream subdirectory: {resolved_root}"
-    return None
-
-
 @dataclass(frozen=True)
 class PullRequestRef:
     """A pull request as the reconciler records it."""
@@ -134,8 +119,6 @@ class GitEvidence:
     #: caller must leave the row alone rather than lower it: the 2026-10-26 run could not confirm
     #: ``run_states_unclassifiable``'s recorded PR #1514 and would otherwise have overwritten it with "No work".
     recorded_pr_unconfirmed: bool = False
-    #: A recorded commit could not be inspected because the caller's clone is shallow.
-    commit_status: str | None = None
 
 
 def _check_key(key: object) -> str:
@@ -239,8 +222,6 @@ def match_git_evidence(
     issues: Iterable[Mapping[str, object]],
     recorded_pr_number: int | None = None,
     recorded_commit_url: str | None = None,
-    shallow: bool = False,
-    commit_present: Mapping[str, bool] | None = None,
 ) -> GitEvidence:
     """Match already-fetched git records to one DCA Issues Key.
 
@@ -276,10 +257,6 @@ def match_git_evidence(
             When it is among ``commits`` and its message still cites the key,
             it wins over any other match, so a newer commit that merely
             discusses the key never displaces the real fix commit.
-        shallow: Whether the caller's repository is shallow.
-        commit_present: Per-SHA results of ``git cat-file -e <sha>^{commit}``,
-            queried by the caller for recorded commits. Never infer absence from
-            the bounded recent-commit listing.
 
     Returns:
         The frozen :class:`GitEvidence`; unmatched fields are ``None``.
@@ -289,15 +266,6 @@ def match_git_evidence(
             or a link points outside the repository.
     """
     _check_key(key)
-    if not isinstance(shallow, bool):
-        raise EvidenceError("shallow must be a boolean")
-    if commit_present is not None:
-        _mapping(commit_present, "commit_present")
-        for sha, present in commit_present.items():
-            if not isinstance(sha, str) or not _SHA_PATTERN.fullmatch(sha):
-                raise EvidenceError(f"commit_present key {sha!r} is not a full lower-case 40-character SHA")
-            if not isinstance(present, bool):
-                raise EvidenceError(f"commit_present value for {sha!r} must be a boolean")
     if not isinstance(repo_url, str) or not _REPO_URL_PATTERN.fullmatch(repo_url):
         raise EvidenceError(f"repo_url {repo_url!r} is not an https://github.com/<owner>/<repo> URL")
 
@@ -337,12 +305,6 @@ def match_git_evidence(
         (url for url, _subject, message in parsed_commits if url == recorded_commit_url and _mentions(key, message)),
         None,
     ) or next((url for url, subject, _message in parsed_commits if _mentions(key, subject)), None)
-    commit_status = None
-    if recorded_commit_url is not None and shallow and commit_present is not None:
-        recorded_sha = recorded_commit_url.rsplit("/", 1)[-1]
-        if commit_present.get(recorded_sha) is False:
-            commit_url = None
-            commit_status = "unverifiable_shallow"
 
     matching_issues = [ref for ref, title in (_parse_issue(raw, repo_url) for raw in issues) if _mentions(key, title)]
     issue = max(matching_issues, key=lambda ref: ref.number, default=None)
@@ -354,7 +316,6 @@ def match_git_evidence(
         issue=issue,
         mentioned_in=mentioned_in,
         recorded_pr_unconfirmed=pr is None and recorded_pr_number is not None,
-        commit_status=commit_status,
     )
 
 
@@ -399,68 +360,3 @@ def approved_keys(rows: Iterable[Mapping[str, object]]) -> list[str]:
         if isinstance(approval, str) and approval == APPROVED:
             released.append(key)
     return released
-
-
-def audit_unsupported_fixes(
-    rows: Iterable[Mapping[str, object]], evidence: Mapping[str, GitEvidence]
-) -> dict[str, list[str]]:
-    """Return sorted Keys whose recorded fix claims are not supported by evidence.
-
-    The result has three sorted Key lists: ``unsupported_approved_fix`` for
-    approved repaired or in-review rows without matching PR, commit or issue
-    evidence; ``brief_acceptance_not_demonstrated`` for monitoring rows whose
-    Progress or Proposed plan says that acceptance was not demonstrated; and
-    ``recorded_pr_not_found`` when a recorded PR number is absent from the
-    matching evidence.
-
-    Raises:
-        EvidenceError: A row, key, PR number or evidence record is malformed,
-            or a Key appears more than once.
-    """
-    checked_evidence: dict[str, GitEvidence] = {}
-    for raw_key, item in evidence.items():
-        key = _check_key(raw_key)
-        if key in checked_evidence:
-            raise EvidenceError(f"Key {key!r} appears more than once in evidence")
-        if not isinstance(item, GitEvidence):
-            raise EvidenceError(f"evidence for Key {key!r} must be GitEvidence")
-        checked_evidence[key] = item
-
-    categories: dict[str, list[str]] = {
-        "unsupported_approved_fix": [],
-        "brief_acceptance_not_demonstrated": [],
-        "recorded_pr_not_found": [],
-    }
-    seen: set[str] = set()
-    for raw_row in rows:
-        row = _mapping(raw_row, "row")
-        key = _check_key(row.get("Key"))
-        if key in seen:
-            raise EvidenceError(f"Key {key!r} appears more than once")
-        seen.add(key)
-
-        item = checked_evidence.get(key)
-        approval = row.get("Approval")
-        fix_state = row.get("Fix state")
-        if approval == APPROVED and fix_state in ("Repaired", "In review") and (
-            item is None or not any((item.pr, item.commit_url, item.issue))
-        ):
-            categories["unsupported_approved_fix"].append(key)
-
-        progress = _text(row, "Progress", "row")
-        proposed_plan = _text(row, "Proposed plan", "row")
-        if row.get("Status") == "Monitoring" and "brief acceptance not demonstrated" in (
-            f"{progress}\n{proposed_plan}".lower()
-        ):
-            categories["brief_acceptance_not_demonstrated"].append(key)
-
-        recorded_pr = row.get("PR number")
-        if recorded_pr is not None and recorded_pr != "":
-            if isinstance(recorded_pr, bool) or not isinstance(recorded_pr, int) or recorded_pr <= 0:
-                raise EvidenceError(f"row PR number {recorded_pr!r} must be a positive integer")
-            if item is None or item.pr is None or item.pr.number != recorded_pr:
-                categories["recorded_pr_not_found"].append(key)
-
-    for keys in categories.values():
-        keys.sort()
-    return categories

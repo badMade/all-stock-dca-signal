@@ -3214,8 +3214,7 @@ def load_alert_files(directory: Path) -> List[AlertRecord]:
     records: List[AlertRecord] = []
     if not directory.is_dir():
         return records
-    from dca_fileio import iter_files_by_suffix_fast
-    for path in iter_files_by_suffix_fast(directory, ".txt"):
+    for path in sorted(directory.rglob("*.txt")):
         if not _is_alert_candidate(path, directory):
             continue
         match = _ALERT_FILENAME.match(path.name)

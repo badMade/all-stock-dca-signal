@@ -1836,7 +1836,7 @@ def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     (see config/tickers.json's exclusion_reasons.QBUT)."""
     loaded = load_tickers(get_config_dir())
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
-    assert loaded["excluded_tickers"] == frozenset({"QBUT", "KVUE"})
+    assert loaded["excluded_tickers"] == frozenset({"QBUT"})
     for whole_share in ("BYDDY", "RVII"):
         assert whole_share not in loaded["tickers"]
 

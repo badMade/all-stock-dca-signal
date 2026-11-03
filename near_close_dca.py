@@ -367,6 +367,7 @@ ACTIVE_TICKERS = [
     "HRL",
     "PFGC",
     "SYY",
+    "KVUE",
     "HSY",
     "USFD",
     "MRK",
@@ -405,9 +406,7 @@ ACTIVE_TICKERS = [
 # all" category -- e.g. a delisting/wind-down, or QBUT's not-found status --
 # distinct from WHOLE_SHARE_TICKERS' "different mechanism, still actively
 # bought" category.
-# KVUE joined QBUT here on 2026-11-02 (owner request): Robinhood returns not-found for it on every live payload run, so it
-# has no buying mechanism; see config/tickers.json's exclusion_reasons.KVUE.
-EXCLUDED_TICKERS: frozenset[str] = frozenset({"QBUT", "KVUE"})
+EXCLUDED_TICKERS: frozenset[str] = frozenset({"QBUT"})
 
 # Tickers not tradable for fractional/notional buys on Robinhood. Evaluated
 # by the SAME graded ladder as ACTIVE_TICKERS (so they appear in signals.csv
@@ -25687,7 +25686,7 @@ def _is_usable_reconciled_order_id(value: object) -> bool:
     """
     if value is None or isinstance(value, bool):
         return False
-    if not isinstance(value, (str, int, float)):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return False
     if isinstance(value, str):
         return bool(value.strip())
