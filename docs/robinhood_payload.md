@@ -104,6 +104,10 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
 
+## Refusal notification (2026-11-03)
+
+When `publish` refuses a build (coverage floor, quiet cap, or built before the anchor) it writes the `.refused.json` marker and then raises a macOS notification titled `Payload refused: slot <slot> <day>`, whose body is the reason, `valid/universe` and up to five failed tickers (`+N more`), at most 250 characters. The launcher exports `DCA_NOTIFY_REFUSAL=1` by default; inside the publisher it is opt-in, so tests and direct callers stay silent. Set `DCA_NOTIFY_REFUSAL=0` in the job's environment to turn it off. It reuses `schedule_watchdog.notify_macos`, is best-effort (a missing, failing or hung notifier changes neither exit status 2 nor the marker, and the log names only the exception class), and a published payload never notifies. It needs a logged-in GUI session; under a headless launchd context `osascript` may fail, which is logged and harmless.
+
 ## Plan-first ingest (2026-10-26)
 
 This program now does everything the retired 5-minute Claude courier did. After the merge, when `DCA_PLAN_FIRST_INGEST=1`,
