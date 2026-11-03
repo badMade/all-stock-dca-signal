@@ -67,7 +67,10 @@ SHADOW_BAR_START_ET = {
 }
 PLANNABLE_SLOTS = SLOTS + tuple(SHADOW_BAR_START_ET)
 
-DEFAULT_CHUNK_SIZE = 8
+#: Tickers per worker call. 4 since 2026-11-02 (was 8): the workers fetched every ticker but answered most of them
+#: "full response exceeds output capacity", refusing 0935, 1130, 1230, 1330 and 1530 (15/84). Half the tickers is half
+#: the reply one worker has to write back; the compact list bars in ``build_prompt`` cut it again.
+DEFAULT_CHUNK_SIZE = 4
 #: Share of the universe that must validate before a payload is published at all. It was 1.0 (2026-10-15
 #: adversarial review: Gate 6 allocates a binding cap by allocation_priority, so a missing high-priority ticker
 #: could hand its budget to lower-priority names). 0.95 since 2026-10-21: one stale thin name (TOPT, QTOP, DXYZ
@@ -146,8 +149,21 @@ def _num(value: Any, field: str, *, allow_zero: bool = False) -> float:
     return number
 
 
+#: Field order of a compact list bar, the shape ``build_prompt`` asks workers for (2026-11-02).
+COMPACT_BAR_FIELDS = ("timestamp", "open", "high", "low", "close", "volume")
+
+
 def validate_bar(raw: Any) -> dict[str, Any]:
-    """One OHLCV bar with a tz-aware timestamp and a self-consistent range; returns the normalized bar."""
+    """One OHLCV bar with a tz-aware timestamp and a self-consistent range; returns the normalized bar.
+
+    Accepts the object form or the compact ``[timestamp, open, high, low, close, volume]`` list the worker prompt
+    asks for since 2026-11-02, and normalizes both to the same object, so ``check`` and the generator never see
+    the difference. A list of any other length is refused rather than guessed at.
+    """
+    if isinstance(raw, list):
+        if len(raw) != len(COMPACT_BAR_FIELDS):
+            raise PayloadError(f"compact bar needs {len(COMPACT_BAR_FIELDS)} fields, got {len(raw)}: {raw!r}")
+        raw = dict(zip(COMPACT_BAR_FIELDS, raw, strict=True))
     if not isinstance(raw, dict):
         raise PayloadError(f"bar is not an object: {raw!r}")
     stamp = _parse_ts(raw.get("timestamp"))
@@ -378,7 +394,9 @@ For EACH ticker fetch:
 
 Reply with ONE JSON object and nothing else (no prose, no code fence). Keys are the tickers above:
 {{"TICKER": {{"previous_close_bar": BAR, "intraday_bars": [BAR, ...], "quote": {{"price": number, "as_of": "<iso with offset>", "bid_price": number, "ask_price": number}}}}}}
-where BAR is {{"timestamp": "<iso with offset>", "open": n, "high": n, "low": n, "close": n, "volume": n}}.
+where BAR is a list of exactly six values, [timestamp, open, high, low, close, volume], with the timestamp an
+"<iso with offset>" string and the rest numbers; no field names, no extra whitespace. This compact form keeps the
+whole reply short enough to write in full.
 
 Rules: copy every number and timestamp exactly as the tool returned it; never estimate, round, interpolate or
 fill a gap. Never convert a timestamp between time zones and never attach an offset the tool did not return:
