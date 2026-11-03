@@ -61,7 +61,8 @@ def test_calls_are_ignored_not_suggested():
 
 @pytest.mark.parametrize(
     ("days", "kept"),
-    [(24, False), (25, True), (45, True), (46, False)],  # window is 25..45 days inclusive
+    # Window is 18..46 days inclusive (ADR Amendment 1, 2026-11-02; was 25..45).
+    [(17, False), (18, True), (46, True), (47, False)],
 )
 def test_days_to_expiry_window(days, kept):
     result = select([chain_row(expiration_date=SESSION + timedelta(days=days))])
