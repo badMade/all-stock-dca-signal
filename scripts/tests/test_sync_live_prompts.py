@@ -20,6 +20,7 @@ The account value below is the suite's synthetic one (``conftest.py`` assigns it
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -492,3 +493,89 @@ def test_a_write_that_cannot_be_staged_touches_no_live_file(tmp_path):
 
     for slot in drift.EXPECTED_SLOTS:
         assert _live_path(scheduled, slot).read_bytes() == before[slot], slot
+
+
+# --- 2026-11-04: a prompt that resolves the account itself no longer carries the literal. ---------------------------
+# PR #2034 gave the 9:35 prompt a RESOLVED ACCOUNT FOR NATIVE CALLS rule: it reads the account from the environment at
+# run time and writes the number nowhere. The other six mirrors lack the rule, and their native tool calls perform no
+# shell expansion, so THEY still need the literal. The sync must therefore keep the placeholder only for a mirror that
+# carries the rule, never for all seven.
+
+RESOLVE_RULE = (
+    "RESOLVED ACCOUNT FOR NATIVE CALLS (operator, 2026-10-28): the account number is written nowhere in this prompt.\n"
+)
+RESOLVING_SLOT = drift.EXPECTED_SLOTS[0]
+
+
+def _setup_with_resolving_slot(tmp_path: Path):
+    mirror_dir, scheduled = _setup(tmp_path)
+    mirror = next(mirror_dir.glob(f"{RESOLVING_SLOT}-*.txt"))
+    mirror.write_text(mirror.read_text(encoding="utf-8") + RESOLVE_RULE, encoding="utf-8")
+    return mirror_dir, scheduled
+
+
+def test_a_mirror_with_the_resolve_rule_keeps_the_placeholder_after_a_write(tmp_path):
+    mirror_dir, scheduled = _setup_with_resolving_slot(tmp_path)
+
+    assert _run(mirror_dir, scheduled, "--write") == 0
+
+    new = _live_path(scheduled, RESOLVING_SLOT).read_text(encoding="utf-8")
+    assert PLACEHOLDER in new
+    assert ACCOUNT not in new
+
+
+def test_a_mirror_without_the_resolve_rule_still_gets_the_account_when_another_slot_resolves_it(tmp_path):
+    mirror_dir, scheduled = _setup_with_resolving_slot(tmp_path)
+
+    _run(mirror_dir, scheduled, "--write")
+
+    other = next(slot for slot in drift.EXPECTED_SLOTS if slot != RESOLVING_SLOT)
+    new = _live_path(scheduled, other).read_text(encoding="utf-8")
+    assert PLACEHOLDER not in new
+    assert f"--account {ACCOUNT} --trading-day" in new
+
+
+def test_after_a_write_the_drift_checker_reads_zero_drift_with_a_resolving_slot(tmp_path):
+    mirror_dir, scheduled = _setup_with_resolving_slot(tmp_path)
+    _run(mirror_dir, scheduled, "--write")
+
+    report = drift.check(mirror_dir=mirror_dir, scheduled_dir=scheduled, window_end_date="2027-11-05",
+                         account_number=ACCOUNT)
+    assert [s["status"] for s in report["slots"]] == ["match"] * 7
+
+
+def test_a_second_write_without_the_env_var_still_finds_the_account_and_changes_nothing(tmp_path, monkeypatch):
+    mirror_dir, scheduled = _setup_with_resolving_slot(tmp_path)
+    _run(mirror_dir, scheduled, "--write")
+    before = _snapshot(scheduled)
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+
+    # The resolving slot now holds no account reference at all; inference must skip it, not give up.
+    assert _run(mirror_dir, scheduled, "--write") == 0
+
+    assert _snapshot(scheduled) == before
+
+
+def test_the_committed_9_35_mirror_writes_no_account_shaped_number(tmp_path):
+    mirror_dir = drift.DEFAULT_MIRROR_DIR
+    scheduled = tmp_path / "Scheduled"
+    for mirror in sorted(mirror_dir.glob("*.txt")):
+        if mirror.name.startswith("."):
+            continue
+        task = drift.task_id_for(mirror)
+        body = "\n".join(drift._mirror_body(mirror.read_text(encoding="utf-8")))
+        body = body.replace(PLACEHOLDER, ACCOUNT) + "\nstale body line\n"
+        (scheduled / task).mkdir(parents=True)
+        (scheduled / task / "SKILL.md").write_text(f"---\nname: {task}\n---\n{body}", encoding="utf-8")
+
+    assert _run(mirror_dir, scheduled, "--write") == 0
+
+    opener = next(m for m in mirror_dir.glob("0935ET-*.txt"))
+    live = (scheduled / drift.task_id_for(opener) / "SKILL.md").read_text(encoding="utf-8")
+    assert ACCOUNT not in live
+    assert not re.search(r"\d{9,}", live)
+    for mirror in sorted(mirror_dir.glob("*.txt")):
+        if mirror.name.startswith(".") or mirror == opener:
+            continue
+        other = (scheduled / drift.task_id_for(mirror) / "SKILL.md").read_text(encoding="utf-8")
+        assert ACCOUNT in other, mirror.name
