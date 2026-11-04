@@ -267,3 +267,77 @@ def test_the_suite_never_publishes_for_real(monkeypatch):
     assert ss._configured_publisher() is None
     monkeypatch.delenv(ss.DISABLE_ENV)
     assert ss._configured_publisher() is not None  # the checked-in config enables publishing on the operator's Mac
+
+
+# --- publish: the Mac pushes what the live runs recorded (2026-11-04) -------------------------
+# 2026-11-03: all seven slots recorded their status through finalize_run_evidence, but the public signal never moved.
+# The live runs execute in a Cowork bridge VM that mounts the checkout and has no GitHub credentials, so every push
+# failed (silently, by design). The operator's Terminal push worked. ``publish`` runs on the Mac (launchd), reads the
+# local document the VM wrote, and pushes it with the Mac's own credentials. It never changes the document.
+
+
+def test_cli_publish_pushes_the_local_document_unchanged(monkeypatch, capsys):
+    publisher = RecordingPublisher()
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: publisher)
+    ss.record(DAY, "0935", "succeeded", now=NOW)
+    before = ss.state_path().read_text(encoding="utf-8")
+    assert ss.main(["publish"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": True, "trading_day": DAY, "published": True, "detail": "abc123"}
+    assert publisher.documents == [json.loads(before)]
+    assert ss.state_path().read_text(encoding="utf-8") == before  # publish never rewrites the local document
+
+
+def test_cli_publish_skips_a_document_it_already_published(monkeypatch, capsys):
+    # launchd also wakes it on a timer as a fallback, so an unchanged document must not push a new commit each time.
+    publisher = RecordingPublisher()
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: publisher)
+    ss.record(DAY, "0935", "succeeded", now=NOW)
+    assert ss.main(["publish"]) == 0
+    capsys.readouterr()
+    assert ss.main(["publish"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "trading_day": DAY, "published": False,
+                                                   "detail": "unchanged"}
+    assert len(publisher.documents) == 1
+    ss.record(DAY, "1030", "failed", now=NOW)  # a new status is a new document: it is pushed
+    assert ss.main(["publish"]) == 0
+    assert len(publisher.documents) == 2
+
+
+def test_cli_publish_retries_after_a_failed_push(monkeypatch, capsys):
+    failing = RecordingPublisher(ok=False)
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: failing)
+    ss.record(DAY, "0935", "succeeded", now=NOW)
+    assert ss.main(["publish"]) == 1
+    assert json.loads(capsys.readouterr().out)["published"] is False
+    working = RecordingPublisher()
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: working)
+    assert ss.main(["publish"]) == 0  # a failed push is not remembered as published
+    assert len(working.documents) == 1
+
+
+def test_cli_publish_never_echoes_a_token_from_a_crashing_publisher(monkeypatch, capsys):
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: RecordingPublisher(raises=True))
+    ss.record(DAY, "0935", "succeeded", now=NOW)
+    assert ss.main(["publish"]) == 1
+    out = capsys.readouterr()
+    assert "ghp_TOKEN" not in out.out + out.err and "github.com" not in out.out + out.err
+
+
+@pytest.mark.parametrize("content", [None, "{not json", '{"schema": "other"}', "[1, 2]"])
+def test_cli_publish_refuses_a_missing_or_malformed_document_and_pushes_nothing(monkeypatch, capsys, content):
+    publisher = RecordingPublisher()
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: publisher)
+    if content is not None:
+        ss.state_dir().mkdir(parents=True, exist_ok=True)
+        ss.state_path().write_text(content, encoding="utf-8")
+    assert ss.main(["publish"]) == 2
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "no_local_document"}
+    assert publisher.documents == []
+
+
+def test_cli_publish_with_publishing_disabled_pushes_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(ss, "_configured_publisher", lambda: None)
+    ss.record(DAY, "0935", "succeeded", now=NOW)
+    assert ss.main(["publish"]) == 1
+    assert json.loads(capsys.readouterr().out)["detail"] == "publishing disabled"
