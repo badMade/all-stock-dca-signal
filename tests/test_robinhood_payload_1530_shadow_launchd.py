@@ -85,3 +85,19 @@ def test_1530_agent_publishes_or_refuses_before_the_live_prompt_stops_re_checkin
     # And neither may cut a normal build short: the slowest measured build (264 s from 15:31) with room to spare.
     assert cutoff >= dt.datetime(2026, 10, 30, 15, 31) + dt.timedelta(seconds=2 * 264)
     assert "DCA_BUILD_DEADLINE_ET" not in _load(LIVE)["EnvironmentVariables"]
+
+
+def test_shadow_agent_runs_enough_workers_to_publish_by_about_15_35():
+    # 2026-11-03: with 4-ticker chunks (#2115) the 90-ticker plan is 23 chunks of about 60 s each, all clean on the
+    # first attempt. At the launcher's default 3 workers that is 8 waves, 519 s, published 15:39, so the 3:30 session
+    # had 14 minutes left for 34 candidates and aborted at Gate 6.5. The build must fit in about 4 waves.
+    env = _load(SHADOW)["EnvironmentVariables"]
+    parallel = int(env["DCA_CODEX_PARALLEL"])
+    import dca_config
+
+    config = dca_config.load_strategy_config(dca_config.get_config_dir())
+    universe = [t for t in config.tickers if t not in config.excluded_tickers]  # what build_plan("1530", ...) plans
+    chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
+    waves = -(-chunks // parallel)
+    assert waves * 65 <= 270, (chunks, parallel, waves)  # ~65 s per wave observed; about 4.5 minutes from 15:31
+    assert "DCA_CODEX_PARALLEL" not in _load(LIVE)["EnvironmentVariables"]  # the six live slots keep their default
