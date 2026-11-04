@@ -57,6 +57,26 @@ Usage::
         --out "$ROOT/orders_pages_2026-09-09_1230.json" [--expect-count N --expect-total-usd X] \\
         page1.txt page2.txt
 
+Per-state slices (2026-11-03): when even ONE page is too large for the session to show or
+move (the 11-03 12:30 weekly page was 61k characters and its saved file was cloud-side,
+unreachable from the repo shell), fetch the window once per order state instead --
+``get_equity_orders`` takes a ``state`` filter and no other way to shrink a page -- and pass
+every page of every state with ``--slice STATE=PAGE_FILE`` (repeat per page, in fetch order
+within a state)::
+
+    python3 -m scripts.assemble_order_pages --account "$ACCT" --trading-day 2026-11-03 \\
+        --out "$ROOT/orders_pages_2026-11-03_1230.json" \\
+        --slice filled=filled_p1.json --slice filled=filled_p2.json --slice cancelled=cancelled_p1.json \\
+        ... one or more pages for EVERY state in ``ORDER_STATES``
+
+Each state's pages are proven a complete chain on their own, every row must carry the state
+its slice names, and ALL of ``ORDER_STATES`` must be present (a state with no orders is an
+``{"orders": []}`` page, not an omitted flag). The slices are then merged, one row per order
+id, into a single terminal page, so the envelope looks to every downstream gate like one
+complete history; its ``ingest.mode`` is ``state_slices`` with per-state counts and hashes.
+Residual risk, stated plainly: a state the broker adds later is invisible to this partition,
+which is why the list is pinned by a test and an unknown row state is refused.
+
 Exit 0 prints ``{"ok": true, "page_count", "order_count", "out", "payload_sha256",
 "provenance"}``; every refusal exits 2, prints ``{"ok": false, "reason", "detail"}``, and
 writes nothing (an existing ``--out`` file is left untouched).
@@ -308,6 +328,82 @@ def assemble(
     return envelope, order_count
 
 
+# Every value of get_equity_orders' ``state`` filter (its tool description, 2026-11-03). The slice mode demands each one,
+# because a partition is only a complete history when no part of it is missing.
+ORDER_STATES = (
+    "new",
+    "queued",
+    "confirmed",
+    "unconfirmed",
+    "partially_filled",
+    "filled",
+    "cancelled",
+    "rejected",
+    "failed",
+    "voided",
+)
+
+
+def assemble_state_slices(
+    slices: dict,
+    *,
+    account_number: str,
+    trading_day: str,
+    snapshot_at: Optional[str] = None,
+) -> tuple[dict, int]:
+    """Return ``(envelope, order_count)`` for a complete set of per-state page chains.
+
+    ``slices`` maps each state in :data:`ORDER_STATES` to its page files in fetch order. Raises
+    :class:`AssemblyRefused` when a state is missing or unknown, a chain is incomplete, a row's
+    state disagrees with its slice, or two slices disagree about the same order id.
+    """
+    unknown = sorted(set(slices) - set(ORDER_STATES))
+    if unknown:
+        raise AssemblyRefused("unknown_order_state", ", ".join(unknown))
+    missing = [state for state in ORDER_STATES if not slices.get(state)]
+    if missing:
+        raise AssemblyRefused("state_slice_missing", ", ".join(missing))
+
+    merged: dict = {}
+    per_state: dict = {}
+    for state in ORDER_STATES:
+        envelope, count = assemble(
+            slices[state], account_number=account_number, trading_day=trading_day, snapshot_at=snapshot_at
+        )
+        for row in (row for page in envelope["pages"] for row in _order_rows(page)):
+            if row.get("state") != state:
+                raise AssemblyRefused("slice_state_mismatch", f"{state} slice holds an order in state {row.get('state')!r}")
+            key = row["id"].lower()
+            if key in merged and merged[key] != row:
+                raise AssemblyRefused("slice_row_conflict", f"order {key} differs between slices")
+            merged[key] = row
+        per_state[state] = {
+            "order_count": count,
+            "provenance": envelope["ingest"]["provenance"],
+            "pages_sha256": envelope["ingest"]["pages_sha256"],
+        }
+
+    # Newest first, as the broker returns them; the sort is stable and keyed on a string every raw row carries.
+    rows = sorted(merged.values(), key=lambda row: str(row.get("created_at")), reverse=True)
+    pages: List[Any] = [{"orders": rows}]
+    total_usd = _validate_rows(pages)
+    out: dict = {"account_number": account_number.strip(), "trading_day": _validated_day(trading_day)}
+    if snapshot_at:
+        out["snapshot_at"] = snapshot_at
+    out["pages"] = pages
+    out["ingest"] = {
+        "tool": TOOL,
+        "mode": "state_slices",
+        "provenance": "stdin_paste" if any(v["provenance"] == "stdin_paste" for v in per_state.values()) else "spilled_file",
+        "order_count": len(rows),
+        "total_usd": float(total_usd),
+        "cross_check": {"expected_count": None, "expected_total_usd": None, "matched": None},
+        "slices": per_state,
+        "payload_sha256": hashlib.sha256(_canonical(pages)).hexdigest(),
+    }
+    return out, len(rows)
+
+
 def _decimal_arg(text: str) -> Decimal:
     try:
         value = Decimal(text)
@@ -328,18 +424,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--expect-total-usd", type=_decimal_arg, default=None, help="The response's own dollar total; off by half a cent or more is refused."
     )
+    parser.add_argument(
+        "--slice",
+        action="append",
+        default=[],
+        metavar="STATE=PAGE_FILE",
+        help="Per-state mode: one saved page of the fetch filtered to STATE; repeat per page, in fetch order, for every state.",
+    )
     parser.add_argument("page_files", nargs="*", help="Saved page files, in fetch order; '-' reads one page from stdin.")
     args = parser.parse_args(argv)
 
     try:
-        envelope, order_count = assemble(
-            args.page_files,
-            account_number=args.account,
-            trading_day=args.trading_day,
-            snapshot_at=args.snapshot_at,
-            expect_count=args.expect_count,
-            expect_total_usd=args.expect_total_usd,
-        )
+        if args.slice:
+            if args.page_files or args.expect_count is not None or args.expect_total_usd is not None:
+                raise AssemblyRefused("slice_mode_exclusive", "--slice takes no positional pages or --expect-* flags")
+            slices: dict = {}
+            for item in args.slice:
+                state, sep, path = item.partition("=")
+                if not sep or not state or not path:
+                    raise AssemblyRefused("bad_slice_argument", item)
+                slices.setdefault(state, []).append(path)
+            envelope, order_count = assemble_state_slices(
+                slices, account_number=args.account, trading_day=args.trading_day, snapshot_at=args.snapshot_at
+            )
+        else:
+            envelope, order_count = assemble(
+                args.page_files,
+                account_number=args.account,
+                trading_day=args.trading_day,
+                snapshot_at=args.snapshot_at,
+                expect_count=args.expect_count,
+                expect_total_usd=args.expect_total_usd,
+            )
         atomic_write_text(args.out, json.dumps(envelope, indent=2) + "\n")
     except AssemblyRefused as exc:
         print(json.dumps({"ok": False, "reason": exc.reason, "detail": exc.detail}))

@@ -52,9 +52,17 @@ MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
 # Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
 # costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).
 RESCUE_SIZE="${DCA_RESCUE_CHUNK_SIZE:-2}"
-case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL$RESCUE_SIZE" in
-  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS, DCA_CODEX_PARALLEL and DCA_RESCUE_CHUNK_SIZE must be whole numbers" >&2; exit 2 ;;
+# Tickers per first-pass chunk (2026-11-03). Unset = the planner's default (8). The 15:31 build on 11-03 had nearly every
+# 8-ticker chunk answered "response exceeds the output limit" (errors=8 on both attempts), spent its 480 s deadline on
+# retries and rescues, and only a rebuild with smaller chunks published, at 15:40, leaving the 3:30 session too little
+# window. Smaller chunks keep each worker's reply under its output cap; the 15:30 plist sets 4.
+CHUNK_SIZE="${DCA_CHUNK_SIZE:-}"
+case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL$RESCUE_SIZE$CHUNK_SIZE" in
+  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS, DCA_CODEX_PARALLEL, DCA_RESCUE_CHUNK_SIZE and DCA_CHUNK_SIZE must be whole numbers" >&2; exit 2 ;;
 esac
+[ -z "$CHUNK_SIZE" ] || [ "$CHUNK_SIZE" -gt 0 ] || { echo "robinhood_payload: DCA_CHUNK_SIZE must be at least 1" >&2; exit 2; }
+CHUNK_ARGS=()
+[ -n "$CHUNK_SIZE" ] && CHUNK_ARGS=(--chunk-size "$CHUNK_SIZE")
 [ "$RESCUE_SIZE" -gt 0 ] || { echo "robinhood_payload: DCA_RESCUE_CHUNK_SIZE must be at least 1" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dca-rhpayload.XXXXXX")"
@@ -66,7 +74,7 @@ NOW_ARGS=()
 [ -n "${DCA_PAYLOAD_NOW_ET:-}" ] && NOW_ARGS=(--now-et "$DCA_PAYLOAD_NOW_ET")
 
 PLAN_STATUS=0
-"$PY" -m scripts.robinhood_payload plan --slot "$SLOT_ARG" ${DAY_ARGS[@]+"${DAY_ARGS[@]}"} ${NOW_ARGS[@]+"${NOW_ARGS[@]}"} >"$WORK/plan.json" || PLAN_STATUS=$?
+"$PY" -m scripts.robinhood_payload plan --slot "$SLOT_ARG" ${DAY_ARGS[@]+"${DAY_ARGS[@]}"} ${NOW_ARGS[@]+"${NOW_ARGS[@]}"} ${CHUNK_ARGS[@]+"${CHUNK_ARGS[@]}"} >"$WORK/plan.json" || PLAN_STATUS=$?
 case "$PLAN_STATUS" in
   0) ;;
   3) echo "robinhood_payload: day is outside config/trading_window.json; skipping"; exit 0 ;;
