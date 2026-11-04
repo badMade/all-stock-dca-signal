@@ -538,3 +538,89 @@ def test_a_non_finite_expected_total_is_a_usage_error(tmp_path, value):
     with pytest.raises(SystemExit) as exc:
         _run(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], extra=("--expect-total-usd", value))
     assert exc.value.code == 2
+
+
+# -- per-state slices (2026-11-03): the weekly page was too big to show or move, so fetch once per `state` --
+
+
+def _slice_files(tmp_path, per_state, *, skip=(), raw=None):
+    """Write one page file per state (``per_state`` maps state -> orders); return ``--slice`` arguments.
+
+    ``raw`` maps a state to a ready-made page body written as-is (rows keep whatever state they carry).
+    """
+    args = []
+    for state in asm.ORDER_STATES:
+        if state in skip:
+            continue
+        body = (raw or {}).get(state) or _page([dict(o, state=state) for o in per_state.get(state, [])])
+        args += ["--slice", f"{state}={_write(tmp_path, f'{state}.json', body)}"]
+    return args
+
+
+def _run_slices(tmp_path, slice_args):
+    out = tmp_path / "out.json"
+    code = asm.main(["--account", ACCOUNT, "--trading-day", DAY, "--out", str(out), *slice_args])
+    return code, out
+
+
+def test_state_slices_merge_into_one_terminal_page_with_per_state_provenance(tmp_path):
+    per_state = {"filled": [_order("a"), _order("b")], "cancelled": [_order("c")]}
+    code, out = _run_slices(tmp_path, _slice_files(tmp_path, per_state))
+    assert code == 0
+    env = json.loads(out.read_text())
+    assert len(env["pages"]) == 1 and "next" not in env["pages"][0]
+    assert {r["id"] for r in env["pages"][0]["orders"]} == {_uuid("a"), _uuid("b"), _uuid("c")}
+    ingest = env["ingest"]
+    assert ingest["mode"] == "state_slices" and ingest["order_count"] == 3
+    assert ingest["slices"]["filled"]["order_count"] == 2 and ingest["slices"]["voided"]["order_count"] == 0
+
+
+def test_state_slice_envelope_passes_the_top_up_gate_replay(tmp_path):
+    # The merged page must read as one complete history to every downstream consumer.
+    code, out = _run_slices(tmp_path, _slice_files(tmp_path, {"filled": [_order("a")]}))
+    assert code == 0
+    page = json.loads(out.read_text())["pages"][0]
+    assert asm._is_provable_orders_page(page)
+
+
+def test_a_missing_state_is_refused_and_writes_nothing(tmp_path, capsys):
+    code, out = _run_slices(tmp_path, _slice_files(tmp_path, {"filled": [_order("a")]}, skip=("voided",)))
+    assert code == 2 and not out.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "state_slice_missing"
+
+
+def test_an_unknown_state_is_refused(tmp_path, capsys):
+    args = _slice_files(tmp_path, {}) + ["--slice", f"bogus={_write(tmp_path, 'bogus.json', _page([]))}"]
+    code, out = _run_slices(tmp_path, args)
+    assert code == 2 and not out.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "unknown_order_state"
+
+
+def test_a_row_in_the_wrong_slice_is_refused(tmp_path, capsys):
+    # The filled slice holds a cancelled order: the filter and the rows disagree.
+    args = _slice_files(tmp_path, {}, raw={"filled": _page([dict(_order("a"), state="cancelled")])})
+    code, out = _run_slices(tmp_path, args)
+    assert code == 2 and not out.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "slice_state_mismatch"
+
+
+def test_an_incomplete_chain_inside_one_slice_is_refused(tmp_path, capsys):
+    first = _page([dict(_order("a"), state="filled")], next_url="https://api/orders/?cursor=x")
+    args = _slice_files(tmp_path, {}, raw={"filled": first})
+    code, out = _run_slices(tmp_path, args)
+    assert code == 2 and not out.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "history_incomplete"
+
+
+def test_slice_mode_refuses_positional_pages(tmp_path, capsys):
+    page = _write(tmp_path, "p.json", _page([]))
+    code, out = _run_slices(tmp_path, [*_slice_files(tmp_path, {}), page])
+    assert code == 2 and not out.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "slice_mode_exclusive"
+
+
+def test_order_states_are_pinned_to_the_tools_filter_values():
+    assert asm.ORDER_STATES == (
+        "new", "queued", "confirmed", "unconfirmed", "partially_filled",
+        "filled", "cancelled", "rejected", "failed", "voided",
+    )  # fmt: skip

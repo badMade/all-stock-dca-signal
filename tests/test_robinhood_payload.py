@@ -970,6 +970,26 @@ def test_launcher_rejects_an_unusable_rescue_size(tmp_path, size, needle):
     assert done.returncode == 2 and needle in done.stderr and "timing chunk=" not in done.stderr, done.stderr
 
 
+def test_launcher_chunk_size_env_shrinks_the_first_pass_chunks(tmp_path):
+    # 2026-11-03: 8-ticker chunks drew "exceeds the output limit" on nearly every reply at 15:31; DCA_CHUNK_SIZE=4 is the
+    # 15:30 plist's remedy. n tickers at 8 per chunk is c chunks, so at 4 per chunk there are at least 2c - 1.
+    import re
+
+    (tmp_path / "default").mkdir()
+    (tmp_path / "small").mkdir()
+    _, default_chunks = _run_launcher(tmp_path / "default")
+    small = tmp_path / "small"
+    done, _ = _run_launcher(small, extra_env={"DCA_CHUNK_SIZE": "4"})
+    total = re.search(r"timing total seconds=\d+ chunks=(\d+)", done.stdout + done.stderr)
+    assert total and int(total.group(1)) >= 2 * default_chunks - 1, done.stderr
+
+
+@pytest.mark.parametrize("size, needle", [("four", "must be whole numbers"), ("0", "must be at least 1")])
+def test_launcher_rejects_an_unusable_chunk_size(tmp_path, size, needle):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_CHUNK_SIZE": size})
+    assert done.returncode == 2 and needle in done.stderr and "timing chunk=" not in done.stderr, done.stderr
+
+
 # -- 3:30 PM: plannable and buildable on demand by its own 15:31 agent, never by `auto`; its live prompt reads the payload since 2026-10-30 --
 
 

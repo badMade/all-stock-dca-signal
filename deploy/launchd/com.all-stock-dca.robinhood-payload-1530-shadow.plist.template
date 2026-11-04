@@ -26,6 +26,10 @@
     <!-- Overall build deadline, seconds from the start of the fetch. A real 90-ticker build takes 2-4 minutes; 8 minutes
          ends a slow build by about 15:40 so a payload that cannot be ready in time fails at the build, not at Gate 5. -->
     <key>DCA_BUILD_DEADLINE_SECONDS</key><string>480</string>
+    <!-- 4 tickers per chunk (2026-11-03): at 8 the 11-03 build got "exceeds the output limit" on nearly every chunk and
+         burned its whole deadline; 4 per chunk with 6 workers is the shape that published. -->
+    <key>DCA_CHUNK_SIZE</key><string>4</string>
+    <key>DCA_CODEX_PARALLEL</key><string>6</string>
     <!-- Wall-clock cutoff, ET (2026-10-30). The live 1530ET prompt re-checks `check` for 12 minutes and then aborts, and
          its session fires at 15:30, so it never gives up before 15:42. 480 s only counts from the build's own start, so a
          job launchd fires late would fetch past that. 15:40 caps the fetch whatever the start, leaving the merge and one

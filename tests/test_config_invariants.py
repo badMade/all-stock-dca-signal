@@ -4903,7 +4903,13 @@ def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
         if first_fetch != -1 and rule > first_fetch:
             offenders.append(f"{name}: rule appears after the first get_equity_orders call")
         paragraph = text[rule : text.find("\n", rule)]
-        for required in ("python3 -m scripts.assemble_order_pages", "--error-class output_cap_exceeded"):
+        for required in (
+            "python3 -m scripts.assemble_order_pages",
+            "--error-class output_cap_exceeded",
+            "PER-STATE FALLBACK",
+            "--slice",
+            "partially_filled",
+        ):
             if required not in paragraph:
                 offenders.append(f"{name}: rule lacks {required!r}")
         if "python3 scripts/assemble_order_pages.py" in text:

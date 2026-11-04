@@ -75,6 +75,11 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
 - A transient miss on one ticker costs the slot. The launcher retries a chunk once (2026-10-19: the 10:30 run
   covered 52/68 tickers, 9 daily-bar replies truncated and 8 quotes stamped with a wrong offset, so nothing was
   published) and keeps the attempt with fewer per-ticker errors. The coverage floor is 95% (see above).
+- First-pass chunk size is `DCA_CHUNK_SIZE` (unset = the planner's 8). On 2026-11-03 the 15:31 build got "exceeds the output
+  limit" on nearly every 8-ticker chunk (`errors=8` on both attempts), spent its 480 s deadline on retries and rescues, and
+  refused at 15/84; a rebuild with smaller chunks published at 15:40, too late for the 3:30 session (`window_exhausted`,
+  0 orders). The 15:30 plist template now sets `DCA_CHUNK_SIZE=4` and `DCA_CODEX_PARALLEL=6`; the live plist under
+  `~/Library/LaunchAgents` needs the same `DCA_CHUNK_SIZE` added and a reload.
 - A chunk that returns no reply on both attempts is rescued (2026-10-26: the 09:35 run lost chunks 4 and 10 whole,
   16 of 91 tickers, and refused at 75/91 although every other chunk validated). The floor tolerates 4 misses but a
   chunk holds 8, so one dead worker used to cost the slot. Its tickers are now asked for again in requests of
