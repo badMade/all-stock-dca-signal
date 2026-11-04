@@ -33,11 +33,13 @@ from scripts.backup_procedure import BACKUPS
 TARGET_PER_DAY = 200  # operator target, 2026-10-30
 FIELDS = ("trading_day", "task_id", "credits", "status", "recorded_at")
 TASK_IDS = tuple(backup.task_id for backup in BACKUPS)
-# The STEP 8 state-record statuses of the served procedure (scripts/backup_procedure.py), one vocabulary.
+# The STEP 8 state-record statuses of the served procedure (scripts/backup_procedure.py), one vocabulary, plus the
+# short signal-first prompt's STEP A stand-down (2026-11-03), the most common normal-day fire and otherwise "unrecorded".
 STATUSES = (
     "placed", "partial", "nothing_to_place", "shadow_only", "stood_down_unrecognized_order",
     "stood_down_local_active", "stood_down_local_unknown", "skipped_market_closed", "skipped_outside_window",
     "failed_unexpected_error",
+    "stood_down_signal",  # STEP A signal stand-down (slot succeeded or market closed): ends before STEP 8, no record
 )
 UNRECORDED = "unrecorded"
 

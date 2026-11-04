@@ -3073,7 +3073,7 @@ def _is_usable_order_id(order_id: object) -> bool:
         # Falsy (None, "", 0) or a bool -- True is an int in Python and would
         # otherwise read as a perfectly good id.
         return False
-    if isinstance(order_id, bool) or not isinstance(order_id, (str, int, float)):
+    if not isinstance(order_id, (str, int, float)):
         # A container ({"value": "ORD"}, ["ORD"]) is not an identifier.
         return False
     if isinstance(order_id, str) and not order_id.strip():
@@ -4660,7 +4660,7 @@ def _placement_failure_reason(
         if (
             not _candidate_id
             or isinstance(_candidate_id, bool)
-            or isinstance(_candidate_id, bool) or not isinstance(_candidate_id, (str, int, float))
+            or not isinstance(_candidate_id, (str, int, float))
         ):
             continue
         order_id = _candidate_id

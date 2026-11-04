@@ -14,6 +14,14 @@ import pandas as pd
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cron_tracking_root(monkeypatch, tmp_path):
+    """guarded_publish() appends to the sizing-suggestion history under the cron-tracking
+    root; point it at a per-test tmp tree so the suite never writes into the checkout
+    (the repo-root conftest does the same, but this subproject's rootdir is its own)."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+
 def make_synthetic_ohlcv(
     *,
     n: int = 260,

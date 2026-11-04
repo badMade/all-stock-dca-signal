@@ -54,6 +54,8 @@
   "dca_slot_guard": "Makes sure only one buyer can claim a given day and slot, so two runs starting together cannot place the same buys twice.",
   "dca_ticker_paths": "Says where the shared folder of daily price history files lives on this computer.",
   "dca_weekly_dashboard": "Builds the weekly performance dashboard from all the run files.",
+  "sizing_suggestion_history": "The shared notebook where each sizing idea (the ML model, the octopus forecaster) writes what it recommends, one dated line per run, never erased. Neither idea can change real buy sizes; this record is what you compare over the months.",
+  "sizing_suggestion_compare": "The scorecard for the sizing ideas. It reads each idea's dated recommendations and the real price moves that followed, and shows which idea (or an even blend of them) did better. It only reads and reports; it never changes real buy sizes.",
   "dca_whole_share_accumulator": "For stocks that cannot be bought in fractions (like BYDDY). It tracks the dollars it would have bought and places one whole-share order once they add up to a share's price.",
   "find_issues": "A tiny developer tool that lists unused imports in a Python file.",
   "from": "The launcher. Running python3 from.py starts the local console.",

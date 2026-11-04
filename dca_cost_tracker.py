@@ -59,7 +59,10 @@ def find_run_state_files(root: str | Path) -> List[Path]:
         if root_path.name == "run_state.json":
             return [root_path]
         return []
-    return sorted(root_path.rglob("run_state.json"))
+    from dca_fileio import iter_run_state_files_fast
+    # Note: iter_run_state_files_fast matches run_state*.json which includes run_state.json.
+    # To strictly match run_state.json only as before without regressions if other run_states exist here:
+    return [p for p in iter_run_state_files_fast(root_path) if p.name == "run_state.json"]
 
 
 def _month_prefix(year: int, month: int) -> str:
