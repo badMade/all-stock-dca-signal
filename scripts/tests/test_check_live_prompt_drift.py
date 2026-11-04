@@ -518,3 +518,39 @@ def test_no_committed_mirror_names_the_text_key_as_its_ref_id():
         if "dca-runner-" in text and "Send a UUID ref_id with every order" not in text:
             # Only the 3:30 mirror (run_slot path, no per-order dca-runner key sentence) may omit it.
             assert mirror.name.startswith("1530ET"), mirror.name
+
+
+# --- 2026-11-04: a mirror that resolves the account itself has a live body with no account literal. ---------------
+RESOLVE_RULE = "RESOLVED ACCOUNT FOR NATIVE CALLS (operator, 2026-10-28): the account number is written nowhere.\n"
+
+
+def _resolving_full_mirror_dir(tmp_path: Path, slot: str = "0935ET") -> Path:
+    mirror_dir = _full_mirror_dir(tmp_path)
+    mirror = next(mirror_dir.glob(f"{slot}-*.txt"))
+    mirror.write_text(mirror.read_text(encoding="utf-8") + RESOLVE_RULE, encoding="utf-8")
+    return mirror_dir
+
+
+def _live_with_placeholder_only_slot(tmp_path: Path, mirror_dir: Path, slot: str = "0935ET") -> Path:
+    scheduled = _live_from_full_mirror(tmp_path, mirror_dir, {})
+    task = f"task-{slot.lower()}"
+    path = scheduled / task / "SKILL.md"
+    path.write_text(path.read_text(encoding="utf-8").replace(SYNTHETIC_ACCOUNT, drift.ACCOUNT_PLACEHOLDER),
+                    encoding="utf-8")
+    return scheduled
+
+
+def test_a_placeholder_only_live_slot_is_skipped_when_its_mirror_resolves_the_account(tmp_path):
+    mirror_dir = _resolving_full_mirror_dir(tmp_path)
+    scheduled = _live_with_placeholder_only_slot(tmp_path, mirror_dir)
+
+    assert drift.shared_live_account(mirror_dir, scheduled) == SYNTHETIC_ACCOUNT
+    report = _check(tmp_path, mirror_dir, scheduled, account=SYNTHETIC_ACCOUNT)
+    assert [s["status"] for s in report["slots"]] == ["match"] * 7
+
+
+def test_a_placeholder_only_live_slot_still_blocks_inference_when_its_mirror_has_no_resolve_rule(tmp_path):
+    mirror_dir = _full_mirror_dir(tmp_path)
+    scheduled = _live_with_placeholder_only_slot(tmp_path, mirror_dir)
+
+    assert drift.shared_live_account(mirror_dir, scheduled) is None

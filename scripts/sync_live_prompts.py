@@ -15,6 +15,8 @@ live account.
   matches is neither rewritten nor backed up, so a second write changes nothing.
 * All or nothing: every slot is validated first, and one slot that cannot be handled
   (no ``SKILL.md``, a different account) means no slot is written.
+* A mirror carrying the ``RESOLVED ACCOUNT FOR NATIVE CALLS`` rule (the 9:35 prompt) keeps the placeholder; only
+  the mirrors without it get the account written in.
 * The account is ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``, else the single value every
   live slot already carries. A live task is never repointed to another account, and no
   account-shaped number is ever printed.
@@ -78,7 +80,10 @@ def _plan(mirror_dir: Path, scheduled_dir: Path, account: Optional[str]) -> tupl
             problems.append(f"{task}: mirror has no prompt body")
             continue
         body = "\n".join(mirror_lines) + "\n"
-        if account:
+        # A mirror that resolves the account at run time keeps the placeholder: the number is written into no file
+        # for it (2026-11-04). Every other mirror still gets the literal, because its native tool calls expand no
+        # shell variable and would send the placeholder text to the broker.
+        if account and not drift.mirror_resolves_account(text):
             body = body.replace(drift.ACCOUNT_PLACEHOLDER, account)
         frontmatter, live_body = _split_frontmatter(live_text)
         plans.append(

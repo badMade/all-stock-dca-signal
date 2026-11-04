@@ -35,6 +35,11 @@
          job launchd fires late would fetch past that. 15:40 caps the fetch whatever the start, leaving the merge and one
          30-second re-check before 15:42; the earlier of the two deadlines wins. -->
     <key>DCA_BUILD_DEADLINE_ET</key><string>15:40</string>
+    <!-- Concurrent Codex workers (2026-11-04). With 4-ticker chunks (#2115) the plan is 23 chunks of about 60 s each;
+         the launcher's default 3 workers ran them in 8 waves, 519 s, and the 11-03 payload published at 15:39, too late
+         for the 3:30 session to place its 34 candidates. 6 workers is 4 waves, about 4 minutes, ready near 15:35. Only
+         this agent sets it: the six live slots keep the default. -->
+    <key>DCA_CODEX_PARALLEL</key><string>6</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- 15:31 Mon-Fri, local Mac time (the Mac must be pinned to America/New_York, or Hour shifted by the difference). -->
