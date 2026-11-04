@@ -102,6 +102,53 @@ def test_every_other_signal_goes_to_step_b(instructions, backup):
     assert "Read it once" in step_a and "do not retry" in step_a
 
 
+STAND_DOWN_REPLY = "RESULT: stood_down_signal"
+
+
+def _stand_down_sentence(text: str) -> str:
+    # The sentence that ends the fire: from "On either result" to the first full stop after "end the run".
+    step_a = text.split("STEP A", 1)[1].split("STEP B -", 1)[0]
+    start = step_a.index("On either result")
+    return step_a[start:step_a.index("end the run", start)]
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_a_step_a_stand_down_names_its_ledger_status_in_the_final_reply(instructions, backup):
+    # 2026-11-04: a STEP A stand-down writes no state record, so the operator could only log it in
+    # scripts/backup_cost_ledger.py with no --status, and it vanished into "unrecorded". The run now says which
+    # status it was in its last reply line: no tool call, no file, no notification, a few output tokens.
+    sentence = _stand_down_sentence(instructions[backup.file])
+    assert STAND_DOWN_REPLY in sentence
+    assert "final reply" in sentence
+    # Still free: the reply line is the only output, not a write.
+    for phrase in ("no other tool call", "no file", "no notification"):
+        assert phrase in sentence, phrase
+
+
+def test_the_stand_down_reply_status_is_a_ledger_status_and_not_a_state_record_status():
+    # One vocabulary: what the prompt prints is exactly what `backup_cost_ledger add --status` accepts.
+    from scripts import backup_cost_ledger
+
+    status = STAND_DOWN_REPLY.split(": ", 1)[1]
+    assert status in backup_cost_ledger.STATUSES
+    assert status not in backup_procedure.PROCEDURE_TEMPLATE
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_only_the_stand_down_prints_the_signal_status(instructions, backup):
+    # A fire that goes on to STEP B never reports stood_down_signal; its outcome is the STEP 8 state record.
+    text = instructions[backup.file]
+    assert text.count("stood_down_signal") == 1
+    assert "stood_down_signal" not in text.split("STEP B -", 1)[1]
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_the_committed_prompt_files_carry_the_stand_down_reply(backup):
+    # The pasted files are generated; a stale file would keep the old, silent stand-down after a repaste.
+    committed = (gen.DEFAULT_OUT_DIR / backup.file).read_text(encoding="utf-8")
+    assert STAND_DOWN_REPLY in committed
+
+
 def test_the_two_fire_prompt_picks_its_slot_from_the_clock_and_single_fires_name_one_slot(instructions):
     for backup in backup_procedure.BACKUPS:
         step_a = instructions[backup.file].split("STEP A", 1)[1].split("STEP B", 1)[0]
