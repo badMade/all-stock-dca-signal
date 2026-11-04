@@ -86,6 +86,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MIRROR_DIR = REPO_ROOT / "claude" / "dca-executor-prompts" / "live-mirror"
 ACCOUNT_PLACEHOLDER = "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
+# A mirror carrying this rule (PR #2034, the 9:35 prompt) reads the account from the environment at run time and
+# writes the number nowhere, so its live body keeps ``ACCOUNT_PLACEHOLDER`` and holds no account literal. The other
+# mirrors lack it: their native tool calls expand no shell variable, so THEY still need the literal.
+RESOLVE_ACCOUNT_RULE = "RESOLVED ACCOUNT FOR NATIVE CALLS"
 TOP_UP_GATE_MODULE = "scripts.same_day_top_up_gate"
 # The one Gate 9 command that writes verifiable evidence (2026-09-22 schedule
 # audit: every slot fired, none left a run_state.json or a valid pointer).
@@ -385,6 +389,8 @@ def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
         if not live.is_file():
             return None
         references = set(_ACCOUNT_REFERENCE_RE.findall(live.read_text(encoding="utf-8")))
+        if not references and mirror_resolves_account(mirror.read_text(encoding="utf-8")):
+            continue  # a placeholder-only live body is what such a mirror writes; it says nothing about the account
         if len(references) != 1:
             return None
         account = next(iter(references))
@@ -392,6 +398,11 @@ def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
             return None
         shared = account
     return shared
+
+
+def mirror_resolves_account(mirror_text: str) -> bool:
+    """True when the mirror's prompt resolves the account itself and needs no literal in its live body."""
+    return RESOLVE_ACCOUNT_RULE in mirror_text
 
 
 def mirror_set_problem(mirror_dir: Path) -> Optional[str]:
