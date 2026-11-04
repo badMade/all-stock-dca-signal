@@ -41,6 +41,11 @@ from scripts.backup_procedure import BACKUPS, Backup
 
 GITHUB_REPOSITORY = backup_procedure.GITHUB_REPOSITORY  # re-exported: tests and docs name it here
 DEFAULT_OUT_DIR = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "perplexity"
+# 2026-11-04: a STEP A stand-down writes no state record, so the operator had no status to give
+# scripts/backup_cost_ledger.py and the fire landed in "unrecorded". The run now names the ledger status in its last
+# reply line instead: no tool call, no file, a few output tokens. The word is the ledger's own vocabulary.
+STAND_DOWN_STATUS = "stood_down_signal"
+STAND_DOWN_REPLY = f"RESULT: {STAND_DOWN_STATUS}"
 
 _SHORT_PROMPT = """\
 STANDING BACKUP EXECUTOR @@TITLE@@
@@ -55,7 +60,7 @@ RUN VALUES (filled in when this prompt is pasted):
 
 STEP A - SIGNAL CHECK
 Read @@RAW_URL@@ once, without any other tool call. It is the public @@GITHUB_REPOSITORY@@ branch "@@BRANCH@@" file `slot_status.json`; expect this schema: {"schema": "slot_status/1", "trading_day": "YYYY-MM-DD", "market": "open" or "closed", "updated_at": "...", "slots": {"0935": {"status": "in_progress", "stamped_at": "..."}}}.
-Use the current date and clock in America/New_York. This task backs up @@SLOT_LINE@@; @@SLOT_FROM_CLOCK@@. Stand down only when "schema" is "slot_status/1", the trading_day is today, and either "market" is "closed" or today's entry for this task's slot has a nonempty "stamped_at" and "status" is "succeeded". On either result, make no Robinhood call, place nothing, make no other tool call, write no file, send no notification, and end the run.
+Use the current date and clock in America/New_York. This task backs up @@SLOT_LINE@@; @@SLOT_FROM_CLOCK@@. Stand down only when "schema" is "slot_status/1", the trading_day is today, and either "market" is "closed" or today's entry for this task's slot has a nonempty "stamped_at" and "status" is "succeeded". On either result, make no Robinhood call, place nothing, make no other tool call, write no file, send no notification, make your final reply the single line `@@STAND_DOWN_REPLY@@`, and end the run.
 If the file cannot be read, is not JSON, has another schema or another day, is malformed, the market is not closed and the slot is in_progress or failed, or there is no entry for this slot, do not stand down: go to STEP B. This signal never authorizes a buy. Read it once and do not retry.
 
 STEP B - STAMP AND PROCEDURE
@@ -98,6 +103,7 @@ def _render_short_prompt(backup: Backup, common: dict[str, str], settings: dict)
         "@@GITHUB_REPOSITORY@@": settings["repository"],
         "@@SLOT_FROM_CLOCK@@": slot_from_clock,
         "@@BUILD_STAMP@@": _build_stamp(),
+        "@@STAND_DOWN_REPLY@@": STAND_DOWN_REPLY,
     }
     text = backup_procedure.substitute(_SHORT_PROMPT, values)
     assert "@@" not in text, backup.file
