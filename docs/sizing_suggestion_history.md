@@ -69,7 +69,25 @@ python -m sizing_suggestion_compare --horizon 5 --write    # also write <history
 Read the run counts next to every number: a handful of matured runs is noise. The comparison never writes live
 sizing; promoting any suggester or blend stays a manual edit after the review period.
 
+## Octopus freshness gate
+
+`scripts/publish_octopus_sizing.py` refuses to record (status `stale_source`, exit 1, nothing written, also on
+`--dry-run`) when the forecast CSV's newest `origin_date` is missing, unparseable, more than one day in the future, or
+older than `--max-origin-age-days` (default 5: a weekend plus one market holiday). Without it a stale
+`all_shards_tomorrow.csv` re-run later would be stamped with a fresh `recorded_at` and read as a new forecast.
+
+## Viewing the history in DuckDB or Notion
+
+The JSONL stays the source of truth. `python -m sizing_suggestion_history --export-csv PATH [--suggester NAME]`
+writes a derived, rebuildable CSV with one row per ticker per run (`suggester, run_id, recorded_at, generated_at,
+model_version, status, ticker, multiplier, tilt, min_multiplier, max_multiplier, origin_date`). It is read-only over
+the history and adds no dependency; rerun it to refresh.
+
+- **DuckDB:** `SELECT suggester, ticker, avg(tilt) FROM read_csv_auto('history.csv') GROUP BY ALL;` or skip the CSV
+  and query the files directly with `read_json_auto('<cron root>/sizing_suggestions/*/*.jsonl')`.
+- **Notion:** import the CSV into a database (Notion, `...` menu, Merge with CSV). Nothing in this repo calls the
+  Notion API for it, so a refresh is a manual re-import.
+
 ## Not built yet
 
-A freshness gate on the octopus forecast CSV (`origin_date` is recorded as provenance only), and any DuckDB view
-over the JSONL (the files are plain JSONL, so `read_json_auto` already works).
+An automated push of the CSV to Notion (it is a manual import today).
