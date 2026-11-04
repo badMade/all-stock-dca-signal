@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from dca_config import load_ml_sizing_adjustment
 from scripts.publish_octopus_sizing import (
+    check_source_freshness,
     evaluate_tier_c_candidates,
     load_active_universe,
     publish_octopus_sizing,
@@ -153,7 +154,10 @@ def test_repeated_publishes_accumulate_history(
 
 def test_dry_run_records_nothing(tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path):
     history = tmp_path / "history"
-    result = publish_octopus_sizing(sample_forecasts_csv, sample_tickers_json, history_root=history, dry_run=True)
+    result = publish_octopus_sizing(
+        sample_forecasts_csv, sample_tickers_json, history_root=history, dry_run=True,
+        now=datetime(2026, 9, 21, tzinfo=timezone.utc),
+    )
     assert result["status"] == "dry_run"
     assert not history.exists()
 
@@ -163,3 +167,64 @@ def test_cli_has_no_flag_that_targets_live_config():
 
     source = Path(module.__file__).read_text(encoding="utf-8")
     assert "--output" not in source and "atomic_write_text" not in source
+
+
+def test_freshness_boundaries():
+    today = date(2026, 9, 23)
+    assert check_source_freshness("2026-09-18", today, 5)[0]  # exactly at the limit
+    assert not check_source_freshness("2026-09-17", today, 5)[0]
+    assert check_source_freshness("2026-09-24", today, 5)[0]  # one day ahead tolerated
+    assert not check_source_freshness("2026-09-26", today, 5)[0]
+    assert not check_source_freshness(None, today, 5)[0]
+    assert not check_source_freshness("09/18/2026", today, 5)[0]
+
+
+def test_stale_csv_is_refused_and_nothing_recorded(
+    tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path
+):
+    history = tmp_path / "history"
+    result = publish_octopus_sizing(
+        sample_forecasts_csv,
+        sample_tickers_json,
+        history_root=history,
+        now=datetime(2026, 10, 30, 15, 30, tzinfo=timezone.utc),  # CSV origin is 2026-09-18
+    )
+    assert result["status"] == "stale_source"
+    assert result["origin_date"] == "2026-09-18"
+    assert not history.exists()
+
+
+def test_stale_csv_is_refused_even_on_dry_run(
+    tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path
+):
+    result = publish_octopus_sizing(
+        sample_forecasts_csv,
+        sample_tickers_json,
+        history_root=tmp_path / "history",
+        dry_run=True,
+        now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+    )
+    assert result["status"] == "stale_source"
+
+
+def test_csv_without_origin_date_is_refused(tmp_path: Path, sample_tickers_json: Path):
+    csv_file = tmp_path / "no_origin.csv"
+    csv_file.write_text("ticker,close_p90,ref_close\nAAPL,105,100\n", encoding="utf-8")
+    result = publish_octopus_sizing(
+        csv_file, sample_tickers_json, history_root=tmp_path / "h",
+        now=datetime(2026, 9, 21, tzinfo=timezone.utc),
+    )
+    assert result["status"] == "stale_source"
+
+
+def test_max_origin_age_is_overridable(
+    tmp_path: Path, sample_forecasts_csv: Path, sample_tickers_json: Path
+):
+    result = publish_octopus_sizing(
+        sample_forecasts_csv,
+        sample_tickers_json,
+        history_root=tmp_path / "history",
+        max_origin_age_days=60,
+        now=datetime(2026, 10, 30, tzinfo=timezone.utc),
+    )
+    assert result["status"] == "published"

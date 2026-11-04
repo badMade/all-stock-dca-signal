@@ -35,14 +35,17 @@ Standard library only; imports only the dependency-free :mod:`dca_paths` and
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import math
 import os
 import re
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 import dca_paths
 from scripts.file_lock import cross_process_lock
@@ -168,4 +171,94 @@ def read_history(suggester: str, *, root: Optional[Path] = None) -> List[Dict[st
     return list(iter_history(suggester, root=root))
 
 
-__all__ = ["HISTORY_DIRNAME", "SCHEMA_VERSION", "history_root", "iter_history", "read_history", "record_suggestions"]
+
+
+# One CSV row per (run, ticker): the shape DuckDB (``read_csv_auto``) and a Notion database
+# CSV import both consume directly, so neither needs a third-party dependency here. The JSONL
+# stays the source of truth; this is a derived, rebuildable view (rerun to refresh it).
+EXPORT_COLUMNS = (
+    "suggester", "run_id", "recorded_at", "generated_at", "model_version", "status",
+    "ticker", "multiplier", "tilt", "min_multiplier", "max_multiplier", "origin_date",
+)
+
+
+def known_suggesters(*, root: Optional[Path] = None) -> List[str]:
+    """Suggester streams present on disk (directories matching the name rule), sorted."""
+    base = Path(root) if root is not None else history_root()
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir() if p.is_dir() and _SUGGESTER_RE.match(p.name) and p.name != "comparisons")
+
+
+def flat_rows(
+    suggesters: Optional[Sequence[str]] = None, *, root: Optional[Path] = None
+) -> Iterator[Dict[str, Any]]:
+    """Yield one flat row per ticker per recorded run, oldest first within each suggester.
+
+    A run with no adjustments yields no rows (the run is still in the JSONL); ``tilt`` is
+    ``multiplier - 1`` so the sign reads directly as overweight/underweight.
+    """
+    for name in suggesters if suggesters is not None else known_suggesters(root=root):
+        for rec in iter_history(name, root=root):
+            bounds = rec.get("bounds") or {}
+            source = rec.get("source") or {}
+            for ticker, multiplier in (rec.get("adjustments") or {}).items():
+                yield {
+                    "suggester": rec.get("suggester", name),
+                    "run_id": rec.get("run_id"),
+                    "recorded_at": rec.get("recorded_at"),
+                    "generated_at": rec.get("generated_at"),
+                    "model_version": rec.get("model_version"),
+                    "status": rec.get("status"),
+                    "ticker": ticker,
+                    "multiplier": multiplier,
+                    "tilt": round(multiplier - 1.0, 12),
+                    "min_multiplier": bounds.get("min_multiplier"),
+                    "max_multiplier": bounds.get("max_multiplier"),
+                    "origin_date": source.get("origin_date"),
+                }
+
+
+def write_csv(rows: Iterable[Mapping[str, Any]], path: Path) -> int:
+    """Write ``rows`` to ``path`` (parents created, replaced atomically); returns the row count."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
+    count = 0
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=EXPORT_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+                count += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return count
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Export the sizing-suggestion history as one flat CSV (read-only over the JSONL)."
+    )
+    parser.add_argument("--export-csv", type=Path, required=True, help="CSV file to write")
+    parser.add_argument("--suggester", action="append", help="Limit to a stream (repeatable)")
+    parser.add_argument("--root", type=Path, default=None, help="History root (default: cron root)")
+    args = parser.parse_args(argv)
+    count = write_csv(flat_rows(args.suggester, root=args.root), args.export_csv)
+    print(f"wrote {count} rows to {args.export_csv}")
+    return 0
+
+
+__all__ = [
+    "EXPORT_COLUMNS", "HISTORY_DIRNAME", "SCHEMA_VERSION", "flat_rows", "history_root", "iter_history",
+    "known_suggesters", "read_history", "record_suggestions", "write_csv",
+]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

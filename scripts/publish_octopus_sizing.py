@@ -21,7 +21,7 @@ import csv
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Set, Tuple
 
@@ -41,6 +41,11 @@ DEFAULT_TICKERS_PATH = REPO_ROOT / "config" / "tickers.json"
 DEFAULT_MIN_MULTIPLIER = 0.8
 DEFAULT_MAX_MULTIPLIER = 1.4
 DEFAULT_TIER_C_MULTIPLIER = 1.25
+# Calendar days the newest forecast ``origin_date`` may trail the run date. 5 covers a normal
+# weekend plus a market holiday (Fri forecast read on Tue after a Monday holiday is 4); a CSV
+# older than that is a stale file being re-run, which would otherwise be recorded with a fresh
+# ``recorded_at`` and look like a new forecast in the history (Codex review of cc098ed3, medium).
+DEFAULT_MAX_ORIGIN_AGE_DAYS = 5
 MODEL_VERSION = "wondrous-octopus-v1-mps"
 
 
@@ -218,6 +223,25 @@ def _source_origin_date(forecasts_csv_path: Path) -> str | None:
     return max(dates) if dates else None
 
 
+def check_source_freshness(
+    origin_date: str | None, today: date, max_age_days: int
+) -> tuple[bool, str]:
+    """Return ``(fresh, reason)``; a missing, unparseable or future-dated origin is not fresh."""
+    if not origin_date:
+        return False, "forecast CSV has no origin_date column or no dated rows"
+    try:
+        origin = date.fromisoformat(origin_date)
+    except ValueError:
+        return False, f"origin_date {origin_date!r} is not an ISO date"
+    age = (today - origin).days
+    if age < -1:
+        # A forecast dated in the future means a bad clock or bad data; do not record it.
+        return False, f"origin_date {origin_date} is {-age} days in the future"
+    if age > max_age_days:
+        return False, f"origin_date {origin_date} is {age} days old (limit {max_age_days})"
+    return True, f"origin_date {origin_date} is {age} days old"
+
+
 def publish_octopus_sizing(
     forecasts_csv: Path,
     tickers_json: Path,
@@ -226,14 +250,27 @@ def publish_octopus_sizing(
     min_multiplier: float = DEFAULT_MIN_MULTIPLIER,
     max_multiplier: float = DEFAULT_MAX_MULTIPLIER,
     tier_c_multiplier: float = DEFAULT_TIER_C_MULTIPLIER,
+    max_origin_age_days: int = DEFAULT_MAX_ORIGIN_AGE_DAYS,
     history_root: Path | None = None,
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> Dict[str, Any]:
-    """Append Octopus Tier C suggestions to the suggestion history (never to live config)."""
+    """Append Octopus Tier C suggestions to the suggestion history (never to live config).
+
+    Fails closed (``status: stale_source``, nothing recorded) when the forecast CSV's newest
+    ``origin_date`` is missing, in the future, or older than ``max_origin_age_days``.
+    """
     active_tickers = load_active_universe(tickers_json)
     if not active_tickers:
         return {"status": "failed", "reason": "Active universe is empty or could not be loaded"}
+
+    origin_date = _source_origin_date(forecasts_csv)
+    fresh, freshness_reason = check_source_freshness(
+        origin_date, (now or datetime.now(timezone.utc)).date(), max_origin_age_days
+    )
+    if not fresh:
+        logger.error("Refusing to record a stale Octopus forecast: %s", freshness_reason)
+        return {"status": "stale_source", "reason": freshness_reason, "origin_date": origin_date}
 
     adjustments, metadata = evaluate_tier_c_candidates(
         forecasts_csv,
@@ -274,7 +311,7 @@ def publish_octopus_sizing(
         bounds={"min_multiplier": min_multiplier, "max_multiplier": max_multiplier},
         source={
             "forecasts_csv": forecasts_csv.name,
-            "origin_date": _source_origin_date(forecasts_csv),
+            "origin_date": origin_date,
             "scanned_active_tickers": metadata.get("scanned_active_tickers"),
             "total_active_universe": metadata.get("total_active_universe"),
             "tier_c_multiplier": tier_c_multiplier,
@@ -334,6 +371,12 @@ def main() -> int:
         help="Base multiplier for Tier C recovery signals",
     )
     parser.add_argument(
+        "--max-origin-age-days",
+        type=int,
+        default=DEFAULT_MAX_ORIGIN_AGE_DAYS,
+        help="Refuse a forecast CSV whose newest origin_date is older than this many days",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Compute adjustments without writing file",
@@ -349,6 +392,7 @@ def main() -> int:
         min_multiplier=args.min_multiplier,
         max_multiplier=args.max_multiplier,
         tier_c_multiplier=args.tier_c_multiplier,
+        max_origin_age_days=args.max_origin_age_days,
         dry_run=args.dry_run,
     )
 
