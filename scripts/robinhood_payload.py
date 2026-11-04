@@ -38,7 +38,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -67,7 +67,10 @@ SHADOW_BAR_START_ET = {
 }
 PLANNABLE_SLOTS = SLOTS + tuple(SHADOW_BAR_START_ET)
 
-DEFAULT_CHUNK_SIZE = 8
+#: Tickers per worker call. 4 since 2026-11-02 (was 8): the workers fetched every ticker but answered most of them
+#: "full response exceeds output capacity", refusing 0935, 1130, 1230, 1330 and 1530 (15/84). Half the tickers is half
+#: the reply one worker has to write back; the compact list bars in ``build_prompt`` cut it again.
+DEFAULT_CHUNK_SIZE = 4
 #: Share of the universe that must validate before a payload is published at all. It was 1.0 (2026-10-15
 #: adversarial review: Gate 6 allocates a binding cap by allocation_priority, so a missing high-priority ticker
 #: could hand its budget to lower-priority names). 0.95 since 2026-10-21: one stale thin name (TOPT, QTOP, DXYZ
@@ -77,14 +80,14 @@ DEFAULT_CHUNK_SIZE = 8
 #: At 90 tickers this tolerates 4 misses; a stale-feed slot (2026-10-20 13:30: 8 of 90) still publishes nothing.
 DEFAULT_MIN_COVERAGE = 0.95
 #: Share of the universe that may be "quiet" (no bar in the slot window) before the payload is refused anyway.
-#: Introduced for 2026-10-27 13:30, where eight names (DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ) printed
-#: nothing between 12:30 and 13:30 and 82/90 refused the slot. Corrected 2026-10-31: those eight are exactly plan
-#: chunk 0, which on 10-26 13:30 had left them all out ("no data returned"), and SPCX, LUNR and DFTX traded 1-68M
-#: shares the session before, so that was one worker dropping one chunk, not eight thin names; the launcher's rescue
-#: now re-asks such a chunk (``rescue_targets``). Real quiet names exist all the same (QTOP, GFUZ, CHE under 100k). A quiet name is reported under
-#: ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the coverage denominator. A feed outage
-#: also returns empty series, so more than this share still refuses.
-MAX_QUIET_SHARE = 0.10
+#: History: introduced for 2026-10-27 13:30, where eight names printed nothing between 12:30 and 13:30; corrected
+#: 2026-10-31, when SPCX, LUNR and DFTX (1-68M shares the session before) showed that was a dropped chunk, not thin
+#: names (see ``rescue_targets``). Since 2026-11-03 "quiet" also requires a thin prior session
+#: (< ``LIQUID_PRIOR_VOLUME``): a liquid name with no bars is a real failure counted against the coverage floor, so
+#: this ceiling only bounds genuinely thin names and was raised from 10% to 25% (the 11-02 probe had 10 of 90 empty).
+#: A quiet name is reported under ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the
+#: coverage denominator. A feed outage also returns empty series, so more than this share still refuses.
+MAX_QUIET_SHARE = 0.25
 #: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
 #: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
 #: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
@@ -146,8 +149,21 @@ def _num(value: Any, field: str, *, allow_zero: bool = False) -> float:
     return number
 
 
+#: Field order of a compact list bar, the shape ``build_prompt`` asks workers for (2026-11-02).
+COMPACT_BAR_FIELDS = ("timestamp", "open", "high", "low", "close", "volume")
+
+
 def validate_bar(raw: Any) -> dict[str, Any]:
-    """One OHLCV bar with a tz-aware timestamp and a self-consistent range; returns the normalized bar."""
+    """One OHLCV bar with a tz-aware timestamp and a self-consistent range; returns the normalized bar.
+
+    Accepts the object form or the compact ``[timestamp, open, high, low, close, volume]`` list the worker prompt
+    asks for since 2026-11-02, and normalizes both to the same object, so ``check`` and the generator never see
+    the difference. A list of any other length is refused rather than guessed at.
+    """
+    if isinstance(raw, list):
+        if len(raw) != len(COMPACT_BAR_FIELDS):
+            raise PayloadError(f"compact bar needs {len(COMPACT_BAR_FIELDS)} fields, got {len(raw)}: {raw!r}")
+        raw = dict(zip(COMPACT_BAR_FIELDS, raw, strict=True))
     if not isinstance(raw, dict):
         raise PayloadError(f"bar is not an object: {raw!r}")
     stamp = _parse_ts(raw.get("timestamp"))
@@ -193,7 +209,13 @@ def validate_ticker(
                 raise PayloadError(f"duplicate intraday timestamp {stamp.isoformat()}")
             by_stamp[stamp] = bar
     if not by_stamp:
-        raise QuietTickerError(f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET")
+        gap = f"no intraday bars between {bar_start:%H:%M} and {decision:%H:%M} ET"
+        # 2026-11-03: quiet means thin. A name that traded LIQUID_PRIOR_VOLUME or more the session before and prints
+        # nothing for the window is a dropped series (10-30 AMZN, GOOG, GOOGL; 11-02 10:30 the same), so it is a real
+        # failure that counts against the coverage floor, never filed quiet. A missing prior volume reads as 0 (thin).
+        if prev["volume"] >= LIQUID_PRIOR_VOLUME:
+            raise PayloadError(f"{gap}, although the prior session was liquid ({prev['volume']:,.0f} shares)")
+        raise QuietTickerError(gap)
     # The bar AT the window start is required, not one interval after it (2026-10-30). The old `> start + interval`
     # slack let a 3:30 series beginning at 14:30 pass `merge` and `check` against a 14:25 start, but the generator's
     # 60-minute lookback bar is exactly 14:25 (bars before `start` are dropped above, so nothing else can stand in):
@@ -345,23 +367,55 @@ def build_plan(slot: str, day: date) -> dict[str, Any]:
 # --------------------------------------------------------------------------- prompt
 
 
+def _utc_window(plan: dict[str, Any]) -> tuple[str, str]:
+    """The plan's ET window as RFC3339 UTC stamps (``YYYY-MM-DDTHH:MM:SSZ``) for the tool's ``start_time``/``end_time``.
+
+    2026-11-02: the clocks went back on 11-01 and every worker kept filtering "10:30-11:30 ET" against UTC stamps as if
+    ET were UTC-4, so it returned 09:30-10:25 ET bars and 31/91 tickers read as quiet. The offset is computed here
+    with zoneinfo, never left to the model. The same day's 15:30 chunk logs showed the Robinhood MCP
+    ``get_equity_historicals`` schema is ``additionalProperties: false`` with a required ``start_time`` and no ``span``,
+    so the range is passed as explicit stamps rather than a span name the tool rejects.
+    """
+    day = date.fromisoformat(plan["trading_day"])
+    start = datetime.combine(day, time.fromisoformat(plan["bar_start_et"]), ET).astimezone(timezone.utc)
+    end = datetime.combine(day, time.fromisoformat(plan["decision_time_et"]), ET).astimezone(timezone.utc)
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+#: Calendar days back the previous-session daily bar is requested from: covers a long weekend plus a holiday while
+#: staying a handful of bars, so the reply is not truncated.
+DAILY_LOOKBACK_DAYS = 7
+
+
+def _daily_start(plan: dict[str, Any]) -> str:
+    day = date.fromisoformat(plan["trading_day"]) - timedelta(days=DAILY_LOOKBACK_DAYS)
+    return f"{day.isoformat()}T00:00:00Z"
+
+
 def build_prompt(plan: dict[str, Any], tickers: list[str]) -> str:
+    utc_start, utc_end = _utc_window(plan)
+    daily_start = _daily_start(plan)
     return f"""You are a data-retrieval worker. Use ONLY the Robinhood MCP tools that read market data
 (historicals and quotes). Never call any order, cancel, watchlist or alert tool.
 
 Trading day: {plan['trading_day']} (America/New_York). Tickers: {', '.join(tickers)}
 
 For EACH ticker fetch:
-1. {plan['interval_minutes']}-minute bars for today (historicals, interval {plan['interval_minutes']}minute, span day), covering
-   {plan['bar_start_et']} ET through {plan['decision_time_et']} ET. Keep only bars whose START timestamp is at or after
-   {plan['bar_start_et']} ET and strictly before {plan['decision_time_et']} ET (omit the still-open bar).
-2. The previous completed regular session's daily bar (historicals, interval day, span week -- request ONLY
-   the last few sessions, never a long history, so the reply is not truncated; use the newest completed session).
+1. {plan['interval_minutes']}-minute bars (historicals, interval {plan['interval_minutes']}minute) for the window {plan['bar_start_et']} ET
+   through {plan['decision_time_et']} ET. Pass exactly start_time {utc_start} and end_time {utc_end} (UTC, computed for today's
+   offset; do NOT work the offset out yourself) and no other parameter beyond symbols, interval, start_time and end_time.
+   Keep only bars whose START timestamp is at or after {utc_start} and strictly before {utc_end} (omit the still-open
+   bar). Copy each kept bar's timestamp exactly as returned.
+2. The previous completed regular session's daily bar (historicals, interval day, start_time {daily_start} and no end_time
+   -- a handful of sessions only, never a long history, so the reply is not truncated; use the newest completed
+   session before {plan['trading_day']}).
 3. A current quote, with its best bid and best ask.
 
 Reply with ONE JSON object and nothing else (no prose, no code fence). Keys are the tickers above:
 {{"TICKER": {{"previous_close_bar": BAR, "intraday_bars": [BAR, ...], "quote": {{"price": number, "as_of": "<iso with offset>", "bid_price": number, "ask_price": number}}}}}}
-where BAR is {{"timestamp": "<iso with offset>", "open": n, "high": n, "low": n, "close": n, "volume": n}}.
+where BAR is a list of exactly six values, [timestamp, open, high, low, close, volume], with the timestamp an
+"<iso with offset>" string and the rest numbers; no field names, no extra whitespace. This compact form keeps the
+whole reply short enough to write in full.
 
 Rules: copy every number and timestamp exactly as the tool returned it; never estimate, round, interpolate or
 fill a gap. Never convert a timestamp between time zones and never attach an offset the tool did not return:
@@ -562,7 +616,7 @@ def rescue_targets(reply: dict[str, Any], tickers: list[str]) -> list[str]:
     whole-chunk case of 10-29 15:31); otherwise also any answered ticker with no bars whose prior session was liquid
     (2026-10-31: the same 10-29 failure with one ticker of the chunk still answered would have filed NVDA, GOOGL, GOOG
     and AMZN quiet again). Only *which tickers are asked for again* changes here: the merge still validates whatever
-    comes back, and a liquid name that is empty again is still filed quiet and counted against ``MAX_QUIET_SHARE``.
+    comes back, and a liquid name that is empty again is a real failure (``validate_ticker``) counted against the coverage floor.
     """
     need = [t for t in tickers if t not in reply or (isinstance(reply[t], dict) and reply[t].get("error"))]
     answered = [reply[t] for t in tickers if t not in need]
@@ -736,6 +790,40 @@ def _record_refusal(
         path.write_text(json.dumps(marker, indent=1), encoding="utf-8")
     except OSError as exc:
         print(f"robinhood_payload: could not write refusal marker {path.name}: {exc.__class__.__name__}", file=sys.stderr)
+    # After the marker, so a notifier that hangs or fails can never cost the durable record.
+    _notify_refusal(plan, reason, ok=ok, universe=universe, failed=failed)
+
+
+#: Failed tickers named in the refusal notification before "+N more"; the log and the marker carry the full list.
+NOTIFY_TICKER_LIMIT = 5
+#: macOS truncates a long notification body anyway; keep the useful part (reason and counts) well inside it.
+NOTIFY_MESSAGE_LIMIT = 250
+
+
+def _notify_refusal(plan: dict[str, Any], reason: str, *, ok: int, universe: int, failed: dict[str, str]) -> None:
+    """Raise a macOS notification that this slot's payload build was refused (2026-11-03).
+
+    2026-11-02: five of seven builds were refused and each only surfaced in a launchd log and at the slot's Gate 5
+    abort. Opt-in (``DCA_NOTIFY_REFUSAL=1``, which the launcher exports by default) so the test suite and direct
+    callers stay silent. Best-effort like the marker: a missing, failing or hung notifier changes neither the exit
+    status nor the marker, and the log note names only the exception class, never the message text. Reuses
+    ``schedule_watchdog.notify_macos`` (text as argv, not interpolated into AppleScript) instead of a second notifier.
+    """
+    if os.environ.get("DCA_NOTIFY_REFUSAL") != "1":
+        return
+    import subprocess
+
+    from scripts import schedule_watchdog
+
+    names = sorted(failed)
+    listed = ", ".join(names[:NOTIFY_TICKER_LIMIT]) or "none"
+    if len(names) > NOTIFY_TICKER_LIMIT:
+        listed += f" +{len(names) - NOTIFY_TICKER_LIMIT} more"
+    message = f"{reason} [{ok}/{universe} valid; failed: {listed}]"[:NOTIFY_MESSAGE_LIMIT]
+    try:
+        schedule_watchdog.notify_macos(f"Payload refused: slot {plan['slot']} {plan['trading_day']}", message)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"robinhood_payload: could not raise the refusal notification: {exc.__class__.__name__}", file=sys.stderr)
 
 
 def _refusal_note(plan: dict[str, Any]) -> str | None:
