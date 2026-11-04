@@ -36,7 +36,7 @@ def test_gate_6_5_runs_before_any_time_judgment(name):
 @pytest.mark.parametrize("name", PROMPTS)
 def test_orders_go_in_priority_order_until_the_window_closes(name):
     rule = _rule(name)
-    assert "in allocation_priority order" in rule
+    assert "in the order Gate 6.5 resolved them" in rule
     assert "stop placing when this slot's window closes" in rule
     assert "skipped_window_closed" in rule
 
