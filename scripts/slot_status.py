@@ -9,8 +9,10 @@ now publishes one small document per trading day and the backup reads it once:
     {"schema": "slot_status/1", "trading_day": "2026-10-29", "market": "open" | "closed", "updated_at": "...",
      "slots": {"0935": {"status": "in_progress" | "succeeded" | "failed", "stamped_at": "..."}, ...}}
 
-The writer is the primary's own ``local_heartbeat start`` / ``finish`` (and ``market-day`` below, once each
-morning). The file is public (the ``slot-status`` branch of a public repo), so it carries only the day, the market
+The writer is the Gate 9 finalizer every live prompt calls on every outcome (``scripts/finalize_run_evidence.py``,
+2026-11-03: ``succeeded`` for a run that finished as designed, ``failed`` for an error or abort), the primary's
+``local_heartbeat start`` / ``finish`` when a caller uses them, and ``market-day`` below, once each morning. On
+2026-11-02 the signal never updated because no live prompt calls start/finish; the finalizer is what they all call. The file is public (the ``slot-status`` branch of a public repo), so it carries only the day, the market
 state and each slot's status and time: never a ticker, amount, account, order or reference.
 
 ``is_done`` is the reader's contract, the same rule the short Perplexity prompt applies by hand: stand down only on

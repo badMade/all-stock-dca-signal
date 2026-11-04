@@ -27,10 +27,10 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is b
    **Quiet tickers (2026-10-28).** A ticker that printed no bar at all in the slot window did not trade; it is not a failed
    fetch. (It was added for 10-27 13:30, where eight empty names refused the slot at 82/90; 2026-10-31: those eight were
    exactly plan chunk 0, left out of the reply on 10-26 too, and include SPCX, LUNR and DFTX at 1-68M shares a day, so
-   that was a dropped chunk, which the rescue below now re-asks. Real quiet names exist: QTOP, GFUZ, CHE under 100k.) `publish` leaves it in
+   that was a dropped chunk, which the rescue below now re-asks. Real quiet names exist: QTOP, GFUZ, CHE under 100k. Since 2026-11-03 "quiet" also needs a thin prior session, under `LIQUID_PRIOR_VOLUME`: a liquid name with no bars is a real failure counted against the coverage floor.) `publish` leaves it in
    `ticker_errors.robinhood` (NO_DATA, never a BUY; omitting it would read as "not covered" and allow a single-source BUY),
    lists it under `quiet` in the `.meta.json` sidecar, and takes it out of the coverage denominator. More than
-   `MAX_QUIET_SHARE` (10%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
+   `MAX_QUIET_SHARE` (25%) quiet tickers still refuses, because a feed outage also returns empty series. A ticker that
    traded but whose newest bar is far before the anchor stays a real failure. The prompts leave the sidecar's quiet names
    out of their ">5% errored" count.
    Each worker's reply counts only for the tickers its own chunk was assigned (`chunk_<i>.json` is
@@ -91,7 +91,7 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   chunk 3), and in a chunk that answered others, an empty ticker whose `previous_close_bar.volume` is at least
   `LIQUID_PRIOR_VOLUME` (1,000,000 shares) is re-asked alone (2026-10-31): an hour with no bar cannot be real for a
   name that traded that much the session before. Thinner empty names are left alone and filed quiet. A liquid name
-  that comes back empty again is still filed quiet and still counts toward `MAX_QUIET_SHARE`; the rule only decides
+  that comes back empty again is a real failure (it counts against the coverage floor, not the quiet share); the rule only decides
   what is asked for again. The rule is `rescue_targets` in `scripts/robinhood_payload.py`.
 - Every attempt that returns no reply keeps its worker output in
   `robinhood_payload_<day>_<slot>.chunk_logs/chunk_<i>.attempt<k>.<build epoch>.log` beside the payload (the
@@ -103,6 +103,10 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
 - `~/.codex/config.toml`'s default model is used. Pin one with `DCA_CODEX_MODEL` only if needed (model names
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
+
+## Refusal notification (2026-11-03)
+
+When `publish` refuses a build (coverage floor, quiet cap, or built before the anchor) it writes the `.refused.json` marker and then raises a macOS notification titled `Payload refused: slot <slot> <day>`, whose body is the reason, `valid/universe` and up to five failed tickers (`+N more`), at most 250 characters. The launcher exports `DCA_NOTIFY_REFUSAL=1` by default; inside the publisher it is opt-in, so tests and direct callers stay silent. Set `DCA_NOTIFY_REFUSAL=0` in the job's environment to turn it off. It reuses `schedule_watchdog.notify_macos`, is best-effort (a missing, failing or hung notifier changes neither exit status 2 nor the marker, and the log names only the exception class), and a published payload never notifies. It needs a logged-in GUI session; under a headless launchd context `osascript` may fail, which is logged and harmless.
 
 ## Plan-first ingest (2026-10-26)
 
@@ -163,7 +167,7 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   build from the start of the fetch. Each attempt's timeout is capped to the time left, and no attempt starts with less than
   `DCA_MIN_ATTEMPT_SECONDS` (default 20) left; skipped chunks log `robinhood_payload: deadline chunk=N ... skipped`, the
   merge enforces the 95% coverage floor, and a late build publishes nothing instead of arriving after the slot's window.
-  The shadow agent sets 480 s (a slow build ends by about 15:40), and since 2026-10-30 also the absolute
+  The shadow agent sets 540 s (a slow build ends by about 15:40), and since 2026-10-30 also the absolute
   `DCA_BUILD_DEADLINE_ET=15:40` (HH:MM ET on the plan's trading day; see "Build timing vs. the window" under Cutover).
 - **Go/no-go for step 2b (cutover):** five consecutive shadow days with total build time under 6 minutes, no deadline
   skips, and 95% or better coverage with fresh quotes.
@@ -185,7 +189,7 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   in each `.meta.json`): 220-264 s, published 15:34:45 to 15:35:26 on 10-23 to 10-30, so three of six published after
   15:35. That is not a miss. `scheduled_window_end_et` 15:35 bounds only the reporting fallback that attributes broker
   orders to a run whose state lost its order IDs; nothing gates the payload on it. The real limit is Gate 5's 12-minute
-  re-check of `check`: the session fires at 15:30, so it never gives up before 15:42. The relative 480 s deadline ends
+  re-check of `check`: the session fires at 15:30, so it never gives up before 15:42. The relative 540 s deadline ends
   an on-time build by about 15:39, but counts from the build's own start, so a job launchd fires late could still fetch
   past 15:42. The 15:31 agent therefore also sets `DCA_BUILD_DEADLINE_ET=15:40`: an absolute America/New_York cutoff on
   the plan's trading day (the earlier of the two deadlines wins). A build that starts after it logs
@@ -201,3 +205,17 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   answered, so the rescue now also re-asks any empty ticker whose prior session traded at least
   `LIQUID_PRIOR_VOLUME` (1,000,000) shares (`rescue_targets` in `scripts/robinhood_payload.py`); see the rescue list
   above. Quiet, freshness and coverage checks are unchanged.
+
+## 2026-11-02: the worker prompt named a `span` the tool does not have
+
+Every slot refused on 2026-11-02. The Robinhood MCP `get_equity_historicals` schema is `additionalProperties: false`
+with `symbols` and `start_time` required and only `interval`, `end_time`, `bounds` and `adjustment_type` optional; there
+is no `span`. The prompt told the worker "span day" / "span week", so calls were rejected with
+`unexpected additional properties ["span"]` (15:30 chunk logs) or the worker retried without it and pulled a full-day,
+auto-interval series that blew its output limit ("exceeds the available response limit", 12:30). `build_prompt` now
+passes explicit RFC3339 UTC `start_time`/`end_time` for the slot window and a 7-day `start_time` for the previous daily
+bar. Launchd was not late: the 15:30 build started at 15:31:04 ET (the chunk logs stamp UTC) and `caffeinate`
+assertions held the Mac awake all day. The 13:30 refusal stamped 20:23 ET is a later manual replay, so its "quote too
+long after the decision" reasons are an artifact of that replay. What was actually late is build duration: the 14:30
+build took 1583 s (rescue waves, single chunks of 54-76 s) against the ~25-minute slot window, consistent with workers
+pulling oversized series after the `span` rejection.

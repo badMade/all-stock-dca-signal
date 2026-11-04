@@ -195,7 +195,9 @@ fail-closed publisher, never by hand:
 
 ```
 config/per_ticker_sizing.json      <- scripts/generate_per_ticker_sizing.py (stdlib, in-repo)
-config/ml_sizing_adjustment.json   <- ml-forecaster/publish.py (sibling subproject)
+config/ml_sizing_adjustment.json   <- nothing by default (inactive; the live factor is 1.0). ml-forecaster and
+                                       octopus record to sizing_suggestion_history instead, see
+                                       docs/sizing_suggestion_history.md
         |                                 read by dca_config.load_ml_sizing_adjustment
         |                                 -> StrategyConfig.ml_sizing_adjustment
         v                                 -> near_close_dca.graded_buy_multiplier (bounded)
@@ -228,8 +230,8 @@ Each is excluded from the core stdlib-only ruff and coverage gates. Run and lint
 
 | Subproject | Predicts | Output | Reaches live sizing? |
 |---|---|---|---|
-| `ml-forecaster/` | Pooled ridge regression over no-lookahead daily features -> forward 5-day return on dip days -> bounded per-ticker multiplier adjustment | `config/ml_sizing_adjustment.json`, only through `publish.py`'s fail-closed quality gate | **yes, bounded** (default +-20%, schema cap +-50%) |
-| `wondrous-octopus/` | Next-day OHLC per ticker (point estimate + p10/p50/p90) via a causal Transformer per ticker plus a Perceiver-style cross-ticker market encoder, walk-forward with online updates | Run ledgers, `report.json`, `inspect_run.py` views | **no**, research artifacts only |
+| `ml-forecaster/` | Pooled ridge regression over no-lookahead daily features -> forward 5-day return on dip days -> bounded per-ticker multiplier adjustment | its own shadow incumbent file + the append-only suggestion history (`docs/sizing_suggestion_history.md`); `publish.py`'s fail-closed quality gate still applies | **no by default** (the live file stays `inactive` until a human promotes a suggester; bound if promoted: default +-20%, schema cap +-50%) |
+| `wondrous-octopus/` | Next-day OHLC per ticker (point estimate + p10/p50/p90) via a causal Transformer per ticker plus a Perceiver-style cross-ticker market encoder, walk-forward with online updates | Run ledgers, `report.json`, `inspect_run.py` views; Tier C suggestions appended to the suggestion history by `scripts/publish_octopus_sizing.py` | **no**, research artifacts and recorded suggestions only |
 | `ticker-advisor/` | Scores *candidate* tickers on strategy health, backtest, and sentiment | Ranked report + a **proposed** diff for `config/tickers.json` and friends; edits nothing itself | no, universe proposals for manual review |
 | `dca-sizing-signals/` | `connector_signals/` produces a `SizingSuggestion` from connector market data; `market_data_ingest/` is the **only** place in the repo allowed to make network calls | Versioned point-in-time local files; an immutable `SizingSuggestion` | no (a boundary test fails if it imports `near_close_dca`, `ml_forecaster`, or `wondrous_octopus`) |
 | `ticker-market-breadth/` | Nothing. Fetches `^TICK` NYSE breadth history | `<history_dir>/_breadth/TICK.csv` | **no, data only**, read by nothing |

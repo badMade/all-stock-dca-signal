@@ -68,11 +68,44 @@ def test_add_rejects_a_status_outside_the_state_record_set(capsys):
 
 
 def test_status_set_matches_the_procedure_state_record_statuses():
-    # One vocabulary: the ledger groups by exactly the statuses STEP 8 of the served procedure can record.
+    # One vocabulary: the ledger groups by exactly the statuses STEP 8 of the served procedure can record, plus
+    # stood_down_signal, which has no state record by design (STEP A of the short signal-first prompt ends the fire
+    # before STEP 8 runs).
     from scripts import backup_procedure
 
     for status in ledger.STATUSES:
+        if status == "stood_down_signal":
+            continue
         assert status in backup_procedure.PROCEDURE_TEMPLATE
+
+
+def test_signal_stand_down_is_a_ledger_status_but_not_a_state_record_status():
+    # 2026-11-03: the short Perplexity prompt's STEP A reads slot_status.json and ends the fire on a succeeded slot or
+    # a closed market. That fire writes no state record, so the operator used to log it with no --status and it
+    # vanished into "unrecorded". If the procedure ever records it in STEP 8, the exemption above should go.
+    from scripts import backup_procedure
+
+    assert "stood_down_signal" in ledger.STATUSES
+    assert "stood_down_signal" not in backup_procedure.PROCEDURE_TEMPLATE
+
+
+def test_add_accepts_the_signal_stand_down_status(capsys):
+    code, out = _run(capsys, "add", "--day", "2026-11-03", "--task", "4412c3c4", "--credits", "10",
+                     "--status", "stood_down_signal")
+    assert code == 0 and out["ok"] is True
+    assert out["row"]["status"] == "stood_down_signal"
+
+
+def test_report_lists_signal_stand_downs_apart_from_unrecorded(capsys):
+    _run(capsys, "add", "--day", "2026-11-03", "--task", "4412c3c4", "--credits", "10", "--status", "stood_down_signal")
+    _run(capsys, "add", "--day", "2026-11-03", "--task", "f83b8d62", "--credits", "14", "--status", "stood_down_signal")
+    _run(capsys, "add", "--day", "2026-11-03", "--task", "4412c3c4", "--credits", "30")
+    code, out = _run(capsys, "report")
+    assert code == 0
+    assert out["by_status"] == {
+        "stood_down_signal": {"fires": 2, "mean_credits": 12.0},
+        "unrecorded": {"fires": 1, "mean_credits": 30.0},
+    }
 
 
 def test_report_on_an_empty_ledger_is_ok_and_empty(capsys):
