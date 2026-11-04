@@ -4829,6 +4829,15 @@ PrevCloseFn = Callable[..., Any]                # generic finance previous close
 QuoteFn = Callable[..., Any]                    # generic finance quote -> price or mapping
 
 
+# Relative gap between a quote's official prior close and its adjusted_previous_close
+# at or above which the two are treated as being on different share bases. Quarterly
+# cash dividends move the adjusted close by well under 5%; a 5-for-4 split moves it by
+# exactly 20% and a 10% stock dividend by about 9.1%, so 5% catches every common split
+# and stock dividend. A false trip (a large special dividend) just uses the adjusted
+# close, which is also on today's basis. See RobinhoodDataProvider._previous_close_from_quote.
+_SPLIT_BASIS_MISMATCH_FRACTION = 0.05
+
+
 class RobinhoodDataProvider:
     """``MarketDataProvider`` backed by the Robinhood ``get_equity_historicals`` /
     ``get_equity_quotes`` MCP tools via injected callables.
@@ -5150,6 +5159,18 @@ class RobinhoodDataProvider:
         price = _to_float(official.get("price")) or _to_float(quote.get("previous_close"))
         if price <= 0:
             return None
+        # On a split's ex-date the official close is still the raw pre-split print
+        # while today's trades are post-split, so an 8-for-1 split (SNDK, announced
+        # 2026-10-29) would read as an ~87.5% drop and pick the top multiplier tier in
+        # every slot. adjusted_previous_close comes from the same quote and is on
+        # today's share basis, so when the two differ by a split-sized gap it is the
+        # reference. Do NOT fall back to daily historicals here: this provider requests
+        # adjustment_type="none" by default, which returns the raw pre-split close again
+        # (independent review of PR #2098). A missing or zero adjusted close keeps the
+        # official close, which is the behavior before this change.
+        adjusted = _to_float(quote.get("adjusted_previous_close"))
+        if adjusted > 0 and abs(price - adjusted) / max(price, adjusted) >= _SPLIT_BASIS_MISMATCH_FRACTION:
+            price = adjusted
         close_date_str = official.get("date") or quote.get("previous_close_date")
         close_date = _parse_iso_date(close_date_str) or (as_of.astimezone(EASTERN).date() - timedelta(days=1))
         # Stamp the prior-session close bar at the 4pm ET regular-session close.

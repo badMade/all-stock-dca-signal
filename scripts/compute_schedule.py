@@ -22,7 +22,8 @@ from collections.abc import Sequence
 from typing import Callable, Optional, Tuple
 
 
-def run_cmd(cmd: Sequence[str]):
+def run_cmd(cmd: Sequence[str]) -> Optional[str]:
+    """Executes a command and returns its standard output."""
     if isinstance(cmd, str):
         raise TypeError("run_cmd requires an argument sequence, not a shell-style string command")
 

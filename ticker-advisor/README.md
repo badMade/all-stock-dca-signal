@@ -116,6 +116,31 @@ a single-candidate run, only the composite/classification are affected.
   UPDATE" changelog entries.
 - Does not discover candidates on its own (no S&P 500 / sector-ETF scan). You supply the list.
 
+## Research-only: dynamic 100-ticker universe selection (`universe.py`)
+
+`universe.py` is a pure-stdlib engine that turns a scored candidate pool into a *proposed*
+quarterly membership change. It is research-only: no network calls, no broker calls, no file
+I/O except the explicit `write_proposal(path, proposal)` helper, and it **never edits
+`config/tickers.json`**, `near_close_dca.ACTIVE_TICKERS`, or `config/scheduled_tasks.json`.
+Nothing in the repo imports it, and it is not wired into live sizing or any scheduled task.
+
+| Step | Function | Rule (spec default, NOT operator-approved) |
+| --- | --- | --- |
+| Pool | `filter_pool` | NMS-listed common stock, price > $5, cap > $2B, 60d median $vol > $20M, fractional-eligible, >= 252 sessions; every failing reason recorded |
+| Hard fails | `detect_hard_fails` | delisted, fractional-ineligible, price < $5 for 20 sessions, pending acquisition |
+| Scoring | `sector_zscores`, `winsorize`, `composite_scores` | momentum (6m/12m), gross profitability, low volatility, value; z-scored within sector, winsorized at +/-3, equal 0.25 weights; missing >= 2 factors = unscored |
+| Selection | `select_universe` | enter in the top 75 at this AND the prior review; stay while in the top 150; 25/sector, 10/industry caps; max 100; 2-quarter tenure before a rank-based exit; max 8 rank-based swaps (hard-fail exits excluded); bench = ranks 101-250 |
+| Safeguards | `validate_proposal`, `apply_safeguards` | reject the whole proposal and keep the last approved list on: pool coverage < 95% of prior, > 8 swaps, active < 90 or > 100, quotes > 3 sessions old, EDGAR > 7 days old, any factor > 10% missing, or absent evidence of any of these |
+| Output | `proposal_to_dict`, `write_proposal` | `universe_proposal.json` with `review_id`, `as_of_date`, `generated_at`, per-ticker reasons, safeguard results, and a `content_sha256` that excludes `generated_at` |
+
+Every threshold is a `UniverseConfig` / `PoolThresholds` field defaulting to the spec value. One
+ticker with missing data is **held**, never demoted; an incumbent that genuinely fails a pool floor
+(pass `ineligible=ineligible_tickers(pool)`) exits, using the swap budget. Hard-failed names are
+removed before ranking, and stay removed even when a proposal is rejected. Ties break by ticker symbol, so output is
+deterministic. A passing proposal is `pending_approval`, not approved; operator approval and any
+executor wiring (reading an approved list instead of `config/tickers.json`) need their own ADR.
+Tests: `python -m pytest tests/test_universe.py -q` (synthetic, hand-computed inputs only).
+
 See `docs/ticker_advisory.md` for how this fits into the existing manual ticker-add workflow, and
 its closing section on the (not-yet-built) idea of eventually letting a composite score influence
 sizing, not just universe membership.

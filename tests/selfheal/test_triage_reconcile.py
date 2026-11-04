@@ -153,6 +153,40 @@ def test_commit_url_comes_from_the_matching_commit() -> None:
     assert ev.commit_url == f"{REPO_URL}/commit/{'a' * 40}"
 
 
+def test_non_shallow_result_matches_pre_change_golden() -> None:
+    """The new default field leaves the existing non-shallow result unchanged."""
+    expected = tr.GitEvidence(
+        branch=f"selfheal/{KEY}",
+        pr=tr.PullRequestRef(101, f"{REPO_URL}/pull/101", "open", False, "pending"),
+        commit_url=f"{REPO_URL}/commit/{'a' * 40}",
+        issue=tr.IssueRef(7, f"{REPO_URL}/issues/7", "open"),
+    )
+    assert _match(
+        branches=[f"selfheal/{KEY}"], prs=[_pr()], commits=[_commit("a", f"Fix {KEY}")], issues=[_issue()]
+    ) == expected
+
+
+def test_recorded_commit_unavailable_in_shallow_clone_is_unverifiable() -> None:
+    sha = "a" * 40
+    ev = _match(recorded_commit_url=f"{REPO_URL}/commit/{sha}", shallow=True, commit_present={sha: False})
+    assert ev.commit_url is None
+    assert ev.commit_status == "unverifiable_shallow"
+
+
+def test_absent_commit_in_non_shallow_clone_has_no_status_or_error() -> None:
+    sha = "a" * 40
+    ev = _match(recorded_commit_url=f"{REPO_URL}/commit/{sha}", shallow=False, commit_present={sha: False})
+    assert ev.commit_url is None
+    assert ev.commit_status is None
+
+
+@pytest.mark.parametrize("kwargs", [{"shallow": 1}, {"commit_present": {"bad": False}},
+                                     {"commit_present": {"a" * 40: 0}}])
+def test_shallow_metadata_is_validated(kwargs: dict[str, object]) -> None:
+    with pytest.raises(tr.EvidenceError):
+        _match(**kwargs)
+
+
 def _commit(char: str, message: str) -> dict[str, object]:
     return {"sha": char * 40, "url": f"{REPO_URL}/commit/{char * 40}", "message": message}
 
@@ -331,9 +365,57 @@ def test_result_is_immutable() -> None:
 # --- Purity guard ------------------------------------------------------------
 
 
+def test_blind_run_reason_accepts_readable_fallback_root_when_env_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
+    assert tr.blind_run_reason("/checkout/cron_tracking", True, ["scheduled_runs"]) is None
+
+
+def test_blind_run_reason_flags_missing_root() -> None:
+    reason = tr.blind_run_reason("/missing/cron_tracking", False, [])
+    assert reason is not None and "not an existing directory" in reason
+
+
+def test_blind_run_reason_flags_empty_root() -> None:
+    reason = tr.blind_run_reason("/checkout/cron_tracking", True, [])
+    assert reason is not None and "no stream subdirectory" in reason
+
+
 def test_module_does_no_io_and_holds_no_notion_identifiers() -> None:
     import inspect
 
     source = inspect.getsource(tr)
     for banned in ("import requests", "import urllib", "import http", "import socket", "collection://", "app.notion.com"):
         assert banned not in source, banned
+
+
+def test_audit_flags_approved_repaired_row_without_fix_evidence() -> None:
+    row = {"Key": KEY, "Approval": "Approved", "Fix state": "Repaired"}
+    assert tr.audit_unsupported_fixes([row], {KEY: _match()}) == {
+        "unsupported_approved_fix": [KEY],
+        "brief_acceptance_not_demonstrated": [],
+        "recorded_pr_not_found": [],
+    }
+
+
+def test_audit_flags_monitoring_row_with_brief_acceptance_note() -> None:
+    key = "false_all_clear"
+    row = {
+        "Key": key,
+        "Status": "Monitoring",
+        "Progress": "brief acceptance not demonstrated",
+        "Proposed plan": "",
+    }
+    assert tr.audit_unsupported_fixes([row], {key: _match()})["brief_acceptance_not_demonstrated"] == [key]
+
+
+def test_audit_flags_recorded_pr_missing_from_matching_evidence() -> None:
+    row = {"Key": KEY, "PR number": 101}
+    assert tr.audit_unsupported_fixes([row], {KEY: _match()})["recorded_pr_not_found"] == [KEY]
+
+
+def test_audit_empty_inputs_return_empty_sorted_categories() -> None:
+    assert tr.audit_unsupported_fixes([], {}) == {
+        "unsupported_approved_fix": [],
+        "brief_acceptance_not_demonstrated": [],
+        "recorded_pr_not_found": [],
+    }
