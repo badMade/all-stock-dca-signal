@@ -200,6 +200,20 @@ def _one_time(task: dict[str, Any]) -> datetime | None:
     except ValueError:
         pass
 
+    if len(raw) == 22 and raw.endswith(" ET") and raw[10] == " " and raw[16] == " " and raw[19] == " ":
+        try:
+            h, m = int(raw[11:13]), int(raw[14:16])
+            ampm = raw[17:19]
+            if 1 <= h <= 12 and ampm in ("AM", "PM"):
+                if ampm == "PM" and h != 12:
+                    h += 12
+                elif ampm == "AM" and h == 12:
+                    h = 0
+                iso_str = f"{raw[:10]}T{h:02d}:{m:02d}:00"
+                return datetime.fromisoformat(iso_str).replace(tzinfo=ET)
+        except ValueError:
+            pass
+
     for pattern in ("%Y-%m-%d %I:%M %p ET", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(raw, pattern).replace(tzinfo=ET)

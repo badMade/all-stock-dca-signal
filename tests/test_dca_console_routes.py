@@ -222,3 +222,21 @@ def test_this_module_never_runs_the_real_architecture_scan():
     from dca_console_diagnostics import SCAN_CACHE
 
     assert not inspect.ismethod(SCAN_CACHE.get), "SCAN_CACHE.get is the real method: stub it for this module"
+
+def test_route_config_ladder_point_handles_malformed_drops(app):
+    from unittest.mock import MagicMock
+
+    from dca_console_routes import _route_config_ladder_point
+    request = MagicMock()
+    request.url.query = "drop=10**1000&ticker=AAPL"
+    import pytest
+    with pytest.raises(ValueError, match="drop must be a percentage between 0 and 50"):
+        _route_config_ladder_point(app, request)
+
+    request.url.query = "drop=xyz&ticker=AAPL"
+    with pytest.raises(ValueError, match="drop must be a percentage between 0 and 50"):
+        _route_config_ladder_point(app, request)
+
+    request.url.query = "drop=" + ("1" + "0" * 400) + "&ticker=AAPL"
+    with pytest.raises(ValueError, match="drop must be a percentage between 0 and 50"):
+        _route_config_ladder_point(app, request)
