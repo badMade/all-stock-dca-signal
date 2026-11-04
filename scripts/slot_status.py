@@ -28,6 +28,7 @@ Publishing is best-effort: ``update`` never raises, so a push failure never fail
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -198,6 +199,60 @@ def update(day: str, slot: str, status: str, *, now: datetime | None = None, pub
     return {"recorded": True, "published": ok, "detail": detail}
 
 
+# publish (2026-11-04): the live runs record through finalize_run_evidence inside a Cowork bridge VM that mounts the
+# checkout but has no GitHub credentials, so their own pushes fail (2026-11-03: seven slots recorded, none reached the
+# public branch). The Mac's launchd agent (deploy/launchd/com.all-stock-dca.slot-status-publish.plist.template) runs
+# ``publish`` with the Mac's credentials. It pushes the document exactly as recorded and remembers the hash of the
+# last one it pushed, so its fallback timer does not add a commit every few minutes.
+_PUBLISHED_HASH = "last_published.sha256"
+
+
+def _published_hash_path() -> Path:
+    return state_dir() / _PUBLISHED_HASH
+
+
+def _local_document() -> tuple[dict[str, Any], str] | None:
+    """The recorded document and its hash, or None when it is missing or not a valid slot-status document."""
+    try:
+        text = state_path().read_text(encoding="utf-8")
+        document = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(document, dict) or document.get("schema") != SCHEMA
+            or not isinstance(document.get("slots"), dict) or document.get("market") not in MARKETS):
+        return None
+    try:
+        _check_day(str(document.get("trading_day")))
+    except ValueError:
+        return None
+    return document, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def publish_local(publisher: Any) -> tuple[int, dict[str, Any]]:
+    """Push the recorded document unchanged; (exit code, report). Never raises, never rewrites the document."""
+    loaded = _local_document()
+    if loaded is None:
+        return 2, {"ok": False, "error": "no_local_document"}
+    document, digest = loaded
+    report = {"ok": True, "trading_day": document["trading_day"]}
+    try:
+        already = _published_hash_path().read_text(encoding="utf-8").strip() == digest
+    except OSError:
+        already = False
+    if already:
+        return 0, {**report, "published": False, "detail": "unchanged"}
+    if publisher is None:
+        return 1, {**report, "published": False, "detail": "publishing disabled"}
+    ok, detail = _publish(document, publisher)
+    if not ok:
+        return 1, {**report, "published": False, "detail": detail}  # not remembered: the next run retries
+    try:
+        atomic_write_text(_published_hash_path(), digest + "\n")
+    except OSError:
+        pass  # only costs a repeat push on the next run
+    return 0, {**report, "published": True, "detail": detail}
+
+
 def load_settings(config_dir: Path | None = None) -> dict[str, Any]:
     path = (config_dir or dca_config.get_config_dir()) / "slot_status.json"
     return json.loads(path.read_text(encoding="utf-8"))
@@ -233,7 +288,13 @@ def main(argv: list[str] | None = None) -> int:
     market.add_argument("--trading-day", help="YYYY-MM-DD; default today in ET")
     market.add_argument("--now", help="offset-aware ISO time; for tests")
     sub.add_parser("show", help="Print the local document.")
+    sub.add_parser("publish", help="Push the local document unchanged (the Mac's launchd agent runs this).")
     args = parser.parse_args(argv)
+
+    if args.command == "publish":
+        code, report = publish_local(_configured_publisher())
+        print(json.dumps(report, sort_keys=True))
+        return code
 
     if args.command == "show":
         try:

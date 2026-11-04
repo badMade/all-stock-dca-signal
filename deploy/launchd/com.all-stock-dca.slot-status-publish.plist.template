@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.slot-status-publish</string>
+  <!-- Pushes the public slot-status signal from the Mac (scripts/slot_status.py publish, 2026-11-04). The live runs
+       record each slot's status through finalize_run_evidence inside a Cowork bridge VM that has no GitHub
+       credentials, so their own pushes fail (2026-11-03: seven slots recorded, none published). This agent pushes
+       the recorded document unchanged, with this Mac's git credentials, to the remote named in
+       config/slot_status.json ("signal"). An unchanged document is skipped, so the timer adds no commits. Started
+       through the checkout's venv Python, like the other agents, because macOS privacy protection (TCC) grants
+       ~/Documents access per binary. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.slot_status</string>
+    <string>publish</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Must be the tree the live runs write to, or the agent publishes a stale document. -->
+    <key>DCA_CRON_TRACKING_ROOT</key><string>REPLACE_WITH_CRON_TRACKING_ROOT</string>
+    <!-- No terminal under launchd: a missing credential must fail the push, never wait on a prompt. -->
+    <key>GIT_TERMINAL_PROMPT</key><string>0</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- The folder, not the file: the document is replaced atomically (a rename), which a file watch can miss. -->
+  <key>WatchPaths</key>
+  <array>
+    <string>REPLACE_WITH_CRON_TRACKING_ROOT/slot_status</string>
+  </array>
+  <!-- Fallback every 120 seconds, in case a change event is missed or a push failed; an unchanged document exits
+       at once without a push. -->
+  <key>StartInterval</key><integer>120</integer>
+  <key>StandardOutPath</key><string>/tmp/dca-slot-status-publish.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-slot-status-publish.log</string>
+</dict>
+</plist>
