@@ -37,6 +37,10 @@ STEP 3: Read Notion
 - Query all DCA Issues rows. For each row you need Key, Name, Class, Severity, Status, Fix state, Approval, and the tracking columns GitHub issue, Branch, Commit URL, PR number, Progress, Proposed plan, plus each page's last_edited_time (HARD RULE 6). If the query does not return last_edited_time, fetch the page itself before writing to it; if you still cannot read it, do not write that row and list it under "Skipped items".
 
 STEP 4: Reconcile
+- Where you have a shell on a checkout with `gh` logged in (the local Mac task), do STEPs 2, 4 and 6 with ONE command instead of by hand (2026-11-04: hand conversion stalled the run at PARTIAL). Write the STEP 3 rows to a JSON array file in a temp dir (never in the checkout), keyed by the Notion property names (Key, Approval, Status, Progress, Proposed plan, GitHub issue, Branch, Commit URL, PR number), then run `python -m scripts.triage_reconcile_batch --rows <file> --collect --work-dir <tempdir> --candidate <key> ...` (one --candidate per STEP 1 Key). It fetches read-only with gh/git, converts gh's OPEN/CLOSED/MERGED states, fetches recorded PRs beyond the list window and file lists for docs_only, and runs tr for every Key. Write exactly each decision's `updates` (after the HARD RULE 6 check), create the `create` Keys, list `skip` Keys with their `skip_reason`, and take STEP 6 from its `approved` list. Exit 1 prints {"error": ...}: quote it and fall back to the rules below.
+- A Progress cell that is not empty and not one of tr.PROGRESS_LABELS is an operator note: do not overwrite it (tr.is_progress_label is False; the batch reports `progress_note_kept`). Report the derived label beside it in the digest. That is a completed decision, not undone work.
+- Never lower a Progress that starts with "Merged" to "No work" (the batch reports `progress_regression_blocked`); list the Key for the operator instead.
+- When converting gh records yourself, use tr.gh_pr_record and tr.gh_issue_record; never pass gh's upper-case state through.
 - Do not skim or sample. Run tr.match_git_evidence for EVERY Key, and fetch each matched PR directly for its real merged state and check status. If you could not do that for a Key, list the Key under "Skipped items" and leave its row untouched; never report an unchecked Key as unchanged.
 - For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=..., recorded_pr_number=<the row's PR number as an int, or None>, recorded_commit_url=<the row's Commit URL, or None>); progress = tr.derive_progress(evidence). Always pass the row's recorded values: they keep a real fix that cites its Key only in the body from being lowered or displaced.
 - If evidence.recorded_pr_unconfirmed is True, the row's recorded PR was neither matched nor found citing the Key. Do not write that row; list it under "Skipped items" with the recorded PR number so the operator can confirm or correct it.
@@ -59,7 +63,7 @@ STEP 6: Approved rows
 - keys = tr.approved_keys(rows). List them in the digest with their Progress. Do nothing else with them.
 
 STEP 7: Digest (your final message, plain markdown, under 60 lines)
-- Header: date, LOGS UNAVAILABLE flag if set, counts (rows read, created, updated, skipped).
+- Header: date, COMPLETE or PARTIAL, LOGS UNAVAILABLE flag if set, counts (rows read, created, updated, skipped, notes kept). COMPLETE means STEPs 1-6 ran for every Key and STEP 5b emitted a brief for every qualifying row; rows skipped by rule (notes kept, recorded PR unconfirmed, recently edited) do not make a run PARTIAL. PARTIAL must name the step and the error or limit that stopped it.
 - Table of rows awaiting approval: Key, Severity, Progress, one-line plan summary, Notion row link.
 - Progress changes since last run.
 - Approved rows and their Progress.

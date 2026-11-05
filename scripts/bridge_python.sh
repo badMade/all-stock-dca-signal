@@ -16,6 +16,20 @@
 # Usage, at the start of every device_bash call (each call is a fresh shell):
 #     cd $HOME/mnt/all-stock-dca && export PYTHONDONTWRITEBYTECODE=1 && PY=$(sh scripts/bridge_python.sh)
 #
+# Disk reclaim (2026-11-04), for the prompts' BRIDGE DISK PREFLIGHT when /tmp is under 1 GiB free:
+#     sh scripts/bridge_python.sh --reclaim
+# On 2026-11-04 the 9:35, 2:30 and 3:30 slots aborted at Gate 2 with 68 MiB free on /tmp even after the
+# preflight's `env -u UV_CACHE_DIR uv cache clean; rm -rf "$HOME/.cache/uv"`. That cleanup only clears uv's
+# DEFAULT cache, which this script never uses: every install writes its download cache and temp files under
+# $BASE/uv-<uid>/{cache,tmp}, and every fallback is another whole $BASE/uv-<uid>-XXXXXX dir with its own
+# Python (~90 MiB) and cache, so failed or repeated runs pile up where nothing ever cleans. --reclaim:
+#   * empties cache/ and tmp/ in every dir of THIS uid (pinned and fallbacks), after `uv cache clean`;
+#   * keeps the one Python 3.11 install the next call will reuse (the pinned dir's if it has one, else the
+#     first fallback that has one) and deletes every other fallback dir of this uid;
+#   * clears uv's default cache too (the old preflight step), and never touches another uid's dirs or
+#     anything outside $BASE and $HOME/.cache/uv -- never the mounted repo folder.
+# It prints `BRIDGE_RECLAIM:` lines (df before/after, each dir removed) on stderr, nothing on stdout, exit 0.
+#
 # stdout: exactly one line, the absolute interpreter path, and only on success.
 # stderr: `BRIDGE_PYTHON: ...` notes (e.g. which fallback dir was used) and, on failure, one
 #         `BRIDGE_PYTHON_ERROR: <reason>` line plus `UV_INSTALL_ERROR: ...` lines (the last lines of
@@ -97,6 +111,39 @@ find_or_install() {
         PY=$(uv python find 3.11 2>/dev/null)
     fi
 }
+
+free_line() { df -Pk "$BASE" 2>/dev/null | awk 'NR>1 {printf "%s %d MiB free\n", $6, $4/1024}'; }
+
+# 0 when the install dir $1 holds a Python 3.11 uv can find. Subshell, so the caller's UV_* stay as they were.
+has_311() ( UV_PYTHON_INSTALL_DIR="$1" uv python find 3.11 >/dev/null 2>&1 )
+
+reclaim() {
+    printf 'BRIDGE_RECLAIM: before: %s\n' "$(free_line)" >&2
+    keep=
+    for dir in "$BASE/uv-$UID_NOW" "$BASE/uv-$UID_NOW"-*; do
+        [ -d "$dir" ] || continue
+        [ "$(owner_of "$dir")" = "$UID_NOW" ] || continue
+        if [ -d "$dir/cache" ]; then
+            UV_CACHE_DIR="$dir/cache" uv cache clean >/dev/null 2>&1
+            rm -rf "$dir/cache" && mkdir -p "$dir/cache" && chmod 700 "$dir/cache"
+        fi
+        [ -d "$dir/tmp" ] && rm -rf "$dir/tmp" && mkdir -p "$dir/tmp" && chmod 700 "$dir/tmp"
+        [ -z "$keep" ] && command -v uv >/dev/null 2>&1 && has_311 "$dir/python" && keep=$dir
+    done
+    for dir in "$BASE/uv-$UID_NOW"-*; do
+        [ -d "$dir" ] || continue
+        [ "$dir" = "$keep" ] && continue
+        [ "$(owner_of "$dir")" = "$UID_NOW" ] || continue
+        rm -rf "$dir" && printf 'BRIDGE_RECLAIM: removed %s\n' "$dir" >&2
+    done
+    env -u UV_CACHE_DIR uv cache clean >/dev/null 2>&1
+    rm -rf "$HOME/.cache/uv"
+    [ -n "$keep" ] && printf 'BRIDGE_RECLAIM: kept the Python 3.11 install in %s\n' "$keep" >&2
+    printf 'BRIDGE_RECLAIM: after: %s\n' "$(free_line)" >&2
+    exit 0
+}
+
+[ "${1-}" = "--reclaim" ] && reclaim
 
 command -v uv >/dev/null 2>&1 || fail 3 "uv is not on PATH in the bridge shell"
 
