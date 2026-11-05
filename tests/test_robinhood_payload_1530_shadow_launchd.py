@@ -101,4 +101,26 @@ def test_shadow_agent_runs_enough_workers_to_publish_by_about_15_35():
     chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
     waves = -(-chunks // parallel)
     assert waves * 65 <= 270, (chunks, parallel, waves)  # ~65 s per wave observed; about 4.5 minutes from 15:31
-    assert "DCA_CODEX_PARALLEL" not in _load(LIVE)["EnvironmentVariables"]  # the six live slots keep their default
+
+
+def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minutes():
+    # 2026-11-04 operator request ("make the 9:35 go faster"): the six live builds still ran the launcher's default
+    # 3 workers, so 23 chunks took 8 waves; the last twelve 09:36-14:31 builds in /tmp/dca-robinhood-payload.log took
+    # 263-588 s, the newest 507-588 s, and the 9:35 run waited about 9 minutes for its data. The 3:30 shadow build
+    # already runs 6 (test above). Same plan, same ~65 s per wave, so the live job gets the same budget: about 4 waves.
+    env = _load(LIVE)["EnvironmentVariables"]
+    parallel = int(env["DCA_CODEX_PARALLEL"])
+    import dca_config
+
+    config = dca_config.load_strategy_config(dca_config.get_config_dir())
+    universe = [t for t in config.tickers if t not in config.excluded_tickers]
+    chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
+    waves = -(-chunks // parallel)
+    assert waves * 65 <= 270, (chunks, parallel, waves)
+    # And the 600 s build deadline still leaves room for one full retry wave on top of a normal build.
+    assert waves * 65 + 65 <= int(env["DCA_BUILD_DEADLINE_SECONDS"]), (waves, env["DCA_BUILD_DEADLINE_SECONDS"])
+
+
+def test_live_and_shadow_agents_use_the_same_worker_count():
+    # One number to tune: a later change to one job must not silently leave the other behind.
+    assert _load(LIVE)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"] == _load(SHADOW)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"]
