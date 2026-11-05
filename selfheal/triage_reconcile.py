@@ -34,6 +34,7 @@ __all__ = [
     "CHECKS_RED",
     "PROGRESS_BRANCH_ONLY",
     "PROGRESS_CLOSED_UNMERGED",
+    "PROGRESS_LABELS",
     "PROGRESS_MERGED_DOCS_ONLY",
     "PROGRESS_MERGED_GREEN",
     "PROGRESS_MERGED_PENDING",
@@ -49,6 +50,9 @@ __all__ = [
     "audit_unsupported_fixes",
     "blind_run_reason",
     "derive_progress",
+    "gh_issue_record",
+    "gh_pr_record",
+    "is_progress_label",
     "match_git_evidence",
 ]
 
@@ -76,6 +80,30 @@ PROGRESS_MERGED_RED = "Merged, checks red"
 # A merged PR whose diff touched only documentation drafted a fix; it did not apply one.
 PROGRESS_MERGED_DOCS_ONLY = "Merged, docs only"
 PROGRESS_CLOSED_UNMERGED = "Closed, not merged"
+
+#: Every label :func:`derive_progress` can return. A Progress cell holding anything else carries an
+#: operator-written note (the 2026-11-04 digest found "Applied to digest routine..." style notes on most
+#: Approved rows); the routine must not overwrite it, see :func:`is_progress_label`.
+PROGRESS_LABELS = frozenset(
+    {
+        PROGRESS_NO_WORK,
+        PROGRESS_BRANCH_ONLY,
+        PROGRESS_PR_OPEN,
+        PROGRESS_PR_CHECKS_RED,
+        PROGRESS_MERGED_GREEN,
+        PROGRESS_MERGED_PENDING,
+        PROGRESS_MERGED_RED,
+        PROGRESS_MERGED_DOCS_ONLY,
+        PROGRESS_CLOSED_UNMERGED,
+    }
+)
+
+# Documentation-only paths, the routine's STEP 2 rule (docs/, claude/, *.md, *.txt).
+_DOC_PREFIXES = ("docs/", "claude/")
+_DOC_SUFFIXES = (".md", ".txt")
+# statusCheckRollup conclusions/states that make a PR red. Anything not yet completed is pending.
+_RED_CONCLUSIONS = frozenset({"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"})
+_DONE_OK = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
 _NOT_CHANGED = re.compile(r"\bnot\s+changed\b", re.IGNORECASE)
 _SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -356,6 +384,106 @@ def match_git_evidence(
         recorded_pr_unconfirmed=pr is None and recorded_pr_number is not None,
         commit_status=commit_status,
     )
+
+
+def is_progress_label(value: object) -> bool:
+    """Whether a Progress cell may be overwritten: empty, or exactly one of :data:`PROGRESS_LABELS`.
+
+    Free text is an operator note. Overwriting it loses the note, so the routine leaves the cell alone and
+    reports the derived label instead (the 2026-11-04 run handled this by hand and then called STEP 4 undone).
+    """
+    if value is None:
+        return True
+    return isinstance(value, str) and (value.strip() == "" or value in PROGRESS_LABELS)
+
+
+def _gh_checks(rollup: object) -> str:
+    if rollup is None:
+        return CHECKS_PENDING
+    if not isinstance(rollup, list):
+        raise EvidenceError("statusCheckRollup must be a list")
+    if not rollup:
+        return CHECKS_PENDING
+    pending = False
+    for item in rollup:
+        check = _mapping(item, "status check")
+        # CheckRun rows carry status/conclusion; StatusContext rows carry state.
+        conclusion = check.get("conclusion") or check.get("state") or ""
+        conclusion = conclusion.upper() if isinstance(conclusion, str) else ""
+        if conclusion in _RED_CONCLUSIONS:
+            return CHECKS_RED
+        status = check.get("status")
+        completed = status is None or (isinstance(status, str) and status.upper() == "COMPLETED")
+        if not completed or conclusion not in _DONE_OK:
+            pending = True
+    return CHECKS_PENDING if pending else CHECKS_GREEN
+
+
+def gh_pr_record(raw: object) -> dict[str, object]:
+    """Convert one ``gh pr list/view --json`` object into the PR mapping :func:`match_git_evidence` takes.
+
+    ``gh`` reports ``state`` as ``OPEN``, ``CLOSED`` or ``MERGED``; the reconciler takes ``open``/``closed``
+    plus a separate ``merged`` flag, and refused the raw value on 2026-11-04 ("State must be open/closed").
+    ``merged`` comes from ``mergedAt``, which ``gh`` reports reliably. ``docs_only`` is set only when the
+    record carries ``files`` (``--json ...,files``), so a missing file list never claims docs-only.
+
+    Requires ``number``, ``url``, ``state``, ``headRefName``, ``title``, ``body``, ``mergedAt`` and
+    ``statusCheckRollup``.
+
+    Raises:
+        EvidenceError: A field is missing or has an unexpected value.
+    """
+    record = _mapping(raw, "gh pull request")
+    for field in ("number", "url", "state", "headRefName", "title", "mergedAt", "statusCheckRollup"):
+        if field not in record:
+            raise EvidenceError(f"gh pull request lacks {field!r}")
+    raw_state = record["state"]
+    if raw_state not in ("OPEN", "CLOSED", "MERGED"):
+        raise EvidenceError(f"gh pull request state {raw_state!r} is not OPEN, CLOSED or MERGED")
+    merged_at = record["mergedAt"]
+    merged = isinstance(merged_at, str) and merged_at != ""
+    if merged != (raw_state == "MERGED"):
+        raise EvidenceError(f"gh pull request state {raw_state!r} disagrees with mergedAt {merged_at!r}")
+    out: dict[str, object] = {
+        "number": record["number"],
+        "url": record["url"],
+        "state": "open" if raw_state == "OPEN" else "closed",
+        "merged": merged,
+        "checks": _gh_checks(record["statusCheckRollup"]),
+        "head_ref": record["headRefName"],
+        "title": record["title"],
+        "body": record.get("body") or "",
+    }
+    files = record.get("files")
+    if files is not None:
+        if not isinstance(files, list):
+            raise EvidenceError("gh pull request files must be a list")
+        paths = [_text(_mapping(item, "gh file"), "path", "gh file", required=True) for item in files]
+        out["docs_only"] = bool(paths) and all(
+            path.startswith(_DOC_PREFIXES) or path.endswith(_DOC_SUFFIXES) for path in paths
+        )
+    return out
+
+
+def gh_issue_record(raw: object) -> dict[str, object]:
+    """Convert one ``gh issue list --json number,url,state,title,body`` object (state ``OPEN``/``CLOSED``).
+
+    Raises:
+        EvidenceError: A field is missing or the state is not ``OPEN`` or ``CLOSED``.
+    """
+    record = _mapping(raw, "gh issue")
+    for field in ("number", "url", "state", "title"):
+        if field not in record:
+            raise EvidenceError(f"gh issue lacks {field!r}")
+    if record["state"] not in ("OPEN", "CLOSED"):
+        raise EvidenceError(f"gh issue state {record['state']!r} is not OPEN or CLOSED")
+    return {
+        "number": record["number"],
+        "url": record["url"],
+        "state": record["state"].lower(),
+        "title": record["title"],
+        "body": record.get("body") or "",
+    }
 
 
 def derive_progress(evidence: GitEvidence) -> str:

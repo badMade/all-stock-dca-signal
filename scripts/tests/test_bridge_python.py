@@ -94,8 +94,8 @@ class Env:
         path.write_text(body)
         path.chmod(0o755)
 
-    def run(self, shell: str = "sh", **extra: str) -> subprocess.CompletedProcess:
-        return subprocess.run([shell, str(SCRIPT)], env={**self.env, **extra},
+    def run(self, shell: str = "sh", *args: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run([shell, str(SCRIPT), *args], env={**self.env, **extra},
                               capture_output=True, text=True, timeout=30, check=False)
 
     def installs(self) -> list[str]:
@@ -249,6 +249,65 @@ def test_an_interpreter_older_than_3_11_exits_6(env, tmp_path):
     assert done.returncode == 6
     assert done.stdout == ""
     assert "is not Python 3.11 or newer" in done.stderr
+
+
+def _install(dir_: Path) -> None:
+    for sub in ("python", "cache", "tmp"):
+        (dir_ / sub).mkdir(parents=True, exist_ok=True)
+    (dir_ / "python" / "py311").symlink_to(sys.executable)
+    (dir_ / "cache" / "archive.tar").write_bytes(b"x" * 1024)
+    (dir_ / "tmp" / "partial").write_bytes(b"x")
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_reclaim_empties_caches_keeps_the_pinned_install_and_removes_fallbacks(env, shell):
+    # 2026-11-04: 68 MiB free on /tmp after the preflight's default-cache clean, which never touched these dirs.
+    _install(env.pinned)
+    stale = env.base / f"uv-{os.getuid()}-abc123"
+    _install(stale)
+    home_cache = Path(env.env["HOME"]) / ".cache" / "uv"
+    home_cache.mkdir(parents=True)
+    done = env.run(shell, "--reclaim")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == ""
+    assert (env.pinned / "python" / "py311").exists()
+    assert list((env.pinned / "cache").iterdir()) == []
+    assert list((env.pinned / "tmp").iterdir()) == []
+    assert not stale.exists()
+    assert not home_cache.exists()
+    assert "BRIDGE_RECLAIM: after:" in done.stderr
+    assert env.installs() == []
+
+
+def test_reclaim_keeps_the_one_fallback_holding_python_when_the_pinned_dir_has_none(env):
+    (env.pinned / "cache").mkdir(parents=True)
+    keep = env.base / f"uv-{os.getuid()}-aaa111"
+    _install(keep)
+    empty = env.base / f"uv-{os.getuid()}-bbb222"
+    (empty / "cache").mkdir(parents=True)
+    done = env.run("sh", "--reclaim")
+    assert done.returncode == 0, done.stderr
+    assert (keep / "python" / "py311").exists()
+    assert list((keep / "cache").iterdir()) == []
+    assert not empty.exists()
+    # The next ordinary call still resolves an interpreter.
+    assert env.run().returncode == 0
+
+
+def test_reclaim_never_touches_another_uids_dirs(env):
+    foreign = env.base / f"uv-{os.getuid()}-zzz999"
+    _install(foreign)
+    done = env.run("sh", "--reclaim", FAKE_FOREIGN=str(foreign))
+    assert done.returncode == 0, done.stderr
+    assert (foreign / "cache" / "archive.tar").exists()
+
+
+def test_reclaim_without_uv_still_frees_the_caches(tmp_path):
+    env = Env(tmp_path, with_uv=False)
+    _install(env.pinned)
+    done = env.run("sh", "--reclaim")
+    assert done.returncode == 0, done.stderr
+    assert list((env.pinned / "cache").iterdir()) == []
 
 
 def test_the_script_is_posix_sh_with_no_bashisms():
