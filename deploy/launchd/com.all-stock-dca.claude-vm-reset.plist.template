@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.claude-vm-reset</string>
+  <!-- Weekly fresh Cowork VM (deploy/launchd/claude_vm_reset.sh, 2026-11-04). Quits Claude, deletes the VM root
+       disk (rootfs.img, which survives app restarts and filled up on 2026-11-04), and reopens Claude so it builds a
+       new one. Saturday 03:00 only: no slot runs on a weekend. The script refuses weekdays, never deletes while
+       Claude is running, and never touches sessiondata.img. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>REPLACE_WITH_REPO_PATH/deploy/launchd/claude_vm_reset.sh</string>
+  </array>
+  <!-- launchd Weekday: 0 or 7 is Sunday, 6 is Saturday. If the Mac is asleep at 03:00, launchd runs it on wake. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>6</integer>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>/tmp/dca-claude-vm-reset.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-claude-vm-reset.log</string>
+</dict>
+</plist>
