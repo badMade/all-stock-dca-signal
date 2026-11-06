@@ -612,7 +612,7 @@ def read_history_any(path):
 
 
 def default_ml_root():
-    """ml-forecaster's history root: ``$DCA_CRON_TRACKING_ROOT`` or ``<repo>/cron_tracking``, then sizing_suggestions."""
+    """ml-forecaster's history root: ``$DCA_CRON_TRACKING_ROOT``/sizing_suggestions."""
     base = os.environ.get("DCA_CRON_TRACKING_ROOT") or str(Path(__file__).resolve().parents[2] / "cron_tracking")
     return Path(base) / "sizing_suggestions"
 
