@@ -121,6 +121,21 @@ def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minut
     assert waves * 65 + 65 <= int(env["DCA_BUILD_DEADLINE_SECONDS"]), (waves, env["DCA_BUILD_DEADLINE_SECONDS"])
 
 
+def test_the_worker_count_is_no_more_than_the_four_wave_budget_needs():
+    # 2026-11-06: the universe grew from 91 to 122 symbols (#2175/#2177), 31 four-ticker chunks: 6 workers took 6
+    # waves (~390 s), so both jobs move to the count that fits 4 waves. Never more than that: every extra worker is
+    # another concurrent Codex/Robinhood call (rate-limit risk) for no speed gain inside the same wave count. When the
+    # universe changes, this and the two budget tests above say which way to move the number.
+    import dca_config
+
+    config = dca_config.load_strategy_config(dca_config.get_config_dir())
+    universe = [t for t in config.tickers if t not in config.excluded_tickers]
+    chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
+    needed = -(-chunks // 4)  # the fewest workers that fit the plan in 4 waves
+    for template in (LIVE, SHADOW):
+        assert int(_load(template)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"]) <= needed, (template.name, needed)
+
+
 def test_live_and_shadow_agents_use_the_same_worker_count():
     # One number to tune: a later change to one job must not silently leave the other behind.
     assert _load(LIVE)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"] == _load(SHADOW)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"]
