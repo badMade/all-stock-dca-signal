@@ -31,7 +31,8 @@
          four-ticker chunks in 8 waves of about 65 s: the newest builds took 507-588 s and the 9:35 run waited about 9
          minutes for its data. 6 workers is 4 waves, about 4.5 minutes, the same as the 3:30 shadow job (the tests keep
          the two equal). Watch the `timing total` lines in /tmp/dca-robinhood-payload.log after the change. -->
-    <key>DCA_CODEX_PARALLEL</key><string>6</string>
+    <!-- 2026-11-06: 6 -> 8. The 122-symbol universe is 31 chunks; 6 workers is 6 waves (about 390 s), 8 is 4 waves (about 260 s). -->
+    <key>DCA_CODEX_PARALLEL</key><string>8</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- One minute after each Robinhood-primary slot's decision time (09:35 10:30 11:30 12:30 13:30 14:30),
