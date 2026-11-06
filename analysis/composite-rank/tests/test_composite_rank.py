@@ -202,3 +202,84 @@ def test_history_command_prints_compact_lines(tmp_path, capsys):
     top = capsys.readouterr().out.splitlines()
     assert top[0] == "2026-11-04 top 2 of 3" and top[1].startswith("#  1 B") and len(top) == 3
     assert cr.main(base + ["history", "--date", "2026-01-01"]) == 1
+
+
+# ---- tunable params, daily trade list, review-first proposal, effectiveness ----------------------
+def _scored(scores):
+    return {t: {"score": s, "rank": i} for i, (t, s) in enumerate(scores.items(), 1)}
+
+
+def test_params_load_validate_and_change_scores(tmp_path):
+    base = cr.load_params()
+    assert base["version"] and base["evaluate_threshold"] == 80.0 and base["held_threshold"] == 50.0
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"blend": {"base": 0.5, "lowvol": 0.2, "lowdd": 0.1}}))
+    with pytest.raises(ValueError):
+        cr.load_params(bad)
+    bad.write_text(json.dumps({"held_threshold": 90}))
+    with pytest.raises(ValueError):
+        cr.load_params(bad)
+    universe = {"UP": make_series(0.0015, wobble=0.0), "FLAT": make_series(0.0, wobble=0.0),
+                "DOWN": make_series(-0.0005, wobble=0.0)}
+    default, _ = cr.score_universe(universe, AS_OF)
+    custom = tmp_path / "p.json"
+    flat_weights = {"1y": 1, "1m": 1, "1w": 1, "3m": 1, "6m": 1, "5y": 1}
+    custom.write_text(json.dumps({"version": "x", "period_weights": flat_weights,
+                                  "blend": {"base": 1.0, "lowvol": 0.0, "lowdd": 0.0}}))
+    tuned, _ = cr.score_universe(universe, AS_OF, cr.load_params(custom))
+    assert default["UP"]["score"] != tuned["UP"]["score"]
+    assert default["UP"]["rank"] == tuned["UP"]["rank"] == 1
+
+
+def test_trade_list_is_eval_names_plus_held_above_floor():
+    params = cr.load_params()
+    recs = _scored({"A": 91.0, "B": 85.0, "C": 70.0, "D": 55.0, "E": 49.0, "F": 80.0})
+    trade = dict(cr.build_trade_list(recs, {"B", "D", "E"}, params))
+    assert trade == {"A": "above_eval", "B": "above_eval_held", "D": "held_above_floor"}
+    assert "C" not in trade and "E" not in trade and "F" not in trade  # 80.0 is not above 80
+
+
+def test_proposal_is_a_diff_and_never_touches_config(tmp_path):
+    params = cr.load_params()
+    config = {"active": ["A", "X"], "excluded": ["Q"], "whole_share": ["W"]}
+    trade = [("A", "above_eval"), ("B", "above_eval"), ("Q", "above_eval")]
+    proposal = cr.build_proposal(AS_OF, trade, config, params)
+    assert proposal["add"] == ["B"] and proposal["stop_buying"] == ["X"] and proposal["keep"] == ["A"]
+    assert proposal["skipped_excluded_or_whole_share"] == ["Q"]
+    assert "REVIEW FIRST" in cr.render_proposal_md(proposal)
+
+
+def test_run_writes_trade_list_history_and_proposal_and_stamps_version(tmp_path):
+    data = tmp_path / "data"
+    (data / "inputs").mkdir(parents=True)
+    (data / "inputs" / "holdings.json").write_text(json.dumps({"symbols": ["BBB"]}))
+    constituents = [["AAA", "A", "T"], ["BBB", "B", "T"], ["CCC", "C", "T"]]
+    (data / "inputs" / "sp500.json").write_text(json.dumps(constituents))
+    ext = {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+           for t, s in {"AAA": make_series(0.001), "BBB": make_series(-0.0002), "CCC": make_series(0.0004)}.items()}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "tickers.json").write_text(json.dumps({"active": ["CCC"], "excluded": [], "whole_share": []}))
+    archive = tmp_path / "empty"
+    archive.mkdir()
+    argv = ["--data-dir", str(data), "--archive-dir", str(archive), "--config-dir", str(cfg),
+            "run", "--as-of", "2026-11-04"]
+    assert cr.main(argv) == 0 and cr.main(argv) == 0  # idempotent per date
+    rows = cr.read_history(data / "trade_list_history.csv")
+    version = cr.load_params()["version"]
+    assert len(rows) == len({r["ticker"] for r in rows}) and {r["params_version"] for r in rows} == {version}
+    summary = json.loads((data / "runs" / "2026-11-04" / "summary.json").read_text())
+    assert summary["params_version"] == cr.load_params()["version"] and "trade_list" in summary
+    proposal = json.loads((data / "runs" / "2026-11-04" / "tickers_proposal.json").read_text())
+    assert proposal["active_now"] == 1
+    assert json.loads((cfg / "tickers.json").read_text())["active"] == ["CCC"]  # read-only
+
+
+def test_effectiveness_compares_list_with_universe(tmp_path, capsys):
+    end = AS_OF + dt.timedelta(days=40)
+    up, down = make_series(0.002, days=500, end=end), make_series(-0.002, days=500, end=end)
+    rows = [{"date": AS_OF.isoformat(), "ticker": "UP", "params_version": "v"}]
+    result = cr.effectiveness(rows, {"UP": up, "DOWN": down}, ["UP", "DOWN"], 20)
+    assert result and result[0]["edge"] > 0 and result[0]["listed"] == 1
+    assert cr.effectiveness(rows, {"UP": up, "DOWN": down}, ["UP", "DOWN"], 400) == []

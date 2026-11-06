@@ -52,6 +52,44 @@ BAND_EDGES = (10, 25, 50, 100, 200)  # rank bands used by the movement summary
 # Deliberately no "held" column: the long-term log is pure market data. Holdings live in inputs/holdings.json only.
 HISTORY_FIELDS = ["date", "ticker", "score", "rank", "universe_size", "vol", "max_dd"]
 
+# The daily trade list: everything above the evaluate threshold, plus holdings above the held threshold.
+# The ``reason`` column carries the only trace of holdings (held names between the two thresholds).
+TRADE_LIST_FIELDS = ["date", "ticker", "rank", "score", "reason", "params_version"]
+
+DEFAULT_PARAMS = {
+    "version": "builtin",
+    "period_weights": dict(PERIOD_WEIGHTS),
+    "blend": dict(BLEND),
+    "percentile_share": 0.6,
+    "hurdle_annualised": HURDLE_ANNUALISED,
+    "hurdle_bonus": HURDLE_BONUS,
+    "return_score_cap": RETURN_SCORE_CAP,
+    "evaluate_threshold": 80.0,
+    "held_threshold": 50.0,
+}
+PARAMS_PATH = Path(__file__).resolve().with_name("params.json")
+
+
+def load_params(path=None):
+    """Defaults overlaid with ``params.json`` (or ``path``); a bad file raises instead of silently scoring wrong."""
+    params = json.loads(json.dumps(DEFAULT_PARAMS))
+    path = Path(path) if path else PARAMS_PATH
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in raw.items():
+            if key in ("period_weights", "blend"):
+                params[key].update(value)
+            elif key in params:
+                params[key] = value
+    if set(params["period_weights"]) != set(PERIOD_ORDER) or any(w < 0 for w in params["period_weights"].values()):
+        raise ValueError("period_weights must cover exactly " + ", ".join(PERIOD_ORDER) + " with weights >= 0")
+    blend_total = sum(params["blend"].values())
+    if sum(params["period_weights"].values()) <= 0 or not math.isclose(blend_total, 1.0, abs_tol=1e-6):
+        raise ValueError("period_weights must not all be zero and blend must sum to 1")
+    if params["held_threshold"] > params["evaluate_threshold"]:
+        raise ValueError("held_threshold must not exceed evaluate_threshold")
+    return params
+
 
 # ----------------------------------------------------------------------------------------------
 # Price series
@@ -155,14 +193,16 @@ def annualise(total_return, days):
     return (1.0 + total_return) ** (365.0 / days) - 1.0
 
 
-def return_score(annualised):
-    return min(max(annualised / RETURN_SCORE_CAP, 0.0), 1.0) * 100.0
+def return_score(annualised, cap=RETURN_SCORE_CAP):
+    return min(max(annualised / cap, 0.0), 1.0) * 100.0
 
 
-def period_score(percentile, total_return, period):
+def period_score(percentile, total_return, period, params=None):
+    p = params or DEFAULT_PARAMS
     ann = annualise(total_return, PERIOD_DAYS[period])
-    bonus = HURDLE_BONUS if ann >= HURDLE_ANNUALISED else 0.0
-    return 0.6 * percentile + 0.4 * return_score(ann) + bonus
+    bonus = p["hurdle_bonus"] if ann >= p["hurdle_annualised"] else 0.0
+    share = p["percentile_share"]
+    return share * percentile + (1.0 - share) * return_score(ann, p["return_score_cap"]) + bonus
 
 
 def percentiles(values):
@@ -199,8 +239,10 @@ def risk_stats(series, as_of):
     return vol, worst
 
 
-def score_universe(series_by_ticker, as_of):
+def score_universe(series_by_ticker, as_of, params=None):
     """Return {ticker: record} for every ticker with a 1y return and risk stats."""
+    params = params or DEFAULT_PARAMS
+    weights, blend = params["period_weights"], params["blend"]
     clipped = {t: s.truncate(as_of) for t, s in series_by_ticker.items() if s}
     fresh = {t: s for t, s in clipped.items() if len(s) and s.last_date >= as_of - dt.timedelta(days=STALE_DAYS)}
     returns = {t: period_returns(s, as_of) for t, s in fresh.items()}
@@ -220,10 +262,12 @@ def score_universe(series_by_ticker, as_of):
         num = den = 0.0
         for period in PERIOD_ORDER:
             if period in rets:
-                num += PERIOD_WEIGHTS[period] * period_score(pct[period][ticker], rets[period], period)
-                den += PERIOD_WEIGHTS[period]
+                num += weights[period] * period_score(pct[period][ticker], rets[period], period, params)
+                den += weights[period]
+        if den <= 0:
+            continue
         base = num / den
-        final = BLEND["base"] * base + BLEND["lowvol"] * low_vol[ticker] + BLEND["lowdd"] * low_dd[ticker]
+        final = blend["base"] * base + blend["lowvol"] * low_vol[ticker] + blend["lowdd"] * low_dd[ticker]
         records[ticker] = {
             "score": final,
             "base_score": base,
@@ -378,6 +422,98 @@ def render_movement_md(summary, threshold):
             f"| {t['days_above']} | {t['entries']} | {t['exits']} |"
         )
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------------------------------
+# Daily trade list, review-first proposal, effectiveness
+# ----------------------------------------------------------------------------------------------
+def build_trade_list(records, held, params):
+    """[(ticker, reason)] best rank first: above the evaluate threshold, or held and above the held threshold."""
+    hi, lo = params["evaluate_threshold"], params["held_threshold"]
+    out = []
+    for ticker in sorted(records, key=lambda t: records[t]["rank"]):
+        score = records[ticker]["score"]
+        if score > hi:
+            out.append((ticker, "above_eval_held" if ticker in held else "above_eval"))
+        elif ticker in held and score > lo:
+            out.append((ticker, "held_above_floor"))
+    return out
+
+
+def write_trade_list(run_dir, history_path, run_date, records, trade, params):
+    """Per-run CSV plus an idempotent upsert into the append-only ``trade_list_history.csv``."""
+    stamp = params["version"]
+    rows = [{"date": run_date.isoformat(), "ticker": t, "rank": records[t]["rank"],
+             "score": f"{records[t]['score']:.3f}", "reason": reason, "params_version": stamp} for t, reason in trade]
+    for path in (Path(run_dir) / "trade_list.csv", Path(history_path)):
+        old = [r for r in read_history(path) if r["date"] != run_date.isoformat()] if path == Path(history_path) else []
+        merged = sorted(old + rows, key=lambda r: (r["date"], int(r["rank"])))
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=TRADE_LIST_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(merged)
+    return rows
+
+
+def build_proposal(run_date, trade, tickers_config, params):
+    """Diff of today's trade list against config/tickers.json. Informational: nothing here edits config."""
+    active = list(tickers_config.get("active", []))
+    locked = set(tickers_config.get("excluded", [])) | set(tickers_config.get("whole_share", []))
+    wanted = [t for t, _ in trade if t not in locked]
+    add = [t for t in wanted if t not in set(active)]
+    drop = [t for t in active if t not in set(wanted)]
+    return {"as_of": run_date.isoformat(), "params_version": params["version"], "trade_list_size": len(trade),
+            "active_now": len(active), "add": add, "stop_buying": drop, "keep": [t for t in active if t in set(wanted)],
+            "skipped_excluded_or_whole_share": [t for t, _ in trade if t in locked]}
+
+
+def render_proposal_md(proposal):
+    lines = [
+        f"# Proposed ticker change for {proposal['as_of']} (REVIEW FIRST: nothing has been applied)",
+        "",
+        f"- Daily trade list: {proposal['trade_list_size']} names; active universe now: {proposal['active_now']}",
+        f"- Would add ({len(proposal['add'])}): {', '.join(proposal['add']) or 'none'}",
+        f"- Would stop buying ({len(proposal['stop_buying'])}): {', '.join(proposal['stop_buying']) or 'none'}",
+        "",
+        "To accept: edit `config/tickers.json` and `near_close_dca.ACTIVE_TICKERS`, run "
+        "`python -m scripts.generate_per_ticker_sizing`, regenerate the Perplexity prompts and "
+        "`backup_planner.pyz`, update the universe-count tests, and open a draft PR. "
+        "Ask Claude to do it with: `apply the 2026-MM-DD proposal`.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def forward_returns(series_by_ticker, tickers, start, horizon):
+    """{ticker: return from start to start+horizon days} for tickers with bars on both ends."""
+    end = start + dt.timedelta(days=horizon)
+    out = {}
+    for t in tickers:
+        s = series_by_ticker.get(t)
+        if not s or s.last_date < end:
+            continue
+        a, b = s.value_at(start, max_gap=3), s.value_at(end, max_gap=3)
+        if a and b:
+            out[t] = b / a - 1.0
+    return out
+
+
+def effectiveness(trade_rows, series_by_ticker, universe, horizon):
+    """Per trade-list date: mean forward return of the listed names vs the whole scored universe."""
+    by_date = {}
+    for r in trade_rows:
+        by_date.setdefault(r["date"], []).append(r["ticker"])
+    results = []
+    for day in sorted(by_date):
+        start = dt.date.fromisoformat(day)
+        listed = forward_returns(series_by_ticker, by_date[day], start, horizon)
+        pool = forward_returns(series_by_ticker, universe, start, horizon)
+        if not listed or not pool:
+            continue
+        results.append({"date": day, "listed": len(listed), "list_return": statistics.fmean(listed.values()),
+                        "universe_return": statistics.fmean(pool.values()),
+                        "edge": statistics.fmean(listed.values()) - statistics.fmean(pool.values())})
+    return results
 
 
 # ----------------------------------------------------------------------------------------------
@@ -548,7 +684,10 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     """Score one date and write its outputs; returns the summary dict, or None when nothing scores."""
     data_dir = Path(args.data_dir)
     tradability = _load_json(data_dir / "inputs" / "tradability.json", {})
-    records, unscored = score_universe(series, as_of)
+    params = load_params(getattr(args, "params", None))
+    threshold = params["evaluate_threshold"] if args.threshold is None else args.threshold
+    args.threshold = threshold
+    records, unscored = score_universe(series, as_of, params)
     if not records:
         return None
     run_dir = data_dir / "runs" / as_of.isoformat()
@@ -566,6 +705,15 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     (data_dir / "latest_evaluation_list.md").write_text(evaluation, encoding="utf-8")
     (data_dir / "latest_ranked_all.csv").write_text((run_dir / "ranked_all.csv").read_text(encoding="utf-8"),
                                                    encoding="utf-8")
+    trade = build_trade_list(records, held, params)
+    write_trade_list(run_dir, data_dir / "trade_list_history.csv", as_of, records, trade, params)
+    tickers_config = _load_json(Path(args.config_dir) / "tickers.json", {})
+    proposal = build_proposal(as_of, trade, tickers_config, params)
+    (run_dir / "tickers_proposal.json").write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+    (run_dir / "tickers_proposal.md").write_text(render_proposal_md(proposal), encoding="utf-8")
+    (data_dir / "latest_trade_list.csv").write_text((run_dir / "trade_list.csv").read_text(encoding="utf-8"),
+                                                   encoding="utf-8")
+    (data_dir / "latest_tickers_proposal.md").write_text(render_proposal_md(proposal), encoding="utf-8")
     stale = sorted(t for t in unscored if t in series)
     missing = sorted(set(tickers) - set(series))
     (run_dir / "data_gaps.json").write_text(
@@ -576,7 +724,8 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     above = sum(1 for r in records.values() if r["score"] > args.threshold)
     summary = {"as_of": as_of.isoformat(), "universe": args.universe, "scored": len(records),
                "above_threshold": above, "threshold": args.threshold, "no_price_history": len(missing),
-               "not_scored_or_stale": len(stale)}
+               "not_scored_or_stale": len(stale), "trade_list": len(trade), "params_version": params["version"],
+               "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"])}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # read by the console page
     return {**summary, "run_dir": str(run_dir)}
 
@@ -648,6 +797,29 @@ def cmd_history(args):
     return 0
 
 
+def cmd_effectiveness(args):
+    """How well did past trade lists do versus the whole scored universe over the next N days?"""
+    rows = read_history(Path(args.data_dir) / "trade_list_history.csv")
+    if not rows:
+        print("no trade-list history yet")
+        return 0
+    tickers, _, _, _, series = prepare(args)
+    results = effectiveness(rows, series, tickers, args.horizon)
+    if not results:
+        print(f"no trade-list date has {args.horizon} days of later prices yet")
+        return 0
+    stamps = {}
+    for r in rows:
+        stamps.setdefault(r["date"], r.get("params_version", ""))
+    print(f"{args.horizon}-day forward return of each day's trade list vs the scored universe")
+    for item in results:
+        print(f"  {item['date']} [{stamps.get(item['date'], '')}] {item['listed']:>3} names  "
+              f"list {item['list_return'] * 100:+6.2f}%  universe {item['universe_return'] * 100:+6.2f}%  "
+              f"edge {item['edge'] * 100:+6.2f}%")
+    print(f"  average edge {statistics.fmean(i['edge'] for i in results) * 100:+.2f}% over {len(results)} days")
+    return 0
+
+
 def cmd_missing(args):
     tickers, _, _, _ = build_universe(args.data_dir, args.universe)
     ext = _load_json(Path(args.data_dir) / "inputs" / "ext_prices.json", {})
@@ -679,18 +851,21 @@ def build_parser():
     root = Path(__file__).resolve().parents[2]
     parser.add_argument("--data-dir", default=str(root / "artifacts" / "composite_rank"))
     parser.add_argument("--archive-dir", default=str(root / "ticker_data"))
+    parser.add_argument("--params", default="", help="ranking parameters JSON (default: params.json)")
+    parser.add_argument("--config-dir", default=str(root / "config"),
+                        help="read-only: config/tickers.json is compared with the trade list to build the proposal")
     parser.add_argument("--universe", choices=UNIVERSES, default="sp500",
                         help="sp500 (current scope) or all (also holdings and the watchlist)")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="score, rank, write the evaluation list, update history and movement")
-    run.add_argument("--threshold", type=float, default=80.0)
+    run.add_argument("--threshold", type=float, default=None, help="default: params.json evaluate_threshold")
     run.add_argument("--top", type=int, default=0, help="list the top N instead of score > threshold")
     run.add_argument("--as-of", default="", help="YYYY-MM-DD (default: latest price date)")
     run.set_defaults(func=cmd_run)
     back = sub.add_parser("backfill", help="re-score a date range to seed history")
     back.add_argument("--start", required=True)
     back.add_argument("--end", required=True)
-    back.add_argument("--threshold", type=float, default=80.0)
+    back.add_argument("--threshold", type=float, default=None)
     back.add_argument("--top", type=int, default=0)
     back.set_defaults(func=cmd_backfill)
     hist = sub.add_parser("history", help="compact rank history for chosen tickers, or one day's top list")
@@ -699,6 +874,9 @@ def build_parser():
     hist.add_argument("--date", default="", help="YYYY-MM-DD: show that day's top list instead")
     hist.add_argument("--top", type=int, default=20)
     hist.set_defaults(func=cmd_history)
+    eff = sub.add_parser("effectiveness", help="forward return of past trade lists vs the universe (tuning input)")
+    eff.add_argument("--horizon", type=int, default=20, help="calendar days ahead (default 20)")
+    eff.set_defaults(func=cmd_effectiveness)
     sub.add_parser("missing", help="print tickers with no price history yet").set_defaults(func=cmd_missing)
     bars = sub.add_parser("ingest-bars", help="merge saved get_equity_historicals results into ext_prices.json")
     bars.add_argument("files", nargs="+")

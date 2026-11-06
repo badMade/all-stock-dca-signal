@@ -37,8 +37,9 @@ constituents you own (held names outside the S&P 500, such as ETFs, are not rank
    If a ticker returns no bars, leave it (it is listed in `data_gaps.json`). If a series has an impossible jump
    (for example a 60% one-day drop that matches a stock split), refetch that ticker with
    `adjustment_type: "split"` and note that it is price-only.
-5. **Score and rank.** `python3 analysis/composite-rank/composite_rank.py run --threshold 80`
-   (writes `runs/<date>/ranked_all.csv`, `runs/<date>/evaluation_list.md`, appends `history.csv`, rebuilds
+5. **Score and rank.** `python3 analysis/composite-rank/composite_rank.py run`
+   (thresholds and every weight come from `params.json`; the run is stamped with its `version`; writes
+   `runs/<date>/trade_list.csv`, upserts `trade_list_history.csv`, writes `runs/<date>/tickers_proposal.md`; also writes `runs/<date>/ranked_all.csv`, `runs/<date>/evaluation_list.md`, appends `history.csv`, rebuilds
    `movement_summary.md`, refreshes `latest_*`).
 6. **Fractional tradability (new names only).** For tickers on the evaluation list that are not held and not in
    `inputs/tradability.json` (or whose entry is older than 7 days), call `get_equity_tradability` on the account
@@ -48,6 +49,22 @@ constituents you own (held names outside the S&P 500, such as ETFs, are not rank
    top 10; the five biggest one-day rank climbers and fallers (`movement_summary.md`); data gaps; anything skipped.
    If the as-of date equals the previous run (market holiday), say "no new trading day" and stop.
 
+## The daily trade list and the review-first proposal
+
+Each run builds ONE list: every S&P 500 name scoring above `evaluate_threshold` (80), plus every holding above
+`held_threshold` (50). It is appended to `trade_list_history.csv` (`date, ticker, rank, score, reason, params_version`),
+so the history of what was on the list each day is kept. The same run compares the list with `config/tickers.json` and
+writes `tickers_proposal.md` (names it would add, names that would stop being bought). **The task never edits `config/`.**
+The operator reviews the proposal and asks for it to be applied (a normal draft PR: tickers.json, `near_close_dca`
+constants, sizing calibration, prompts, planner, tests).
+
+## Tuning the ranking
+
+All weights, the 20% ROI bonus, the volatility/drawdown blend and both cutoffs live in `params.json`. Change a value,
+bump `version`, commit. `composite_rank.py effectiveness --horizon 20` then reports, per day and params version, the
+forward return of that day's list against the whole scored universe, which is the evidence for the next change.
+Nothing adjusts weights automatically.
+
 ## Files
 
 | Path (under `artifacts/composite_rank/`) | What it is |
@@ -56,6 +73,8 @@ constituents you own (held names outside the S&P 500, such as ETFs, are not rank
 | `runs/<date>/ranked_all.csv` | Every scored ticker with score, rank, volatility, drawdown, period returns. |
 | `runs/<date>/evaluation_list.md` | The day's list (score above the threshold) with new / dropped names and rank change. |
 | `runs/<date>/data_gaps.json` | Tickers with no price history or too little history to score. |
+| `trade_list_history.csv`, `runs/<date>/trade_list.csv`, `latest_trade_list.csv` | The daily list (score above 80, or held above 50) with the reason and the params version. |
+| `runs/<date>/tickers_proposal.{md,json}`, `latest_tickers_proposal.md` | Review-first diff of the list against `config/tickers.json`. Never applied automatically. |
 | `history.csv` | One row per ticker per run: rank, score, volatility, drawdown. No holdings column. The basis for movement tracking. Read it with the `history` command, not by loading the file. |
 | `movement_summary.md` | How far names typically move by starting rank, and per-ticker rank behaviour. |
 | `latest_evaluation_list.md`, `latest_ranked_all.csv` | Copies of the most recent run. |
