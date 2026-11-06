@@ -571,9 +571,11 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
         encoding="utf-8",
     )
     above = sum(1 for r in records.values() if r["score"] > args.threshold)
-    return {"as_of": as_of.isoformat(), "universe": args.universe, "scored": len(records), "above_threshold": above,
-            "threshold": args.threshold, "no_price_history": len(missing), "not_scored_or_stale": len(stale),
-            "run_dir": str(run_dir)}
+    summary = {"as_of": as_of.isoformat(), "universe": args.universe, "scored": len(records),
+               "above_threshold": above, "threshold": args.threshold, "no_price_history": len(missing),
+               "not_scored_or_stale": len(stale)}
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # read by the console page
+    return {**summary, "run_dir": str(run_dir)}
 
 
 # ----------------------------------------------------------------------------------------------

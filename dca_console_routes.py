@@ -590,6 +590,14 @@ def _route_research(app, request: RouteRequest) -> Response:
     return Response.json(200, build_research_snapshot(app, REPO))
 
 
+def _route_rank(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_rank import build_rank_snapshot
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, build_rank_snapshot(REPO))
+
+
 def _route_tickers(app, request: RouteRequest) -> Response:
     from dca_console import REPO
     from dca_console_tickers import build_tickers_snapshot
@@ -651,6 +659,7 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/diagnostics/architecture.js": _route_architecture_asset("js"),
     "/api/diagnostics/architecture": _route_architecture_data,
     "/api/diagnostics/architecture/module": _route_architecture_module,
+    "/api/rank": _route_rank,
     "/api/tickers": _route_tickers,
     "/api/training": _route_training,
 }
