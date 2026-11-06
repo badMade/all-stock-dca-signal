@@ -393,6 +393,41 @@ ACTIVE_TICKERS = [
     # is_tradable_for_fractional_buy gate admits or blocks LULU fail-closed.
     # See config/tickers.json's notes.
     "LULU",
+    # NOV 6 2026 (user-requested): 32 S&P 500 names above 80 on the daily composite
+    # rank (analysis/composite-rank). Fractional tradability verified read-only.
+    # See config/tickers.json notes and config/ticker_history.csv.
+    "GWW",
+    "KO",
+    "ED",
+    "HLT",
+    "TRV",
+    "ACGL",
+    "EG",
+    "BDX",
+    "MAR",
+    "RSG",
+    "KDP",
+    "MO",
+    "AIZ",
+    "CB",
+    "KIM",
+    "EXR",
+    "AWK",
+    "MRSH",
+    "MSI",
+    "EW",
+    "VLTO",
+    "WELL",
+    "LH",
+    "PSA",
+    "CTAS",
+    "SPG",
+    "REGN",
+    "DRI",
+    "ALL",
+    "EBAY",
+    "CPAY",
+    "CINF",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it

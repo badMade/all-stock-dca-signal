@@ -42,6 +42,6 @@ def test_cci_has_a_sizing_entry():
 
 
 def test_active_count_is_91_everywhere():
-    assert len(_load("tickers.json")["active"]) == 91
+    assert len(_load("tickers.json")["active"]) == 123
     policy = _load("scheduled_tasks.json")["ticker_universe_policy"]
-    assert policy["active_count"] == 91
+    assert policy["active_count"] == 123

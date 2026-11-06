@@ -94,7 +94,7 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 91 tickers (includes `LULU` added 2026-11-05, `CCI` added 2026-10-23, and `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 123 tickers (includes the 32 composite-rank names added 2026-11-06, `LULU` added 2026-11-05, `CCI` added 2026-10-23, and `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
   2026-08-04 addition `VT`, the 2026-08-16 additions `QBUT`,
   `RVI`, `VCX`, `TRLV`, the 2026-09-05 additions `LLY`, `TSLA`, and the
