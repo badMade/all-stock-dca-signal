@@ -143,3 +143,35 @@ def test_the_planner_does_not_bundle_the_watch():
 
     repo = Path(__file__).resolve().parents[2]
     assert "scripts/slot_status_watch.py" not in bbp.collect_files(repo)
+
+
+# -- a finished folder is never marked running (2026-11-05 review) -----------------------------------------------------
+# The watch runs on the Mac; the finalizer records "succeeded" from inside the Cowork VM. Their shared flock lock is
+# not seen across the VM boundary, so a watch write landing in the same instant could replace "succeeded" with
+# "in_progress", and the slot would read as stalled 10 minutes later. The finalizer writes run_summary.json into the
+# run folder BEFORE it records the status (finalize_run_evidence.main: finalize(), then _post_slot_signal), so a
+# folder holding run_summary.json is finished: the watch leaves its slot alone whatever the document says.
+
+
+def test_a_folder_with_a_run_summary_is_finished_and_never_marked(tmp_path):
+    run_dir = _run_dir(tmp_path / "cron", "0935")
+    (run_dir / "run_summary.json").write_text("{}", encoding="utf-8")
+    assert sw.mark_running(tmp_path / "cron", now=NOW) == []
+    assert not ss.state_path().exists()  # nothing written, so nothing can overwrite the finalizer's status
+
+
+def test_a_finished_folder_never_turns_an_in_progress_entry_back_on(tmp_path):
+    # The race itself: the watch saw the folder mid-run, the finalizer has since written run_summary.json, and the
+    # document still says in_progress (the status write lost the race or is about to land). Do not refresh it.
+    run_dir = _run_dir(tmp_path / "cron", "0935", touched=datetime(2026, 11, 5, 9, 40, tzinfo=ET))
+    sw.mark_running(tmp_path / "cron", now=NOW)
+    before = _local()["slots"]["0935"]
+    (run_dir / "run_summary.json").write_text("{}", encoding="utf-8")
+    assert sw.mark_running(tmp_path / "cron", now=NOW) == []
+    assert _local()["slots"]["0935"] == before
+
+
+def test_a_folder_without_a_run_summary_is_still_marked(tmp_path):
+    run_dir = _run_dir(tmp_path / "cron", "0935")
+    (run_dir / "run_state.json").write_text("{}", encoding="utf-8")  # an executor's early state is not the end
+    assert sw.mark_running(tmp_path / "cron", now=NOW) == ["0935"]
