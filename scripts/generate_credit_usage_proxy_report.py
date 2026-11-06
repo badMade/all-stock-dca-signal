@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from dca_alerts import ATTEMPT_LOG_HISTORY_SUFFIX, ATTEMPT_LOG_ROOT_ENV
+from dca_fileio import iter_files_by_suffix_fast, iter_run_state_files_fast
 from dca_paths import CRON_TRACKING_ROOT_ENV as _CRON_TRACKING_ROOT_ENV
 from dca_paths import cron_tracking_root
 from scripts.model_usage_log import MODEL_ROUTING_MODE_VALUES
@@ -2109,7 +2110,7 @@ def _scan_recovery_runs(
 
     for subroot in MANUAL_SCAN_SUBROOTS:
         for base in _manual_scan_bases(cron_root, subroot):
-            for run_state_path in base.rglob(RUN_STATE_FILENAME):
+            for run_state_path in (p for p in iter_run_state_files_fast(base) if p.name == RUN_STATE_FILENAME):
                 run_state = _load_json(run_state_path)
                 if not isinstance(run_state, dict):
                     continue
@@ -2235,7 +2236,7 @@ def _scan_recovery_runs(
             # filled_orders.csv would otherwise never be DISCOVERED here, the same
             # single-filename assumption that made _count_submitted_orders report
             # not_logged for it -- codex review discussion_r3659713605.
-            orphan_csv_paths = sorted({p for name in _ORDER_CSV_NAMES for p in base.rglob(name)})
+            orphan_csv_paths = sorted({p for p in iter_files_by_suffix_fast(base, ".csv") if p.name in _ORDER_CSV_NAMES})
             for csv_path in orphan_csv_paths:
                 run_dir = csv_path.parent
                 if run_dir in seen_manual_dirs:

@@ -300,3 +300,52 @@ def test_an_unreadable_local_document_falls_back_to_the_heartbeat():
     slot_status.state_path().write_text("{not json", encoding="utf-8")
     out, _ = _dispatch(mode="shadow")
     assert out["action"] == "would_send"
+
+
+# -- a running slot waits, a stalled one sends (2026-11-05) ------------------------------------------------------------
+# The dispatcher checks 15 minutes after the slot; on 2026-11-05 the 9:35 run was still placing orders at 9:50 and
+# recorded succeeded at 9:55:04. scripts/slot_status_watch.py now records in_progress with activity_at (the newest
+# file in the run folder). Fresh activity means Claude is working: wait. No activity for RUNNING_FRESH_MINUTES means
+# the run stalled: send, without the heartbeat probe (the live runs never feed it).
+
+
+def _local_doc(**slots):
+    slot_status.state_dir().mkdir(parents=True, exist_ok=True)
+    slot_status.state_path().write_text(json.dumps({
+        "schema": slot_status.SCHEMA, "trading_day": DAY, "market": "open", "updated_at": "x",
+        "slots": slots}), encoding="utf-8")
+
+
+def test_a_slot_still_writing_files_is_left_alone_and_never_probed():
+    _local_doc(**{"0935": {"status": "in_progress", "stamped_at": "x", "activity_at": _at("09:48").isoformat()}})
+    probe = _probe("off", True)
+    out = bd.decide(day=DAY, slot="0935", now=_at("09:51"), calendar=CALENDAR, probe=probe, already_sent=False)
+    assert out == {"action": "skip", "reason": "primary_running"}
+    assert probe.calls == []
+
+
+def test_a_slot_with_no_activity_for_the_fresh_window_counts_as_stalled_and_sends():
+    stale = _at("09:51").replace(minute=51 - bd.RUNNING_FRESH_MINUTES - 1)
+    _local_doc(**{"0935": {"status": "in_progress", "stamped_at": "x", "activity_at": stale.isoformat()}})
+    probe = _probe("off", True)
+    out = bd.decide(day=DAY, slot="0935", now=_at("09:51"), calendar=CALENDAR, probe=probe, already_sent=False)
+    assert out == {"action": "send", "reason": "primary_stalled"}
+    assert probe.calls == []
+
+
+def test_the_fresh_window_is_ten_minutes():
+    assert bd.RUNNING_FRESH_MINUTES == 10
+
+
+def test_an_in_progress_entry_without_activity_falls_back_to_the_heartbeat_probe():
+    _local_doc(**{"0935": {"status": "in_progress", "stamped_at": "x"}})  # the old local_heartbeat start shape
+    probe = _probe("off", True)
+    out = bd.decide(day=DAY, slot="0935", now=_at("09:51"), calendar=CALENDAR, probe=probe, already_sent=False)
+    assert out["action"] == "send" and probe.calls == [(DAY, "0935")]
+
+
+def test_a_malformed_activity_time_falls_back_to_the_heartbeat_probe():
+    _local_doc(**{"0935": {"status": "in_progress", "stamped_at": "x", "activity_at": "not a time"}})
+    probe = _probe("off", True)
+    bd.decide(day=DAY, slot="0935", now=_at("09:51"), calendar=CALENDAR, probe=probe, already_sent=False)
+    assert probe.calls == [(DAY, "0935")]
