@@ -51,6 +51,12 @@ ET = ZoneInfo("America/New_York")
 PERPLEXITY_ADDRESS = "computer@perplexity.com"
 MODES = ("shadow", "live")
 CLOUD_CHECK_AFTER_MINUTES = 20  # five minutes after the Mac's own check, so the Mac decides first when it is up
+# A running slot (2026-11-05): scripts/slot_status_watch.py records in_progress with activity_at, the newest file in
+# the slot's run folder. The 9:35 run on 2026-11-05 wrote a file every 30-40 s from 09:36 to 09:55, so 10 minutes of
+# silence means it stalled; the Mac then sends. The cloud watcher waits longer, because a stale activity_at there also
+# means the Mac stopped publishing (asleep or down) and nobody else will send.
+RUNNING_FRESH_MINUTES = 10
+CLOUD_STALE_MINUTES = 20
 REPO = Path(__file__).resolve().parents[1]
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _SLOT = re.compile(r"\d{4}")
@@ -135,8 +141,14 @@ def decide(*, day: str, slot: str, now: datetime, calendar: Mapping[str, Any], p
         return {"action": "skip", "reason": reason}
     if already_sent:
         return {"action": "skip", "reason": "already_sent"}
-    if _primary_succeeded(day, slot):
+    entry = _local_entry(day, slot)
+    if entry.get("status") == "succeeded":
         return {"action": "skip", "reason": "primary_succeeded"}
+    idle = _idle_minutes(entry, now_et)
+    if idle is not None:
+        if idle <= RUNNING_FRESH_MINUTES:
+            return {"action": "skip", "reason": "primary_running"}
+        return {"action": "send", "reason": "primary_stalled"}
     result = probe(day, slot)
     local_status = str(result.get("local_status"))
     if result.get("backup_may_act") is True:
@@ -147,22 +159,39 @@ def decide(*, day: str, slot: str, now: datetime, calendar: Mapping[str, Any], p
     return {"action": "skip", "reason": local_status}
 
 
-def _primary_succeeded(day: str, slot: str) -> bool:
-    """True when today's local slot-status document says the primary finished this slot (2026-11-03).
+def _local_entry(day: str, slot: str) -> dict[str, Any]:
+    """This slot's entry in today's local slot-status document, or {} (2026-11-03).
 
     No live prompt calls local_heartbeat start/finish, so the heartbeat probe alone sees every slot as never started.
-    The Gate 9 finalizer records each accepted run here instead. Only "succeeded" for this slot today counts; an
-    unreadable, foreign or older document falls through to the probe, as before.
+    The Gate 9 finalizer records each accepted run here, and scripts/slot_status_watch.py marks a running one
+    in_progress. An unreadable, foreign or older document gives {}, so the caller falls through to the probe.
     """
     try:
         document = json.loads(slot_status.state_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return {}
     if not (isinstance(document, dict) and document.get("schema") == slot_status.SCHEMA
             and document.get("trading_day") == day and isinstance(document.get("slots"), dict)):
-        return False
+        return {}
     entry = document["slots"].get(slot)
-    return isinstance(entry, dict) and entry.get("status") == "succeeded"
+    return entry if isinstance(entry, dict) else {}
+
+
+def _idle_minutes(entry: Mapping[str, Any], now_et: datetime) -> float | None:
+    """Minutes since an in_progress slot last wrote a file, or None when there is no usable activity_at.
+
+    None keeps the old behaviour (the heartbeat probe): an entry without activity_at is the old local_heartbeat
+    start shape, and a malformed or timezone-less one is not trusted either way.
+    """
+    if entry.get("status") != "in_progress":
+        return None
+    try:
+        activity = datetime.fromisoformat(str(entry.get("activity_at")))
+    except ValueError:
+        return None
+    if activity.tzinfo is None or activity.utcoffset() is None:
+        return None
+    return (now_et - activity).total_seconds() / 60
 
 
 def cloud_decide(document: Any, *, day: str, slot: str, now: datetime, calendar: Mapping[str, Any]) -> dict[str, Any]:
@@ -182,6 +211,9 @@ def cloud_decide(document: Any, *, day: str, slot: str, now: datetime, calendar:
         return {"action": "skip", "reason": "market_closed"}
     entry = document["slots"].get(slot)
     if isinstance(entry, dict) and entry.get("status"):
+        idle = _idle_minutes(entry, now_et)
+        if idle is not None and idle > CLOUD_STALE_MINUTES:
+            return {"action": "send", "reason": "mac_stalled"}  # the Mac stopped publishing mid-run
         return {"action": "skip", "reason": f"mac_reported_{entry['status']}"}
     return {"action": "send", "reason": "slot_never_started"}
 
