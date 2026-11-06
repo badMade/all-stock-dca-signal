@@ -35,6 +35,11 @@ from scripts import slot_status
 from scripts.verify_schedule import slot_run_dir_relative
 
 FINAL_STATUSES = frozenset({"succeeded", "failed", "backup_requested"})
+# The finalizer writes this into the run folder BEFORE it records the slot's status (finalize_run_evidence.main:
+# finalize(), then _post_slot_signal). The watch runs on the Mac and the finalizer inside the Cowork VM; their shared
+# flock lock is not seen across the VM boundary, so a watch write in the same instant could replace "succeeded" with
+# "in_progress" (2026-11-05 review). A folder holding it is finished: never mark or refresh its slot.
+FINISHED_MARKER = "run_summary.json"
 
 
 def _newest_activity(run_dir: Path) -> float:
@@ -50,7 +55,7 @@ def mark_running(root: str | Path, *, now: datetime) -> list[str]:
     activity: dict[str, str] = {}
     for slot in slot_status.SLOTS:
         run_dir = Path(root) / slot_run_dir_relative(slot, day)
-        if run_dir.is_dir():
+        if run_dir.is_dir() and not (run_dir / FINISHED_MARKER).exists():
             stamp = datetime.fromtimestamp(_newest_activity(run_dir), tz=timezone.utc).astimezone(slot_status.ET)
             activity[slot] = stamp.isoformat(timespec="seconds")
     if not activity:
