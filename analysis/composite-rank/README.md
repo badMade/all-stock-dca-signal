@@ -16,7 +16,13 @@ Quick start (after the inputs exist):
 python3 analysis/composite-rank/composite_rank.py run --threshold 80
 python3 analysis/composite-rank/composite_rank.py run --top 25            # list the top 25 instead
 python3 analysis/composite-rank/composite_rank.py run --as-of 2026-10-30   # re-score a past date
+python3 analysis/composite-rank/composite_rank.py history --ticker GWW KO --days 10   # compact rank history
+python3 analysis/composite-rank/composite_rank.py history --date 2026-11-04 --top 20  # one day's top list
 ```
+
+The daily log is plain CSV on purpose: `history.csv` (one row per ticker per run) and the frozen
+`runs/<date>/` folders. It contains market data only, with no holdings column. Use the `history` command
+to read a few lines of it instead of loading the whole file.
 
 Known limits: percentile scores are relative to whatever pool is scored that day, so adding or removing
 tickers shifts every score slightly. Backfilled history uses today's holdings for every past date. Price

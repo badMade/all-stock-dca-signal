@@ -91,9 +91,9 @@ def _records(order):
 def test_history_upsert_is_idempotent_and_movement_signs(tmp_path):
     path = tmp_path / "history.csv"
     day1, day2 = dt.date(2026, 11, 3), dt.date(2026, 11, 4)
-    cr.upsert_history(path, day1, _records(["A", "B", "C"]), {"A"})
-    cr.upsert_history(path, day2, _records(["B", "A", "C"]), {"A"})
-    rows = cr.upsert_history(path, day2, _records(["B", "A", "C"]), {"A"})  # re-run the same day
+    cr.upsert_history(path, day1, _records(["A", "B", "C"]))
+    cr.upsert_history(path, day2, _records(["B", "A", "C"]))
+    rows = cr.upsert_history(path, day2, _records(["B", "A", "C"]))  # re-run the same day
     assert len(rows) == 6
     summary = cr.movement_summary(rows, threshold=98.5)
     assert summary["tickers"]["B"]["chg_1d"] == 1  # climbed from 2 to 1
@@ -177,3 +177,28 @@ def test_universe_modes_and_backfill(tmp_path):
     dates = {r["date"] for r in cr.read_history(data / "history.csv")}
     assert len(dates) == 10 and "2026-11-04" in dates  # every calendar day here has a synthetic bar
     assert {r["ticker"] for r in cr.read_history(data / "history.csv")} == {"AAA", "CCC"}
+
+
+def test_history_log_has_no_held_column_and_migrates_old_rows(tmp_path):
+    path = tmp_path / "history.csv"
+    path.write_text("date,ticker,held,score,rank,universe_size,vol,max_dd\n2026-11-03,A,1,99.0,1,2,0.2,-0.1\n")
+    rows = cr.upsert_history(path, dt.date(2026, 11, 4), _records(["A", "B"]))
+    header = path.read_text().splitlines()[0]
+    assert "held" not in header and header == ",".join(cr.HISTORY_FIELDS)
+    assert len(rows) == 3  # the old row survived the migration
+
+
+def test_history_command_prints_compact_lines(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    cr.upsert_history(data / "history.csv", dt.date(2026, 11, 3), _records(["A", "B", "C"]))
+    cr.upsert_history(data / "history.csv", dt.date(2026, 11, 4), _records(["B", "A", "C"]))
+    base = ["--data-dir", str(data)]
+    assert cr.main(base + ["history", "--ticker", "a", "zzz"]) == 0
+    out = capsys.readouterr().out
+    assert "A: 2 runs, rank now 2 (best 1, worst 2" in out and "2026-11-04 #2" in out
+    assert "ZZZ: no history" in out
+    assert cr.main(base + ["history", "--date", "2026-11-04", "--top", "2"]) == 0
+    top = capsys.readouterr().out.splitlines()
+    assert top[0] == "2026-11-04 top 2 of 3" and top[1].startswith("#  1 B") and len(top) == 3
+    assert cr.main(base + ["history", "--date", "2026-01-01"]) == 1

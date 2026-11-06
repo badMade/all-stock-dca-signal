@@ -49,7 +49,8 @@ RETURN_SCORE_CAP = 0.40
 HURDLE_BONUS = 5.0
 BAND_EDGES = (10, 25, 50, 100, 200)  # rank bands used by the movement summary
 
-HISTORY_FIELDS = ["date", "ticker", "held", "score", "rank", "universe_size", "vol", "max_dd"]
+# Deliberately no "held" column: the long-term log is pure market data. Holdings live in inputs/holdings.json only.
+HISTORY_FIELDS = ["date", "ticker", "score", "rank", "universe_size", "vol", "max_dd"]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -250,8 +251,11 @@ def read_history(path):
         return list(csv.DictReader(handle))
 
 
-def upsert_history(path, run_date, records, held):
-    """Replace any rows for ``run_date`` and append today's; returns the full row list."""
+def upsert_history(path, run_date, records):
+    """Replace any rows for ``run_date`` and append today's; returns the full row list.
+
+    Rows written by older versions carried a ``held`` column; it is dropped on the next write.
+    """
     rows = [r for r in read_history(path) if r["date"] != run_date.isoformat()]
     size = len(records)
     for ticker, rec in records.items():
@@ -259,7 +263,6 @@ def upsert_history(path, run_date, records, held):
             {
                 "date": run_date.isoformat(),
                 "ticker": ticker,
-                "held": "1" if ticker in held else "0",
                 "score": f"{rec['score']:.3f}",
                 "rank": str(rec["rank"]),
                 "universe_size": str(size),
@@ -271,7 +274,7 @@ def upsert_history(path, run_date, records, held):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     return rows
@@ -557,7 +560,7 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     evaluation = render_evaluation_md(as_of, records, names, held, args.threshold, args.top, prev_date, prev,
                                       tradability)
     (run_dir / "evaluation_list.md").write_text(evaluation, encoding="utf-8")
-    rows = upsert_history(history_path, as_of, records, held)
+    rows = upsert_history(history_path, as_of, records)
     movement = render_movement_md(movement_summary(rows, args.threshold), args.threshold)
     (data_dir / "movement_summary.md").write_text(movement, encoding="utf-8")
     (data_dir / "latest_evaluation_list.md").write_text(evaluation, encoding="utf-8")
@@ -610,6 +613,41 @@ def cmd_backfill(args):
     return 0
 
 
+def cmd_history(args):
+    """Print a few compact lines from history.csv so a model (or you) never has to load the whole log."""
+    rows = read_history(Path(args.data_dir) / "history.csv")
+    if not rows:
+        print("no history yet")
+        return 0
+    dates = sorted({r["date"] for r in rows})
+    if args.date:
+        if args.date not in dates:
+            print(f"no run on {args.date}; recorded runs: {dates[0]} .. {dates[-1]} ({len(dates)} runs)")
+            return 1
+        day_rows = sorted((r for r in rows if r["date"] == args.date), key=lambda r: int(r["rank"]))
+        print(f"{args.date} top {min(args.top, len(day_rows))} of {len(day_rows)}")
+        for r in day_rows[: args.top]:
+            print(f"#{r['rank']:>3} {r['ticker']:<6} {float(r['score']):5.1f}  vol {float(r['vol']) * 100:3.0f}%  "
+                  f"dd {float(r['max_dd']) * 100:4.0f}%")
+        return 0
+    if not args.ticker:
+        print(f"{len(dates)} runs recorded, {dates[0]} .. {dates[-1]}; pass --ticker T [T ...] or --date D --top N")
+        return 0
+    keep = set(dates[-args.days:])
+    for ticker in (t.upper() for t in args.ticker):
+        series = sorted((r["date"], int(r["rank"]), float(r["score"])) for r in rows
+                        if r["ticker"] == ticker and r["date"] in keep)
+        if not series:
+            print(f"{ticker}: no history in the last {args.days} runs")
+            continue
+        ranks = [rank for _, rank, _ in series]
+        print(f"{ticker}: {len(series)} runs, rank now {ranks[-1]} (best {min(ranks)}, worst {max(ranks)}, "
+              f"avg {statistics.fmean(ranks):.0f})")
+        for day, rank, score in series:
+            print(f"  {day} #{rank:<3} {score:5.1f}")
+    return 0
+
+
 def cmd_missing(args):
     tickers, _, _, _ = build_universe(args.data_dir, args.universe)
     ext = _load_json(Path(args.data_dir) / "inputs" / "ext_prices.json", {})
@@ -655,6 +693,12 @@ def build_parser():
     back.add_argument("--threshold", type=float, default=80.0)
     back.add_argument("--top", type=int, default=0)
     back.set_defaults(func=cmd_backfill)
+    hist = sub.add_parser("history", help="compact rank history for chosen tickers, or one day's top list")
+    hist.add_argument("--ticker", nargs="+", default=[], help="one or more tickers")
+    hist.add_argument("--days", type=int, default=30, help="most recent runs to show (default 30)")
+    hist.add_argument("--date", default="", help="YYYY-MM-DD: show that day's top list instead")
+    hist.add_argument("--top", type=int, default=20)
+    hist.set_defaults(func=cmd_history)
     sub.add_parser("missing", help="print tickers with no price history yet").set_defaults(func=cmd_missing)
     bars = sub.add_parser("ingest-bars", help="merge saved get_equity_historicals results into ext_prices.json")
     bars.add_argument("files", nargs="+")

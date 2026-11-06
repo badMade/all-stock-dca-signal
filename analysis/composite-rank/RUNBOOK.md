@@ -44,7 +44,7 @@ constituents you own (held names outside the S&P 500, such as ETFs, are not rank
    `inputs/tradability.json` (or whose entry is older than 7 days), call `get_equity_tradability` on the account
    whose nickname is "MCP" (max 10 symbols per call). Store `{ticker: fractional_tradability}` in
    `inputs/tradability.json`, then re-run step 5 once (the run is idempotent per date).
-7. **Report** (short): as-of date; names scored; how many are above 80; who entered and dropped off the list;
+7. **Report** (short; use `composite_rank.py history --ticker ...` for any rank history you need, never read `history.csv` whole): as-of date; names scored; how many are above 80; who entered and dropped off the list;
    top 10; the five biggest one-day rank climbers and fallers (`movement_summary.md`); data gaps; anything skipped.
    If the as-of date equals the previous run (market holiday), say "no new trading day" and stop.
 
@@ -56,6 +56,6 @@ constituents you own (held names outside the S&P 500, such as ETFs, are not rank
 | `runs/<date>/ranked_all.csv` | Every scored ticker with score, rank, volatility, drawdown, period returns. |
 | `runs/<date>/evaluation_list.md` | The day's list (score above the threshold) with new / dropped names and rank change. |
 | `runs/<date>/data_gaps.json` | Tickers with no price history or too little history to score. |
-| `history.csv` | One row per ticker per run: rank and score. The basis for movement tracking. |
+| `history.csv` | One row per ticker per run: rank, score, volatility, drawdown. No holdings column. The basis for movement tracking. Read it with the `history` command, not by loading the file. |
 | `movement_summary.md` | How far names typically move by starting rank, and per-ticker rank behaviour. |
 | `latest_evaluation_list.md`, `latest_ranked_all.csv` | Copies of the most recent run. |
