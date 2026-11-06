@@ -324,6 +324,7 @@ def test_no_em_dash_no_account_shaped_literal_no_secret(prompts, prefix):
     task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
     token = backup_procedure.part_token(task_id, 0)
     assert "—" not in text
+    assert re.fullmatch(r"[0-9a-f]{8}", token)
     assert not _account_shaped_literal(text, task_id, token)
     assert "@" not in text.replace("${DCA_ALERT_EMAIL_ADDRESS}", "")  # no literal email address
 
