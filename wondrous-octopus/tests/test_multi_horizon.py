@@ -297,7 +297,8 @@ class TestHarnessMultiHorizon:
         assert {record["horizon"] for record in scored} == set(EVAL)
         for record in scored:
             series = panel.series[record["ticker"]]
-            origin = int(np.flatnonzero(series.dates.astype("datetime64[D]") == np.datetime64(record["origin_date"]))[0])
+            days = series.dates.astype("datetime64[D]")
+            origin = int(np.flatnonzero(days == np.datetime64(record["origin_date"]))[0])
             # the target is the ticker's own h-th next row ...
             assert record["target_date"] == str(series.dates[origin + record["horizon"]].astype("datetime64[D]"))
             # ... and the realized close is the h-day log return, never an earlier or later one
