@@ -224,6 +224,19 @@ for every eligible ticker, with an expected calendar date (`expected_target_date
 unset until the ticker's next data row exists) -- and prints a one-line digest. Idempotent (`NOOP` on rerun);
 catches up automatically if days were missed. Scheduling it is the operator's choice.
 
+### Scheduling it (launchd)
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_OCTOPUS_RUN_DIR|$HOME/octopus/quick|g" \
+  deploy/launchd/com.all-stock-dca.octopus-daily-update.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.octopus-daily-update    # run once now to test
+```
+
+Runs 18:30 Mon-Fri local time (after the close and the archive refresh); log at
+`/tmp/dca-octopus-daily-update.log`. Needs an existing run directory with a checkpoint.
+
 ### Recovery retrains
 
 After major discrepancies or errors (a `DEGRADED` health flag, a runtime failure that leaves
