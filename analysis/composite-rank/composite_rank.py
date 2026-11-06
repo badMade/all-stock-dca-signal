@@ -31,6 +31,7 @@ import datetime as dt
 import html
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -72,6 +73,8 @@ DEFAULT_PARAMS = {
 }
 SHADOW_FIELDS = ["origin_date", "ticker", "exp_ret", "p10_ret", "p90_ret", "expected_target_date", "fwd_pct", "model"]
 FORWARD_SIGNALS = ("octopus", "ml")
+SHADOW_ML_FIELDS = ["date", "ticker", "tilt", "fwd_pct", "status", "model_version"]
+ML_HORIZON_DAYS = 7  # ml-forecaster targets the forward 5 trading days, about 7 calendar days
 PARAMS_PATH = Path(__file__).resolve().with_name("params.json")
 
 
@@ -608,6 +611,95 @@ def read_history_any(path):
     return read_history(path)
 
 
+def default_ml_root():
+    """ml-forecaster's history root: ``$DCA_CRON_TRACKING_ROOT`` (default ``<repo>/cron_tracking``)/sizing_suggestions."""
+    base = os.environ.get("DCA_CRON_TRACKING_ROOT") or str(Path(__file__).resolve().parents[2] / "cron_tracking")
+    return Path(base) / "sizing_suggestions"
+
+
+def read_ml_runs(root):
+    """One entry per ml-forecaster run: {date, status, model_version, tilts{ticker: multiplier - 1}}.
+
+    Reads ``<root>/ml_forecaster/*.jsonl`` (torn or malformed lines are skipped). The date is the run's source-data
+    date (``generated_at``). Several runs on one date keep the one recorded last. Tilt is monotonic in the model's
+    predicted forward return, so its rank is the forward signal.
+    """
+    best = {}
+    directory = Path(root) / "ml_forecaster"
+    for path in sorted(directory.glob("*.jsonl")) if directory.is_dir() else []:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+                day = str(rec["generated_at"])[:10]
+                dt.date.fromisoformat(day)
+                tilts = {str(t).upper(): float(m) - 1.0 for t, m in (rec.get("adjustments") or {}).items()
+                         if math.isfinite(float(m))}
+            except (ValueError, KeyError, TypeError):
+                continue
+            if tilts and (day not in best or str(rec.get("recorded_at", "")) >= best[day][0]):
+                best[day] = (str(rec.get("recorded_at", "")),
+                             {"date": day, "status": str(rec.get("status", "")),
+                              "model_version": str(rec.get("model_version") or ""), "tilts": tilts})
+    return [best[d][1] for d in sorted(best)]
+
+
+def ml_percentiles(runs, tickers, as_of, max_age_days=5):
+    """{ticker: percentile of tilt} from the newest run dated within ``max_age_days`` before ``as_of``."""
+    eligible = [r for r in runs if 0 <= (as_of - dt.date.fromisoformat(r["date"])).days <= max_age_days]
+    if not eligible:
+        return {}
+    pool = {t: v for t, v in eligible[-1]["tilts"].items() if t in tickers}
+    return percentiles(pool) if pool else {}
+
+
+def upsert_shadow_ml(path, runs):
+    """Merge runs into ``shadow_ml_history.csv`` keyed by (date, ticker); returns the row count."""
+    path = Path(path)
+    merged = {(r["date"], r["ticker"]): r for r in read_history(path)}
+    for run in runs:
+        pcts = percentiles(run["tilts"]) if run["tilts"] else {}
+        for ticker, tilt in run["tilts"].items():
+            merged[(run["date"], ticker)] = {"date": run["date"], "ticker": ticker, "tilt": f"{tilt:.5f}",
+                                             "fwd_pct": f"{pcts[ticker]:.1f}", "status": run["status"],
+                                             "model_version": run["model_version"]}
+    rows = [merged[k] for k in sorted(merged)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SHADOW_ML_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+def ml_scorecard(ml_rows, history_rows, series_by_ticker, horizon_days=ML_HORIZON_DAYS):
+    """Per run date: rank correlation of ml-forecaster's tilt and of the composite score with the realised return over
+    the next ``horizon_days`` calendar days (only dates whose horizon has fully elapsed in the price data)."""
+    scores = {}
+    for r in history_rows:
+        scores.setdefault(r["date"], {})[r["ticker"]] = float(r["score"])
+    by_date = {}
+    for r in ml_rows:
+        by_date.setdefault(r["date"], []).append(r)
+    out = []
+    for day in sorted(by_date):
+        origin = _parse_day(day)
+        target = origin + dt.timedelta(days=horizon_days) if origin else None
+        pairs, comp = [], []
+        for r in by_date[day]:
+            series = series_by_ticker.get(r["ticker"])
+            if not series or target is None or series.last_date < target:
+                continue
+            a, b = series.value_at(origin, max_gap=3), series.value_at(target, max_gap=3)
+            if not a or not b:
+                continue
+            pairs.append((float(r["tilt"]), b / a - 1.0))
+            if r["ticker"] in scores.get(day, {}):
+                comp.append((scores[day][r["ticker"]], b / a - 1.0))
+        if len(pairs) >= 5:
+            out.append({"date": day, "n": len(pairs), "ml_ic": spearman(pairs), "composite_ic": spearman(comp)})
+    return out
+
+
 def spearman(pairs):
     """Rank correlation of (x, y) pairs; None when fewer than 5 pairs or no variation."""
     if len(pairs) < 5:
@@ -833,6 +925,9 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     forward = {}
     for ticker, pct in octopus_percentiles(octopus, set(series), as_of.isoformat()).items():
         forward.setdefault(ticker, {})["octopus"] = pct
+    ml_runs = read_ml_runs(getattr(args, "ml_root", None) or default_ml_root())
+    for ticker, pct in ml_percentiles(ml_runs, set(series), as_of).items():
+        forward.setdefault(ticker, {})["ml"] = pct
     records, unscored = score_universe(series, as_of, params, forward)
     if not records:
         return None
@@ -854,6 +949,8 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     if octopus:
         pcts = {as_of.isoformat(): {t: f["octopus"] for t, f in forward.items()}}
         upsert_shadow(data_dir / "shadow_octopus_history.csv", octopus, pcts)
+    if ml_runs:
+        upsert_shadow_ml(data_dir / "shadow_ml_history.csv", ml_runs)
     trade = build_trade_list(records, held, params)
     write_trade_list(run_dir, data_dir / "trade_list_history.csv", as_of, records, trade, params)
     tickers_config = _load_json(Path(args.config_dir) / "tickers.json", {})
@@ -983,16 +1080,36 @@ def cmd_shadow_octopus(args):
     return 0
 
 
+def cmd_shadow_ml(args):
+    """Log ml-forecaster's per-ticker tilts (zero weight) into shadow_ml_history.csv."""
+    runs = read_ml_runs(args.root or default_ml_root())
+    if not runs:
+        print("no ml-forecaster runs found (expected <root>/ml_forecaster/*.jsonl)")
+        return 1
+    total = upsert_shadow_ml(Path(args.data_dir) / "shadow_ml_history.csv", runs)
+    print(json.dumps({"runs_read": len(runs), "shadow_rows": total, "latest": runs[-1]["date"]}))
+    return 0
+
+
 def cmd_shadow_scorecard(args):
     """Does Octopus's expected return predict the realised next-day return better than the composite score?"""
     shadow = read_history(Path(args.data_dir) / "shadow_octopus_history.csv")
-    if not shadow:
+    ml_rows = read_history(Path(args.data_dir) / "shadow_ml_history.csv")
+    if not shadow and not ml_rows:
         print("no shadow history yet")
         return 0
     tickers, _, _, _, series = prepare(args)
-    card = shadow_scorecard(shadow, read_history(Path(args.data_dir) / "history.csv"), series)
+    history = read_history(Path(args.data_dir) / "history.csv")
+    ml_card = ml_scorecard(ml_rows, history, series) if ml_rows else []
+    for item in ml_card:
+        ic = "  n/a" if item["ml_ic"] is None else f"{item['ml_ic']:+.2f}"
+        cic = "  n/a" if item["composite_ic"] is None else f"{item['composite_ic']:+.2f}"
+        print(f"  ml {item['date']} n={item['n']:>3}  ml IC {ic}  composite IC {cic}  (next {ML_HORIZON_DAYS} days)")
+    if ml_rows and not ml_card:
+        print("  ml: no logged run has its 7-day horizon in the price data yet")
+    card = shadow_scorecard(shadow, history, series) if shadow else []
     if not card:
-        print("no logged forecast has a realised target date in the price data yet")
+        print("no logged Octopus forecast has a realised target date in the price data yet")
         return 0
 
     def fmt(value):
@@ -1041,6 +1158,7 @@ def build_parser():
     parser.add_argument("--data-dir", default=str(root / "artifacts" / "composite_rank"))
     parser.add_argument("--archive-dir", default=str(root / "ticker_data"))
     parser.add_argument("--params", default="", help="ranking parameters JSON (default: params.json)")
+    parser.add_argument("--ml-root", default="", help="ml-forecaster suggestion history root (default: cron root)")
     parser.add_argument("--config-dir", default=str(root / "config"),
                         help="read-only: config/tickers.json is compared with the trade list to build the proposal")
     parser.add_argument("--universe", choices=UNIVERSES, default="sp500",
@@ -1069,6 +1187,9 @@ def build_parser():
     so = sub.add_parser("shadow-octopus", help="log Octopus next-day forecasts at zero weight")
     so.add_argument("sources", nargs="+", help="Octopus *_next_day_forecasts.csv files or run directories")
     so.set_defaults(func=cmd_shadow_octopus)
+    sm = sub.add_parser("shadow-ml", help="log ml-forecaster tilts at zero weight")
+    sm.add_argument("--root", default="", help="sizing_suggestions root (default: <cron root>/sizing_suggestions)")
+    sm.set_defaults(func=cmd_shadow_ml)
     sub.add_parser("shadow-scorecard", help="Octopus vs composite score against realised returns").set_defaults(
         func=cmd_shadow_scorecard)
     sub.add_parser("missing", help="print tickers with no price history yet").set_defaults(func=cmd_missing)

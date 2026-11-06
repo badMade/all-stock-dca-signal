@@ -67,6 +67,11 @@ change a score or the list. If `inputs/octopus_sources.json` lists Octopus run d
 same by hand. `shadow-scorecard` reports, per forecast day, the rank correlation (IC) of Octopus's expected return and
 of the composite score with the realised return. A model earns weight only when its IC beats the composite's over
 enough days; then raise its `forward_weights` entry, bump `version`, and the blend applies from that run on.
+ml-forecaster is logged the same way: each `run` (or `shadow-ml`) reads its `sizing_suggestions/ml_forecaster/*.jsonl`
+history (default under `$DCA_CRON_TRACKING_ROOT`; `--ml-root` overrides), turns each multiplier into a tilt
+(`multiplier - 1`, monotonic in its predicted 5-day return) and upserts `shadow_ml_history.csv`
+(`date, ticker, tilt, fwd_pct, status, model_version`). `shadow-scorecard` also scores it over the next 7 calendar days.
+It stays empty until ml-forecaster has published at least one run to that history.
 Octopus forecasts are only as fresh as its last `daily_update` run, and today it predicts one day ahead.
 
 ## Tuning the ranking
@@ -86,7 +91,7 @@ Nothing adjusts weights automatically.
 | `runs/<date>/data_gaps.json` | Tickers with no price history or too little history to score. |
 | `trade_list_history.csv`, `runs/<date>/trade_list.csv`, `latest_trade_list.csv` | The daily list (score above 80, or held above 50) with the reason and the params version. |
 | `runs/<date>/tickers_proposal.{md,json}`, `latest_tickers_proposal.md` | Review-first diff of the list against `config/tickers.json`. Never applied automatically. |
-| `shadow_octopus_history.csv` | Octopus next-day forecasts logged at zero weight (see above). |
+| `shadow_octopus_history.csv`, `shadow_ml_history.csv` | Octopus and ml-forecaster signals logged at zero weight (see above). |
 | `history.csv` | One row per ticker per run: rank, score, volatility, drawdown. No holdings column. The basis for movement tracking. Read it with the `history` command, not by loading the file. |
 | `movement_summary.md` | How far names typically move by starting rank, and per-ticker rank behaviour. |
 | `latest_evaluation_list.md`, `latest_ranked_all.csv` | Copies of the most recent run. |

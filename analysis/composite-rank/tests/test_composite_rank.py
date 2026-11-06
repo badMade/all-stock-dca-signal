@@ -367,3 +367,41 @@ def test_stale_origin_dates_in_an_octopus_export_are_not_logged(tmp_path):
         ("NEW", "octopus", "2026-11-04", 100, 101, 99, 102, "2026-11-05")])
     rows = cr.read_octopus_forecasts(cr.find_octopus_files([tmp_path]))
     assert [r["ticker"] for r in rows] == ["NEW"]
+
+
+def _ml_line(day, adjustments, recorded="2026-11-05T22:00:00+00:00", status="published"):
+    return json.dumps({"generated_at": f"{day}T21:00:00+00:00", "recorded_at": recorded, "status": status,
+                       "model_version": "v1", "adjustments": adjustments})
+
+
+def test_ml_forecaster_history_is_read_ranked_and_logged(tmp_path):
+    root = tmp_path / "sizing_suggestions" / "ml_forecaster"
+    root.mkdir(parents=True)
+    (root / "2026.jsonl").write_text("\n".join([
+        _ml_line("2026-11-03", {"A": 1.1, "B": 0.9}),
+        "{torn line",
+        _ml_line("2026-11-04", {"A": 1.2, "B": 1.0, "C": 0.8}, recorded="2026-11-04T22:00:00+00:00"),
+        _ml_line("2026-11-04", {"A": 0.8, "B": 1.0, "C": 1.2}, recorded="2026-11-05T01:00:00+00:00"),
+    ]) + "\n")
+    runs = cr.read_ml_runs(tmp_path / "sizing_suggestions")
+    assert [r["date"] for r in runs] == ["2026-11-03", "2026-11-04"]
+    assert runs[1]["tilts"]["C"] == pytest.approx(0.2)  # the later recording of 11-04 wins
+    pct = cr.ml_percentiles(runs, {"A", "B", "C"}, dt.date(2026, 11, 5))
+    assert pct["C"] == 100.0 and pct["A"] == 0.0
+    assert cr.ml_percentiles(runs, {"A"}, dt.date(2026, 12, 1)) == {}  # too old to be today's signal
+    data = tmp_path / "data"
+    argv = ["--data-dir", str(data), "shadow-ml", "--root", str(tmp_path / "sizing_suggestions")]
+    assert cr.main(argv) == 0 and cr.main(argv) == 0
+    assert len(cr.read_history(data / "shadow_ml_history.csv")) == 5
+    assert cr.main(["--data-dir", str(data), "shadow-ml", "--root", str(tmp_path / "none")]) == 1
+
+
+def test_ml_scorecard_needs_the_horizon_to_elapse_and_rewards_a_correct_ranking():
+    names = ["a", "b", "c", "d", "e", "f"]
+    rows = [{"date": "2026-11-01", "ticker": t.upper(), "tilt": str(0.1 * (5 - i))} for i, t in enumerate(names)]
+    short = {t.upper(): cr.Series([(dt.date(2026, 11, 1), 100.0), (dt.date(2026, 11, 3), 101.0)]) for t in names}
+    assert cr.ml_scorecard(rows, [], short) == []
+    full = {t.upper(): cr.Series([(dt.date(2026, 11, 1), 100.0), (dt.date(2026, 11, 8), 100.0 + (5 - i))])
+            for i, t in enumerate(names)}
+    card = cr.ml_scorecard(rows, [], full)
+    assert card and card[0]["ml_ic"] == pytest.approx(1.0)
