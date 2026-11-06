@@ -58,6 +58,17 @@ writes `tickers_proposal.md` (names it would add, names that would stop being bo
 The operator reviews the proposal and asks for it to be applied (a normal draft PR: tickers.json, `near_close_dca`
 constants, sizing calibration, prompts, planner, tests).
 
+## Forward-looking models in shadow mode (zero weight)
+
+`params.json` `forward_weights` (`octopus`, `ml`) are both **0**, so forward models are logged and measured but cannot
+change a score or the list. If `inputs/octopus_sources.json` lists Octopus run directories (JSON list of paths), each
+`run` reads their newest `*_next_day_forecasts.csv` exports and upserts `shadow_octopus_history.csv`
+(`origin_date, ticker, exp_ret, p10_ret, p90_ret, expected_target_date, fwd_pct`); `shadow-octopus <paths>` does the
+same by hand. `shadow-scorecard` reports, per forecast day, the rank correlation (IC) of Octopus's expected return and
+of the composite score with the realised return. A model earns weight only when its IC beats the composite's over
+enough days; then raise its `forward_weights` entry, bump `version`, and the blend applies from that run on.
+Octopus forecasts are only as fresh as its last `daily_update` run, and today it predicts one day ahead.
+
 ## Tuning the ranking
 
 All weights, the 20% ROI bonus, the volatility/drawdown blend and both cutoffs live in `params.json`. Change a value,
@@ -75,6 +86,7 @@ Nothing adjusts weights automatically.
 | `runs/<date>/data_gaps.json` | Tickers with no price history or too little history to score. |
 | `trade_list_history.csv`, `runs/<date>/trade_list.csv`, `latest_trade_list.csv` | The daily list (score above 80, or held above 50) with the reason and the params version. |
 | `runs/<date>/tickers_proposal.{md,json}`, `latest_tickers_proposal.md` | Review-first diff of the list against `config/tickers.json`. Never applied automatically. |
+| `shadow_octopus_history.csv` | Octopus next-day forecasts logged at zero weight (see above). |
 | `history.csv` | One row per ticker per run: rank, score, volatility, drawdown. No holdings column. The basis for movement tracking. Read it with the `history` command, not by loading the file. |
 | `movement_summary.md` | How far names typically move by starting rank, and per-ticker rank behaviour. |
 | `latest_evaluation_list.md`, `latest_ranked_all.csv` | Copies of the most recent run. |

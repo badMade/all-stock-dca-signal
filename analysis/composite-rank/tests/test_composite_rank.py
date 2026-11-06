@@ -283,3 +283,87 @@ def test_effectiveness_compares_list_with_universe(tmp_path, capsys):
     result = cr.effectiveness(rows, {"UP": up, "DOWN": down}, ["UP", "DOWN"], 20)
     assert result and result[0]["edge"] > 0 and result[0]["listed"] == 1
     assert cr.effectiveness(rows, {"UP": up, "DOWN": down}, ["UP", "DOWN"], 400) == []
+
+
+# ---- shadow logging of forward-looking models (zero weight) ---------------------------------------
+OCTOPUS_HEADER = "ticker,model,origin_date,ref_close,pred_close,close_p10,close_p90,expected_target_date"
+
+
+def _octopus_csv(path, rows):
+    path.write_text(OCTOPUS_HEADER + "\n" + "\n".join(",".join(str(v) for v in r) for r in rows) + "\n")
+
+
+def test_zero_forward_weight_never_changes_the_score_and_positive_weight_does():
+    assert cr.apply_forward(70.0, {"octopus": 100.0}, {"octopus": 0.0, "ml": 0.0}) == 70.0
+    assert cr.apply_forward(70.0, None, {"octopus": 0.5, "ml": 0.0}) == 70.0
+    assert cr.apply_forward(70.0, {"octopus": 100.0}, {"octopus": 0.25, "ml": 0.0}) == pytest.approx(77.5)
+    with pytest.raises(ValueError):
+        bad = {"forward_weights": {"octopus": 0.8, "ml": 0.5}}
+        path = Path(__file__).parent / "_bad_params.json"
+        path.write_text(json.dumps(bad))
+        try:
+            cr.load_params(path)
+        finally:
+            path.unlink()
+    assert cr.load_params()["forward_weights"] == {"octopus": 0.0, "ml": 0.0}
+
+
+def test_octopus_export_is_logged_idempotently_and_scored_in_a_shadow_scorecard(tmp_path):
+    day, target = "2026-11-04", "2026-11-05"
+    names = ["UP", "A", "B", "C", "D", "E", "DOWN"]
+    rows = [(t, "octopus", day, 100, 100 * (1 + (3 - i) / 100), 99, 101, target) for i, t in enumerate(names)]
+    csv_path = tmp_path / "daily" / f"{day}_next_day_forecasts.csv"
+    csv_path.parent.mkdir()
+    _octopus_csv(csv_path, rows)
+    data = tmp_path / "data"
+    argv = ["--data-dir", str(data), "shadow-octopus", str(tmp_path)]
+    assert cr.main(argv) == 0 and cr.main(argv) == 0
+    logged = cr.read_history(data / "shadow_octopus_history.csv")
+    assert len(logged) == len(names) and {r["origin_date"] for r in logged} == {day}
+    assert float(next(r for r in logged if r["ticker"] == "UP")["fwd_pct"]) == 100.0
+    # realised: the forecast ranking is right (UP rises most), so the rank correlation is positive
+    series = {}
+    for i, t in enumerate(names):
+        series[t] = cr.Series([(dt.date(2026, 11, 4), 100.0), (dt.date(2026, 11, 5), 100.0 * (1 + (3 - i) / 100))])
+    card = cr.shadow_scorecard(logged, [], series)
+    assert card and card[0]["octopus_ic"] == pytest.approx(1.0) and card[0]["octopus_spread"] > 0
+    assert cr.main(["--data-dir", str(tmp_path / "none"), "shadow-octopus", str(tmp_path / "missing")]) == 1
+
+
+def test_run_consumes_octopus_sources_but_leaves_scores_unchanged_at_zero_weight(tmp_path):
+    def run(with_octopus):
+        data = tmp_path / ("with" if with_octopus else "without")
+        (data / "inputs").mkdir(parents=True)
+        (data / "inputs" / "holdings.json").write_text(json.dumps({"symbols": []}))
+        members = [["AAA", "A", "T"], ["BBB", "B", "T"], ["CCC", "C", "T"]]
+        (data / "inputs" / "sp500.json").write_text(json.dumps(members))
+        ext = {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+               for t, s in {"AAA": make_series(0.001), "BBB": make_series(-0.0002), "CCC": make_series(0.0004)}.items()}
+        (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+        if with_octopus:
+            src = tmp_path / "oct"
+            src.mkdir(exist_ok=True)
+            _octopus_csv(src / "x_next_day_forecasts.csv",
+                         [(t, "octopus", "2026-11-04", 100, 100 + i, 99, 101, "2026-11-05")
+                          for i, t in enumerate(["AAA", "BBB", "CCC"])])
+            (data / "inputs" / "octopus_sources.json").write_text(json.dumps([str(src)]))
+        empty = tmp_path / "empty"
+        empty.mkdir(exist_ok=True)
+        cfg = tmp_path / "cfg"
+        cfg.mkdir(exist_ok=True)
+        assert cr.main(["--data-dir", str(data), "--archive-dir", str(empty), "--config-dir", str(cfg),
+                        "run", "--as-of", "2026-11-04"]) == 0
+        return data
+
+    plain, shadowed = run(False), run(True)
+    assert (plain / "history.csv").read_text() == (shadowed / "history.csv").read_text()
+    assert not (plain / "shadow_octopus_history.csv").exists()
+    assert len(cr.read_history(shadowed / "shadow_octopus_history.csv")) == 3
+
+
+def test_stale_origin_dates_in_an_octopus_export_are_not_logged(tmp_path):
+    _octopus_csv(tmp_path / "a_next_day_forecasts.csv", [
+        ("OLD", "octopus", "2012-11-08", 100, 101, 99, 102, "2012-11-09"),
+        ("NEW", "octopus", "2026-11-04", 100, 101, 99, 102, "2026-11-05")])
+    rows = cr.read_octopus_forecasts(cr.find_octopus_files([tmp_path]))
+    assert [r["ticker"] for r in rows] == ["NEW"]

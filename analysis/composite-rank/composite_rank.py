@@ -66,7 +66,12 @@ DEFAULT_PARAMS = {
     "return_score_cap": RETURN_SCORE_CAP,
     "evaluate_threshold": 80.0,
     "held_threshold": 50.0,
+    # Share of the final score taken from each forward-looking model's percentile. ZERO = shadow mode: the signal is
+    # logged and measured (shadow_octopus_history.csv) but cannot change the score or the list.
+    "forward_weights": {"octopus": 0.0, "ml": 0.0},
 }
+SHADOW_FIELDS = ["origin_date", "ticker", "exp_ret", "p10_ret", "p90_ret", "expected_target_date", "fwd_pct", "model"]
+FORWARD_SIGNALS = ("octopus", "ml")
 PARAMS_PATH = Path(__file__).resolve().with_name("params.json")
 
 
@@ -77,7 +82,7 @@ def load_params(path=None):
     if path.exists():
         raw = json.loads(path.read_text(encoding="utf-8"))
         for key, value in raw.items():
-            if key in ("period_weights", "blend"):
+            if key in ("period_weights", "blend", "forward_weights"):
                 params[key].update(value)
             elif key in params:
                 params[key] = value
@@ -86,6 +91,10 @@ def load_params(path=None):
     blend_total = sum(params["blend"].values())
     if sum(params["period_weights"].values()) <= 0 or not math.isclose(blend_total, 1.0, abs_tol=1e-6):
         raise ValueError("period_weights must not all be zero and blend must sum to 1")
+    fw = params["forward_weights"]
+    if set(fw) != set(FORWARD_SIGNALS) or any(w < 0 for w in fw.values()) or sum(fw.values()) > 1.0:
+        raise ValueError("forward_weights must cover " + ", ".join(FORWARD_SIGNALS)
+                         + " with weights >= 0 summing to <= 1")
     if params["held_threshold"] > params["evaluate_threshold"]:
         raise ValueError("held_threshold must not exceed evaluate_threshold")
     return params
@@ -239,7 +248,16 @@ def risk_stats(series, as_of):
     return vol, worst
 
 
-def score_universe(series_by_ticker, as_of, params=None):
+def apply_forward(historical, signals, weights):
+    """Blend forward-model percentiles into the historical score. With zero weights (shadow mode) this returns
+    ``historical`` unchanged. A ticker missing a signal keeps that signal's weight on the historical score."""
+    used = {k: w for k, w in weights.items() if w > 0 and signals and k in signals}
+    if not used:
+        return historical
+    return (1.0 - sum(used.values())) * historical + sum(w * signals[k] for k, w in used.items())
+
+
+def score_universe(series_by_ticker, as_of, params=None, forward=None):
     """Return {ticker: record} for every ticker with a 1y return and risk stats."""
     params = params or DEFAULT_PARAMS
     weights, blend = params["period_weights"], params["blend"]
@@ -268,6 +286,7 @@ def score_universe(series_by_ticker, as_of, params=None):
             continue
         base = num / den
         final = blend["base"] * base + blend["lowvol"] * low_vol[ticker] + blend["lowdd"] * low_dd[ticker]
+        final = apply_forward(final, (forward or {}).get(ticker), params["forward_weights"])
         records[ticker] = {
             "score": final,
             "base_score": base,
@@ -517,6 +536,128 @@ def effectiveness(trade_rows, series_by_ticker, universe, horizon):
 
 
 # ----------------------------------------------------------------------------------------------
+# Shadow logging of forward-looking models (zero weight until they earn it)
+# ----------------------------------------------------------------------------------------------
+def find_octopus_files(sources):
+    """Every ``*_next_day_forecasts.csv`` at or below the given files / directories."""
+    found = []
+    for source in sources:
+        path = Path(source)
+        if path.is_file():
+            found.append(path)
+        elif path.is_dir():
+            found.extend(sorted(path.rglob("*_next_day_forecasts.csv")))
+    return found
+
+
+def read_octopus_forecasts(paths):
+    """[{origin_date, ticker, exp_ret, p10_ret, p90_ret, expected_target_date, model}] from Octopus CSV exports."""
+    rows = []
+    for path in paths:
+        with Path(path).open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    ref = float(row["ref_close"])
+                    exp = float(row["pred_close"]) / ref - 1.0
+                    lo, hi = float(row["close_p10"]) / ref - 1.0, float(row["close_p90"]) / ref - 1.0
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    continue
+                if not (math.isfinite(exp) and math.isfinite(lo) and math.isfinite(hi)):
+                    continue
+                rows.append({"origin_date": row.get("origin_date", ""), "ticker": row.get("ticker", ""),
+                             "exp_ret": exp, "p10_ret": lo, "p90_ret": hi,
+                             "expected_target_date": row.get("expected_target_date", ""),
+                             "model": row.get("model", "octopus")})
+    rows = [r for r in rows if r["origin_date"] and r["ticker"]]
+    # An export also carries forecasts for tickers whose data ended long ago (origin dates years back); only the
+    # current batch is a live forecast, so keep origins within a week of the newest one in the export.
+    if rows:
+        newest = max(r["origin_date"] for r in rows)
+        cutoff = (dt.date.fromisoformat(newest) - dt.timedelta(days=7)).isoformat()
+        rows = [r for r in rows if r["origin_date"] >= cutoff]
+    return rows
+
+
+def octopus_percentiles(forecasts, tickers, origin_date):
+    """{ticker: percentile of expected 1-day return} among ``tickers`` forecast for ``origin_date``."""
+    pool = {f["ticker"]: f["exp_ret"] for f in forecasts if f["origin_date"] == origin_date and f["ticker"] in tickers}
+    return percentiles(pool) if pool else {}
+
+
+def upsert_shadow(path, forecasts, pct_by_date):
+    """Merge forecasts into ``shadow_octopus_history.csv`` keyed by (origin_date, ticker); returns the row count."""
+    path = Path(path)
+    merged = {(r["origin_date"], r["ticker"]): r for r in read_history_any(path)}
+    for f in forecasts:
+        pct = pct_by_date.get(f["origin_date"], {}).get(f["ticker"])
+        merged[(f["origin_date"], f["ticker"])] = {
+            "origin_date": f["origin_date"], "ticker": f["ticker"], "exp_ret": f"{f['exp_ret']:.5f}",
+            "p10_ret": f"{f['p10_ret']:.5f}", "p90_ret": f"{f['p90_ret']:.5f}",
+            "expected_target_date": f["expected_target_date"], "fwd_pct": "" if pct is None else f"{pct:.1f}",
+            "model": f["model"]}
+    rows = [merged[k] for k in sorted(merged)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SHADOW_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+def read_history_any(path):
+    return read_history(path)
+
+
+def spearman(pairs):
+    """Rank correlation of (x, y) pairs; None when fewer than 5 pairs or no variation."""
+    if len(pairs) < 5:
+        return None
+    rx = percentiles({i: x for i, (x, _) in enumerate(pairs)})
+    ry = percentiles({i: y for i, (_, y) in enumerate(pairs)})
+    xs, ys = [rx[i] for i in range(len(pairs))], [ry[i] for i in range(len(pairs))]
+    if statistics.pstdev(xs) == 0 or statistics.pstdev(ys) == 0:
+        return None
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    cov = statistics.fmean((a - mx) * (b - my) for a, b in zip(xs, ys, strict=False))
+    return cov / (statistics.pstdev(xs) * statistics.pstdev(ys))
+
+
+def shadow_scorecard(shadow_rows, history_rows, series_by_ticker):
+    """Per origin date: rank correlation of Octopus's expected return and of the composite score with the realised
+    return to the forecast's target date, plus the top-quintile minus bottom-quintile realised spread for Octopus."""
+    scores = {}
+    for r in history_rows:
+        scores.setdefault(r["date"], {})[r["ticker"]] = float(r["score"])
+    by_date = {}
+    for r in shadow_rows:
+        by_date.setdefault(r["origin_date"], []).append(r)
+    out = []
+    for day in sorted(by_date):
+        pairs, comp = [], []
+        for r in by_date[day]:
+            series = series_by_ticker.get(r["ticker"])
+            target = _parse_day(r["expected_target_date"])
+            origin = _parse_day(day)
+            if not series or target is None or origin is None or series.last_date < target:
+                continue
+            a, b = series.value_at(origin, max_gap=3), series.value_at(target, max_gap=3)
+            if not a or not b:
+                continue
+            realised = b / a - 1.0
+            pairs.append((float(r["exp_ret"]), realised))
+            if r["ticker"] in scores.get(day, {}):
+                comp.append((scores[day][r["ticker"]], realised))
+        if len(pairs) < 5:
+            continue
+        ordered = sorted(pairs)
+        k = max(1, len(ordered) // 5)
+        spread = statistics.fmean(y for _, y in ordered[-k:]) - statistics.fmean(y for _, y in ordered[:k])
+        out.append({"date": day, "n": len(pairs), "octopus_ic": spearman(pairs), "composite_ic": spearman(comp),
+                    "octopus_spread": spread})
+    return out
+
+
+# ----------------------------------------------------------------------------------------------
 # Rendering
 # ----------------------------------------------------------------------------------------------
 def _pct(value):
@@ -687,7 +828,12 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     params = load_params(getattr(args, "params", None))
     threshold = params["evaluate_threshold"] if args.threshold is None else args.threshold
     args.threshold = threshold
-    records, unscored = score_universe(series, as_of, params)
+    sources = _load_json(data_dir / "inputs" / "octopus_sources.json", [])
+    octopus = read_octopus_forecasts(find_octopus_files(sources)) if sources else []
+    forward = {}
+    for ticker, pct in octopus_percentiles(octopus, set(series), as_of.isoformat()).items():
+        forward.setdefault(ticker, {})["octopus"] = pct
+    records, unscored = score_universe(series, as_of, params, forward)
     if not records:
         return None
     run_dir = data_dir / "runs" / as_of.isoformat()
@@ -705,6 +851,9 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     (data_dir / "latest_evaluation_list.md").write_text(evaluation, encoding="utf-8")
     (data_dir / "latest_ranked_all.csv").write_text((run_dir / "ranked_all.csv").read_text(encoding="utf-8"),
                                                    encoding="utf-8")
+    if octopus:
+        pcts = {as_of.isoformat(): {t: f["octopus"] for t, f in forward.items()}}
+        upsert_shadow(data_dir / "shadow_octopus_history.csv", octopus, pcts)
     trade = build_trade_list(records, held, params)
     write_trade_list(run_dir, data_dir / "trade_list_history.csv", as_of, records, trade, params)
     tickers_config = _load_json(Path(args.config_dir) / "tickers.json", {})
@@ -820,6 +969,46 @@ def cmd_effectiveness(args):
     return 0
 
 
+def cmd_shadow_octopus(args):
+    """Log Octopus next-day forecasts (zero weight) from CSV files or directories into shadow_octopus_history.csv."""
+    forecasts = read_octopus_forecasts(find_octopus_files(args.sources))
+    if not forecasts:
+        print("no Octopus forecasts found in the given paths")
+        return 1
+    pcts = {}
+    for day in {f["origin_date"] for f in forecasts}:
+        pcts[day] = octopus_percentiles(forecasts, {f["ticker"] for f in forecasts}, day)
+    total = upsert_shadow(Path(args.data_dir) / "shadow_octopus_history.csv", forecasts, pcts)
+    print(json.dumps({"forecasts_read": len(forecasts), "shadow_rows": total}))
+    return 0
+
+
+def cmd_shadow_scorecard(args):
+    """Does Octopus's expected return predict the realised next-day return better than the composite score?"""
+    shadow = read_history(Path(args.data_dir) / "shadow_octopus_history.csv")
+    if not shadow:
+        print("no shadow history yet")
+        return 0
+    tickers, _, _, _, series = prepare(args)
+    card = shadow_scorecard(shadow, read_history(Path(args.data_dir) / "history.csv"), series)
+    if not card:
+        print("no logged forecast has a realised target date in the price data yet")
+        return 0
+
+    def fmt(value):
+        return "  n/a" if value is None else f"{value:+.2f}"
+
+    for item in card:
+        print(f"  {item['date']} n={item['n']:>3}  octopus IC {fmt(item['octopus_ic'])}  "
+              f"composite IC {fmt(item['composite_ic'])}  "
+              f"octopus top-vs-bottom 20% {item['octopus_spread'] * 100:+.2f}%")
+    ics = [i["octopus_ic"] for i in card if i["octopus_ic"] is not None]
+    if ics:
+        print(f"  mean octopus IC {statistics.fmean(ics):+.3f} over {len(ics)} days "
+              "(IC = rank correlation with the realised return)")
+    return 0
+
+
 def cmd_missing(args):
     tickers, _, _, _ = build_universe(args.data_dir, args.universe)
     ext = _load_json(Path(args.data_dir) / "inputs" / "ext_prices.json", {})
@@ -877,6 +1066,11 @@ def build_parser():
     eff = sub.add_parser("effectiveness", help="forward return of past trade lists vs the universe (tuning input)")
     eff.add_argument("--horizon", type=int, default=20, help="calendar days ahead (default 20)")
     eff.set_defaults(func=cmd_effectiveness)
+    so = sub.add_parser("shadow-octopus", help="log Octopus next-day forecasts at zero weight")
+    so.add_argument("sources", nargs="+", help="Octopus *_next_day_forecasts.csv files or run directories")
+    so.set_defaults(func=cmd_shadow_octopus)
+    sub.add_parser("shadow-scorecard", help="Octopus vs composite score against realised returns").set_defaults(
+        func=cmd_shadow_scorecard)
     sub.add_parser("missing", help="print tickers with no price history yet").set_defaults(func=cmd_missing)
     bars = sub.add_parser("ingest-bars", help="merge saved get_equity_historicals results into ext_prices.json")
     bars.add_argument("files", nargs="+")
