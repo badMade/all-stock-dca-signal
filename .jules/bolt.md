@@ -40,3 +40,7 @@
 ## 2026-11-03 - [Fast-path parsing 12-hour AM/PM times with fromisoformat]
 **Learning:** For strict 12-hour clock time parsing in hot paths (like `%I:%M %p ET` schedules), using `datetime.strptime()` forces slow regex and locale lookups. We can bypass this by validating boundaries (`1 <= h <= 12` and `ampm in ("AM", "PM")`), translating to a 24-hour hour (`h=0` or `h+=12`), and passing the result to `datetime.fromisoformat()` for a ~3x speedup.
 **Action:** When bypassing `strptime` for `%I` strings, manually enforce `1 <= h <= 12` and strict AM/PM checks before formatting the ISO string to perfectly preserve fail-closed semantics on malformed inputs.
+
+## 2026-11-05 - [Avoid Path.rglob() inside repetitive iterative loops]
+**Learning:** Calling `Path.rglob()` repeatedly inside loops (like `_scan_recovery_runs` iterating over `_manual_scan_bases`) causes O(N) system calls and redundant stat overhead because it constructs a large list of `Path` objects in memory.
+**Action:** Replace `Path.rglob()` sweeps with `dca_fileio.iter_files_by_suffix_fast` and `dca_fileio.iter_run_state_files_fast` which utilize `os.scandir` to traverse directories efficiently in a single pass without extra stat calls.
