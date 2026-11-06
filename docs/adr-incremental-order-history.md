@@ -66,3 +66,22 @@ prompt gave the run no legitimate way to read less, and no check that noticed wh
 After the next 09:35 fire: every placed order has a complete line in `per_order_checks.jsonl`,
 `python3 -m scripts.check_per_order_record --run-dir <run dir>` exits 0, the run reports no
 compaction, and no history fetch carries a filter other than `created_at_gte`.
+
+## Addendum 2026-11-05: week baseline reuse at 12:30 (`scripts/reshape_order_pages.py`)
+
+The post-9:35 slots now build their ISO-week history from the 9:35 week envelope plus an
+incremental merge, after the 2026-11-05 3:30 run aborted at Gate 6 because the full week
+(~150+ orders, ~184 KB) could not be saved. 12:30 hit the same wall on 2026-11-03 but could not
+take the same fix: its Gate 4 and Gate 6.5 scripts read `orders_week.json`, a flat list the
+session reshaped from the raw rows BY HAND, not the envelope.
+
+`scripts/reshape_order_pages.py` is that reshape as code. It binds the envelope to the account
+and the week's Monday, re-runs `assemble_order_pages`' row checks and the same complete-chain
+replay `assemble` uses (`same_day_order_snapshot` over `_PageReplayer`; `assemble_order_pages.py`
+itself is untouched because it is bundled into `backup_planner.pyz`), and writes one row per
+order id in the 12:30 Gate 4 shape. Row values follow `backup_planner._to_broker_order`
+(quantity-based buys valued at quantity x price, `executed_dollar_amount` only for dead orders,
+`client_order_id` from `ref_id`), except that "dead" is `dca_runner`'s canonical terminal-state
+set, which also holds `expired` -- `backup_planner._DEAD_STATES` omits it, so the two disagree
+only on an expired, partially filled buy. Any row it cannot map exactly is exit 2, nothing
+written, and the prompt falls back to the full Monday fetch.

@@ -120,6 +120,7 @@
   "scripts.backup_cost_ledger": "A private log of how many Perplexity credits each backup run cost, with a daily total against the target.",
   "scripts.local_heartbeat": "The Mac's \"I'm alive\" signal for a slot, and the check the backup uses to see whether it must step in.",
   "scripts.merge_order_pages": "Adds the newest orders to a saved order history without re-reading the whole day, and refuses if anything could have been missed.",
+  "scripts.reshape_order_pages": "Turns a saved, checked order history into the flat order list the 12:30 run's checks read, so nobody retypes 150 orders by hand; it refuses any order it cannot copy exactly.",
   "scripts.model_usage_log": "Writes one line per run recording which AI model was used, for the usage audit.",
   "scripts.order_refetch": "Re-reads today's orders from the broker so a second buyer can tell whether the first one already placed them.",
   "scripts.plan_first_slot": "Helper the buying agent uses in the plan-first design to fetch what it may buy.",
