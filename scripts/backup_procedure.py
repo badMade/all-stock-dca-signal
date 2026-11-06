@@ -342,7 +342,7 @@ def find_backup(task_id: str) -> Backup | None:
 
 
 def part_token(task_id: str, part: int, directory: Path | None = None) -> str:
-    """Eight hex digits the agent must present to get the NEXT part (bound to the task, the part and its text).
+    """``t`` plus eight hex digits the agent must present to get the NEXT part (bound to the task, the part and its text).
 
     A guard against skipping or reordering, not a secret: it makes later parts fail instead of silently serving
     placement instructions before the preflight, gates, evidence and finalize steps have been read. An agent that
@@ -354,7 +354,11 @@ def part_token(task_id: str, part: int, directory: Path | None = None) -> str:
     if part not in (0, 1, 2):
         raise ValueError("token part must be one of [0, 1, 2]")
     body = _render_part_body(backup, part, directory)
-    return hashlib.sha256(f"{task_id}:{part}:{body}".encode("utf-8")).hexdigest()[:8]
+    # 2026-11-05: the leading "t" is not decoration. Eight hex digits are all decimal about 2.3% of the time
+    # ((10/16)**8), and 54ab24d2's part-0 token came out as one, so the reference prompt carried a bare 8-digit
+    # number that the account-shaped-literal guard (test_no_em_dash_no_account_shaped_literal_no_secret) rightly
+    # rejects. A letter glued to the front means no token can ever read as an account number, whatever the hash.
+    return "t" + hashlib.sha256(f"{task_id}:{part}:{body}".encode("utf-8")).hexdigest()[:8]
 
 
 def render_part(task_id: str, part: int, directory: Path | None = None, token: str | None = None) -> str:
