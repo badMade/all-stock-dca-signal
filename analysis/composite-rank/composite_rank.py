@@ -491,7 +491,18 @@ def _load_json(path, default):
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
 
-def build_universe(data_dir):
+UNIVERSES = ("sp500", "all")
+
+
+def build_universe(data_dir, mode="sp500"):
+    """Tickers to score, the held set (flag only), and name / sector lookups.
+
+    ``sp500`` (default, the current scope) scores only S&P 500 constituents; holdings that are not
+    constituents are ignored but held constituents are flagged. ``all`` also scores every holding and
+    every ticker in ``inputs/watchlist.json`` (the planned wider universe).
+    """
+    if mode not in UNIVERSES:
+        raise ValueError(f"unknown universe {mode!r}")
     inputs = Path(data_dir) / "inputs"
     holdings = _load_json(inputs / "holdings.json", {"symbols": []})
     held = set(holdings.get("symbols", []))
@@ -500,7 +511,8 @@ def build_universe(data_dir):
     names = {t: n for t, n, _ in sp}
     sectors = {t: s for t, _, s in sp}
     names.update(holdings.get("names", {}))
-    tickers = sorted(held | {t for t, _, _ in sp} | watch)
+    members = {t for t, _, _ in sp}
+    tickers = sorted(members if mode == "sp500" else members | held | watch)
     return tickers, held, names, sectors
 
 
@@ -508,39 +520,38 @@ def find_missing(tickers, archive_dir, ext_prices):
     return [t for t in tickers if load_series(archive_dir, ext_prices, t) is None]
 
 
-# ----------------------------------------------------------------------------------------------
-# Commands
-# ----------------------------------------------------------------------------------------------
-def cmd_run(args):
+def default_as_of(series):
+    """The date most series end on, so one early-refreshed ticker cannot move the whole run."""
+    counts = {}
+    for s in series.values():
+        counts[s.last_date] = counts.get(s.last_date, 0) + 1
+    return max(counts, key=lambda d: (counts[d], d))
+
+
+def prepare(args):
     data_dir = Path(args.data_dir)
-    tickers, held, names, sectors = build_universe(data_dir)
+    tickers, held, names, sectors = build_universe(data_dir, args.universe)
     if not tickers:
-        print("error: no universe; write inputs/holdings.json and inputs/sp500.json first", file=sys.stderr)
-        return 2
+        raise SystemExit("error: no universe; run ingest-sp500 first (inputs/sp500.json)")
     ext = _load_json(data_dir / "inputs" / "ext_prices.json", {})
-    tradability = _load_json(data_dir / "inputs" / "tradability.json", {})
     series = {t: load_series(args.archive_dir, ext, t) for t in tickers}
     series = {t: s for t, s in series.items() if s}
     if not series:
-        print("error: no price history found", file=sys.stderr)
-        return 2
-    if args.as_of:
-        as_of = dt.date.fromisoformat(args.as_of)
-    else:  # the date most series end on, so one early-refreshed ticker cannot move the whole run
-        counts = {}
-        for s in series.values():
-            counts[s.last_date] = counts.get(s.last_date, 0) + 1
-        as_of = max(counts, key=lambda d: (counts[d], d))
+        raise SystemExit("error: no price history found")
+    return tickers, held, names, sectors, series
+
+
+def run_once(args, tickers, held, names, sectors, series, as_of):
+    """Score one date and write its outputs; returns the summary dict, or None when nothing scores."""
+    data_dir = Path(args.data_dir)
+    tradability = _load_json(data_dir / "inputs" / "tradability.json", {})
     records, unscored = score_universe(series, as_of)
     if not records:
-        print("error: nothing could be scored", file=sys.stderr)
-        return 2
-
+        return None
     run_dir = data_dir / "runs" / as_of.isoformat()
     run_dir.mkdir(parents=True, exist_ok=True)
     history_path = data_dir / "history.csv"
-    old_rows = read_history(history_path)
-    prev_date, prev = previous_run(old_rows, as_of)
+    prev_date, prev = previous_run(read_history(history_path), as_of)
 
     write_ranked_csv(run_dir / "ranked_all.csv", records, names, sectors, held)
     evaluation = render_evaluation_md(as_of, records, names, held, args.threshold, args.top, prev_date, prev,
@@ -555,18 +566,50 @@ def cmd_run(args):
     stale = sorted(t for t in unscored if t in series)
     missing = sorted(set(tickers) - set(series))
     (run_dir / "data_gaps.json").write_text(
-        json.dumps({"as_of": as_of.isoformat(), "no_price_history": missing, "not_scored_or_stale": stale}, indent=2),
+        json.dumps({"as_of": as_of.isoformat(), "universe": args.universe, "no_price_history": missing,
+                    "not_scored_or_stale": stale}, indent=2),
         encoding="utf-8",
     )
     above = sum(1 for r in records.values() if r["score"] > args.threshold)
-    print(json.dumps({"as_of": as_of.isoformat(), "scored": len(records), "above_threshold": above,
-                      "threshold": args.threshold, "no_price_history": len(missing), "not_scored_or_stale": len(stale),
-                      "run_dir": str(run_dir)}))
+    return {"as_of": as_of.isoformat(), "universe": args.universe, "scored": len(records), "above_threshold": above,
+            "threshold": args.threshold, "no_price_history": len(missing), "not_scored_or_stale": len(stale),
+            "run_dir": str(run_dir)}
+
+
+# ----------------------------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------------------------
+def cmd_run(args):
+    tickers, held, names, sectors, series = prepare(args)
+    as_of = dt.date.fromisoformat(args.as_of) if args.as_of else default_as_of(series)
+    summary = run_once(args, tickers, held, names, sectors, series, as_of)
+    if summary is None:
+        print("error: nothing could be scored", file=sys.stderr)
+        return 2
+    print(json.dumps(summary))
+    return 0
+
+
+def cmd_backfill(args):
+    """Re-score past trading days (series are loaded once). Uses today's holdings for the held flag."""
+    tickers, held, names, sectors, series = prepare(args)
+    start, end = dt.date.fromisoformat(args.start), dt.date.fromisoformat(args.end)
+    ran, skipped = 0, 0
+    day = start
+    while day <= end:
+        bars_today = sum(1 for s in series.values() if s.value_at(day, max_gap=0) is not None)
+        if bars_today >= 0.5 * len(series):  # a real trading day, not a weekend or holiday
+            if run_once(args, tickers, held, names, sectors, series, day):
+                ran += 1
+        else:
+            skipped += 1
+        day += dt.timedelta(days=1)
+    print(json.dumps({"backfilled_runs": ran, "skipped_non_trading_days": skipped}))
     return 0
 
 
 def cmd_missing(args):
-    tickers, _, _, _ = build_universe(args.data_dir)
+    tickers, _, _, _ = build_universe(args.data_dir, args.universe)
     ext = _load_json(Path(args.data_dir) / "inputs" / "ext_prices.json", {})
     print(json.dumps(find_missing(tickers, args.archive_dir, ext)))
     return 0
@@ -596,12 +639,20 @@ def build_parser():
     root = Path(__file__).resolve().parents[2]
     parser.add_argument("--data-dir", default=str(root / "artifacts" / "composite_rank"))
     parser.add_argument("--archive-dir", default=str(root / "ticker_data"))
+    parser.add_argument("--universe", choices=UNIVERSES, default="sp500",
+                        help="sp500 (current scope) or all (also holdings and the watchlist)")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="score, rank, write the evaluation list, update history and movement")
     run.add_argument("--threshold", type=float, default=80.0)
     run.add_argument("--top", type=int, default=0, help="list the top N instead of score > threshold")
     run.add_argument("--as-of", default="", help="YYYY-MM-DD (default: latest price date)")
     run.set_defaults(func=cmd_run)
+    back = sub.add_parser("backfill", help="re-score a date range to seed history")
+    back.add_argument("--start", required=True)
+    back.add_argument("--end", required=True)
+    back.add_argument("--threshold", type=float, default=80.0)
+    back.add_argument("--top", type=int, default=0)
+    back.set_defaults(func=cmd_backfill)
     sub.add_parser("missing", help="print tickers with no price history yet").set_defaults(func=cmd_missing)
     bars = sub.add_parser("ingest-bars", help="merge saved get_equity_historicals results into ext_prices.json")
     bars.add_argument("files", nargs="+")

@@ -147,10 +147,33 @@ def test_full_run_writes_outputs(tmp_path):
     (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
     archive = tmp_path / "empty_archive"
     archive.mkdir()
-    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "run", "--as-of", "2026-11-04",
-                    "--threshold", "10"])
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "--universe", "all", "run",
+                    "--as-of", "2026-11-04", "--threshold", "10"])
     assert code == 0
     assert (data / "runs" / "2026-11-04" / "ranked_all.csv").exists()
     assert (data / "history.csv").exists() and (data / "movement_summary.md").exists()
     assert "Evaluation list for 2026-11-04" in (data / "latest_evaluation_list.md").read_text()
     assert math.isfinite(float((data / "latest_ranked_all.csv").read_text().splitlines()[1].split(",")[5]))
+
+
+def test_universe_modes_and_backfill(tmp_path):
+    data = tmp_path / "data"
+    (data / "inputs").mkdir(parents=True)
+    (data / "inputs" / "holdings.json").write_text(json.dumps({"symbols": ["AAA", "ETF1"]}))
+    (data / "inputs" / "sp500.json").write_text(json.dumps([["AAA", "Alpha", "Tech"], ["CCC", "Gamma", "Tech"]]))
+    tickers, held, _, _ = cr.build_universe(data, "sp500")
+    assert tickers == ["AAA", "CCC"] and held == {"AAA", "ETF1"}  # ETF1 is held but outside the S&P 500
+    assert cr.build_universe(data, "all")[0] == ["AAA", "CCC", "ETF1"]
+    with pytest.raises(ValueError):
+        cr.build_universe(data, "everything")
+
+    bars = {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+            for t, s in {"AAA": make_series(0.001), "CCC": make_series(0.0005)}.items()}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(bars))
+    archive = tmp_path / "empty_archive"
+    archive.mkdir()
+    base = ["--data-dir", str(data), "--archive-dir", str(archive)]
+    assert cr.main(base + ["backfill", "--start", "2026-10-26", "--end", "2026-11-04"]) == 0
+    dates = {r["date"] for r in cr.read_history(data / "history.csv")}
+    assert len(dates) == 10 and "2026-11-04" in dates  # every calendar day here has a synthetic bar
+    assert {r["ticker"] for r in cr.read_history(data / "history.csv")} == {"AAA", "CCC"}

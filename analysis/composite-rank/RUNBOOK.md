@@ -3,6 +3,12 @@
 Scheduled task id: `daily-composite-rank` (weekdays, 5:45 PM local time = after the 4:00 PM ET close).
 This file is the source of truth for what that task does; edit it here and the next run follows it.
 
+## Scope
+
+The ranked universe is the **S&P 500 only** (`--universe sp500`, the default). Holdings are read only to flag which
+constituents you own (held names outside the S&P 500, such as ETFs, are not ranked for now). The wider universe
+(`--universe all`: holdings plus a watchlist, later the whole archive) is built in but not scheduled yet.
+
 ## Hard rules
 
 - **Read-only.** Never place, cancel, or modify an order. Use only read tools (quotes, positions, portfolio,
@@ -16,14 +22,14 @@ This file is the source of truth for what that task does; edit it here and the n
 
 1. **Archive freshness.** Look at the last date in `ticker_data/AAPL.csv`. If it is older than the most recent
    trading day, run the `tickers-daily-update` skill first. If it is still stale afterwards, continue and report it.
-2. **Holdings (read-only).** Call `get_accounts`; for every account with a funded position call
-   `get_equity_positions` (follow pagination). Write `artifacts/composite_rank/inputs/holdings.json` as
+2. **Holdings (read-only, used for the "Held" flag).** Call `get_accounts`; for every account with a funded position
+   call `get_equity_positions` (follow pagination). Write `artifacts/composite_rank/inputs/holdings.json` as
    `{"symbols": [sorted unique tickers with quantity > 0]}`.
 3. **S&P 500 list (weekly).** If `artifacts/composite_rank/inputs/sp500.json` is missing or older than 7 days,
    download `https://en.wikipedia.org/wiki/List_of_S%26P_500_companies` with `curl -A "Mozilla/5.0 (research script)"`
    into the scratchpad and run
    `python3 analysis/composite-rank/composite_rank.py ingest-sp500 <saved.html>`. If parsing fails, keep the old file.
-4. **Tickers the archive lacks.** Run `python3 analysis/composite-rank/composite_rank.py missing`. For those
+4. **S&P 500 tickers the archive lacks.** Run `python3 analysis/composite-rank/composite_rank.py missing`. For those
    tickers call `get_equity_historicals` (max 10 symbols per call) with `interval: "day"`,
    `adjustment_type: "all"` (dividend-adjusted), `start_time` = 420 days ago. The results are large and get saved to
    files by the tool; pass those file paths to
