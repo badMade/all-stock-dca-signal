@@ -50519,6 +50519,24 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     assert order_id is None
 
 
+def test_a_boolean_reconciled_order_id_is_not_usable():
+    """`True` is an `int` in Python (`isinstance(True, int)` holds and `True == 1`), so without the explicit bool
+    gate a history row whose id is a JSON `true` would read as order id 1, and `false` as a falsy-but-numeric 0.
+    `dca_runner._is_usable_order_id` has pinned this since PR #786 (see `test_dca_runner.py`'s invalid list);
+    this pins the near-close twin the same way. 2026-11-06: PR #2138 claimed to add exactly this check, but it was
+    already present on main and that PR's real diff only rolled back newer work (reverted by PR #2152), so nothing
+    guarded it against a future edit.
+    """
+    import near_close_dca
+
+    for value in (True, False):
+        assert near_close_dca._is_usable_reconciled_order_id(value) is False, value
+
+    # The integers the booleans are equal to stay distinct verdicts: 1 is a usable id, 0 is not.
+    assert near_close_dca._is_usable_reconciled_order_id(1) is True
+    assert near_close_dca._is_usable_reconciled_order_id(0) is False
+
+
 def test_an_unresolved_placement_cannot_halt_without_the_adapter_distinction():
     """Why an UNKNOWN verdict isolates rather than stopping the batch.
 
