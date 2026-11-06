@@ -787,7 +787,7 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 > `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
 
 > **PAUSED 2026-10-31 (operator, Perplexity credit plan step 5):** only three backup fires stay scheduled:
-> 9:55 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:45 PM (`f83b8d62`, backs up
+> 10:00 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:45 PM (`f83b8d62`, backs up
 > 3:30). The 10:50 AM (`e028361e`) and 11:50 AM (`e3590042`) tasks and the 1:50/2:50 PM task (`54ab24d2`) are
 > paused, not retired: their prompts stay generated and re-enabling one is a status change in the config plus a
 > paste in Perplexity. A Claude failure at 10:30, 11:30, 1:30 or 2:30 now has no Perplexity backup. Source:
@@ -795,7 +795,7 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 
 | Canonical ET | Canonical task | Backup ET | Backup task | Trades | Status |
 |---|---|---|---|---|---|
-| 9:35 AM | `2ba19526` | 9:55 AM | `4412c3c4` | **backup only** | standing |
+| 9:35 AM | `2ba19526` | 10:00 AM | `4412c3c4` | **backup only** | standing |
 | 10:30 AM | `42173154` | 10:50 AM | `e028361e` | **backup only** | **PAUSED 2026-10-31** |
 | 11:30 AM | `7be82b97` (11:30 fire) | 11:50 AM | `e3590042` | **backup only** | **PAUSED 2026-10-31** |
 | 12:30 PM | `a6239dae` | 12:50 PM | `062605c6` | **backup only** | standing |
@@ -826,7 +826,7 @@ see the note at the top of this section for why that ordering is load-bearing.
 
 | ET | Task | ID | Cadence | Cron (ET) | Trades | Status |
 |---|---|---|---|---|---|---|
-| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 9 * * 1-5` | **yes** | active |
+| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `31 9 * * 1-5` (fires 9:31; decision time stays 9:35) | **yes** | active |
 | 10:30 AM | Morning DCA live Robinhood execution | `42173154` | Weekdays | `30 10 * * 1-5` | **yes** | active |
 | 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 11,13,14 * * 1-5` | **yes** | active |
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 12 * * 1-5` | **yes** | active |
@@ -866,7 +866,7 @@ carry the EDT-calibrated UTC values; they are not what the live routines are reg
 
 Verifier and watchdog prompts follow the same rule: **derive the slot window from the ET
 boundaries at run time, never hardcode a Z value.** Use, e.g. for the 9:35 slot (window
-09:30 to 10:20 ET, widened from 10:00 on 2026-10-28 after the scheduler fired the slot 18 minutes late):
+09:31 to 10:20 ET, widened from 10:00 on 2026-10-28 after the scheduler fired the slot 18 minutes late):
 
 ```
 W_START=$(TZ=America/New_York date -u -d "today 09:30" +%Y-%m-%dT%H:%M:%SZ)

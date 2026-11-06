@@ -327,7 +327,7 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
      parts 1-3 as before.
    - A bad signal costs credits but never skips a check or adds a buy.
    - See `docs/adr-plan-first-backup-executor.md`, "Amendment: read the slot-status signal first".
-4. **Fewer fires (operator decision 2026-10-31).** Only the backups at 09:55, 12:50 and 15:45 stay scheduled
+4. **Fewer fires (operator decision 2026-10-31).** Only the backups at 10:00, 12:50 and 15:45 stay scheduled (10:00 moved from 09:55 on 2026-11-05)
    (for the 09:35, 12:30 and 15:30 slots); the 10:50, 11:50 and 13:50/14:50 tasks are paused, not retired
    (`config/scheduled_tasks.json`, `standing_perplexity_backup_policy.amendment_2026_10_31`).
 5. **Backup only on failure (step 6, `scripts/backup_dispatch.py`).** The goal is zero Perplexity credits on a normal

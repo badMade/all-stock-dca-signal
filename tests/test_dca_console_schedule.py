@@ -88,7 +88,7 @@ def test_manifest_tasks_enriches_the_committed_schedule():
     assert morning["notes"] and len(morning["notes"]) <= 303 and "/home/user" not in json.dumps(result)
     backups = [row for row in result["tasks"] if row["timing"] == "outside this repo"]
     assert backups and all(row["trades"] is True and row["cron_utc"] is None for row in backups)
-    assert any(row["fires_at_et"] == "09:55" for row in backups)
+    assert any(row["fires_at_et"] == "10:00" for row in backups)
     assert "disabled" in {row["status"] for row in result["tasks"]}
     assert {row["status"] for row in result["tasks"]} <= {
         "timing_unverified", "elapsed_unverified", "planned", "disabled", "not_registered", "market_closed",

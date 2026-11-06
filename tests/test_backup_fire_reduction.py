@@ -1,7 +1,7 @@
 """Step 5 of the 2026-10-30 credit plan: fewer scheduled Perplexity backup fires (operator decision 2026-10-31).
 
 The backups cost about 2,500 credits a trading day against a target under 200 (docs/cost_tracking.md). Steps 1-4
-made each fire cheaper; step 5 cuts how many fire. The operator kept three: 09:55 (backs up the 09:35 slot), 12:50
+made each fire cheaper; step 5 cuts how many fire. The operator kept three: 10:00 (backs up the 09:35 slot), 12:50
 (12:30) and 15:45 (15:30). The 10:50 and 11:50 tasks and the two-fire 13:50/14:50 task are PAUSED, not retired: their
 prompts stay generated and re-enabling one is a config change plus a paste.
 
@@ -45,7 +45,7 @@ def test_the_policy_records_the_amendment_and_still_never_expires():
     policy = _data()["standing_perplexity_backup_policy"]
     assert policy["amended_on_et"] == "2026-10-31"
     amendment = policy["amendment_2026_10_31"]
-    for needle in ("credit", "09:55", "12:50", "15:45", "paused", "2026-09-08"):
+    for needle in ("credit", "10:00", "12:50", "15:45", "paused", "2026-09-08"):
         assert needle in amendment, needle
     assert policy["all_backup_tasks_live"] is False
     assert "expires" not in json.dumps(policy).lower()
@@ -92,4 +92,4 @@ def test_the_docs_show_which_backups_are_paused():
     assert "Handoff - 2026-10-31 Perplexity backup fires reduced" in todos
 
     cost = (REPO / "docs" / "cost_tracking.md").read_text(encoding="utf-8")
-    assert "09:55, 12:50 and 15:45" in cost
+    assert "10:00, 12:50 and 15:45" in cost

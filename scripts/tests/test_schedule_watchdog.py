@@ -358,4 +358,5 @@ class EarlyStartFailureMarkerTests(unittest.TestCase):
         self.assertIsNone(self._classify("1430", 14, 26)["failure_key"])
 
     def test_0935_gets_no_early_allowance(self):
-        self.assertIsNotNone(self._classify("0935", 9, 31)["failure_key"])
+        # The slot window opens 09:31 (decision still 09:35); nothing earlier is allowed.
+        self.assertIsNotNone(self._classify("0935", 9, 30)["failure_key"])

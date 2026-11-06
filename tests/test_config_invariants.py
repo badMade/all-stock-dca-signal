@@ -2026,7 +2026,7 @@ _SLOT_FILES = [
 # filename, so a copy-pasted neighbor's window landing in the wrong file is
 # caught even though nothing at runtime ever reads these files as config.
 _SLOT_TIME_WINDOWS = {
-    "1-executor-0935-cron_35_13.txt": "9:35-10:20 AM ET",
+    "1-executor-0935-cron_35_13.txt": "9:31-10:20 AM ET",
     "2-executor-1030-cron_30_14.txt": "10:30-11:00 AM ET",
     "3-executor-1130-cron_30_15.txt": "11:30 AM-12:00 PM ET",
     "4-executor-1230-cron_30_16.txt": "12:30-1:00 PM ET",
@@ -2810,7 +2810,7 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
 
     slots = policy["authorized_slots_et"]
     expected = {
-        "09:35": ("2ba19526", "4412c3c4", "09:55"),
+        "09:35": ("2ba19526", "4412c3c4", "10:00"),
         "10:30": ("42173154", "e028361e", "10:50"),
         "11:30": ("7be82b97", "e3590042", "11:50"),
         "12:30": ("a6239dae", "062605c6", "12:50"),
