@@ -27,7 +27,8 @@ def _load() -> dict:
 def test_label_and_command_publish_from_the_checkout():
     agent = _load()
     assert agent["Label"] == "com.all-stock-dca.slot-status-publish"
-    assert agent["ProgramArguments"] == ["/repo/.venv/bin/python", "-m", "scripts.slot_status", "publish"]
+    # 2026-11-05: the watch marks running slots in_progress, then publishes (it replaced plain `publish`).
+    assert agent["ProgramArguments"] == ["/repo/.venv/bin/python", "-m", "scripts.slot_status_watch"]
     assert agent["WorkingDirectory"] == "/repo"
 
 

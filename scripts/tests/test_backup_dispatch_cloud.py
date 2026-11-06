@@ -149,3 +149,28 @@ def test_every_slot_gets_exactly_one_run_inside_its_cloud_window_in_summer_and_w
         if slot:
             covered.append(slot)
     assert sorted(covered) == ["0935", "1030", "1130", "1230", "1330", "1430", "1530"]
+
+
+# -- a Mac that went silent mid-run (2026-11-05) -----------------------------------------------------------------------
+# Any entry still leaves the decision to the Mac, with one exception: an in_progress slot whose activity_at is more
+# than CLOUD_STALE_MINUTES old means the Mac stopped publishing mid-run (asleep or down), so nobody else will send.
+
+
+def _running(minutes_ago: int, now="10:20"):
+    when = _now(now).timestamp() - minutes_ago * 60
+    stamp = datetime.fromtimestamp(when, tz=ET).isoformat()
+    doc = _doc()
+    doc["slots"]["0935"] = {"status": "in_progress", "stamped_at": "x", "activity_at": stamp}
+    return bd.cloud_decide(doc, day=DAY, slot="0935", now=_now(now), calendar=CALENDAR)
+
+
+def test_a_running_slot_with_recent_activity_is_left_to_the_mac():
+    assert _running(5) == {"action": "skip", "reason": "mac_reported_in_progress"}
+
+
+def test_a_running_slot_silent_past_the_cloud_limit_sends():
+    assert _running(bd.CLOUD_STALE_MINUTES + 1) == {"action": "send", "reason": "mac_stalled"}
+
+
+def test_the_cloud_stale_limit_is_twenty_minutes():
+    assert bd.CLOUD_STALE_MINUTES == 20

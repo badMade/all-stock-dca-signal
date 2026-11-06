@@ -14,8 +14,9 @@
   <array>
     <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
     <string>-m</string>
-    <string>scripts.slot_status</string>
-    <string>publish</string>
+    <!-- 2026-11-05: the watch marks a slot in_progress while its run folder is being written, then publishes, so
+         the backup dispatcher and the cloud watcher wait for a running slot instead of emailing Perplexity. -->
+    <string>scripts.slot_status_watch</string>
   </array>
   <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
   <key>EnvironmentVariables</key>
