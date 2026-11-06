@@ -309,12 +309,33 @@ def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
 # -- hygiene -----------------------------------------------------------------------------
 
 
+def _account_shaped_literal(text, task_id, token):
+    footer = (f"NEXT, only when this part's steps are done: python3 backup_planner.pyz procedure --task {task_id} "
+              f"--part 1 --token {token}\n")
+    text = text.replace(footer, footer.replace(token + "\n", "<procedure-token>\n"), 1)
+    return re.search(r"(?<![.\w])\d{6,12}(?![\w.])", text)
+
+
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_no_em_dash_no_account_shaped_literal_no_secret(prompts, prefix):
+    from scripts import backup_procedure
+
     text = _by_prefix(prompts, prefix)
+    task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
+    token = backup_procedure.part_token(task_id, 0)
     assert "—" not in text
-    assert not re.search(r"(?<![.\w])\d{6,12}(?![\w.])", text)
+    assert not _account_shaped_literal(text, task_id, token)
     assert "@" not in text.replace("${DCA_ALERT_EMAIL_ADDRESS}", "")  # no literal email address
+
+
+def test_account_hygiene_exempts_only_the_generated_procedure_footer():
+    token = "1234" + "5678"
+    footer = ("NEXT, only when this part's steps are done: python3 backup_planner.pyz procedure "
+              f"--task test --part 1 --token {token}\n")
+    assert not _account_shaped_literal(footer, "test", token)
+    for text in (token, f"--token {token}", footer + token, footer.replace(token, token + "9"),
+                 footer.replace("--part 1", "--part 2")):
+        assert _account_shaped_literal(text, "test", token)
 
 
 def test_the_two_fire_prompt_resolves_its_slot_from_the_clock(prompts):
