@@ -316,7 +316,7 @@ def test_refuses_a_condensed_capture_via_the_shared_proof(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     "override,reason",
-    [({"account": "999000222"}, "orders_pages_account_mismatch"), ({"day": "2026-10-26"}, "orders_pages_trading_day_mismatch")],
+    [({"account": "another-account"}, "orders_pages_account_mismatch"), ({"day": "2026-10-26"}, "orders_pages_trading_day_mismatch")],
 )
 def test_refuses_an_envelope_for_another_account_or_week(tmp_path, capsys, override, reason):
     code, out = _run(tmp_path, _envelope(tmp_path, _week_rows()), **override)
