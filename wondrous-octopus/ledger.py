@@ -59,7 +59,9 @@ from typing import Any, Callable, Generator, Iterator
 
 _LEDGER_DIRNAME = "ledger"
 
-RECORD_KINDS = ("forecast", "score", "diagnostic", "repair", "retrain")
+# "horizon_score": one scored multi-horizon forecast (horizon h >= 2) at an
+# evaluation checkpoint, stamped with its horizon (horizon_tracker.py).
+RECORD_KINDS = ("forecast", "score", "horizon_score", "diagnostic", "repair", "retrain")
 # How long an adoption check waits for a shard's extra hard links to go away
 # before refusing. Sized for the file-sync and backup agents that hard-link
 # each freshly written file while they copy it -- Google Drive for Desktop
@@ -88,7 +90,9 @@ def _shard_parts(relpath: str) -> tuple[str, str]:
         raise LedgerError(f"REFUSED: invalid ledger shard path {relpath!r}")
     parts = relpath.split("/")
     if (len(parts) != 2 or parts[0] in ("", ".", "..")
-            or not re.fullmatch(r"(?:forecast|score|diagnostic|repair|retrain)_[0-9]{4}\.jsonl\.gz", parts[1])):
+            or not re.fullmatch(
+                r"(?:forecast|score|horizon_score|diagnostic|repair|retrain)_[0-9]{4}\.jsonl\.gz", parts[1]
+            )):
         raise LedgerError(f"REFUSED: invalid ledger shard path {relpath!r}")
     return parts[0], parts[1]
 
