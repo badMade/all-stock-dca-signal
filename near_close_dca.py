@@ -393,7 +393,7 @@ ACTIVE_TICKERS = [
     # is_tradable_for_fractional_buy gate admits or blocks LULU fail-closed.
     # See config/tickers.json's notes.
     "LULU",
-    # NOV 6 2026 (user-requested): 32 S&P 500 names above 80 on the daily composite
+    # NOV 6 2026 (user-requested): 31 S&P 500 names above 80 on the daily composite
     # rank (analysis/composite-rank). Fractional tradability verified read-only.
     # See config/tickers.json notes and config/ticker_history.csv.
     "GWW",
@@ -424,7 +424,6 @@ ACTIVE_TICKERS = [
     "SPG",
     "REGN",
     "DRI",
-    "ALL",
     "EBAY",
     "CPAY",
     "CINF",

@@ -1,4 +1,4 @@
-"""32 composite-rank S&P 500 names join the active DCA universe (2026-11-06, user-requested)."""
+"""31 composite-rank S&P 500 names join the active DCA universe (2026-11-06, user-requested)."""
 import csv
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ import near_close_dca
 ROOT = Path(__file__).resolve().parent.parent
 NEW = (
     "GWW KO ED HLT TRV ACGL EG BDX MAR RSG KDP MO AIZ CB KIM EXR AWK MRSH MSI EW VLTO WELL LH PSA CTAS SPG "
-    "REGN DRI ALL EBAY CPAY CINF"
+    "REGN DRI EBAY CPAY CINF"
 ).split()
 
 

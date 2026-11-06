@@ -36,5 +36,5 @@ def test_kvue_excluded_in_scheduled_tasks_mirror():
 
 
 def test_active_count_is_90_everywhere():
-    assert len(_load("tickers.json")["active"]) == 123
-    assert _load("scheduled_tasks.json")["ticker_universe_policy"]["active_count"] == 123
+    assert len(_load("tickers.json")["active"]) == 122
+    assert _load("scheduled_tasks.json")["ticker_universe_policy"]["active_count"] == 122

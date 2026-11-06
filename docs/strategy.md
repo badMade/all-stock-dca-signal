@@ -74,7 +74,7 @@ GE VRT CAT QQQ QCOM ABBV JPM VT RVI VCX TRLV LLY TSLA
 VIAV CIEN ANET CSCO FFIV COHR QUBT APH TEL GFS
 TSN RPRX CVS SJM KR CAH HCA HRL PFGC SYY
 HSY USFD MRK RMD DGX CHE ABT MDLZ MCK CHD CL CCI LULU
-GWW KO ED HLT TRV ACGL EG BDX MAR RSG KDP MO AIZ CB KIM EXR AWK MRSH MSI EW VLTO WELL LH PSA CTAS SPG REGN DRI ALL EBAY CPAY CINF
+GWW KO ED HLT TRV ACGL EG BDX MAR RSG KDP MO AIZ CB KIM EXR AWK MRSH MSI EW VLTO WELL LH PSA CTAS SPG REGN DRI EBAY CPAY CINF
 ```
 
 - **Excluded:** `KVUE` -- added 2026-10-19 without an in-repo Robinhood instrument search; on 2026-11-02 Robinhood reported it as an inactive instrument (`inactive_instruments: ["KVUE"]`) and the 9:35 AM payload publisher refused, so it was excluded (see `exclusion_reasons.KVUE`). `QBUT` -- added 2026-08-16 without an in-repo Robinhood instrument search; Robinhood returned not-found for it on every live run since, so it was excluded 2026-09-18 (no confirmed buying mechanism at all -- see `exclusion_reasons.QBUT` in `config/tickers.json`). QBUT was a misspelling of `QUBT` (Quantum Computing Inc.), added to the active list 2026-09-24 after Robinhood resolved it; QBUT stays excluded as a guard against stale ticker lists.
