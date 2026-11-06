@@ -143,7 +143,12 @@ jobs:
     # 15-minute ceiling cancelled the 3.12 leg after its tests had passed
     # on PR 1712. Still a ceiling that stops a hung job from burning the
     # full 6-hour runner default.
-    timeout-minutes: 30
+    # 2026-11-04: raised 30 -> 45. After PR 2152 restored ~19k reverted lines the
+    # 3.12 leg took 29m19s on main (ec07c5c) and 25m on PR 2151's rerun, and
+    # PR 2151's first attempt was cancelled at 30m at 95% with no failures.
+    # Still a hang ceiling. PR-reachable timeouts now sum to 150, which is
+    # config/self_heal.json's ci_worst_case_minutes; raise that with this.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
