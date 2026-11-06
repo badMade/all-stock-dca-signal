@@ -28,8 +28,7 @@
          ready in time fails at the build, not at Gate 5. 540 s is the most that still ends by the 15:40 cutoff below. -->
     <key>DCA_BUILD_DEADLINE_SECONDS</key><string>540</string>
     <!-- 6 parallel workers (the installed plist already runs 6): 4-ticker chunks mean more worker calls, and at 3 the
-         23-chunk rebuild on 2026-11-03 took 519 s. -->
-    <!-- 2026-11-06: 6 -> 8. The 122-symbol universe is 31 chunks; 6 workers is 6 waves (about 390 s), 8 is 4 waves (about 260 s). -->
+         23-chunk rebuild on 2026-11-03 took 519 s. 2026-11-06: 8, see the second DCA_CODEX_PARALLEL entry below. -->
     <key>DCA_CODEX_PARALLEL</key><string>8</string>
     <!-- Wall-clock cutoff, ET (2026-10-30). The live 1530ET prompt re-checks `check` for 12 minutes and then aborts, and
          its session fires at 15:30, so it never gives up before 15:42. 480 s only counts from the build's own start, so a
@@ -39,7 +38,10 @@
     <!-- Concurrent Codex workers (2026-11-04). With 4-ticker chunks (#2115) the plan is 23 chunks of about 60 s each;
          the launcher's default 3 workers ran them in 8 waves, 519 s, and the 11-03 payload published at 15:39, too late
          for the 3:30 session to place its 34 candidates. 6 workers is 4 waves, about 4 minutes, ready near 15:35. Only
-         this agent sets it: the six live slots keep the default. -->
+         this agent sets it: the six live slots keep the default.
+         2026-11-06: 6 -> 8. The universe grew from 91 to 122 symbols, so 31 chunks: 6 workers would be 6 waves, about
+         390 s, published near 15:37; 8 workers is 4 waves, about 260 s, ready near 15:35 again. The live agent runs the
+         same count (tested). 8 concurrent workers is not yet measured against the Codex and Robinhood rate limits. -->
     <key>DCA_CODEX_PARALLEL</key><string>8</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
