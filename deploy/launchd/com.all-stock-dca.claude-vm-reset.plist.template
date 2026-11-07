@@ -6,7 +6,8 @@
   <!-- Weekly fresh Cowork VM (deploy/launchd/claude_vm_reset.sh, 2026-11-04). Quits Claude, deletes the VM root
        disk (rootfs.img, which survives app restarts and filled up on 2026-11-04), and reopens Claude so it builds a
        new one. Saturday 03:00 only: no slot runs on a weekend. The script refuses weekdays, never deletes while
-       Claude is running, and never touches sessiondata.img. -->
+       Claude is running, and never touches sessiondata.img. Launch through the checkout's venv Python because
+       macOS privacy protection (TCC) grants ~/Documents access per binary; the child shell inherits its access. -->
   <key>ProgramArguments</key>
   <!-- Started through the checkout's venv Python, not /bin/sh directly (2026-11-07): macOS privacy protection (TCC)
        grants ~/Documents access per binary, and the first Saturday run of `/bin/sh <script>` failed with
