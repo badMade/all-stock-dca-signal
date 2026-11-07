@@ -16,7 +16,11 @@ import sys
 
 
 def run_cmd(cmd: list[str]) -> None:
-    """Executes a command silently, ignoring errors."""
+    """Executes a command silently, ignoring errors.
+
+    Args:
+        cmd (list[str]): The command to execute.
+    """
     try:
         subprocess.run(cmd, check=False, shell=False)  # nosec B603 - explicit shell=False
     except FileNotFoundError:
@@ -24,7 +28,11 @@ def run_cmd(cmd: list[str]) -> None:
 
 
 def check_health() -> bool:
-    """Runs the healthcheck script and returns True if healthy."""
+    """Runs the healthcheck script and returns True if healthy.
+
+    Returns:
+        bool: True if the healthcheck passes, False otherwise.
+    """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     healthcheck_script = os.path.join(repo_root, "scripts", "healthcheck.py")
     result = subprocess.run([sys.executable, healthcheck_script], shell=False)  # nosec B603 - explicit shell=False
@@ -32,12 +40,20 @@ def check_health() -> bool:
 
 
 def has_diff() -> bool:
-    """Returns True if there is a git diff."""
+    """Returns True if there is a git diff.
+
+    Returns:
+        bool: True if a diff exists, False otherwise.
+    """
     return bool(_status())
 
 
 def _status() -> str:
-    """Returns the current git status porcelain output."""
+    """Returns the current git status porcelain output.
+
+    Returns:
+        str: The porcelain status output.
+    """
     result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, shell=False)  # nosec B603 - explicit shell=False
     return result.stdout.strip()
 

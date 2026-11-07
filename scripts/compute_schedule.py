@@ -43,6 +43,9 @@ def compute_cadence() -> tuple[str, str]:
     Computes a cron schedule based on recent git activity.
     Implements the 5-tier self-scheduling logic, dynamically computing
     intervals and finding the quietest contiguous window for the execution hour.
+
+    Returns:
+        tuple[str, str]: A tuple containing the cron schedule string and the rationale.
     """
     import collections
     import datetime
@@ -168,6 +171,14 @@ def compute_cadence() -> tuple[str, str]:
         return f"0 {run_hour} 1 * *", f"Dormant velocity; running monthly at {run_hour}:00."
 
 def update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
+    """Updates the schedule file with the new schedule and rationale.
+
+    Args:
+        schedule (str): The cron schedule string.
+        rationale (str): The rationale for the schedule.
+        file_path (str): The path to the schedule file.
+        override (bool, optional): Whether this is a manual override. Defaults to False.
+    """
     import os
     try:
         from ruamel.yaml import YAML
@@ -206,7 +217,14 @@ def update_schedule_file(schedule: str, rationale: str, file_path: str, *, overr
 
 def _old_update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
     """(Over)write the schedule file. Plain writes -- no YAML library needed for this
-    fixed, four-key shape (avoids the ruamel dependency: Codex review, PR #389)."""
+    fixed, four-key shape (avoids the ruamel dependency: Codex review, PR #389).
+
+    Args:
+        schedule (str): The cron schedule string.
+        rationale (str): The rationale for the schedule.
+        file_path (str): The path to the schedule file.
+        override (bool, optional): Whether this is a manual override. Defaults to False.
+    """
     new_lines = [
         f"schedule: '{schedule}'\n",
         f"rationale: '{rationale}'\n",
@@ -221,7 +239,14 @@ def parse_schedule_file(file_path: str) -> Tuple[Optional[str], Optional[str], b
     """Returns (schedule, rationale, override) parsed from the schedule file, or
     (None, None, False) if the file does not exist yet. A missing `override:` line
     (e.g. a file written before that key existed) defaults to `override=False`, which
-    preserves the original always-recompute behavior for anyone who hasn't opted in."""
+    preserves the original always-recompute behavior for anyone who hasn't opted in.
+
+    Args:
+        file_path (str): The path to the schedule file.
+
+    Returns:
+        Tuple[Optional[str], Optional[str], bool]: The parsed schedule, rationale, and override flag.
+    """
     if not os.path.exists(file_path):
         return None, None, False
 
@@ -241,6 +266,15 @@ def parse_schedule_file(file_path: str) -> Tuple[Optional[str], Optional[str], b
 
 
 def sync_workflow_cron(workflow_file: str, schedule: str) -> bool:
+    """Synchronizes the workflow file's cron schedule.
+
+    Args:
+        workflow_file (str): The path to the workflow file.
+        schedule (str): The new cron schedule string.
+
+    Returns:
+        bool: True if the file was modified, False otherwise.
+    """
     if not os.path.exists(workflow_file):
         return False
 
@@ -300,6 +334,16 @@ def compute_and_sync(
     workflow_file: str,
     cadence_fn: Callable[[], Tuple[str, str]] = compute_cadence,
 ) -> int:
+    """Computes the schedule and synchronizes it with the workflow file.
+
+    Args:
+        schedule_file (str): The path to the schedule file.
+        workflow_file (str): The path to the workflow file.
+        cadence_fn (Callable[[], Tuple[str, str]], optional): Function to compute the cadence. Defaults to compute_cadence.
+
+    Returns:
+        int: Exit code (0 for success).
+    """
     current_schedule, _current_rationale, override = parse_schedule_file(schedule_file)
 
     if override:
@@ -337,6 +381,7 @@ def compute_and_sync(
 
 
 def main() -> None:
+    """Main entrypoint for the compute_schedule script."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 

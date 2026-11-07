@@ -12,7 +12,14 @@ import tempfile
 
 
 def run_cmd(cmd: list[str]) -> bool:
-    """Executes a command and returns True if successful."""
+    """Executes a command and returns True if successful.
+
+    Args:
+        cmd (list[str]): The command to execute.
+
+    Returns:
+        bool: True if the command succeeds, False otherwise.
+    """
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, shell=False)  # nosec B603 - explicit shell=False
         if result.returncode != 0:
