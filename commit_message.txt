@@ -1,0 +1,39 @@
+[Self-Heal] Auto-repair drift: add type-hinted Google-style docstrings
+
+## Scope/Summary of changes
+Added Google-style docstrings (with Args and Returns sections matching existing type hints) to the top-level functions in the self-healing toolkit:
+- `scripts/healthcheck.py` (`run_cmd`)
+- `scripts/self_heal.py` (`run_cmd`, `check_health`, `has_diff`, `_status`)
+- `scripts/compute_schedule.py` (`compute_cadence`, `update_schedule_file`, `_old_update_schedule_file`, `parse_schedule_file`, `sync_workflow_cron`, `compute_and_sync`, `main`)
+
+## AI Usage
+Fully implemented and verified autonomously using Claude.
+
+## Assumptions & Validation
+- Assumes the existing function signatures and type hints accurately reflect intended behavior.
+- Validated that `shell=False` was already present in all `subprocess.run` calls, adhering to the trust boundary requirements.
+- Validated that the changes do not touch `.github/workflows/self-heal.yml` or the business logic.
+
+## Design Rationale
+- Minimal, deterministic, stdlib-compatible changes were applied solely to docstrings. No runtime behavior was altered.
+
+## Testing
+The following commands were run and passed successfully:
+- `pytest scripts/tests/test_healthcheck.py scripts/tests/test_self_heal.py scripts/tests/test_self_heal_workflow.py scripts/tests/test_compute_schedule.py scripts/tests/test_workflow_policy.py -q`
+- `ruff check scripts/healthcheck.py scripts/self_heal.py scripts/compute_schedule.py`
+- `.venv/bin/python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`
+
+## Risk & Rollback
+- Risk is near zero as changes are confined to docstrings. Rollback is a simple `git revert`.
+
+## Tech Debt
+- None added. Improves documentation debt.
+
+## Known Limitations
+- The reactive trigger only validates the core lint/test/audit surface.
+
+## Secrets Confirmation
+- Checked the patch explicitly; no secrets, credentials, or API keys were added.
+
+## Entry-Point Coverage
+- These changes cover CI/self-heal tooling only (specifically `scripts/healthcheck.py`, `scripts/self_heal.py`, and `scripts/compute_schedule.py`). They do not touch `run_dca.run_slot()`, `MorningDCAExecutor`, or `dca_runner.py`.
