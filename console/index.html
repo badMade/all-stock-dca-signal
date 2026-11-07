@@ -23,6 +23,7 @@
       <a href="#alerts" data-page="alerts"><span aria-hidden="true">△</span> Alerts &amp; health</a>
       <a href="#config" data-page="config"><span aria-hidden="true">⚙</span> Config</a>
       <a href="#tickers" data-page="tickers"><span aria-hidden="true">🏷</span> Tickers</a>
+      <a href="#rank" data-page="rank"><span aria-hidden="true">⇅</span> Composite rank</a>
       <a href="#reports" data-page="reports"><span aria-hidden="true">≣</span> Reports</a>
       <a href="#research" data-page="research"><span aria-hidden="true">⌁</span> Research</a>
       <a href="#training" data-page="training"><span aria-hidden="true">⚡</span> Training</a>
@@ -95,6 +96,11 @@
       <section class="page" data-page="tickers" id="page-tickers" hidden>
         <div class="section-heading"><div><div class="eyebrow">UNIVERSE &amp; FRESHNESS</div><h2>Tickers &amp; Data Archive</h2><p class="muted">Active graded DCA universe, whole-share accumulation tracking, exclusions, symbol corrections and historical OHLCV bar freshness in the local archive.</p></div></div>
         <div data-page-body><div class="panel empty-state">Loading ticker universe…</div></div>
+      </section>
+
+      <section class="page" data-page="rank" id="page-rank" hidden>
+        <div class="section-heading"><div><div class="eyebrow">DAILY RESEARCH</div><h2>Composite rank</h2><p class="muted">S&amp;P 500 ranked each weekday after the close on weighted multi-period ROI (dividends included) with a low-volatility tilt, plus how ranks move day to day. Read-only: this page only shows what the scheduled task <code>daily-composite-rank</code> wrote; it never places an order.</p></div></div>
+        <div data-page-body><div class="panel empty-state">Loading composite rank…</div></div>
       </section>
 
       <section class="page" data-page="reports" id="page-reports" hidden>

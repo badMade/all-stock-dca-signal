@@ -124,3 +124,19 @@ def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minut
 def test_live_and_shadow_agents_use_the_same_worker_count():
     # One number to tune: a later change to one job must not silently leave the other behind.
     assert _load(LIVE)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"] == _load(SHADOW)["EnvironmentVariables"]["DCA_CODEX_PARALLEL"]
+
+
+def test_no_payload_agent_sets_an_environment_variable_twice():
+    # 2026-11-07: the shadow template set DCA_CODEX_PARALLEL twice. plistlib (and launchd) keep the LAST value, so a
+    # later edit to the first entry alone would change nothing while reading as if it had; one key, one place.
+    for path in (SHADOW, LIVE):
+        text = path.read_text(encoding="utf-8")
+        env_block = text[text.index("<key>EnvironmentVariables</key>"):]
+        env_block = env_block[: env_block.index("</dict>")]
+        keys = re.findall(r"<key>([^<]+)</key>", env_block)[1:]  # drop the EnvironmentVariables key itself
+        assert len(keys) == len(set(keys)), (path.name, sorted(k for k in set(keys) if keys.count(k) > 1))
+
+
+def test_shadow_comments_no_longer_say_the_live_slots_keep_the_default_workers():
+    # Since 2026-11-04 the live agent sets DCA_CODEX_PARALLEL too, and a test keeps the two equal (now 8).
+    assert "six live slots keep the default" not in SHADOW.read_text(encoding="utf-8")
