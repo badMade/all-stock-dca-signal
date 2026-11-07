@@ -27,10 +27,13 @@
          Gate 5. Seconds, not DCA_BUILD_DEADLINE_ET: this one job serves six slots, and a single wall-clock cutoff fits
          only one of them. -->
     <key>DCA_BUILD_DEADLINE_SECONDS</key><string>600</string>
-    <!-- Codex workers run at once (2026-11-04, operator: "make the 9:35 go faster"). The launcher's default 3 meant 31
-         four-ticker chunks in 11 waves; 8 workers fit the current universe into 4 waves, about 4.5 minutes. Keep this
-         equal to the 3:30 shadow job (the tests enforce the deadline for both). Watch the `timing total` lines in
-         /tmp/dca-robinhood-payload.log after the change. -->
+    <!-- Codex workers run at once (2026-11-04, operator: "make the 9:35 go faster"). The launcher's default 3 meant 23
+         four-ticker chunks in 8 waves of about 65 s: the newest builds took 507-588 s and the 9:35 run waited about 9
+         minutes for its data. 6 workers is 4 waves, about 4.5 minutes, the same as the 3:30 shadow job (the tests keep
+         the two equal). Watch the `timing total` lines in /tmp/dca-robinhood-payload.log after the change.
+         2026-11-06: 6 -> 8. The universe grew from 91 to 122 symbols, so 31 four-ticker chunks: 6 workers would be 6
+         waves, about 390 s; 8 workers is 4 waves, about 260 s, back inside the 270 s budget. 8 concurrent workers is
+         not yet measured against the Codex and Robinhood rate limits: watch the log for per-ticker errors and rescues. -->
     <key>DCA_CODEX_PARALLEL</key><string>8</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>

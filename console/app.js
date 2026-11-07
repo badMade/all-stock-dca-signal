@@ -689,7 +689,7 @@ async function openDocs(path) {
    the snapshot the server already produced (GUI expansion Phase 0). */
 const PAGE_TITLES = {
   today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers",
-  alerts: "Alerts & health", config: "Config", tickers: "Tickers", reports: "Reports",
+  alerts: "Alerts & health", config: "Config", tickers: "Tickers", rank: "Composite rank", reports: "Reports",
   research: "Research", training: "Training", workflows: "Workflows & jobs",
   environment: "Environment", docs: "Docs"
 };
