@@ -140,7 +140,14 @@ def _agent() -> dict:
 def test_agent_runs_the_script_every_saturday_at_three_am():
     agent = _agent()
     assert agent["Label"] == "com.all-stock-dca.claude-vm-reset"
-    assert agent["ProgramArguments"] == ["/bin/sh", "/repo/deploy/launchd/claude_vm_reset.sh"]
+    # 2026-11-07: the first Saturday run failed with "/bin/sh: ...claude_vm_reset.sh: Operation not permitted".
+    # macOS privacy protection (TCC) grants ~/Documents access per binary; /bin/sh run straight from launchd has none.
+    # Start it through the checkout's venv Python like the payload agent does: a child inherits the parent's access.
+    assert agent["ProgramArguments"] == [
+        "/repo/.venv/bin/python", "-c",
+        'import subprocess, sys; sys.exit(subprocess.call(["/bin/sh", sys.argv[1]]))',
+        "/repo/deploy/launchd/claude_vm_reset.sh",
+    ]
     assert agent["StartCalendarInterval"] == {"Weekday": 6, "Hour": 3, "Minute": 0}
     assert "StartInterval" not in agent and "RunAtLoad" not in agent  # never on install, never on a timer
 
@@ -152,3 +159,14 @@ def test_agent_logs_to_tmp_and_holds_no_secret():
     assert not re.search(r"\d{8,}", text)
     assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in text
     assert "CLAUDE_VM_DISK" not in text  # the agent uses the script's default path, not an override
+
+
+def test_every_launchd_agent_starts_through_the_checkout_venv_python():
+    # The same TCC failure must not come back with the next agent: none may launch a shell (or anything else) on a
+    # file under ~/Documents directly. Every template's first program is the checkout's venv Python.
+    for template in sorted((REPO / "deploy/launchd").glob("*.plist.template")):
+        text = template.read_text(encoding="utf-8")
+        for placeholder in ("REPLACE_WITH_REPO_PATH", "REPLACE_WITH_CRON_TRACKING_ROOT", "REPLACE_WITH_CODEX_PATH"):
+            text = text.replace(placeholder, "/repo")
+        program = plistlib.loads(text.encode("utf-8"))["ProgramArguments"][0]
+        assert program == "/repo/.venv/bin/python", (template.name, program)
