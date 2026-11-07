@@ -77,8 +77,9 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   published) and keeps the attempt with fewer per-ticker errors. The coverage floor is 95% (see above).
 - First-pass chunk size is `DCA_CHUNK_SIZE` (unset = the planner's default, 4 since 2026-11-02). It exists to retune without a
   code change: on 2026-11-03 the 15:31 build, still at 8-ticker chunks, got "exceeds the output limit" on nearly every reply,
-  spent its deadline on retries and rescues and refused at 15/84. The 15:30 plist template also sets `DCA_CODEX_PARALLEL=8` (was 6 until the 122-symbol universe, 2026-11-06)
-  (the installed plist already does), since 4-ticker chunks mean more worker calls.
+  spent its deadline on retries and rescues and refused at 15/84. The 15:30 and live plist templates set `DCA_CODEX_PARALLEL=8`
+  (it was 6 until the 122-symbol universe of 2026-11-06 made 31 chunks, 6 waves at 6 workers; reload the plists on the Mac
+  after a change), since 4-ticker chunks mean more worker calls.
 - A chunk that returns no reply on both attempts is rescued (2026-10-26: the 09:35 run lost chunks 4 and 10 whole,
   16 of 91 tickers, and refused at 75/91 although every other chunk validated). The floor tolerates 4 misses but a
   chunk holds 8, so one dead worker used to cost the slot. Its tickers are now asked for again in requests of
