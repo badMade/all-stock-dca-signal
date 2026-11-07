@@ -83,3 +83,10 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
   Apple-Silicon MPS, then CPU.
 - It does not fetch data. The archive is maintained by the repo's existing ticker-update
   pipeline; this tool only reads it.
+
+## Multi-horizon (t+1..t+N)
+
+`python run_walkforward.py --max-horizon 90 --eval-horizons 5,10,15,20 ...` emits all 90 horizons
+daily, scores/calibrates the evaluation horizons per horizon, and exports the full forecast to
+`<run_dir>/horizons/<model>.csv`. Design, the h-row embargo and limits:
+`docs/wondrous_octopus.md#multi-horizon-forecasting-t1--t90`.

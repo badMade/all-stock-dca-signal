@@ -63,6 +63,8 @@ else:
 
 import numpy as np
 from data import COMPONENTS, TrainingPanel
+from horizon_tracker import HorizonTracker, HorizonTrackerError
+from horizons import validate_horizons
 from ledger import Ledger
 from metrics import score_forecast
 from model_interface import (
@@ -256,14 +258,33 @@ class HarnessConfig:
     #: unbounded; a trip checkpoints cleanly and the run resumes later.
     max_steps_per_run: int | None = None
     max_hours_per_run: float | None = None
+    #: Multi-horizon forecasting: every horizon 1..max_horizon is EMITTED each
+    #: day; only ``eval_horizons`` (each in [2, max_horizon]) are matured,
+    #: scored, ledgered and calibrated. max_horizon == 1 is the legacy
+    #: single-step system, byte-identical (these keys are then left out of the
+    #: config hash so existing checkpoints still resume). Both are frozen
+    #: run properties: a resume that changes either is REFUSED.
+    max_horizon: int = 1
+    eval_horizons: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        # ValueError here is a refusal of an invalid horizon config; the
+        # normalized (sorted, defaulted) tuple is what the hash and a resume
+        # comparison see, so a list read back from JSON equals the tuple.
+        self.max_horizon, self.eval_horizons = validate_horizons(self.max_horizon, self.eval_horizons)
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["models"] = list(self.models)
+        payload["eval_horizons"] = list(self.eval_horizons)
         return payload
 
     def config_hash(self) -> str:
         payload = {key: value for key, value in self.as_dict().items() if key not in _RESUME_SAFE_FIELDS}
+        if self.max_horizon == 1:
+            # Pre-multi-horizon checkpoints hashed without these keys.
+            payload.pop("max_horizon", None)
+            payload.pop("eval_horizons", None)
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -398,6 +419,29 @@ class WalkForwardHarness:
             name: ConformalCalibrator() for name in config.models
         }
         self.running: dict[str, _RunningStats] = {name: _RunningStats() for name in config.models}
+        self.horizon_tracker: HorizonTracker | None = None
+        if config.max_horizon > 1:
+            horizon_models = [name for name in config.models if hasattr(models.get(name), "predict_horizons")]
+            if not horizon_models:
+                raise HarnessError(
+                    f"REFUSED: --max-horizon {config.max_horizon} needs a model with multi-horizon support "
+                    "(persistence or octopus); gbm_quantile is single-horizon"
+                )
+            for name in horizon_models:
+                built_for = getattr(models[name], "max_horizon", config.max_horizon)
+                if built_for != config.max_horizon:
+                    raise HarnessError(
+                        f"REFUSED: model {name!r} was built for max_horizon={built_for}, "
+                        f"config says {config.max_horizon}"
+                    )
+            self.horizon_tracker = HorizonTracker(
+                config.max_horizon,
+                config.eval_horizons,
+                horizon_models,
+                calibration=config.calibration,
+                seed=config.seed,
+                schema_version=SCHEMA_VERSION,
+            )
         self._interrupted = False
         #: Set by fresh()/resume() to the open lock file handle; released
         #: by _release_lock() (called from run()'s finally, or implicitly
@@ -917,6 +961,13 @@ class WalkForwardHarness:
             harness.running = {
                 name: _RunningStats.from_dict(payload) for name, payload in state["running"].items()
             }
+            if harness.horizon_tracker is not None:
+                if "horizon" not in state:
+                    raise HarnessError("REFUSED: checkpoint has no multi-horizon state but the run config asks for it")
+                try:
+                    harness.horizon_tracker.load(checkpoint_dir, state["horizon"])
+                except HorizonTrackerError as error:
+                    raise HarnessError(str(error)) from error
             harness._lock_handle = lock_handle
             return harness
         except BaseException:
@@ -1349,6 +1400,43 @@ class WalkForwardHarness:
                 n_predicted += 1
         return n_predicted
 
+    def _predict_horizons(
+        self,
+        requests: list[ForecastRequest],
+        rows_for_requests: list[tuple[str, int]],
+        records: list[dict[str, Any]],
+        date_iso: str,
+    ) -> None:
+        """Every horizon 1..H from each multi-horizon model; queue the evaluated ones."""
+        tracker = self.horizon_tracker
+        assert tracker is not None
+        for name in tracker.model_names:
+            model = self.models[name]
+            forecasts = model.predict_horizons(requests, max_horizon=self.config.max_horizon)
+            if forecasts and not all(
+                bool(np.isfinite(forecast.point).all() and np.isfinite(forecast.quantiles).all())
+                for forecast in forecasts
+            ):
+                self.log(f"CRITICAL: Model {name!r} emitted non-finite multi-horizon forecasts on {date_iso}!")
+                self._model_failure = True
+                continue
+            repairs = getattr(model, "last_horizon_repairs", None)
+            if repairs is not None and (repairs.quantile_crossings or repairs.bar_repairs):
+                records.append(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "record_type": "repair",
+                        "model": name,
+                        "origin_date": date_iso,
+                        "target_date": date_iso,
+                        "seed": self.config.seed,
+                        "n_predicted": len(forecasts),
+                        "horizons": self.config.max_horizon,
+                        **repairs.as_dict(),
+                    }
+                )
+            tracker.record(name, forecasts, rows_for_requests, self.panel, date_iso)
+
     def step(self, date64: np.datetime64) -> dict[str, int]:
         """One full reveal->score->diagnose->update->predict day."""
         import pandas as pd
@@ -1403,6 +1491,10 @@ class WalkForwardHarness:
             )
         for model, target_date in sorted(calibration_batches, key=lambda pair: (pair[1], pair[0])):
             self.calibrators[model].observe_batch(calibration_batches[(model, target_date)], target_date=target_date)
+        if self.horizon_tracker is not None:
+            # Multi-horizon scores whose h-th row has been revealed by today (the
+            # tracker's embargo reads targets only through `date_iso`).
+            records.extend(self.horizon_tracker.mature(self.panel, date_iso))
 
         # -- 2. diagnostics ---------------------------------------------------
         eligible = [
@@ -1471,6 +1563,8 @@ class WalkForwardHarness:
         n_predicted = 0
         if requests:
             n_predicted = self._predict_and_ledger(requests, rows_for_requests, records, date_iso)
+            if self.horizon_tracker is not None:
+                self._predict_horizons(requests, rows_for_requests, records, date_iso)
 
         if records:
             self.ledger.append(records)
@@ -2055,6 +2149,10 @@ class WalkForwardHarness:
             "model_fingerprints": model_fingerprints,
             "panel_fingerprint": _fingerprint_panel_history(self.panel, last_processed_date),
         }
+        if self.horizon_tracker is not None:
+            # Numeric arrays + plain JSON only (no pickle); the SHA-256 in the
+            # state makes a swapped or edited horizon_pending.npz a REFUSAL.
+            state["horizon"] = self.horizon_tracker.save(tmp_dir)
         state_path = tmp_dir / _STATE_FILENAME
         with state_path.open("w", encoding="utf-8") as handle:
             json.dump(state, handle, sort_keys=True)
@@ -2084,5 +2182,9 @@ class WalkForwardHarness:
                 shutil.rmtree(good_dir)
             shutil.copytree(checkpoint_dir, good_dir)
         _fsync_dir(self.run_dir)
+        if self.horizon_tracker is not None:
+            # Convenience export of the newest full 1..H forecast; derived
+            # state, rewritten wholesale, never read back by the harness.
+            self.horizon_tracker.write_latest(self.run_dir)
         if previous_dir.exists():
             shutil.rmtree(previous_dir)

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.octopus-daily-update</string>
+  <!-- Wondrous Octopus daily cycle (wondrous-octopus/daily_update.py): scores the multi-horizon forecasts whose
+       target day has now arrived, adjusts each horizon's calibration, applies the online update, forecasts
+       t+1..t+N again and checkpoints. Idempotent (NOOP on rerun) and catches up if days were missed.
+       Research artifacts only: reads the ticker CSV archive, writes only under the run directory, never touches
+       config/ or live sizing. Started through the checkout's venv Python (needs torch), like the other agents,
+       because macOS privacy protection (TCC) grants ~/Documents access per binary.
+       Replace REPLACE_WITH_OCTOPUS_RUN_DIR with an existing run directory that holds a checkpoint
+       (created once by run_walkforward.py). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>REPLACE_WITH_REPO_PATH/wondrous-octopus/daily_update.py</string>
+    <string>--run-dir</string>
+    <string>REPLACE_WITH_OCTOPUS_RUN_DIR</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH/wondrous-octopus</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- 18:30 Mon-Fri local time, after the close and after the archive refresh (tickers-daily-update). Local Mac
+       time: pin the Mac to America/New_York or shift Hour. If the Mac is asleep launchd runs the job on wake;
+       move this later if your archive refresh finishes after 18:30. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/tmp/dca-octopus-daily-update.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-octopus-daily-update.log</string>
+</dict>
+</plist>
