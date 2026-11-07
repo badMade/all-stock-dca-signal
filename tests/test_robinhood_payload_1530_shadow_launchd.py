@@ -89,9 +89,8 @@ def test_1530_agent_publishes_or_refuses_before_the_live_prompt_stops_re_checkin
 
 
 def test_shadow_agent_runs_enough_workers_to_publish_by_about_15_35():
-    # 2026-11-03: with 4-ticker chunks (#2115) the 90-ticker plan is 23 chunks of about 60 s each, all clean on the
-    # first attempt. At the launcher's default 3 workers that is 8 waves, 519 s, published 15:39, so the 3:30 session
-    # had 14 minutes left for 34 candidates and aborted at Gate 6.5. The build must fit in about 4 waves.
+    # 2026-11-07: the expanded 121-ticker plan is 31 chunks of about 60 s each, all clean on the first attempt.
+    # At 8 workers it fits in 4 waves (about 4.5 minutes) before the 3:30 session's placement window.
     env = _load(SHADOW)["EnvironmentVariables"]
     parallel = int(env["DCA_CODEX_PARALLEL"])
     import dca_config
@@ -104,10 +103,8 @@ def test_shadow_agent_runs_enough_workers_to_publish_by_about_15_35():
 
 
 def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minutes():
-    # 2026-11-04 operator request ("make the 9:35 go faster"): the six live builds still ran the launcher's default
-    # 3 workers, so 23 chunks took 8 waves; the last twelve 09:36-14:31 builds in /tmp/dca-robinhood-payload.log took
-    # 263-588 s, the newest 507-588 s, and the 9:35 run waited about 9 minutes for its data. The 3:30 shadow build
-    # already runs 6 (test above). Same plan, same ~65 s per wave, so the live job gets the same budget: about 4 waves.
+    # 2026-11-07: the six live builds need the same 8 workers as the shadow build because both now plan 31 chunks.
+    # At about 65 s per wave, 4 waves fit within the 4.5-minute budget and leave room for a retry under the 600 s deadline.
     env = _load(LIVE)["EnvironmentVariables"]
     parallel = int(env["DCA_CODEX_PARALLEL"])
     import dca_config
