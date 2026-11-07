@@ -40,6 +40,7 @@ import numpy as np
 from data import COMPONENTS, TrainingPanel
 from model_interface import (
     ForecastRequest,
+    HorizonForecast,
     OHLCForecast,
     RepairCounts,
     RevealedDay,
@@ -47,6 +48,7 @@ from model_interface import (
     finalize_forecast,
     load_arrays,
     read_metadata,
+    repair_horizon_arrays,
     save_arrays,
     write_metadata,
 )
@@ -181,6 +183,53 @@ class PersistenceModel:
                 )
             )
         self.last_repairs = repairs
+        return forecasts
+
+    def predict_horizons(self, requests: Sequence[ForecastRequest], *, max_horizon: int) -> list[HorizonForecast]:
+        """The multi-horizon yardstick: "the bar stays today's bar, price stays put".
+
+        Every horizon's point is the horizon-1 persistence point (close = 0
+        log-return, open/high/low at today's offsets from today's close), and
+        its band is the horizon-1 empirical residual band widened by sqrt(h)
+        -- the random-walk scaling, an ASSUMPTION about this baseline (it is
+        what makes persistence a fair, hard-to-beat yardstick at long horizon
+        rather than a strawman), not a fitted fact. The conformal calibrators
+        then correct it per horizon from measured coverage.
+        """
+        counts = RepairCounts()
+        h_axis = np.arange(1, max_horizon + 1, dtype=np.float64)
+        spread = np.sqrt(h_axis)[:, None]
+        pool_quantiles = self._quantiles_of(self._pool) if self._pool else None
+        forecasts: list[HorizonForecast] = []
+        for request in requests:
+            feature_row = request.features_window[np.flatnonzero(request.window_mask)[-1]]
+            point = _persistence_point(feature_row)
+            bands = self._bands(request.ticker, point, pool_quantiles)
+            point_vec = np.array([point[component] for component in COMPONENTS], dtype=np.float64)
+            # (4, 3) offsets of each quantile from the point, then fanned out by sqrt(h).
+            offsets = np.array(
+                [
+                    [bands[component][key] - point[component] for key in ("p10", "p50", "p90")]
+                    for component in COMPONENTS
+                ],
+                dtype=np.float64,
+            )
+            point_grid = np.broadcast_to(point_vec, (max_horizon, len(COMPONENTS))).copy()
+            quantile_grid = point_grid[:, :, None] + offsets[None, :, :] * spread[:, :, None]
+            fixed_point, fixed_quantiles, repaired = repair_horizon_arrays(point_grid, quantile_grid)
+            counts.quantile_crossings += repaired.quantile_crossings
+            counts.bar_repairs += repaired.bar_repairs
+            forecasts.append(
+                HorizonForecast(
+                    ticker=request.ticker,
+                    origin_date=request.origin_date,
+                    point=fixed_point,
+                    quantiles=fixed_quantiles,
+                    ref_close=request.ref_close,
+                    adj_ratio=request.adj_ratio,
+                )
+            )
+        self.last_horizon_repairs = counts
         return forecasts
 
     def update(self, revealed: Sequence[RevealedDay], *, step_index: int) -> dict[str, Any]:

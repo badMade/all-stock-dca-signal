@@ -37,10 +37,91 @@ bar through it). Read it as "reconstructed from the day's market state", not str
   ticker has before the cutoff, however far back its archive goes.
 - The as-of rule is calendar-day-exclusive (a run "as of" an instant never sees that day's own
   bar), and a row becomes trainable only once its next trading row's date has passed — the
-  horizon-1 form of ml-forecaster's walk-forward leakage guard.
+  horizon-1 form (generalized to an h-row embargo under "Multi-horizon forecasting") of ml-forecaster's walk-forward leakage guard.
 - Missing/corrupt/short tickers are **never blockers**: they are logged, counted in the run
   report, and skipped; a short-history ticker joins automatically once it has 60 prior rows.
   Only an archive with zero usable tickers refuses.
+
+## Multi-horizon forecasting (t+1 .. t+90)
+
+`--max-horizon N` (default 1 = the single-step system, byte-identical; `--eval-horizons H,H,...`
+default `5,10,15,20` clipped to N) makes every model that supports it emit a forecast for **every**
+trading row t+1..t+N each day: the OHLC point plus p10/p50/p90 per component. Only the *evaluation
+horizons* are matured, scored, ledgered (`horizon_score` records) and calibrated; the full 1..N
+forecast of the newest origin day is exported to `<run_dir>/horizons/<model>.csv` at every checkpoint
+(calibrated bands, log-returns vs the origin close, one row per ticker x horizon). Widen the
+evaluation set as the model earns it by starting a new run -- both flags are frozen run properties
+and a resume that changes either (or turns horizons on/off) is REFUSED, like every other flag.
+gbm_quantile stays single-horizon (a run with only gbm and `--max-horizon > 1` is refused).
+
+**"t+h" is the ticker's own h-th next trading row**, the same convention horizon 1 always used.
+
+### Design choice: direct heads with a horizon embedding, not recursive rollouts
+
+Recursive rollout (predict t+1, feed it back, repeat 90 times) needs the model to also predict the
+inputs of the next step -- every feature, including the cross-sectional and market blocks -- and
+compounds its own error 90 times; its t+90 band is a product of 90 unvalidated steps and its
+calibration can only be measured at the end of the chain. **Direct** forecasting trains each horizon
+against the realized h-day outcome, so the error at h=20 is exactly the error being optimized and
+scored, never an accumulation of simulated ones. The octopus keeps its horizon-1 head untouched and
+adds one extension head for horizons 2..N: a shared trunk summary `z`, then
+`hidden_h = GELU(W z + E[h])`, `out_h = V hidden_h` with a learned horizon embedding `E` (so
+neighbouring horizons share statistical strength instead of 90 independent heads each seeing few
+labels). Outputs are in per-sqrt(h) units and multiplied back by sqrt(h) so a t+90 residual does not
+swamp the short horizons' loss. A single-horizon model owns none of these parameters and initializes
+exactly as before. Persistence's yardstick is "the bar stays today's bar", its horizon-1 residual
+band widened by sqrt(h) -- the random-walk assumption, stated, then corrected by calibration.
+
+### The horizon-h embargo (the leakage guard, generalized)
+
+Horizon 1's rule is "trainable once the next row's date has passed". Horizon h is: **the target of
+origin row i is usable only once row i+h has been revealed** -- an embargo of h trading rows.
+`horizons.py` is the single place it lives: `usable_horizon_count(series, row, asof, H)` turns an
+explicit revealed-through date into "horizons 1..K are knowable" (always a prefix), and
+`horizon_targets()` returns NaN beyond it. It is never "is the target finite?" -- the replay panel
+holds the whole archive, so a future bar always exists in memory. Applied everywhere a target is read:
+
+- **fit / retrain**: `asof` = the fit cutoff (`window_end`); a row near the cutoff trains only the
+  horizons its revealed future covers;
+- **online update**: `asof` advances only to a *revealed* target date, so replay-buffer rows and
+  recent days are re-used each day with more of their horizons unlocked;
+- **scoring**: a horizon-h forecast is scored on the cursor day with `asof` = that day, and not
+  looked at at all before `calendar[origin_pos + h]`.
+
+Tests corrupt every bar after `asof` and assert the usable targets (and the trained extension-head
+weights) do not move, with a negative control showing a leaky `asof` fails them. An external loop
+that never declares an `asof` (train_foundation.py) gets *no* extension-head targets, not unbounded ones.
+
+### Per-horizon calibration, metrics, ledger
+
+- `model_interface.HorizonConformalCalibrator`: one `ConformalCalibrator` (own per-component scales,
+  own once-per-target-day watermark) per *evaluated* horizon. A t+20 band is never widened because
+  t+5 missed. Emitted-but-unevaluated horizons use scales interpolated geometrically in log h between
+  the nearest evaluated horizons (clamped beyond them): an **assumption, not a measurement** --
+  widening `--eval-horizons` is how it becomes one.
+- `metrics.build_horizon_report` / `report.md`: error, pinball, calibrated vs raw coverage and band
+  width **by model x horizon x component**, skill vs persistence *at the same horizon*, and a
+  model x horizon x year table (close) so error by horizon is comparable over time. Horizon 1 comes
+  from the native `score` records, h>=2 from `horizon_score`.
+- Ledger kind `horizon_score` (sharded by origin year like the rest; SHA-256 fingerprinted and
+  truncated-on-resume identically). Pending forecasts checkpoint as `horizon_pending.npz`
+  (`allow_pickle=False`; SHA-256 in the harness state, mismatch REFUSES) -- no pickle anywhere.
+- Cost: score records grow by the number of evaluation horizons; memory by (tickers x max eval
+  horizon days x models) small arrays. Keep the evaluation set small until it is wanted.
+
+### Daily updating and tracking against real data
+
+Nothing here costs money or needs an API: truth is the same per-ticker CSV archive (`ticker_data`,
+refreshed by the existing `tickers-daily-update` / yfinance prefetch). Each day's harness step (the
+replay, and `daily_update.py` which drives the same step) does, in order: reveal the new day, score
+every matured evaluation-horizon forecast against it, nudge that horizon's calibrator, run the
+online update (gradient steps on recent + replay days, now including the horizon head with the
+embargo-unlocked horizons), then forecast t+1..t+N again. Out-of-sample error per horizon is
+therefore measured against real archived closes continuously, with no hand-written claims.
+Limits to know: the model is *adjusted* online, not re-optimized to an "optimal match" -- it is a
+small online learner scored honestly, and a recovery retrain stays an operator decision.
+`daily_update.py`'s own `*_next_day_forecasts.csv` is still horizon-1 only; the 1..N forecast is
+`horizons/<model>.csv`. Research artifacts only; nothing reads or writes `config/` or live sizing.
 
 ## Models compared on identical metrics
 
@@ -142,6 +223,19 @@ for every eligible ticker, with an expected calendar date (`expected_target_date
 `expected_target_date_basis` = `calendar` | `weekday_estimate`; the resolved `target_date` stays
 unset until the ticker's next data row exists) -- and prints a one-line digest. Idempotent (`NOOP` on rerun);
 catches up automatically if days were missed. Scheduling it is the operator's choice.
+
+### Scheduling it (launchd)
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_OCTOPUS_RUN_DIR|$HOME/octopus/quick|g" \
+  deploy/launchd/com.all-stock-dca.octopus-daily-update.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.octopus-daily-update    # run once now to test
+```
+
+Runs 18:30 Mon-Fri local time (after the close and the archive refresh); log at
+`/tmp/dca-octopus-daily-update.log`. Needs an existing run directory with a checkpoint.
 
 ### Recovery retrains
 

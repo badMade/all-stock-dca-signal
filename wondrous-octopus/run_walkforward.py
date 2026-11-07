@@ -75,6 +75,7 @@ from harness import (  # noqa: E402
     _fsync_dir,
     _release_run_lock,
 )
+from horizons import validate_horizons  # noqa: E402
 from ledger import Ledger, LedgerError  # noqa: E402
 
 #: Preset tiers bundling the scale knobs for local machines. Explicit flags
@@ -143,6 +144,13 @@ def _finite_float(value: str) -> float:
     return number
 
 
+def _horizon_list(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a comma-separated list of integers") from error
+
+
 def _nonnegative_finite_float(value: str) -> float:
     # Shared by --max-hours (`_breaker_tripped()` evaluates `elapsed_hours
     # >= max_hours_per_run`; a NaN limit makes that comparison always False,
@@ -209,6 +217,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="circuit breaker: hard wall-clock budget in hours for THIS invocation",
     )
+    parser.add_argument(
+        "--max-horizon",
+        type=_positive_int,
+        default=1,
+        help="emit a forecast for EVERY trading day t+1..t+N (default 1 = the legacy next-day system); "
+        "frozen for the run -- a resume with a different value is refused",
+    )
+    parser.add_argument(
+        "--eval-horizons",
+        type=_horizon_list,
+        default=None,
+        metavar="H,H,...",
+        help="horizons actually matured, scored, ledgered and calibrated (each in 2..N; default 5,10,15,20 "
+        "clipped to N); frozen for the run -- widen by starting a new run",
+    )
     parser.add_argument("--no-calibration", action="store_true", help="disable adaptive conformal bands")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-dir", type=Path, default=None)
@@ -260,6 +283,7 @@ def _build_models(names: tuple[str, ...], args: argparse.Namespace, knobs: dict)
                 online_steps=args.online_steps,
                 replay_capacity=args.replay_capacity,
                 device=args.device,
+                max_horizon=getattr(args, "max_horizon", 1),
             )
     return models
 
@@ -316,6 +340,13 @@ def _build_config(args: argparse.Namespace, knobs: dict) -> HarnessConfig:
         raise Refused(f"--end {end} is before --start {start}; no prediction date would ever be simulated")
     resolved_models = getattr(args, "_resolved_models", None)
     models = tuple(resolved_models) if resolved_models is not None else _model_names(args.model)
+    try:
+        # Validated up front so a bad horizon config REFUSES before the run dir exists.
+        max_horizon, eval_horizons = validate_horizons(
+            getattr(args, "max_horizon", 1), getattr(args, "eval_horizons", None) or ()
+        )
+    except ValueError as error:
+        raise Refused(str(error)) from error
     return HarnessConfig(
         start=start,
         end=end,
@@ -330,6 +361,8 @@ def _build_config(args: argparse.Namespace, knobs: dict) -> HarnessConfig:
         calibration=not args.no_calibration,
         max_steps_per_run=args.max_steps,
         max_hours_per_run=args.max_hours,
+        max_horizon=max_horizon,
+        eval_horizons=eval_horizons,
     )
 
 
@@ -421,13 +454,31 @@ def write_report(run_dir: Path) -> Path:
     streams = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)  # type: ignore[arg-type]
+    horizon_models = [model for model in models if ledger.available_years(model=model, kind="horizon_score")]
+    if horizon_models:
+        # Error BY HORIZON: the h=1 row comes from the native `score` records,
+        # h>=2 from the evaluation-checkpoint `horizon_score` records.
+        def _horizon_stream(m: str):
+            def stream():
+                yield from ledger.iter_records(model=m, kind="score")
+                yield from ledger.iter_records(model=m, kind="horizon_score")
+
+            return stream
+
+        horizon_report = metrics_module.build_horizon_report(
+            {model: _horizon_stream(model) for model in horizon_models}  # type: ignore[arg-type]
+        )
+        report["horizons"] = horizon_report
     report_dir = run_dir / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     # render_markdown() includes non-ASCII characters (--, an en dash, a
     # minus sign); an implicit platform-default encoding is not always
     # UTF-8 (Codex review: "Write generated reports using UTF-8").
-    (report_dir / "report.md").write_text(metrics_module.render_markdown(report), encoding="utf-8")
+    markdown = metrics_module.render_markdown(report)
+    if "horizons" in report:
+        markdown = "\n".join([markdown, *metrics_module.render_horizon_markdown(report["horizons"])])
+    (report_dir / "report.md").write_text(markdown, encoding="utf-8")
     return report_dir / "report.json"
 
 
@@ -1069,6 +1120,7 @@ def _model_hyper(args: argparse.Namespace, knobs: dict) -> dict:
         "replay_capacity": args.replay_capacity,
         "refit_every": int(knobs["refit_every"]),
         "gbm_row_cap": args.gbm_row_cap,
+        "max_horizon": getattr(args, "max_horizon", 1),
     }
 
 

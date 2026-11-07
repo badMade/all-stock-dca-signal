@@ -429,6 +429,184 @@ def build_report(
     return report
 
 
+class HorizonMetricsAccumulator:
+    """Streams score records into model x horizon x component tables, plus a
+    model x horizon x year view so error by horizon can be compared over time.
+
+    Accepts ``horizon_score`` records (they carry ``horizon``) and legacy
+    ``score`` records (no ``horizon`` key => horizon 1), so the h=1 row of the
+    table is the native single-step score, scored exactly as before.
+    """
+
+    def __init__(self) -> None:
+        zero = lambda: {  # noqa: E731 - tiny factory, clearer inline
+            "n": 0.0,
+            "abs_err": 0.0,
+            "sq_err": 0.0,
+            "pinball_p10": 0.0,
+            "pinball_p50": 0.0,
+            "pinball_p90": 0.0,
+            "in_band": 0.0,
+            "in_band_raw": 0.0,
+            "band_width": 0.0,
+        }
+        self._sums: dict[tuple[str, int, str], dict[str, float]] = defaultdict(zero)
+        # Over-time view is close-only: the headline component, and 90
+        # horizons x 4 components x every year would bury the table.
+        self._yearly: dict[tuple[str, int, str], dict[str, float]] = defaultdict(zero)
+
+    def add_score(self, record: Mapping[str, Any]) -> None:
+        model = record["model"]
+        horizon = int(record.get("horizon", 1))
+        score = record["score"]
+        year = record["target_date"][:4]
+        for component in COMPONENTS:
+            self._fold(self._sums[(model, horizon, component)], score, component)
+        self._fold(self._yearly[(model, horizon, year)], score, "close")
+
+    @staticmethod
+    def _fold(sums: dict[str, float], score: Mapping[str, Any], component: str) -> None:
+        sums["n"] += 1
+        sums["abs_err"] += score["abs_err"][component]
+        sums["sq_err"] += score["sq_err"][component]
+        for key in QUANTILE_KEYS:
+            sums[f"pinball_{key}"] += score["pinball"][component][key]
+        sums["in_band"] += 1.0 if score["in_band"][component] else 0.0
+        sums["in_band_raw"] += 1.0 if score["in_band_raw"][component] else 0.0
+        sums["band_width"] += score["band_width"][component]
+
+    @staticmethod
+    def _summary(sums: Mapping[str, float]) -> dict[str, Any]:
+        n = sums["n"]
+        return {
+            "n": int(n),
+            "mae": sums["abs_err"] / n,
+            "rmse": math.sqrt(sums["sq_err"] / n),
+            "pinball": {key: sums[f"pinball_{key}"] / n for key in QUANTILE_KEYS},
+            "coverage": sums["in_band"] / n,
+            "coverage_raw": sums["in_band_raw"] / n,
+            "band_width": sums["band_width"] / n,
+        }
+
+    def report(self) -> dict[str, Any]:
+        by_horizon: dict[str, Any] = {}
+        for (model, horizon, component), sums in sorted(self._sums.items()):
+            if sums["n"]:
+                by_horizon.setdefault(model, {}).setdefault(str(horizon), {})[component] = self._summary(sums)
+        over_time: dict[str, Any] = {}
+        for (model, horizon, year), sums in sorted(self._yearly.items()):
+            if sums["n"]:
+                over_time.setdefault(model, {}).setdefault(str(horizon), {})[year] = self._summary(sums)
+        skill: dict[str, Any] = {}
+        persistence = by_horizon.get("persistence", {})
+        for model, horizons in by_horizon.items():
+            if model == "persistence":
+                continue
+            for horizon, components in horizons.items():
+                for component, stats in components.items():
+                    base = persistence.get(horizon, {}).get(component)
+                    if base and base["mae"] > 0:
+                        cell = skill.setdefault(model, {}).setdefault(horizon, {})
+                        cell[component] = 1.0 - stats["mae"] / base["mae"]
+        return {
+            "nominal_coverage": NOMINAL_COVERAGE,
+            "by_horizon": by_horizon,
+            "by_horizon_over_time": over_time,
+            "skill_vs_persistence_by_horizon": skill,
+        }
+
+
+def build_horizon_report(
+    records_by_model: Mapping[str, Callable[[], Iterable[Mapping[str, Any]]]],
+    *,
+    intersect: bool = True,
+) -> dict[str, Any]:
+    """Aggregate each model's horizon-score stream (h=1 may be included).
+
+    Same compact-int intersection as :func:`build_report`, with the horizon in
+    the key: a (ticker, origin_date, horizon) cell is compared across models
+    only when every model forecast it.
+    """
+    ticker_ids: dict[str, int] = {}
+    date_ids: dict[str, int] = {}
+    _DATE_ID_SPACE = 10_000_000
+
+    def _key_id(record: Mapping[str, Any]) -> int:
+        ticker_id = ticker_ids.setdefault(record["ticker"], len(ticker_ids))
+        date_id = date_ids.setdefault(record["origin_date"], len(date_ids))
+        return (ticker_id * _DATE_ID_SPACE + date_id) * 256 + int(record.get("horizon", 1))
+
+    keep: np.ndarray | None = None
+    if intersect and len(records_by_model) > 1:
+        for _model, stream in records_by_model.items():
+            keys = np.unique(np.fromiter((_key_id(record) for record in stream()), dtype=np.int64))
+            keep = keys if keep is None else np.intersect1d(keep, keys, assume_unique=True)
+    accumulator = HorizonMetricsAccumulator()
+    counts: dict[str, int] = {}
+    for model, stream in records_by_model.items():
+        count = 0
+        for record in stream():
+            if keep is not None:
+                key = _key_id(record)
+                position = np.searchsorted(keep, key)
+                if position >= len(keep) or keep[position] != key:
+                    continue
+            accumulator.add_score(record)
+            count += 1
+        counts[model] = count
+    report = accumulator.report()
+    report["n_scored"] = counts
+    report["intersection_applied"] = keep is not None
+    return report
+
+
+def render_horizon_markdown(report: Mapping[str, Any]) -> list[str]:
+    """The per-horizon sections of report.md (close component; full detail in report.json)."""
+    lines: list[str] = []
+    by_horizon = report.get("by_horizon") or {}
+    if not by_horizon:
+        return lines
+    lines.append("## Error by forecast horizon (close)")
+    lines.append("")
+    lines.append(
+        "Horizon h forecasts the bar h trading rows after the origin day. `coverage` is the calibrated "
+        "p10–p90 band, `raw` the model's own; skill is vs persistence at the SAME horizon."
+    )
+    lines.append("")
+    lines.append(
+        "| model | horizon | n | MAE (log) | pinball p50 | coverage | raw | band width | skill vs persistence |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    skill = report.get("skill_vs_persistence_by_horizon", {})
+    for model, horizons in by_horizon.items():
+        for horizon in sorted(horizons, key=int):
+            stats = horizons[horizon].get("close")
+            if not stats:
+                continue
+            cell = skill.get(model, {}).get(horizon, {}).get("close")
+            lines.append(
+                f"| {model} | {horizon} | {stats['n']} | {stats['mae']:.5f} | {stats['pinball']['p50']:.5f} | "
+                f"{_format_pct(stats['coverage'])} | {_format_pct(stats['coverage_raw'])} | "
+                f"{stats['band_width']:.5f} | {_format_pct(cell) if cell is not None else 'n/a'} |"
+            )
+    lines.append("")
+    over_time = report.get("by_horizon_over_time") or {}
+    if over_time:
+        lines.append("## Close MAE by horizon over time (log-return; compare rows across years)")
+        lines.append("")
+        years = sorted({year for horizons in over_time.values() for years_ in horizons.values() for year in years_})
+        lines.append("| model | horizon | " + " | ".join(years) + " |")
+        lines.append("|---|---|" + "---|" * len(years))
+        for model, horizons in over_time.items():
+            for horizon in sorted(horizons, key=int):
+                cells = [
+                    f"{horizons[horizon][year]['mae']:.5f}" if year in horizons[horizon] else "–" for year in years
+                ]
+                lines.append(f"| {model} | {horizon} | " + " | ".join(cells) + " |")
+        lines.append("")
+    return lines
+
+
 def latest_retrain_date(records: Iterable[dict[str, Any]]) -> str | None:
     """Latest ``origin_date`` among a model's ledgered retrain markers, or ``None``."""
     dates = [record["origin_date"] for record in records]
@@ -572,4 +750,5 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{_format_pct(stats['error_variance_market_fraction'])} | {stats['n_days']} |"
             )
         lines.append("")
+    lines.extend(render_horizon_markdown(report))
     return "\n".join(lines)
