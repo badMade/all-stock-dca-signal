@@ -82,3 +82,86 @@ def test_per_order_record_is_written_and_audited_before_notifying():
 def test_the_old_every_order_full_refetch_sentence_is_gone():
     # "Fetch all pages again before every order" contradicted the incremental rule.
     assert "Fetch all pages again before every order" not in _text()
+
+
+# --- 2026-11-06: the same four rules in all seven live-mirror prompts. -----------------------------------------
+# The 9:35 prompt ran the incremental design on 2026-11-05 with 18 orders (17 incremental merges, a clean
+# check_per_order_record), the size at which the old full re-read compacted the session on 2026-10-29. The ADR
+# (docs/adr-incremental-order-history.md) held the other six slots back until that happened. The rule text is
+# identical across slots apart from the slot code in the baseline file names, so these tests pin both that each
+# prompt carries it and that no prompt drifts from the 9:35 wording.
+
+import re  # noqa: E402
+
+import pytest  # noqa: E402
+
+MIRROR_DIR = Path(__file__).resolve().parent.parent / "claude/dca-executor-prompts/live-mirror"
+MIRRORS = sorted(p for p in MIRROR_DIR.glob("*.txt") if not p.name.startswith("."))
+RULE_MARKERS = (INCREMENTAL, BATCHED, NO_SKIP, "PER-ORDER RECORD")
+AUDIT = "PER-ORDER AUDIT"
+
+
+def _slot(path: Path) -> str:
+    return path.name[:4]
+
+
+def _paragraph(text: str, marker: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith(marker))
+
+
+def _gate_text(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    return text[begin : text.index(end, begin)]
+
+
+def test_the_mirror_set_is_the_seven_live_slots():
+    assert [_slot(p) for p in MIRRORS] == ["0935", "1030", "1130", "1230", "1330", "1430", "1530"]
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_every_mirror_carries_the_four_rules_inside_gate_7(mirror):
+    gate7 = _gate_text(mirror.read_text(encoding="utf-8"), "GATE 7 - ", "GATE 8 - ")
+    for marker in RULE_MARKERS:
+        assert marker in gate7, f"{mirror.name}: {marker} is not inside Gate 7"
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_the_rules_sit_before_per_order_timing(mirror):
+    text = mirror.read_text(encoding="utf-8")
+    assert text.index(INCREMENTAL) < text.index("PER-ORDER TIMING")
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_the_incremental_rule_names_this_slots_baseline_files_and_no_other_slots(mirror):
+    rule = _paragraph(mirror.read_text(encoding="utf-8"), INCREMENTAL)
+    slot = _slot(mirror)
+    assert f"orders_pages_<YYYY-MM-DD>_{slot}.json" in rule
+    assert f"orders_pages_week_<Monday YYYY-MM-DD>_{slot}.json" in rule
+    other_codes = set(re.findall(r"_(\d{4})\.json", rule)) - {slot}
+    assert not other_codes, f"{mirror.name}: baseline names carry another slot's code {sorted(other_codes)}"
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_the_incremental_rule_supersedes_the_full_refetch_and_names_the_merge_script(mirror):
+    rule = _paragraph(mirror.read_text(encoding="utf-8"), INCREMENTAL)
+    for needle in ("supersedes", "scripts.merge_order_pages", "--overlap-seconds 120", "exit 2"):
+        assert needle in rule, f"{mirror.name}: {needle!r} missing from the incremental rule"
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_gate_9_runs_the_per_order_audit_after_the_finalize_check(mirror):
+    text = mirror.read_text(encoding="utf-8")
+    gate9 = text[text.index("GATE 9 - ") :]
+    assert AUDIT in gate9 and "scripts.check_per_order_record" in gate9
+    assert gate9.index("Exit 0: verified") < gate9.index(AUDIT)
+
+
+@pytest.mark.parametrize("mirror", MIRRORS, ids=_slot)
+def test_the_rule_paragraphs_match_the_9_35_wording_apart_from_the_slot_code(mirror):
+    reference = PROMPT.read_text(encoding="utf-8")
+    text = mirror.read_text(encoding="utf-8")
+    slot = _slot(mirror)
+    for marker in (*RULE_MARKERS, AUDIT):
+        assert _paragraph(text, marker).replace(slot, "0935") == _paragraph(reference, marker), (
+            f"{mirror.name}: {marker} differs from the 9:35 paragraph"
+        )

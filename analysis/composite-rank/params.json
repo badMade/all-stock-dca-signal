@@ -1,0 +1,27 @@
+{
+  "version": "2026-11-06.2",
+  "description": "Tunable ranking parameters. Edit, bump version, and every later run is stamped with it so results before and after a change can be compared (composite_rank.py effectiveness).",
+  "period_weights": {
+    "1y": 6,
+    "1m": 5,
+    "1w": 4,
+    "3m": 3,
+    "6m": 2,
+    "5y": 1
+  },
+  "blend": {
+    "base": 0.7,
+    "lowvol": 0.2,
+    "lowdd": 0.1
+  },
+  "percentile_share": 0.6,
+  "hurdle_annualised": 0.2,
+  "hurdle_bonus": 5.0,
+  "return_score_cap": 0.4,
+  "evaluate_threshold": 80.0,
+  "held_threshold": 50.0,
+  "forward_weights": {
+    "octopus": 0.0,
+    "ml": 0.0
+  }
+}

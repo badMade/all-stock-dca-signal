@@ -78,7 +78,7 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
 - First-pass chunk size is `DCA_CHUNK_SIZE` (unset = the planner's default, 4 since 2026-11-02). It exists to retune without a
   code change: on 2026-11-03 the 15:31 build, still at 8-ticker chunks, got "exceeds the output limit" on nearly every reply,
   spent its deadline on retries and rescues and refused at 15/84. Both plist templates also set `DCA_CODEX_PARALLEL`,
-  since 4-ticker chunks mean more worker calls: 6 from 2026-11-04, 8 since 2026-11-05 (the 122-ticker universe is 31
+  since 4-ticker chunks mean more worker calls: 6 from 2026-11-04, 8 since 2026-11-06 (the 122-symbol universe is 31
   chunks, and 8 workers keeps that at 4 waves). An installed plist keeps its old value until it is re-rendered and reloaded.
 - A chunk that returns no reply on both attempts is rescued (2026-10-26: the 09:35 run lost chunks 4 and 10 whole,
   16 of 91 tickers, and refused at 75/91 although every other chunk validated). The floor tolerates 4 misses but a
