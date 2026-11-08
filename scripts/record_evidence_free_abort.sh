@@ -90,7 +90,7 @@ if command -v python3 >/dev/null 2>&1; then
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
-t = datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=ZoneInfo('UTC'))
+t = datetime.fromisoformat(sys.argv[1]).replace(tzinfo=ZoneInfo('UTC'))
 e = t.astimezone(ZoneInfo('America/New_York'))
 print(e.strftime('%Y-%m-%d %z'))" "$FIRED_AT" 2>/dev/null)
     ET_DAY=${ET_LINE% *} ET_OFFSET=${ET_LINE#* }
