@@ -49,22 +49,26 @@ def mac(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # Claude "runs" while state/running exists; quitting removes it unless state/stuck exists.
-    _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; [ -e "{state}/stuck" ] || rm -f "{state}/running"')
+    _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; '
+          f'if [ -e "{state}/denied" ]; then echo "execution error: Not authorized to send Apple events to Claude. (-1743)" >&2; exit 1; fi; '
+          f'[ -e "{state}/stuck" ] || rm -f "{state}/running"')
     _stub(bin_dir, "pgrep", f'echo "pgrep $*" >> "{calls}"; [ -e "{state}/running" ]')
     _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; touch "{state}/running"')
     _stub(bin_dir, "date", f'if [ "$1" = "+%u" ]; then cat "{state}/weekday"; else /bin/date "$@"; fi')
     (state / "running").touch()
     (state / "weekday").write_text("6\n", encoding="utf-8")  # Saturday
 
-    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True):
+    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True, denied: bool = False):
         (state / "weekday").write_text(f"{weekday}\n", encoding="utf-8")
+        if denied:
+            (state / "denied").touch()
         if stuck:
             (state / "stuck").touch()
         if not running:
             (state / "running").unlink(missing_ok=True)
         env = {**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin", "CLAUDE_VM_DISK": str(bundle / "rootfs.img"),
                "CLAUDE_VM_QUIT_WAIT": "2"}
-        done = subprocess.run(["/bin/sh", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30)
+        done = subprocess.run(["/bin/bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30)
         log = calls.read_text(encoding="utf-8") if calls.exists() else ""
         return done, log
 
@@ -145,7 +149,7 @@ def test_agent_runs_the_script_every_saturday_at_three_am():
     # Start it through the checkout's venv Python like the payload agent does: a child inherits the parent's access.
     assert agent["ProgramArguments"] == [
         "/repo/.venv/bin/python", "-c",
-        'import subprocess, sys; sys.exit(subprocess.call(["/bin/sh", sys.argv[1]]))',
+        'import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1]]))',
         "/repo/deploy/launchd/claude_vm_reset.sh",
     ]
     assert agent["StartCalendarInterval"] == {"Weekday": 6, "Hour": 3, "Minute": 0}
@@ -170,3 +174,30 @@ def test_every_launchd_agent_starts_through_the_checkout_venv_python():
             text = text.replace(placeholder, "/repo")
         program = plistlib.loads(text.encode("utf-8"))["ProgramArguments"][0]
         assert program == "/repo/.venv/bin/python", (template.name, program)
+
+
+# -- 2026-11-08: what the Saturday runs taught us ----------------------------------------------------------------------
+# With the venv-Python wrapper the script was still refused ("Operation not permitted") while it ran under /bin/sh,
+# and ran once it ran under /bin/bash, the shell the payload agents use: /bin/sh on macOS is a launcher that re-execs
+# another shell, and that hop loses the ~/Documents grant. Then it stopped at "refused: claude_still_running" with no
+# reason, because the script threw away osascript's output. A refused quit must say why in the agent's log.
+
+
+def test_the_agent_runs_the_script_with_bash_not_sh():
+    args = _agent()["ProgramArguments"]
+    assert '"/bin/bash"' in args[2] and '"/bin/sh"' not in args[2]
+
+
+def test_a_refused_quit_writes_osascripts_reason_to_the_log(mac):
+    done, _ = mac(denied=True)
+    assert done.returncode == 1
+    out = done.stdout + done.stderr  # launchd sends both to /tmp/dca-claude-vm-reset.log
+    assert "refused: claude_still_running" in out
+    assert "Not authorized to send Apple events" in out  # the reason, not just the outcome
+    assert (mac.bundle / "rootfs.img").exists()
+
+
+def test_a_successful_quit_logs_nothing_extra_from_osascript(mac):
+    done, _ = mac()
+    assert done.returncode == 0
+    assert "osascript" not in done.stdout + done.stderr

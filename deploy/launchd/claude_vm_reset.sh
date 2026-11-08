@@ -38,7 +38,9 @@ fi
 claude_running() { pgrep -x Claude >/dev/null 2>&1; }
 
 if claude_running; then
-  osascript -e 'quit app "Claude"' >/dev/null 2>&1
+  # stderr stays on (2026-11-08): the 11-08 run stopped at claude_still_running with no reason because osascript's
+  # error went to /dev/null. A refused quit (e.g. "Not authorized to send Apple events", -1743) now lands in the log.
+  osascript -e 'quit app "Claude"' >/dev/null
   waited=0
   while claude_running; do
     if [ "$waited" -ge "$WAIT" ]; then
