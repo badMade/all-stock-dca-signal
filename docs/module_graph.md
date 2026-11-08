@@ -2,7 +2,7 @@
 
 Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; `--check` exits 1 when this copy is stale and `--impact <module>` lists everything that depends on a module. A workflow refreshes this file on every push to `main`.
 
-182 core modules, 569 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
+182 core modules, 570 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
 
 ## Most depended-on modules (change these with care)
 
@@ -10,7 +10,7 @@ Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; 
 | --- | ---: | --- |
 | `dca_paths` | 51 | `dca_alerts`, `dca_console`, `dca_console_alerts`, `dca_console_launch`, `dca_console_runs`, `dca_cumulative`, +45 more |
 | `dca_fileio` | 45 | `dca_alerts`, `dca_average_cost_snapshot`, `dca_console`, `dca_console_jobs`, `dca_console_launch`, `dca_cost_tracker`, +39 more |
-| `dca_config` | 38 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +32 more |
+| `dca_config` | 39 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +33 more |
 | `near_close_dca` | 32 | `dca_alerts`, `dca_config`, `dca_console_config`, `dca_console_jobs`, `dca_live_adapters`, `dca_market_graph`, +26 more |
 | `dca_runner` | 25 | `dca_console`, `dca_console_config`, `dca_console_data`, `dca_console_schedule`, `dca_console_state`, `dca_order_plan`, +19 more |
 | `dca_console_reader` | 17 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_docs`, `dca_console_env`, `dca_console_launch`, +11 more |
@@ -89,7 +89,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.workflow_policy` | 230 | 4 |
 | `scripts.workspace_probe` | 138 | 0 |
 | `selfheal` | 5 | 0 |
-| `sizing_adjustment_reader` | 102 | 0 |
+| `sizing_adjustment_reader` | 123 | 0 |
 | `sizing_suggestion_compare` | 276 | 1 |
 | `snap` | 46 | 0 |
 
@@ -106,7 +106,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_average_cost_snapshot` | 207 | 1 | 1 | 0 | `dca_fileio` |
 | `dca_bootstrap` | 220 | 0 | 2 | 0 |  |
 | `dca_common` | 99 | 0 | 4 | 0 |  |
-| `dca_config` | 1542 | 1 | 38 | 2 | `near_close_dca` |
+| `dca_config` | 1542 | 1 | 39 | 2 | `near_close_dca` |
 | `dca_console` | 1539 | 12 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, `dca_console_routes`, +4 more |
 | `dca_console_alerts` | 650 | 12 | 1 | 0 | `dca_alerts`, `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_paths`, `dca_risk`, `scripts.alert_digest`, +4 more |
 | `dca_console_config` | 827 | 5 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `near_close_dca` |
@@ -275,7 +275,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `selfheal.notion_issue_loop` | 1624 | 0 | 2 | 0 |  |
 | `selfheal.reasons` | 185 | 0 | 2 | 0 |  |
 | `selfheal.triage_reconcile` | 594 | 1 | 2 | 1 | `selfheal.notion_issue_loop` |
-| `sizing_adjustment_reader` | 102 | 0 | 0 | 0 |  |
+| `sizing_adjustment_reader` | 123 | 1 | 0 | 0 | `dca_config` |
 | `sizing_suggestion_compare` | 276 | 2 | 0 | 1 | `dca_ticker_paths`, `sizing_suggestion_history` |
 | `sizing_suggestion_history` | 264 | 2 | 2 | 0 | `dca_paths`, `scripts.file_lock` |
 | `snap` | 46 | 0 | 0 | 0 |  |
