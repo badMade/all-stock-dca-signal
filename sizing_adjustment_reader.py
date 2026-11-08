@@ -15,9 +15,12 @@ decision belongs here, not in either suggester.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from dca_config import _reject_duplicate_keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,14 +92,32 @@ def _read_if_fresh(path: Path, ticker: str, max_staleness_hours: float) -> float
     is treated as absent, never as an error."""
     if not path.exists():
         return None
+    if (
+        isinstance(max_staleness_hours, bool)
+        or not isinstance(max_staleness_hours, (int, float))
+        or not math.isfinite(max_staleness_hours)
+        or max_staleness_hours <= 0
+    ):
+        return None
     try:
-        data = json.loads(path.read_bytes())
-        if data.get("ticker") != ticker:
+        data = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        if not isinstance(data, dict) or data.get("ticker") != ticker:
             return None
-        generated_at = datetime.fromisoformat(data["generated_at"])
+        raw_dt = data.get("generated_at")
+        if not isinstance(raw_dt, str):
+            return None
+        generated_at = datetime.fromisoformat(raw_dt)
+        if generated_at.tzinfo is None:
+            return None
         age_hours = (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600
-        if age_hours > max_staleness_hours:
+        if age_hours < 0 or age_hours > max_staleness_hours:
             return None
-        return float(data["multiplier_adjustment_pct"])
-    except (json.JSONDecodeError, KeyError, ValueError, OSError):
+        raw_pct = data.get("multiplier_adjustment_pct")
+        if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)):
+            return None
+        pct = float(raw_pct)
+        if not math.isfinite(pct):
+            return None
+        return pct
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, OverflowError, OSError):
         return None

@@ -158,3 +158,65 @@ def test_load_combined_adjustment_unknown_policy(tmp_path: Path):
     _write_adjustment(f1, "AAPL", 0.10, hours_ago=1.0)
     with pytest.raises(ValueError, match="unknown combine policy"):
         load_combined_adjustment("AAPL", {"s1": f1}, 24.0, combine="invalid_policy")
+
+
+def test_read_if_fresh_rejects_boolean_multiplier(tmp_path: Path):
+    path = tmp_path / "bad_bool.json"
+    generated_at = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps({"ticker": "AAPL", "multiplier_adjustment_pct": True, "generated_at": generated_at}))
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+@pytest.mark.parametrize("bad_val", ["nan", "inf", "-inf"])
+def test_read_if_fresh_rejects_non_finite_multiplier(tmp_path: Path, bad_val: str):
+    path = tmp_path / "bad_float.json"
+    generated_at = datetime.now(timezone.utc).isoformat()
+    # Write literal JSON token for NaN / Infinity
+    path.write_text(f'{{"ticker": "AAPL", "multiplier_adjustment_pct": {bad_val}, "generated_at": "{generated_at}"}}')
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+def test_read_if_fresh_rejects_duplicate_json_keys(tmp_path: Path):
+    path = tmp_path / "duplicate.json"
+    generated_at = datetime.now(timezone.utc).isoformat()
+    path.write_text(
+        f'{{"ticker": "AAPL", "multiplier_adjustment_pct": 0.10, "multiplier_adjustment_pct": 0.20, "generated_at": "{generated_at}"}}'
+    )
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+def test_read_if_fresh_rejects_non_dict_json(tmp_path: Path):
+    path = tmp_path / "list.json"
+    path.write_text(json.dumps(["AAPL", 0.15]))
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+def test_read_if_fresh_rejects_naive_timestamp(tmp_path: Path):
+    path = tmp_path / "naive.json"
+    path.write_text(
+        json.dumps({"ticker": "AAPL", "multiplier_adjustment_pct": 0.15, "generated_at": "2026-11-08T12:00:00"})
+    )
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+def test_read_if_fresh_rejects_future_timestamp(tmp_path: Path):
+    path = tmp_path / "future.json"
+    future_time = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    path.write_text(json.dumps({"ticker": "AAPL", "multiplier_adjustment_pct": 0.15, "generated_at": future_time}))
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
+
+
+@pytest.mark.parametrize("bad_hours", [0, -1, float("nan"), float("inf"), True])
+def test_read_if_fresh_rejects_invalid_staleness_hours(tmp_path: Path, bad_hours):
+    path = tmp_path / "valid.json"
+    _write_adjustment(path, "AAPL", 0.15, hours_ago=1.0)
+    assert _read_if_fresh(path, "AAPL", bad_hours) is None
+
+
+def test_read_if_fresh_rejects_oversized_integer_overflow(tmp_path: Path):
+    path = tmp_path / "overflow.json"
+    generated_at = datetime.now(timezone.utc).isoformat()
+    # 400-digit integer exceeds float max (~1e308)
+    huge = "9" * 400
+    path.write_text(f'{{"ticker": "AAPL", "multiplier_adjustment_pct": {huge}, "generated_at": "{generated_at}"}}')
+    assert _read_if_fresh(path, "AAPL", 24.0) is None
