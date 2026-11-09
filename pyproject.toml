@@ -149,6 +149,9 @@ py-modules = [
     "sizing_suggestion_history",
     # Read-only scorecard over that history (python -m sizing_suggestion_compare).
     "sizing_suggestion_compare",
+    # Shadow-only live-quote vs 09:30-bar recorder for the proposed 09:32 market-open fire
+    # (standalone CLI: python -m market_open_quote_shadow).
+    "market_open_quote_shadow",
     # Imported by scripts/run_tickers_daily_update.py, scripts/run_ticker_maintenance.py,
     # and scripts/refresh_active_ticker_histories.py to resolve the ticker-history
     # directory; without it those jobs fail with ModuleNotFoundError outside a
