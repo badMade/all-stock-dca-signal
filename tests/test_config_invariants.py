@@ -2816,7 +2816,7 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
         "12:30": ("a6239dae", "062605c6", "12:50"),
         "13:30": ("7be82b97", "54ab24d2", "13:50"),
         "14:30": ("7be82b97", "54ab24d2", "14:50"),
-        "15:30": ("10ce362c", "f83b8d62", "15:45"),
+        "15:30": ("10ce362c", "f83b8d62", "15:40"),
     }
     assert set(slots) == set(expected)
     task_by_id = {task["id"]: task for task in data["tasks"]}

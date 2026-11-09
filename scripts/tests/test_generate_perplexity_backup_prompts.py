@@ -31,7 +31,7 @@ EXPECTED = [
     ("1150ET", "e3590042", ("11:50",), ("1130",), "12:30"),
     ("1250ET", "062605c6", ("12:50",), ("1230",), "13:30"),
     ("1350-1450ET", "54ab24d2", ("13:50", "14:50"), ("1330", "1430"), "14:30 for the 13:50 fire, 15:30 for the 14:50 fire"),
-    ("1545ET", "f83b8d62", ("15:45",), ("1530",), "16:00"),
+    ("1540ET", "f83b8d62", ("15:40",), ("1530",), "16:00"),
 ]
 
 
@@ -75,7 +75,7 @@ def test_each_prompt_names_its_task_fire_times_slots_and_deadline(prompts, prefi
 
 
 def test_only_the_final_prompt_carries_the_accepted_time_limitation(prompts):
-    final = _by_prefix(prompts, "1545ET")
+    final = _by_prefix(prompts, "1540ET")
     assert "KNOWN LIMITATION (accepted 2026-10-06)" in final
     for prefix in ("0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET"):
         assert "KNOWN LIMITATION" not in _by_prefix(prompts, prefix)
@@ -441,7 +441,7 @@ def _gated():
 
 def _is_gated_prompt(prefix):
     slots = {"0955ET": {"0935"}, "1050ET": {"1030"}, "1150ET": {"1130"}, "1250ET": {"1230"}, "1350-1450ET": {"1330", "1430"},
-             "1545ET": {"1530"}}[prefix]
+             "1540ET": {"1530"}}[prefix]
     return slots <= _gated()
 
 
@@ -460,7 +460,7 @@ def test_the_task_does_no_sizing_of_its_own_and_says_so(prompts, prefix):
     assert "--deployed-last-7d-usd auto" in text or not _is_gated_prompt(prefix)  # the figure is derived, never summed by hand
 
 
-@pytest.mark.parametrize("prefix", ["0955ET", "1150ET", "1350-1450ET", "1545ET"])
+@pytest.mark.parametrize("prefix", ["0955ET", "1150ET", "1350-1450ET", "1540ET"])
 def test_a_gated_slot_dumps_raw_responses_and_lets_the_assembler_build_the_payload(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     assert _is_gated_prompt(prefix)
@@ -602,7 +602,7 @@ def test_claim_is_unconfirmed_and_confirm_follows_the_first_accepted_order(promp
     assert "the claim expires and a later run may claim again" in text
 
 
-@pytest.mark.parametrize("prefix", ["0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET", "1545ET"])
+@pytest.mark.parametrize("prefix", ["0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET", "1540ET"])
 def test_the_task_also_fetches_the_previous_sessions_daily_bar_and_saves_it_under_daily(prompts, prefix):
     """Copilot's review of #1643: without the daily bar the assembled payload has no real prior low."""
     text = _by_prefix(prompts, prefix)
