@@ -100,6 +100,20 @@ def build_records(
     return records
 
 
+def _existing_keys(path: Path) -> set:
+    """Keys already on file; unreadable or torn lines are ignored (append-only, never repaired here)."""
+    keys = set()
+    if not path.is_file():
+        return keys
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+            keys.add((row["trading_day"], row["run_id"], row["ticker"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return keys
+
+
 def record_shadow(
     market_data: Mapping[str, Mapping[str, Any]],
     *,
@@ -108,13 +122,20 @@ def record_shadow(
     root: Optional[Path] = None,
     recorded_at: Optional[datetime] = None,
 ) -> Path:
-    """Append one JSON line per ticker; returns the file written. Never raises on empty input."""
+    """Append one JSON line per ticker; returns the file written. Never raises on empty input.
+
+    Idempotent per (trading_day, run_id, ticker): a rerun of the same run (a retry, or an operator
+    re-running the step) skips rows already on file instead of double-counting them in later stats.
+    """
     records = build_records(market_data, trading_day=trading_day, run_id=run_id, recorded_at=recorded_at)
     base = Path(root) if root is not None else shadow_root()
     base.mkdir(parents=True, exist_ok=True)
     path = base / f"{trading_day.year}.jsonl"
+    seen = _existing_keys(path)
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
+            if (record["trading_day"], record["run_id"], record["ticker"]) in seen:
+                continue
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     return path
 

@@ -40,7 +40,9 @@ def test_record_shadow_appends_jsonl_and_never_rewrites(tmp_path):
     first = path.read_text().splitlines()
     assert path.name == "2026.jsonl" and len(first) == 3
     assert [json.loads(line)["ticker"] for line in first] == ["AAA", "BBB", "CCC"]
-    shadow.record_shadow(PAYLOAD, **kwargs)
+    shadow.record_shadow(PAYLOAD, **kwargs)  # same run again: idempotent, nothing appended
+    assert path.read_text().splitlines() == first
+    shadow.record_shadow(PAYLOAD, **{**kwargs, "run_id": "r2"})  # a different run appends
     assert path.read_text().splitlines()[:3] == first and len(path.read_text().splitlines()) == 6
 
 
