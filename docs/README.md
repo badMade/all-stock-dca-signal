@@ -83,6 +83,7 @@ environment (see the repository README).
 | [price_source_poc_report.md](price_source_poc_report.md) | The opt-in live PoC report for that price source (20 tickers x 60 sessions vs Yahoo) |
 | [verified_sizing_and_backup_facts.md](verified_sizing_and_backup_facts.md) | Re-checkable repo facts found during the backup-executor work: live per-ticker sizing and the $16 cap, stale "$10"/"5x" prose, same-day repeats, where sources disagree |
 | [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
+| [market_open_0932_move.md](market_open_0932_move.md) | Proposal (not implemented) to fire the market-open slot at 09:32 on a live-quote decision price; the full change list and the shadow-only `market_open_quote_shadow` recorder that gathers evidence first |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 
 ## Machine-readable backup

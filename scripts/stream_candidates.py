@@ -1628,15 +1628,6 @@ def build_parser(
             "(Gate 4's compatible-stand-down case). Never scored, never published. Default: none."
         ),
     )
-    parser.add_argument(
-        "--quote-shadow",
-        action="store_true",
-        help=(
-            "Market-open (0935) only: append a per-ticker live-quote vs 09:30-bar comparison to "
-            "market_open_quote_shadow/<YYYY>.jsonl (docs/market_open_0932_move.md). Record-only, "
-            "best-effort, never changes the emitted document. Default off."
-        ),
-    )
     if spec.requires_deployed_last_7d_usd:
         parser.add_argument(
             "--deployed-last-7d-usd",
@@ -1963,20 +1954,6 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         check_planner_compatibility=True,
         decision_time_et=args.decision_time_et,
     )
-    if getattr(args, "quote_shadow", False) and effective_spec.runner_slot_id == "0935":
-        # Shadow evidence only: a recording failure (disk, permissions) must never block or
-        # alter the live Gate 5 document, hence the deliberately broad guard (cf. the
-        # house rule against broad try/except, which targets imports, not best-effort logging).
-        try:
-            import market_open_quote_shadow
-
-            market_open_quote_shadow.record_shadow(
-                sources[effective_spec.source.value],
-                trading_day=trading_day,
-                run_id=f"market_open_live_{trading_day:%Y%m%d}_0935ET",
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"quote-shadow not recorded: {exc}", file=sys.stderr)
     document["validation_context_sources_present"] = sorted(set(sources) - {effective_spec.source.value})
     document["validation_context_source_errors"] = sorted(
         s for s in source_errors if s != effective_spec.source.value

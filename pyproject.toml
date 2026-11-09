@@ -150,7 +150,7 @@ py-modules = [
     # Read-only scorecard over that history (python -m sizing_suggestion_compare).
     "sizing_suggestion_compare",
     # Shadow-only live-quote vs 09:30-bar recorder for the proposed 09:32 market-open fire
-    # (imported lazily by scripts/stream_candidates.py behind --quote-shadow).
+    # (standalone CLI: python -m market_open_quote_shadow).
     "market_open_quote_shadow",
     # Imported by scripts/run_tickers_daily_update.py, scripts/run_ticker_maintenance.py,
     # and scripts/refresh_active_ticker_histories.py to resolve the ticker-history

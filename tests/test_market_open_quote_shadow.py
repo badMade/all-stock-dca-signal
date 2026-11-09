@@ -52,3 +52,15 @@ def test_empty_payload_writes_nothing_and_does_not_raise(tmp_path):
 def test_default_root_honours_cron_tracking_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
     assert str(shadow.shadow_root()).startswith(str(tmp_path))
+
+
+def test_cli_records_and_never_blocks(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "ct"))
+    good = tmp_path / "p.json"
+    good.write_text(json.dumps({"sources": {"robinhood": PAYLOAD}}))
+    assert shadow.main(["--market-data", str(good), "--trading-day", "2026-11-09"]) == 0
+    assert "recorded to" in capsys.readouterr().out
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert shadow.main(["--market-data", str(bad), "--trading-day", "2026-11-09"]) == 0
+    assert "not recorded" in capsys.readouterr().err

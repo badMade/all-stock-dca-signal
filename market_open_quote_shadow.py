@@ -14,11 +14,13 @@ Standard library only; imports only the dependency-free :mod:`dca_paths`.
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import dca_paths
 
@@ -115,3 +117,30 @@ def record_shadow(
         for record in records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     return path
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """``python -m market_open_quote_shadow --market-data payload.json --trading-day YYYY-MM-DD``.
+
+    Reads the same Gate 5 payload the candidate generator takes (``sources.robinhood``). Always
+    exits 0 on a recording problem so a wrapper step can never block a live run; errors go to stderr.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--market-data", type=Path, required=True)
+    parser.add_argument("--trading-day", type=date.fromisoformat, required=True)
+    parser.add_argument("--run-id", default=None)
+    args = parser.parse_args(argv)
+    try:
+        payload = json.loads(args.market_data.read_text(encoding="utf-8"))
+        market_data = payload["sources"]["robinhood"]
+        run_id = args.run_id or f"market_open_live_{args.trading_day:%Y%m%d}_0935ET"
+        path = record_shadow(market_data, trading_day=args.trading_day, run_id=run_id)
+    except Exception as exc:  # noqa: BLE001 -- shadow-only; must never block a live run
+        print(f"quote-shadow not recorded: {exc}", file=sys.stderr)
+        return 0
+    print(f"quote-shadow recorded to {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

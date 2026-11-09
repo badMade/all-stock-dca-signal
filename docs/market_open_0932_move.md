@@ -55,12 +55,13 @@ Until then the safe state is the routine firing at 09:35 or later.
 ## Shadow phase (implemented)
 
 `market_open_quote_shadow.py` records, per ticker, the live-quote decision drop versus the previous
-close next to the 09:30 five-minute bar's drop, plus the gap in percentage points. Enable it with
-`--quote-shadow` on `scripts/generate_market_open_candidates.py` (default off, market-open slot only).
-It appends to `<cron root>/market_open_quote_shadow/<YYYY>.jsonl`, is best-effort, and never changes
+close next to the 09:30 five-minute bar's drop, plus the gap in percentage points. Run it as a separate step:
+`python -m market_open_quote_shadow --market-data <gate5 payload.json> --trading-day YYYY-MM-DD`.
+It is a standalone CLI (deliberately not wired into the candidate generator, whose import closure
+is hashed into the Perplexity backup planner). It appends to `<cron root>/market_open_quote_shadow/<YYYY>.jsonl`, is best-effort, and never changes
 the emitted Gate 5 document, sizing, state or orders.
 
-To start collecting, add `--quote-shadow` to the Gate 5 command in the live prompt (external re-paste,
+To start collecting, add that command after Gate 5 in the live prompt (external re-paste,
 then `check_live_prompt_drift`). Review the JSONL after about a week: if `drop_gap_pct_points` is
 small and rarely crosses a ladder tier, proceed to the remaining changes above. Note the payload at
 09:35 carries a ~09:35 quote, so it slightly understates a true 09:32 quote's divergence.
