@@ -51,7 +51,7 @@ Unverified until an acceptance run (below).
 
 **D. Make the backup wait for primary completion.** Already effectively the policy (backup runs
 20 minutes after the primary; Mac heartbeat `in_progress` blocks it). Waiting longer shrinks overlap
-but cannot remove it, delays the backup past its useful window (15:45 has no slack before 16:00),
+but cannot remove it, delays the backup past its useful window (15:40 has little slack before 16:00; it was 15:45),
 and does nothing for two primaries. Rejected as a mechanism; keep the existing schedule offset.
 
 ## Recommendation: defense in depth, B + C everywhere, A where a medium exists

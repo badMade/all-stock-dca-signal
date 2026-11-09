@@ -275,7 +275,7 @@ def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
 
     task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
     pasted = _by_prefix(gen.build_instructions(), prefix)
-    assert pasted.index("--build-info") < pasted.index(f"procedure --task {task_id} --part 0")
+    assert pasted.index("preflight --task") < pasted.index(f"procedure --task {task_id} --part 0")
     text = backup_procedure.render_part(task_id, 0)
     heading = text.find("\nSTAND-DOWN GATE")
     assert heading != -1, "part 0 has no STAND-DOWN GATE section"
@@ -450,7 +450,7 @@ def test_the_cloud_planner_is_the_stamped_sandbox_file_not_a_vendored_script(pro
     text = _by_prefix(prompts, prefix)
     assert "backup_planner.pyz" in text
     assert "python3 backup_planner.py " not in text and "vendored single-file" not in text
-    assert "--build-info" in text and "source_commit" in text  # the state record names the exact build that ran
+    assert "preflight" in text and "source_commit" in text  # the state record names the exact build that ran
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
@@ -539,7 +539,7 @@ def test_every_prompt_embeds_the_expected_build_stamp(prompts, prefix, built_sta
 def test_step_b_compares_the_stamp_before_fetching_part_0(prompts, prefix, built_stamp):
     text = _by_prefix(prompts, prefix)
     step_b = text[text.index("STEP B"):text.index("PROCEDURE FOR TASK")]
-    assert step_b.index("--build-info") < step_b.index(built_stamp) < step_b.index("--part 0")
+    assert step_b.index("preflight --task") < step_b.index(built_stamp) < step_b.index("--part 0")
     assert text.index("--part 0") < text.index("backup_planner.pyz universe"), "check first, then request part 0"
     assert "content_sha256" in step_b and "exactly" in step_b
     compare = step_b[step_b.index(built_stamp):step_b.index("--part 0")]

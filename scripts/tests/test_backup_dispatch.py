@@ -65,9 +65,13 @@ def test_every_slot_maps_to_its_backup_task(slot, task_id):
 
 
 @pytest.mark.parametrize("slot, start, end", [
-    ("0935", "09:50", "10:30"), ("1230", "12:45", "13:30"), ("1530", "15:45", "16:00"),
+    ("0935", "09:50", "10:30"), ("1230", "12:45", "13:30"),
+    # 2026-11-09: the final slot's window opens at 15:40 (10 minutes after the slot), not 15:45, because its backup
+    # fires at 15:40 and only has until 16:00; every other slot keeps 15 minutes.
+    ("1530", "15:40", "16:00"),
 ])
-def test_the_check_window_opens_15_minutes_after_the_slot_and_closes_at_its_latest_placement(slot, start, end):
+def test_the_check_window_opens_15_minutes_after_the_slot_except_the_final_slot_and_closes_at_its_latest_placement(
+        slot, start, end):
     assert bd.check_window(slot) == (start, end)
 
 
