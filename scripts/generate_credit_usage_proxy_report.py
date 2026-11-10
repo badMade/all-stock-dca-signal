@@ -475,7 +475,7 @@ def _expand_artifact_path(path: Path) -> List[str]:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
-                                paths.append(entry.path.replace("\\", "/"))
+                                paths.append(Path(entry.path).as_posix())
                         except OSError:
                             pass
                 except OSError:
