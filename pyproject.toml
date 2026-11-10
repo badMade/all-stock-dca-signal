@@ -53,7 +53,7 @@ dev = [
     "scipy-stubs==1.18.1.0; python_version >= '3.12'",
     "pip-audit==2.10.1",
     "pyright==1.1.414",
-    "uv==0.13.5",
+    "uv==0.13.7",
 ]
 # Yahoo Finance client for the NON-BUYING scheduled tasks only (the daily ticker-history
 # archive refresh, the ^TICK breadth fetch, ticker-advisor, ml-forecaster research). Owner
