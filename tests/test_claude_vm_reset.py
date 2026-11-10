@@ -51,17 +51,23 @@ def mac(tmp_path):
     # Claude "runs" while state/running exists; quitting removes it unless state/stuck exists.
     _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; '
           f'if [ -e "{state}/denied" ]; then echo "execution error: Not authorized to send Apple events to Claude. (-1743)" >&2; exit 1; fi; '
-          f'[ -e "{state}/stuck" ] || rm -f "{state}/running"')
+          f'if [ -e "{state}/late" ]; then (sleep 3; rm -f "{state}/running"; touch "{state}/late_quit") & '
+          f'elif [ ! -e "{state}/stuck" ]; then rm -f "{state}/running"; fi')
     _stub(bin_dir, "pgrep", f'echo "pgrep $*" >> "{calls}"; [ -e "{state}/running" ]')
-    _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; touch "{state}/running"')
+    _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; '
+          f'if [ -e "{state}/late" ]; then while [ ! -e "{state}/late_quit" ]; do sleep 0.1; done; fi; '
+          f'touch "{state}/running"')
     _stub(bin_dir, "date", f'if [ "$1" = "+%u" ]; then cat "{state}/weekday"; else /bin/date "$@"; fi')
     (state / "running").touch()
     (state / "weekday").write_text("6\n", encoding="utf-8")  # Saturday
 
-    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True, denied: bool = False):
+    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True, denied: bool = False,
+            late: bool = False):
         (state / "weekday").write_text(f"{weekday}\n", encoding="utf-8")
         if denied:
             (state / "denied").touch()
+        if late:
+            (state / "late").touch()
         if stuck:
             (state / "stuck").touch()
         if not running:
@@ -73,6 +79,7 @@ def mac(tmp_path):
         return done, log
 
     run.bundle = bundle
+    run.state = state
     return run
 
 
@@ -92,7 +99,17 @@ def test_it_never_deletes_the_disk_while_claude_is_still_running(mac):
     assert done.returncode == 1
     assert "refused: claude_still_running" in done.stdout
     assert (mac.bundle / "rootfs.img").exists()
-    assert "open -a Claude" not in log  # it is still running: nothing to reopen
+    assert "open -a Claude" in log
+    assert log.index("osascript") < log.index("open -a Claude")
+
+
+def test_late_quit_reopens_claude_without_deleting_the_disk(mac):
+    done, log = mac(late=True)
+    assert done.returncode == 1
+    assert "refused: claude_still_running" in done.stdout
+    assert "open -a Claude" in log
+    assert (mac.state / "running").exists()
+    assert (mac.bundle / "rootfs.img").exists()
 
 
 def test_it_refuses_on_a_weekday_so_it_can_never_interrupt_a_slot(mac):
@@ -102,6 +119,16 @@ def test_it_refuses_on_a_weekday_so_it_can_never_interrupt_a_slot(mac):
         assert "refused: weekday" in done.stdout
         assert (mac.bundle / "rootfs.img").exists()
         assert "osascript" not in log  # did not even quit Claude
+
+
+def test_refusal_status_lines_include_timestamps(mac):
+    timestamp = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+    weekday, _ = mac(weekday=3)
+    still_running, _ = mac(stuck=True)
+    for result, status in ((weekday, "refused: weekday"),
+                           (still_running, "refused: claude_still_running")):
+        line = next(line for line in result.stdout.splitlines() if status in line)
+        assert timestamp.search(line), line
 
 
 def test_force_allows_a_weekday_run_for_a_manual_reset(mac):

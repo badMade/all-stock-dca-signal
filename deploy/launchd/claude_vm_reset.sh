@@ -9,6 +9,10 @@
 # while Claude is quit made the app build a fresh VM on the next start
 # (verified 2026-11-04 20:23 ET). This does that once a week.
 #
+# Why: on 2026-11-09 all seven slots were missed while Claude stayed quit from
+# 2026-11-08 22:24 to 2026-11-09 19:12. A late quit after the timeout used to
+# leave Claude closed, so the refusal path now reopens it.
+#
 # Safety:
 #   - Saturday/Sunday only, unless --force: no slot runs on a weekend, so it
 #     can never interrupt a trade or a backup.
@@ -25,13 +29,13 @@ WAIT="${CLAUDE_VM_QUIT_WAIT:-60}"
 
 case "$(basename "$DISK")" in
   rootfs.img) ;;
-  *) echo "refused: not_rootfs"; exit 2 ;;  # never delete anything but the root disk
+  *) echo "refused: not_rootfs $(date '+%Y-%m-%dT%H:%M:%S%z')"; exit 2 ;;  # never delete anything but the root disk
 esac
 
 if [ "${1:-}" != "--force" ]; then
   case "$(date +%u)" in
     6|7) ;;
-    *) echo "refused: weekday"; exit 2 ;;
+    *) echo "refused: weekday $(date '+%Y-%m-%dT%H:%M:%S%z')"; exit 2 ;;
   esac
 fi
 
@@ -44,7 +48,11 @@ if claude_running; then
   waited=0
   while claude_running; do
     if [ "$waited" -ge "$WAIT" ]; then
-      echo "refused: claude_still_running"
+      # 2026-11-09: all seven slots were missed while Claude stayed quit from
+      # 2026-11-08 22:24 to 2026-11-09 19:12; a late quit after timeout used
+      # to leave Claude closed. Reopen it before refusing, without deleting the disk.
+      open -a Claude
+      echo "refused: claude_still_running $(date '+%Y-%m-%dT%H:%M:%S%z')"
       exit 1
     fi
     sleep 1
