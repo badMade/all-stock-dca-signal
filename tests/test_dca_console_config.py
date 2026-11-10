@@ -544,3 +544,23 @@ def test_stream_gate_distinguishes_unread_from_disabled(cfg):
     gates = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
     assert gates["stream_live_execution_enabled"]["state"] == "configured"
     assert "market_open" in gates["stream_live_execution_enabled"]["detail"]
+
+
+def test_broker_gate_cites_last_run_evidence_but_stays_unknown(cfg, monkeypatch):
+    import dca_console_runs
+
+    def rows(*runs):
+        monkeypatch.setattr(dca_console_runs, "build_run_index", lambda roots, **kw: {"runs": list(runs)})
+        gate = {g["name"]: g for g in reader.live_gate_summary(cfg, DAY, roots=("x",))["gates"]}["broker_enable_live_orders"]
+        assert gate["state"] == "unknown"  # evidence is history, never a reading of the injected flag
+        return gate["detail"]
+
+    blocked = {"day": "2026-11-08", "stream": "afternoon", "mode": "unknown"}  # holiday gate: no broker was built
+    manual = {"day": "2026-11-07", "stream": "afternoon", "mode": "live", "origin": "manual"}
+    dry = {"day": "2026-11-05", "stream": "afternoon", "mode": "dry_run", "submitted": 0}
+    live = {"day": "2026-11-04", "stream": "midday", "mode": "live", "submitted": 3}
+    assert "2026-11-05" in rows(blocked, manual, dry, live) and "dry run" in rows(blocked, manual, dry, live)
+    assert "live mode, 3 submitted" in rows(live)
+    assert "No recorded run has built a broker" in rows(blocked, manual)
+    # No roots (the Config page's call) adds nothing and never touches the run index.
+    assert "Last run" not in reader.live_gate_summary(cfg, DAY)["gates"][1]["detail"]

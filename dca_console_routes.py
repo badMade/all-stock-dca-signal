@@ -439,7 +439,7 @@ def _route_today(app, request: RouteRequest) -> Response:
     day = _day_field(app, fields)
     return Response.json(200, {
         "date": day.isoformat(),
-        "gates": live_gate_summary(app.settings.config_dir, day),
+        "gates": live_gate_summary(app.settings.config_dir, day, _roots(app), _excluded_roots(app)),
         "window": window_countdown(app.settings.config_dir, day),
         "pointers": pointer_strip(_roots(app), day, config_dir=app.settings.config_dir),
     })

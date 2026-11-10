@@ -691,7 +691,31 @@ def _gate(name: str, state: str, detail: str) -> dict[str, Any]:
     return {"name": name, "state": state, "detail": _text(detail)}
 
 
-def live_gate_summary(config_dir: Path, day: date) -> dict[str, Any]:
+def _last_run_broker_evidence(roots: Any, excluded_roots: Any) -> str:
+    """One sentence on the newest non-manual run that recorded ``dry_run``; informational, never a gate reading.
+
+    A date/holiday-blocked run leaves ``dry_run`` null (mode ``unknown``), so it is skipped: only a run that
+    actually built a broker says anything about ``enable_live_orders``. History, not the flag's current value.
+    """
+    if not roots:
+        return ""
+    from dca_console_runs import build_run_index  # lazy: dca_console_runs imports this module's siblings
+
+    try:
+        rows = build_run_index(roots, excluded_roots=tuple(excluded_roots or ()))["runs"]
+    except Exception:  # an unreadable artifact tree must never take the whole Today page down
+        return ""
+    for row in rows:
+        if row.get("incomplete") or row.get("origin") == "manual" or row.get("mode") not in {"dry_run", "live"}:
+            continue
+        day = row.get("day") or "unknown day"
+        if row["mode"] == "dry_run":
+            return f"Last run that built a broker ({day}, {row.get('stream')}): dry run, no live orders."
+        return f"Last run that built a broker ({day}, {row.get('stream')}): live mode, {row.get('submitted') or 0} submitted."
+    return "No recorded run has built a broker yet."
+
+
+def live_gate_summary(config_dir: Path, day: date, roots: Any = (), excluded_roots: Any = ()) -> dict[str, Any]:
     """The six independent live gates as configured/unconfigured/unknown from a checkout.
 
     ``configured`` means the gate currently permits live money on ``day``; a
@@ -705,10 +729,12 @@ def live_gate_summary(config_dir: Path, day: date) -> dict[str, Any]:
     warnings.extend(w for w in flags["warnings"] if w not in warnings)
     observed = [row for row in flags["streams"] if row["found"]]
     enabled = [row["stream"] for row in observed if row["live_execution_enabled"] is True]
+    evidence = _last_run_broker_evidence(roots, excluded_roots)
     broker_gate = _gate(
         "broker_enable_live_orders",
         "unknown",
-        "RobinhoodBroker.enable_live_orders is injected by the external runner and is not observable from this checkout.",
+        "RobinhoodBroker.enable_live_orders is injected by the external runner and is not observable from this checkout."
+        + (f" {evidence}" if evidence else ""),
     )
     gates = [
         _gate(
