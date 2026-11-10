@@ -313,10 +313,10 @@ def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
 def test_no_em_dash_no_account_shaped_literal_no_secret(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     assert "—" not in text
-    # The part token is eight hex digits (see backup_procedure.part_token); it is all digits for about 2% of
-    # builds, which is not an account number, so it is removed before the account-shape check.
-    without_tokens = re.sub(r"--token [0-9a-f]{8}\b", "--token <hex>", text)
-    assert not re.search(r"(?<![.\w])\d{6,12}(?![\w.])", without_tokens)
+    # No exemption for the part tokens: since 2026-11-05 backup_procedure.part_token() prefixes its eight hex digits
+    # with "t", so a token can never read as a bare number. #2175 had stripped `--token <8 hex>` before this check,
+    # which would also have hidden an 8-digit account number placed after `--token`; the check sees the raw text.
+    assert not re.search(r"(?<![.\w])\d{6,12}(?![\w.])", text)
     assert "@" not in text.replace("${DCA_ALERT_EMAIL_ADDRESS}", "")  # no literal email address
 
 
