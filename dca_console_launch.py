@@ -300,6 +300,14 @@ def _archive_configured(repo: Path) -> bool:
     return os.path.lexists(target)
 
 
+def _ledger_has_model(run_dir: Path, model: str) -> bool:
+    """True when the run's ledger holds ``model``; mirrors export_octopus_ledger's check, including shard_1 resolution."""
+    target = Path(run_dir)
+    if (target / "shard_1" / "checkpoint").is_dir() and not (target / "checkpoint").is_dir():
+        target = target / "shard_1"
+    return (target / "ledger" / model).is_dir()
+
+
 def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None = None) -> list[dict[str, Any]]:
     """Availability rows for every launcher, in the shape ConsoleApp.actions() already uses."""
     from dca_console import RESEARCH_PACKAGES, dependency_reason
@@ -326,6 +334,10 @@ def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None =
             active_run = getattr(app, "octopus_run", None) or settings.octopus_run
             available = not research_reason and active_run is not None
             reason = research_reason or "Supply --octopus-run with an existing Octopus run directory."
+            if spec.id == "octopus-ledger-export" and available and not _ledger_has_model(active_run, "octopus"):
+                # The synthetic demo run only carries baseline models; the export CLI exits 2 on a missing model,
+                # so surface that as setup-needed instead of letting the card launch a job that always fails.
+                available, reason = False, "The active Octopus run's ledger has no 'octopus' model (baseline-only or demo run)."
         elif spec.id == "ml-train-dry-run":
             available, reason = not research_reason, research_reason
         elif spec.id.startswith("gate5-replay-"):

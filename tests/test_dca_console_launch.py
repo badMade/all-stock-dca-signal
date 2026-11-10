@@ -376,3 +376,18 @@ def test_finite_rejects_boolean_values():
     from dca_console_launch import _finite
     assert _finite(True) is None
     assert _finite(False) is None
+
+
+def test_ledger_export_needs_an_octopus_model_in_the_ledger(app, tmp_path, monkeypatch):
+    # Regression: the demo run's ledger holds only baseline models, so the export CLI always exited 2
+    # ("Model 'octopus' not found") and the card showed Failed. It must read as setup-needed instead.
+    run = tmp_path / "octopus_run"
+    (run / "ledger" / "gbm_quantile").mkdir(parents=True)
+    (run / "ledger" / "persistence").mkdir()
+    monkeypatch.setattr(app, "octopus_run", run, raising=False)
+    monkeypatch.setattr(app, "packages", {pkg: True for pkg in app.packages})
+    row = {r["id"]: r for r in launch_actions(app, REPO)}["octopus-ledger-export"]
+    assert row["available"] is False and "no 'octopus' model" in row["reason"]
+    (run / "ledger" / "octopus").mkdir()
+    row = {r["id"]: r for r in launch_actions(app, REPO)}["octopus-ledger-export"]
+    assert row["available"] is True
