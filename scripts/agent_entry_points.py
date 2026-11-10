@@ -271,6 +271,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Check Claude Desktop is running before a live slot",
+        command="python -m scripts.claude_liveness [--notify] [--now ISO] [--wait SECONDS]",
+        exists_path="scripts/claude_liveness.py",
+        doc_ref="docs/schedule_verification.md",
+        symbols=("check", "main"),
+        notes=(
+            "Pre-slot launchd check; reopens Claude if absent, records an append-only check row, "
+            "and writes one alert per check minute. It never places orders. Install the rendered "
+            "deploy/launchd/com.all-stock-dca.claude-liveness.plist.template on the Mac."
+        ),
+    ),
+    EntryPoint(
         need="Alert independently of the executor session when a live slot left no scheduled evidence",
         command=(
             "python -m scripts.schedule_watchdog [--date YYYY-MM-DD] [--root <cron-tracking root>] "

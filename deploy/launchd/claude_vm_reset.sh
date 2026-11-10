@@ -39,7 +39,10 @@ if [ "${1:-}" != "--force" ]; then
   esac
 fi
 
-claude_running() { pgrep -x Claude >/dev/null 2>&1; }
+# -a (2026-11-09 review): macOS pgrep drops its own ancestors from the match list. Run by hand from a shell that a
+# Claude session started, a plain `pgrep -x Claude` misses the open app, so this script would skip the quit and
+# delete the root disk of a live VM. -a keeps ancestors in the match, so a running Claude is always seen.
+claude_running() { pgrep -a -x Claude >/dev/null 2>&1; }
 
 if claude_running; then
   # stderr stays on (2026-11-08): the 11-08 run stopped at claude_still_running with no reason because osascript's

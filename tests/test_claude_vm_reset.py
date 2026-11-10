@@ -228,3 +228,9 @@ def test_a_successful_quit_logs_nothing_extra_from_osascript(mac):
     done, _ = mac()
     assert done.returncode == 0
     assert "osascript" not in done.stdout + done.stderr
+
+
+def test_claude_is_detected_even_when_the_script_runs_under_a_claude_session():
+    # 2026-11-09: macOS pgrep drops its own ancestors from the match list, so from a shell a Claude session started a
+    # plain `pgrep -x Claude` misses the open app and the script would delete a live VM disk. -a keeps ancestors in.
+    assert "pgrep -a -x Claude" in SCRIPT.read_text(encoding="utf-8")
