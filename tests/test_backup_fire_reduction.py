@@ -45,7 +45,7 @@ def test_the_policy_records_the_amendment_and_still_never_expires():
     policy = _data()["standing_perplexity_backup_policy"]
     assert policy["amended_on_et"] == "2026-10-31"
     amendment = policy["amendment_2026_10_31"]
-    for needle in ("credit", "09:55", "12:50", "15:45", "paused", "2026-09-08"):
+    for needle in ("credit", "09:55", "12:50", "15:40", "paused", "2026-09-08"):
         assert needle in amendment, needle
     assert policy["all_backup_tasks_live"] is False
     assert "expires" not in json.dumps(policy).lower()
@@ -92,4 +92,4 @@ def test_the_docs_show_which_backups_are_paused():
     assert "Handoff - 2026-10-31 Perplexity backup fires reduced" in todos
 
     cost = (REPO / "docs" / "cost_tracking.md").read_text(encoding="utf-8")
-    assert "09:55, 12:50 and 15:45" in cost
+    assert "09:55, 12:50 and 15:40" in cost

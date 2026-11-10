@@ -28,12 +28,14 @@ from scripts import generate_perplexity_backup_prompts as gen
 
 REPO = Path(__file__).resolve().parents[2]
 # The short prompt is what every normal-day fire pays for; keep it small (the old pasted prompt was ~12 KB).
-SHORT_PROMPT_BUDGET = 3_500
+# Raised from 3,500 on 2026-11-09 for the preflight skip record (it lets a skipped fire end without fetching part 0).
+SHORT_PROMPT_BUDGET = 5_200
 BROKER_AND_MAC_TOOLS = (
     "get_accounts", "get_equity_orders", "get_equity_quotes", "get_equity_historicals", "get_equity_tradability",
     "place_equity_order", "review_equity_order", "get_portfolio", "list_devices", "run_local_subagent",
 )
-RUN_VALUE_NAMES = ("PPLX_RUN_STATE_DIR", "DCA_ALERT_EMAIL_ADDRESS", "ROBINHOOD_AGENTIC_ACCOUNT_LAST4")
+RUN_VALUE_NAMES = ("PPLX_RUN_STATE_DIR", "DCA_ALERT_EMAIL_ADDRESS", "ROBINHOOD_AGENTIC_ACCOUNT_LAST4",
+                   "PPLX_PROJECT_FILES_DIR")
 
 
 @pytest.fixture(scope="module")
@@ -63,7 +65,7 @@ def test_the_pasted_prompt_is_short(instructions, backup):
 def test_step_a_reads_the_signal_before_any_other_command(instructions, backup):
     text = instructions[backup.file]
     signal = text.index(slot_status.FILENAME)
-    assert signal < text.index("--build-info") < text.index(f"procedure --task {backup.task_id} --part 0")
+    assert signal < text.index("preflight --task") < text.index(f"procedure --task {backup.task_id} --part 0")
     assert text.index("STEP A") < text.index("STEP B")
     # Nothing runs before the signal: the first command-looking text is the signal read.
     assert "python3" not in text[:signal]
@@ -170,7 +172,7 @@ def test_the_pasted_prompt_names_no_broker_or_mac_tool(instructions, backup):
 @pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
 def test_step_b_checks_the_stamp_then_fetches_part_0(instructions, backup):
     step_b = instructions[backup.file].split("STEP B", 1)[1]
-    assert step_b.index("--build-info") < step_b.index("content_sha256 must equal")
+    assert step_b.index("preflight --task") < step_b.index("content_sha256 must equal")
     assert step_b.index("content_sha256 must equal") < step_b.index(f"procedure --task {backup.task_id} --part 0")
     assert f"PROCEDURE FOR TASK {backup.task_id} - PART 0 OF 3" in step_b
     assert "place NOTHING" in step_b and "failed_unexpected_error" in step_b
@@ -296,3 +298,72 @@ def test_the_stand_down_condition_itself_requires_the_schema(instructions, backu
     step_a = instructions[backup.file].split("\nSTEP A", 1)[1].split("\nSTEP B", 1)[0]
     condition = step_a[step_a.index("Stand down only when"):].split(".", 1)[0]
     assert f'"schema" is "{slot_status.SCHEMA}"' in condition
+
+
+# -- 2026-11-09: a faster start. One preflight call, a known folder, no part 0 on a skipped fire ------------------------
+
+
+def _step_b(text: str) -> str:
+    return text.split("STEP B", 1)[1]
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_step_b_changes_into_the_named_project_folder_and_never_searches_the_disk(instructions, backup):
+    step_b = _step_b(instructions[backup.file])
+    assert "${PPLX_PROJECT_FILES_DIR}" in step_b
+    assert step_b.index("cd ") < step_b.index("preflight --task")
+    # 2026-11-09: the run ran `find / -name backup_planner.pyz`, a whole-filesystem scan, to locate the file.
+    assert "find /" not in step_b
+    assert "Do not search the file system" in step_b
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_step_b_runs_preflight_once_instead_of_build_info_and_gates_separately(instructions, backup):
+    text = instructions[backup.file]
+    step_b = _step_b(text)
+    assert f"python3 backup_planner.pyz preflight --task {backup.task_id}" in step_b
+    assert "--build-info" not in text  # the stamp comes from preflight's `build`, never a second command
+    assert "build.content_sha256 must equal" in text or "content_sha256 must equal" in step_b
+    assert "once" in step_b and "do not run" in step_b
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_a_skipped_status_ends_the_run_before_part_0_is_requested(instructions, backup):
+    step_b = _step_b(instructions[backup.file])
+    before_part_0 = step_b[:step_b.index(f"procedure --task {backup.task_id} --part 0")]
+    for status in ("skipped_market_closed", "skipped_outside_window"):
+        assert status in before_part_0, status
+    assert "request no procedure part" in before_part_0
+    assert "send no notification" in before_part_0
+    assert "end the run" in before_part_0
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_the_skip_record_names_the_build_and_the_preflight_time(instructions, backup):
+    step_b = _step_b(instructions[backup.file])
+    before_part_0 = step_b[:step_b.index(f"procedure --task {backup.task_id} --part 0")]
+    for field in ("preflight_at_et", "planner_build", "run_origin scheduled_backup", "task_id", "trading_day"):
+        assert field in before_part_0, field
+    assert "never include the account number" in before_part_0.lower()
+    assert "${PPLX_RUN_STATE_DIR}/run_state_<YYYYMMDD>_<HHMM>ET.json" in before_part_0
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_a_failed_or_unexpected_preflight_places_nothing_and_notifies(instructions, backup):
+    step_b = _step_b(instructions[backup.file])
+    before_part_0 = step_b[:step_b.index(f"procedure --task {backup.task_id} --part 0")]
+    assert "non-zero exit" in before_part_0
+    assert "place NOTHING" in before_part_0 and "failed_unexpected_error" in before_part_0 and "notify" in before_part_0
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_part_0_reuses_the_preflight_gates_instead_of_running_them_again(backup):
+    text = _part0(backup.task_id)
+    assert "preflight" in text
+    assert "do not run it again" in text
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_the_final_state_record_carries_preflight_at_et(backup):
+    procedure = backup_procedure.render_procedure(backup, backup_procedure.common_values())
+    assert "preflight_at_et" in procedure[procedure.index("STEP 8"):procedure.index("STEP 9")]

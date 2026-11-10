@@ -787,7 +787,7 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 > `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
 
 > **PAUSED 2026-10-31 (operator, Perplexity credit plan step 5):** only three backup fires stay scheduled:
-> 9:55 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:45 PM (`f83b8d62`, backs up
+> 9:55 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:40 PM (`f83b8d62`, moved from 3:45 PM on 2026-11-09, backs up
 > 3:30). The 10:50 AM (`e028361e`) and 11:50 AM (`e3590042`) tasks and the 1:50/2:50 PM task (`54ab24d2`) are
 > paused, not retired: their prompts stay generated and re-enabling one is a status change in the config plus a
 > paste in Perplexity. A Claude failure at 10:30, 11:30, 1:30 or 2:30 now has no Perplexity backup. Source:
@@ -801,10 +801,10 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 | 12:30 PM | `a6239dae` | 12:50 PM | `062605c6` | **backup only** | standing |
 | 1:30 PM | `7be82b97` (1:30 fire) | 1:50 PM | `54ab24d2` | **backup only** | **PAUSED 2026-10-31** |
 | 2:30 PM | `7be82b97` (2:30 fire) | 2:50 PM | `54ab24d2` | **backup only** | **PAUSED 2026-10-31** |
-| 3:30 PM | `10ce362c` | 3:45 PM | `f83b8d62` | **backup only** | standing |
+| 3:30 PM | `10ce362c` | 3:40 PM | `f83b8d62` | **backup only** | standing |
 
 Each backup fires 20 minutes after its canonical counterpart except the final
-slot, which fires at 3:45 PM so the backup still has time before close. Claude
+slot, which fires at 3:40 PM so the backup still has time before close (it was 3:45 PM until a 2026-11-09 fire reached its gates at 4:03 PM and skipped). Claude
 gets first chance to buy; per `config/scheduled_tasks.json` ->
 `standing_perplexity_backup_policy.mechanism`, Perplexity proceeds only when a
 complete, current per-slot check proves Claude placed no qualifying submitted

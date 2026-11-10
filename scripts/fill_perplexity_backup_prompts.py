@@ -8,6 +8,11 @@ never holds the operator's values:
 * ``${PPLX_RUN_STATE_DIR}``: the run-state folder, one per task (``<state root>/<task id>``).
 * ``${DCA_ALERT_EMAIL_ADDRESS}``: where failure alerts are sent.
 
+A fourth placeholder, ``${PPLX_PROJECT_FILES_DIR}`` (the folder holding ``backup_planner.pyz``, 2026-11-09), is
+filled from the environment variable of the same name when a prompt carries it. The final backup once ran
+``find /`` to locate that file and reached its gates after the window closed. A prompt that names the folder
+while the variable is unset or malformed fails closed.
+
 This script renders a private, filled copy of every prompt for pasting into Perplexity. Nothing it writes is
 meant to be committed, so it refuses any output directory inside this repo checkout, writes owner-only files,
 and never prints a value.
@@ -55,10 +60,12 @@ DEFAULT_STATE_ROOT = "cron_tracking"
 LAST4_VAR = "ROBINHOOD_AGENTIC_ACCOUNT_LAST4"
 ACCOUNT_VAR = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
 EMAIL_VAR = "DCA_ALERT_EMAIL_ADDRESS"
+PROJECT_DIR_VAR = "PPLX_PROJECT_FILES_DIR"
 
 TOKEN_LAST4 = "${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}"
 TOKEN_STATE_DIR = "${PPLX_RUN_STATE_DIR}"
 TOKEN_EMAIL = "${DCA_ALERT_EMAIL_ADDRESS}"
+TOKEN_PROJECT_DIR = "${PPLX_PROJECT_FILES_DIR}"
 
 _PROMPT_GLOB = "*-backup.txt"
 _LAST4 = re.compile(r"\d{4}")
@@ -67,6 +74,7 @@ _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _TASK_HEADER = re.compile(r"^Task ([0-9a-f]{8})\.", re.MULTILINE)
 _ANY_PLACEHOLDER = re.compile(r"\$\{[A-Za-z0-9_]+\}")
 _STATE_ROOT = re.compile(r"[A-Za-z0-9_./-]+")
+_PROJECT_DIR = re.compile(r"/[A-Za-z0-9_./-]+")  # absolute, no spaces or shell characters
 _FOLDER_ARG = re.compile(r"([0-9a-f]{8})=([A-Za-z0-9_-]{8,64})")
 
 EXIT_OK = 0
@@ -112,6 +120,21 @@ def resolve_values(environ: MutableMapping[str, str]) -> tuple[str, str]:
     return last4, email
 
 
+def resolve_project_dir(environ: MutableMapping[str, str]) -> Optional[str]:
+    """The folder that holds ``backup_planner.pyz`` from ``PPLX_PROJECT_FILES_DIR``, or None when it is not set.
+
+    Raises:
+        FillError: The value is set but is not an absolute path of plain characters with no ``..`` part. The message
+            names the variable, never the value.
+    """
+    value = environ.get(PROJECT_DIR_VAR)
+    if value is None:
+        return None
+    if not _PROJECT_DIR.fullmatch(value) or ".." in value.split("/"):
+        raise FillError(f"{PROJECT_DIR_VAR} must be an absolute path of letters, digits, '_', '.', '-' and '/', with no '..'")
+    return value.rstrip("/") or value
+
+
 def _checked_state_root(state_root: str) -> str:
     root = state_root.rstrip("/") or state_root
     if not _STATE_ROOT.fullmatch(root) or ".." in root.split("/"):
@@ -150,7 +173,14 @@ def parse_folders(pairs: Sequence[str]) -> dict[str, str]:
 
 
 def render(
-    text: str, *, name: str, last4: str, email: str, state_root: str, folders: Optional[dict[str, str]] = None
+    text: str,
+    *,
+    name: str,
+    last4: str,
+    email: str,
+    state_root: str,
+    folders: Optional[dict[str, str]] = None,
+    project_dir: Optional[str] = None,
 ) -> str:
     """One prompt with its three placeholders filled.
 
@@ -172,7 +202,11 @@ def render(
         if token not in text:
             raise FillError(f"{name}: expected placeholder {token} is not present")
     filled = text.replace(TOKEN_LAST4, last4).replace(TOKEN_STATE_DIR, state_dir).replace(TOKEN_EMAIL, email)
+    if project_dir is not None:
+        filled = filled.replace(TOKEN_PROJECT_DIR, project_dir)
     leftover = sorted(set(_ANY_PLACEHOLDER.findall(filled)))
+    if TOKEN_PROJECT_DIR in filled:
+        raise FillError(f"{name}: it names the planner folder, so set {PROJECT_DIR_VAR} (an absolute path)")
     if leftover:
         raise FillError(f"{name}: unfilled placeholder(s) remain: {', '.join(leftover)}")
     return filled
@@ -234,6 +268,7 @@ def fill_prompts(
     email: str,
     state_root: str = DEFAULT_STATE_ROOT,
     folders: Optional[dict[str, str]] = None,
+    project_dir: Optional[str] = None,
 ) -> list[Path]:
     """Fill every prompt in ``src`` and write the private copies into ``out``; return the files written.
 
@@ -255,6 +290,7 @@ def fill_prompts(
             email=email,
             state_root=root,
             folders=folders,
+            project_dir=project_dir,
         )
         for path in sources
     }
@@ -278,6 +314,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[MutableMapping[
     env = os.environ if environ is None else environ
     try:
         last4, email = resolve_values(env)
+        project_dir = resolve_project_dir(env)
         written = fill_prompts(
             args.src,
             args.out,
@@ -285,6 +322,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[MutableMapping[
             email=email,
             state_root=args.state_root,
             folders=parse_folders(args.folder),
+            project_dir=project_dir,
         )
     except FillError as error:
         print(f"fill_perplexity_backup_prompts: {error}", file=sys.stderr)

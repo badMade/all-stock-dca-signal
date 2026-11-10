@@ -52,5 +52,5 @@ re-checked. Nothing here changes behavior; it records where older prose is stale
 
 ## Accepted limitation
 
-- The 15:45 ET backup may run out of time before the 16:00 ET close if a Mac-first check is added in front of it.
+- The 15:40 ET backup (was 15:45 until 2026-11-09) may run out of time before the 16:00 ET close if a Mac-first check is added in front of it.
   Accepted by the owner on 2026-10-06; no slot-specific timeout or shortcut is to be added for it.
