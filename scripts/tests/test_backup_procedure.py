@@ -179,7 +179,7 @@ def test_parts_must_be_requested_in_order_with_the_token_the_previous_part_print
 
 
 def test_every_token_starts_with_a_letter_so_it_never_reads_as_a_bare_number():
-    # 2026-11-05: 54ab24d2's part-0 token was the all-decimal hex "20714284", which the prompts' account-shaped-literal
+    # 2026-11-05: 54ab24d2's part-0 token was eight hex digits that were all decimal, which the prompts' account-shaped-literal
     # guard rejected. The "t" prefix makes that impossible for any hash; pin the shape so nobody drops it.
     for backup in backup_procedure.BACKUPS:
         for part in (0, 1, 2):
