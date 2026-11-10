@@ -338,6 +338,34 @@ relaying the result, since the exit code has already made the ABORT/alert
 call. That is deliberately the opposite of the failure mode this script
 exists to catch.
 
+## Pre-slot Claude liveness check (2026-11-09)
+
+`scripts/claude_liveness.py` runs before each live slot, independently of Claude's
+scheduled task. On 2026-11-09 Claude Desktop was closed from 22:24 the prior day
+until 19:12 ET; all seven tasks caught up after their windows and correctly
+aborted at Gate 1. The Mac and launchd remained up, but the existing watchdog
+only runs at 16:35, after the missed slots. The new check runs at :15 for each
+slot hour (09 through 15), uses `pgrep -x Claude`, and opens Claude if needed.
+It writes append-only checks under `<cron root>/claude_liveness/` and a
+minute-idempotent alert file for either reopen outcome. `still_down` exits 1;
+`reopened` exits 0. An alert means Claude was absent at check time: open Claude,
+do not place a slot whose window has passed late, and check Robinhood order
+history before any manual placement because the Perplexity backup may have bought.
+
+Install on the Mac by rendering
+`deploy/launchd/com.all-stock-dca.claude-liveness.plist.template` with the repo
+path and shared cron root, then loading the rendered plist with launchd. The
+template starts through the checkout `.venv/bin/python` and assumes the Mac is
+pinned to America/New_York. From the checkout root, render and install it with:
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$PWD/cron_tracking|g" \
+  deploy/launchd/com.all-stock-dca.claude-liveness.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.claude-liveness.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.claude-liveness.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.claude-liveness  # run once now to test
+```
+
 ## Post-slot submission check (2026-10-07)
 
 `verify_schedule` proves a slot fired and finalized, "not that any order
