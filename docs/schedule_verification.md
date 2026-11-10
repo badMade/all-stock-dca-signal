@@ -50,6 +50,28 @@ If the first run is blocked by macOS privacy protection, grant the venv Python a
 `~/Documents` as for the robinhood-payload agent. Notifications may need allowing for
 `osascript` under System Settings > Notifications.
 
+## Claude app watchdog (launchd, 2026-11-09)
+
+The 16:35 alert above only reports a missed day after it is over. On Monday 2026-11-09 the Claude desktop
+app was not running from 22:25 ET Sunday to 19:12 ET Monday while the Mac stayed awake. The live slots are
+Claude scheduled tasks, so none fired in its window. When the app came back, all seven fired at once and
+aborted `GATE1_OFF_WINDOW`, and nothing was bought.
+
+`deploy/launchd/claude_app_watchdog.sh` prevents that. It runs every 5 minutes. Mon-Fri 08:30-16:00
+America/New_York (it reads the clock in ET whatever the Mac's zone), it checks for a `Claude` process and,
+if there is none, opens the app and raises a macOS notification. It does nothing outside that window, so
+quitting Claude in the evening or at the weekend sticks. It never quits or restarts a running app, and it
+does nothing on a weekend, so it cannot fight the Saturday `claude_vm_reset.sh`. Like that agent, it starts
+through the checkout's venv Python and `/bin/bash` (macOS privacy protection, 2026-11-07/08).
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" \
+  deploy/launchd/com.all-stock-dca.claude-app-watchdog.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.claude-app-watchdog.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.claude-app-watchdog.plist
+tail /tmp/dca-claude-app-watchdog.log   # one status line per run: ok / skip / relaunched / failed
+```
+
 ## Repaste issue (GitHub)
 
 The Mac check above only helps when the Mac is on, and it cannot see the prompt text pasted into Perplexity (on

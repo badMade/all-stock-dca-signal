@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.claude-app-watchdog</string>
+  <!-- Claude app watchdog (deploy/launchd/claude_app_watchdog.sh, 2026-11-09). The live DCA slots are Claude
+       scheduled tasks, so they only fire while the Claude app is running; on 2026-11-09 it was not running all
+       trading day and nothing was bought. Every 5 minutes this opens Claude if no Claude process exists, but only
+       Mon-Fri 08:30-16:00 America/New_York (the script checks the window itself, in ET). It never quits or
+       restarts a running Claude. -->
+  <key>ProgramArguments</key>
+  <!-- Started through the checkout's venv Python, then /bin/bash, like claude-vm-reset: macOS privacy protection
+       (TCC) grants ~/Documents access per binary, /bin/sh straight from launchd has none, and /bin/sh's re-exec hop
+       loses the grant (2026-11-07/08). -->
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-c</string>
+    <string>import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1]]))</string>
+    <string>REPLACE_WITH_REPO_PATH/deploy/launchd/claude_app_watchdog.sh</string>
+  </array>
+  <!-- A plain timer: the window check lives in the script so it can use ET whatever the Mac's zone is. -->
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/tmp/dca-claude-app-watchdog.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-claude-app-watchdog.log</string>
+</dict>
+</plist>
