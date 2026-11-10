@@ -7,6 +7,7 @@ the preceding part's token. The full reference prompt and pasteable prompt are b
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -175,6 +176,14 @@ def test_parts_must_be_requested_in_order_with_the_token_the_previous_part_print
     with pytest.raises(ValueError, match="token"):
         backup_procedure.render_part(task, 3, token=token)  # part 2's token is the one part 3 needs
     assert backup_procedure.render_part(task, 2, token=token)
+
+
+def test_every_token_starts_with_a_letter_so_it_never_reads_as_a_bare_number():
+    # 2026-11-05: 54ab24d2's part-0 token was the all-decimal hex "20714284", which the prompts' account-shaped-literal
+    # guard rejected. The "t" prefix makes that impossible for any hash; pin the shape so nobody drops it.
+    for backup in backup_procedure.BACKUPS:
+        for part in (0, 1, 2):
+            assert re.fullmatch(r"t[0-9a-f]{8}", backup_procedure.part_token(backup.task_id, part))
 
 
 def test_a_token_is_bound_to_its_task_and_part():
