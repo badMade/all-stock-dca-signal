@@ -48,3 +48,7 @@
 ## 2026-11-09 - [os.scandir OSError Handling]
 **Learning:** When using `os.scandir` to replace `Path.rglob()`, placing the `try...except OSError:` block *outside* the `for entry in os.scandir():` loop will cause silent data loss. If `entry.stat()` raises an error (e.g. `FileNotFoundError` for a broken symlink or `PermissionError`), the exception breaks the loop and silently skips the rest of the files in that directory.
 **Action:** Always place the `try...except OSError:` block *inside* the `os.scandir()` loop (wrapping `entry.stat()` and `entry.is_dir()`) to ensure that an error on a single file does not abort the entire directory scan.
+
+## 2026-11-10 - [Avoid Path.rglob() in tight loops for artifact scanning]
+**Learning:** `Path.rglob()` requires resolving entire directory trees and instantiating costly Path objects before yielding any results. This causes severe I/O bottlenecks when repeatedly iterating over large numbers of artifacts in reporting logic.
+**Action:** Directly import `iter_run_state_files_fast` (or similar scandir-based utilities) from `dca_fileio.py` when identifying specific artifact subsets. This provides a single-pass traversal that bypasses O(N) `stat` calls while avoiding duplicating manual `os.scandir` logic.
