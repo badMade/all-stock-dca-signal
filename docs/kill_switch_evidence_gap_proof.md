@@ -1,6 +1,7 @@
 # Kill-switch evidence gap proof (12:30 Gate 5) — design note
 
-Status: **proposed, 2026-11-10, awaiting operator approval.** Nothing here is wired yet.
+Status: **approved by the operator 2026-11-10; implemented in a draft PR, not merged.** Needs its own
+review and acceptance run, then a repaste of the 12:30 prompt.
 DCA Issues key: `kill_switch_evidence_incomplete`.
 
 ## Problem
@@ -73,28 +74,31 @@ each excused pair is also printed to **stderr** as
 `KILL_SWITCH_GAP_EXCUSED <D> <S> gate1/GATE1_OFF_WINDOW broker_orders_in_window=0` so the run's
 evidence and alert text record it. It is never written into any artifact that sizes or caps.
 
-## Implementation shape (if approved)
+## Implementation
 
-- New stdlib module `scripts/kill_switch_gap_proof.py` with one pure function,
-  `excuse_missing_pairs(missing_pairs, *, claimed_pairs, marker_root, orders_doc) -> (excused, reasons)`,
-  using `scripts.abort_markers.read_abort_markers` plus a strict line-level reader (so a malformed
-  line blocks instead of being skipped), and a `__main__` that is not used by the prompt.
-- The 12:30 prompt's Gate 5 block: after computing `missing_pairs`, if every missing pair has a
-  clean Gate-1 marker and no claiming artifact, print `KILL_SWITCH_GAP_NEEDS_BROKER_PROOF <earliest D>`
-  and exit 3. The agent then fetches orders from that day, saves
-  `$ROOT/kill_switch_gap_orders.json` as `{"created_at_gte": "<iso+offset>", "pagination_complete": true, "orders": [...]}`
-  and reruns the same block with `KILL_SWITCH_GAP_ORDERS=$ROOT/kill_switch_gap_orders.json`. Any
-  other exit stays the existing abort. No extra broker call on an ordinary day.
-- `scripts/abort_markers.py` docstring updated: still never run evidence; the one reader outside
-  triage is this gap proof, which uses it only as a precondition for a broker check.
-- Tests (`scripts/tests/test_kill_switch_gap_proof.py`): Gate-1 marker + empty broker window ⇒
-  excused as $0; later-gate (`gate2`/`gate7`) marker ⇒ rejected; mixed file (gate1 + later gate) ⇒
-  rejected; malformed line ⇒ rejected; no marker ⇒ blocks; marker + any order in window (buy, sell,
-  cancelled) ⇒ rejected; boundary after `D 00:00 ET` ⇒ rejected; `pagination_complete` false/missing
-  ⇒ rejected; claiming-but-rejected `run_state.json` ⇒ rejected; prompt-block test that the
-  printed scalar is unchanged when nothing is excused.
-- Scope: the 12:30 prompt only — it is the only live-mirror prompt carrying this pair check
-  (grep for `incomplete trailing-7-day`, 2026-11-10).
+- `scripts/kill_switch_gap_proof.py` (stdlib, reads only): `classify_missing_pairs` returns one
+  verdict per missing pair — `excused`, `needs_broker_proof` or `blocked` — and only `excused`
+  counts as coverage.
+- **Marker check is stricter than the triage reader.** `scripts.abort_markers.read_abort_markers`
+  skips bad lines so the watchdog degrades toward `slot_did_not_fire`; here a skipped line could hide
+  a later-gate marker, so any malformed, foreign, duplicate-key or non-`gate1/GATE1_OFF_WINDOW` line
+  blocks the pair. `gate2/GATE2_ABORT_NO_PYTHON311` is pre-broker too but is left out on purpose.
+- **Broker proof is a `scripts.assemble_order_pages` envelope, re-replayed.** The prompt builds it with
+  the existing assembler (`--trading-day <D>`, `created_at_gte` = D 00:00 ET). The module replays the
+  pages again through `broker_reconciliation.same_day_order_snapshot` + `_PageReplayer` (the same
+  chain `same_day_top_up_gate` trusts), so a hand-built or truncated file is refused rather than
+  trusted for having the right keys. It must be pinned to `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` and its
+  `trading_day` must be on or before D. Residual trust: the request's own `created_at_gte` is not
+  visible in the pages, so a fetch started later than D would look complete — the same trust Gate 4
+  and Gate 6.5 already place in the session's fetch parameters.
+- 12:30 prompt, Gate 5 block: after `missing_pairs`, any `blocked` verdict raises the existing
+  `incomplete trailing-7-day afternoon evidence` SystemExit (exit 1), naming each reason. If the only
+  gaps need broker proof, it prints `KILL_SWITCH_GAP_NEEDS_BROKER_PROOF <earliest D>` and exits 3; the
+  agent fetches, assembles `$ROOT/kill_switch_gap_orders.json`, and reruns with
+  `KILL_SWITCH_GAP_ORDERS` set. Exit 0 prints the same single figure plus one
+  `KILL_SWITCH_GAP_EXCUSED` stderr line per excused pair. No extra broker call on an ordinary day.
+- Tests: `scripts/tests/test_kill_switch_gap_proof.py`, including four that execute the prompt's
+  real block (extracted from the mirror) against a recreated 2026-11-10 cron tree with a frozen clock.
 
 ## Rollout
 
