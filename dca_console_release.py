@@ -16,9 +16,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 
-CONSOLE_VERSION = "1.1.0"
+CONSOLE_VERSION = "1.2.0"
 # Regenerate with: python -m dca_console_release   (see docs/local_console.md#release-process)
-ASSET_DIGEST = "4f5bd686fdc24c8e"
+ASSET_DIGEST = "5721c1e35b8dd59e"
 
 CHANNEL_STABLE = "stable"
 CHANNEL_SANDBOX = "sandbox"
