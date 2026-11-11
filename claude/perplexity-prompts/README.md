@@ -1,6 +1,6 @@
 # Perplexity backup-task prompts (corrected text)
 
-Six files, one per Perplexity backup task: 10:00, 10:50 (watchdog that delegates
+Six files, one per Perplexity backup task: 9:55, 10:50 (watchdog that delegates
 to the Mac Studio), 11:50, 12:50, 1:50/2:50 (one task, two fires) and 3:45.
 
 **These do not run from here.** Perplexity cannot read this repo, so a human

@@ -39,9 +39,9 @@ def _planner(*args: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize("args", [
     ("universe",),
-    ("gates", "--task", "4412c3c4", "--now", "2026-10-29T10:00:00-04:00"),   # PROCEED
-    ("gates", "--task", "4412c3c4", "--now", "2026-10-31T10:00:00-04:00"),   # Saturday: skipped_market_closed
-    ("gates", "--task", "deadbeef", "--now", "2026-10-29T10:00:00-04:00"),   # refused: exit 2
+    ("gates", "--task", "4412c3c4", "--now", "2026-10-29T09:55:00-04:00"),   # PROCEED
+    ("gates", "--task", "4412c3c4", "--now", "2026-10-31T09:55:00-04:00"),   # Saturday: skipped_market_closed
+    ("gates", "--task", "deadbeef", "--now", "2026-10-29T09:55:00-04:00"),   # refused: exit 2
 ])
 def test_every_planner_json_output_is_one_compact_line(args):
     done = _planner(*args)

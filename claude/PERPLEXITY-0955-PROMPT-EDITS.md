@@ -1,4 +1,4 @@
-# Edits to the Perplexity 10:00 AM (was 9:55 AM until 2026-11-05) backup prompt (and its siblings)
+# Edits to the Perplexity 9:55 AM backup prompt (and its siblings)
 
 Written 2026-10-06. Source document, not executable: Perplexity cannot read this
 repo, so nothing here takes effect until Geoff pastes it into each Perplexity

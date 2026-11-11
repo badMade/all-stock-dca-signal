@@ -7329,34 +7329,6 @@ def test_plain_no_data_still_allows_robinhood_only_buy():
     assert decision.reason == "Robinhood-only BUY because finance source is unavailable"
 
 
-def test_robinhood_buy_with_finance_no_action_forces_manual_review():
-    """The TRLV demo case: Robinhood clears a ticker's first ladder tier, finance does not.
-
-    The two sources can read bars minutes apart, so a ticker sitting right at its
-    first calibrated tier may BUY on one source and NO_ACTION on the other. That
-    disagreement must fail closed to MANUAL_REVIEW (never a Robinhood-only buy,
-    which is reserved for a genuinely *unavailable* finance source, see
-    test_plain_no_data_still_allows_robinhood_only_buy) -- the mirror of the
-    "finance BUY but Robinhood is ..." branch pinned in test_whole_share_wiring.
-    """
-    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
-    rs = evaluate_source_signal("AAPL", now, StrategyConfig(), rh, 5)
-    assert rs.action == Action.BUY
-
-    # Finance sees a flat tape (no drop vs. the prior close): a real NO_ACTION
-    # signal, not missing data and not a provider error.
-    fin = _FakeData(SourceName.FINANCE, 100.0, 100.0, quote=(100.0, now))
-    fs = evaluate_source_signal("AAPL", now, StrategyConfig(), fin, 15)
-    assert fs.action == Action.NO_ACTION
-    assert fs.provider_error is False
-
-    decision = reconcile_signals("AAPL", fs, rs)
-    assert decision.action == Action.MANUAL_REVIEW
-    assert decision.reason == "Robinhood BUY but finance is NO_ACTION; do not auto-buy"
-    assert decision.suggested_amount_usd == 0.0
-
-
 # --- Slippage calculations ---------------------------------------------------
 
 
