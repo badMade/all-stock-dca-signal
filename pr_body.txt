@@ -7,7 +7,7 @@
 🧭 **Entry-Point Coverage:** Scoped solely to the dashboard and reporting layer risk logic, not changing live order/slot execution paths.
 
 ## Scope
-Updated `dca_risk.py` to use `iter_run_state_files_fast` rather than native `.rglob()`.
+Updated `dca_risk.py` to use `iter_run_state_files_fast` rather than native `.rglob()`. Fixed a regression in `docs_index.py` introduced in the previous iteration and a bug where a non account number in `deploy/launchd/robinhood_payload.sh` was matched.
 
 ## AI Usage
 Assisted by Bolt Performance Agent (Jules).
@@ -20,7 +20,7 @@ We chose to avoid creating a new traversal utility directly in `dca_risk.py`, an
 
 ## Testing
 - `ruff check .`
-- `.venv/bin/python -m pytest tests/test_dca_risk.py -q`
+- `.venv/bin/python -m pytest -q`
 - Smoke test: `.venv/bin/python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`
 
 ## Risk & Rollback
