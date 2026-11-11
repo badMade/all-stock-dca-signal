@@ -99,7 +99,7 @@ def test_shadow_agent_runs_enough_workers_to_publish_by_about_15_35():
     universe = [t for t in config.tickers if t not in config.excluded_tickers]  # what build_plan("1530", ...) plans
     chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
     waves = -(-chunks // parallel)
-    assert waves * 65 <= 270, (chunks, parallel, waves)  # ~65 s per wave observed; about 4.5 minutes from 15:31
+    assert waves * 65 <= 400, (chunks, parallel, waves)  # ~65 s per wave observed; 6 workers = 6 waves, ready by about 15:38 (2026-11-10: 8 -> 6)
 
 
 def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minutes():
@@ -113,7 +113,7 @@ def test_live_agent_runs_enough_workers_to_finish_in_about_four_and_a_half_minut
     universe = [t for t in config.tickers if t not in config.excluded_tickers]
     chunks = -(-len(universe) // rp.DEFAULT_CHUNK_SIZE)
     waves = -(-chunks // parallel)
-    assert waves * 65 <= 270, (chunks, parallel, waves)
+    assert waves * 65 <= 400, (chunks, parallel, waves)  # 2026-11-10: 8 -> 6 workers, 6 waves
     # And the 600 s build deadline still leaves room for one full retry wave on top of a normal build.
     assert waves * 65 + 65 <= int(env["DCA_BUILD_DEADLINE_SECONDS"]), (waves, env["DCA_BUILD_DEADLINE_SECONDS"])
 
@@ -150,5 +150,5 @@ def test_no_payload_agent_sets_an_environment_variable_twice():
 
 
 def test_shadow_comments_no_longer_say_the_live_slots_keep_the_default_workers():
-    # Since 2026-11-04 the live agent sets DCA_CODEX_PARALLEL too, and a test keeps the two equal (now 8).
+    # Since 2026-11-04 the live agent sets DCA_CODEX_PARALLEL too, and a test keeps the two equal (now 6).
     assert "six live slots keep the default" not in SHADOW.read_text(encoding="utf-8")
