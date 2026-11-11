@@ -63,6 +63,8 @@ ALLOWED_KEYS = (
     "NEWS_API_KEY",
     "NOTION_TOKEN",
     "PIPEDREAM_TOKEN",
+    # scripts/fill_perplexity_backup_prompts.py (2026-11-11): the absolute folder holding backup_planner.pyz.
+    "PPLX_PROJECT_FILES_DIR",
     "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER",
     "SMTP_PASSWORD",
 )
