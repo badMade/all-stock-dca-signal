@@ -33,8 +33,14 @@
          the two equal). Watch the `timing total` lines in /tmp/dca-robinhood-payload.log after the change.
          2026-11-06: 6 -> 8. The universe grew from 91 to 122 symbols, so 31 four-ticker chunks: 6 workers would be 6
          waves, about 390 s; 8 workers is 4 waves, about 260 s, back inside the 270 s budget. 8 concurrent workers is
-         not yet measured against the Codex and Robinhood rate limits: watch the log for per-ticker errors and rescues. -->
-    <key>DCA_CODEX_PARALLEL</key><string>8</string>
+         not yet measured against the Codex and Robinhood rate limits: watch the log for per-ticker errors and rescues.
+         2026-11-10: 8 -> 6, an operator compromise. The 09:35 and 10:30 builds were refused (49% and 80% coverage) with
+         Codex answering "429 Too Many Requests"; the 11:30-15:30 builds at 8 workers published 120-122 of 122, and Codex's
+         own usage meter read 2-5% (5-hour window), so the cause is not shown to be the worker count. 6 workers is 6 waves,
+         about 390 s, inside the 600 s deadline with the whole-build retry (DCA_BUILD_RETRIES) still possible. Every failed
+         worker attempt now writes a line to <payload>.failures.jsonl (status, running Codex processes, usage snapshot):
+         raise this again only if those lines show the 429s do not depend on how many workers ran. -->
+    <key>DCA_CODEX_PARALLEL</key><string>6</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- One minute after each Robinhood-primary slot's decision time (09:35 10:30 11:30 12:30 13:30 14:30),

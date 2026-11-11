@@ -38,8 +38,14 @@
          installed plist already ran 6). The live six-slot agent got the same setting on 2026-11-04.
          2026-11-06: 6 -> 8. The universe grew from 91 to 122 symbols, so 31 chunks: 6 workers would be 6 waves, about
          390 s, published near 15:37; 8 workers is 4 waves, about 260 s, ready near 15:35 again. The live agent runs the
-         same count (tested). 8 concurrent workers is not yet measured against the Codex and Robinhood rate limits. -->
-    <key>DCA_CODEX_PARALLEL</key><string>8</string>
+         same count (tested). 8 concurrent workers is not yet measured against the Codex and Robinhood rate limits.
+         2026-11-10: 8 -> 6, an operator compromise. The 09:35 and 10:30 builds were refused (49% and 80% coverage) with
+         Codex answering "429 Too Many Requests"; the 11:30-15:30 builds at 8 workers published 120-122 of 122, and Codex's
+         own usage meter read 2-5% (5-hour window), so the cause is not shown to be the worker count. 6 workers is 6 waves,
+         about 390 s, inside the 600 s deadline with the whole-build retry (DCA_BUILD_RETRIES) still possible. Every failed
+         worker attempt now writes a line to <payload>.failures.jsonl (status, running Codex processes, usage snapshot):
+         raise this again only if those lines show the 429s do not depend on how many workers ran. -->
+    <key>DCA_CODEX_PARALLEL</key><string>6</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- 15:31 Mon-Fri, local Mac time (the Mac must be pinned to America/New_York, or Hour shifted by the difference). -->
