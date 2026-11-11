@@ -69,9 +69,9 @@ def _envelope(tmp_path, orders, *, trading_day="2026-11-09"):
     return envelope
 
 
-def _classify(root, envelope=None, *, pairs=(PAIR_1430, PAIR_1530), claimed=frozenset()):
+def _classify(root, envelope=None, *, pairs=(PAIR_1430, PAIR_1530), claimed=frozenset(), known=None):
     return gap.classify_missing_pairs(pairs, claimed_pairs=set(claimed), marker_root=root,
-                                      orders_envelope=envelope, account_number=ACCOUNT)
+                                      orders_envelope=envelope, account_number=ACCOUNT, known_order_ids=known)
 
 
 @pytest.fixture
@@ -208,6 +208,123 @@ def test_load_orders_envelope_rejects_duplicate_keys(tmp_path):
         gap.load_orders_envelope(str(path))
 
 
+# --- review 2026-11-11 fix 1: provenance (the ingest block must still describe the pages) --------
+
+
+def test_a_well_formed_hand_built_envelope_without_ingest_blocks(root):
+    # Replays as one complete, empty page -- exactly what the first draft accepted.
+    envelope = {"account_number": ACCOUNT, "trading_day": "2026-11-09", "pages": [{"orders": []}]}
+    verdicts = _classify(root, envelope)
+    assert {v.status for v in verdicts.values()} == {gap.BLOCKED}
+    assert "no assemble_order_pages ingest block" in verdicts[PAIR_1430].reason
+
+
+def test_a_row_removed_after_assembly_blocks(root, tmp_path):
+    envelope = _envelope(tmp_path, [_order("am", "2026-11-09T10:00:00-05:00"),
+                                    _order("pm", "2026-11-09T14:31:00-05:00")])
+    envelope["pages"][0]["orders"] = [row for row in envelope["pages"][0]["orders"]
+                                      if not row["created_at"].startswith("2026-11-09T14")]
+    verdicts = _classify(root, envelope)
+    assert verdicts[PAIR_1430].status == gap.BLOCKED
+    assert "ingest.payload_sha256" in verdicts[PAIR_1430].reason
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda ing: ing.update(tool="hand_written"),
+    lambda ing: ing.update(order_count=5),
+    lambda ing: ing.update(order_count=True),
+    lambda ing: ing.update(pages_sha256=[]),
+    lambda ing: ing.update(pages_sha256=["not-a-digest"]),
+    lambda ing: ing.pop("payload_sha256"),
+])
+def test_an_ingest_block_that_no_longer_matches_blocks(root, tmp_path, tamper):
+    envelope = _envelope(tmp_path, [])
+    tamper(envelope["ingest"])
+    assert _classify(root, envelope)[PAIR_1430].status == gap.BLOCKED
+
+
+def test_a_state_slice_envelope_with_its_ingest_intact_is_accepted(root, tmp_path):
+    slices = {}
+    for state in asm.ORDER_STATES:
+        page = tmp_path / f"slice_{state}.json"
+        page.write_text(json.dumps({"orders": []}), encoding="utf-8")
+        slices[state] = [str(page)]
+    envelope, _count = asm.assemble_state_slices(slices, account_number=ACCOUNT, trading_day="2026-11-09")
+    assert _classify(root, envelope)[PAIR_1430].status == gap.EXCUSED
+
+
+# --- review 2026-11-11 fix 2: the self-reported fetch boundary is cross-checked ------------------
+
+
+NEXT_DAY_ORDER = _order("tue", "2026-11-10T10:05:00-05:00")
+
+
+def test_an_envelope_missing_a_known_later_order_blocks(root, tmp_path):
+    # The file claims trading_day 11-09 but holds nothing from 11-10, where a run_state recorded an
+    # order: it was really fetched later than it says, so its empty 11-09 afternoon proves nothing.
+    envelope = _envelope(tmp_path, [])
+    verdicts = _classify(root, envelope, known={date(2026, 11, 10): {NEXT_DAY_ORDER["id"]}})
+    assert {v.status for v in verdicts.values()} == {gap.BLOCKED}
+    assert verdicts[PAIR_1430].reason == (f"orders file does not contain known order {NEXT_DAY_ORDER['id']}; "
+                                          "fetch boundary unproven")
+
+
+def test_an_envelope_holding_every_known_later_order_is_excused(root, tmp_path):
+    envelope = _envelope(tmp_path, [NEXT_DAY_ORDER])
+    known = {date(2026, 11, 10): {NEXT_DAY_ORDER["id"].upper()},  # case-insensitive, as the replay is
+             D: {"same-day-order-id"}}  # same-day ids are not boundary evidence
+    verdicts = _classify(root, envelope, known=known)
+    assert {v.status for v in verdicts.values()} == {gap.EXCUSED}
+    assert "known_later_orders_present=1" in verdicts[PAIR_1430].reason
+
+
+def test_with_no_known_later_order_the_reason_says_the_boundary_was_not_cross_checked(root, tmp_path):
+    verdicts = _classify(root, _envelope(tmp_path, []), known={})
+    assert verdicts[PAIR_1430].status == gap.EXCUSED
+    assert "no known later order to cross-check the fetch boundary" in verdicts[PAIR_1430].reason
+
+
+def test_known_order_ids_by_day_reads_buy_candidate_order_ids():
+    states = [
+        {"trading_day": "2026-11-10", "buy_candidates": [{"order_id": " ABC "}, {"order_id": None}, "junk"]},
+        {"trading_day": "2026-11-10", "buy_candidates": [{"order_id": "def"}]},
+        {"trading_day": None, "buy_candidates": [{"order_id": "undated"}]},
+        {"trading_day": "2026-11-06", "buy_candidates": "not a list"},
+    ]
+    assert gap.known_order_ids_by_day(states) == {date(2026, 11, 10): {"abc", "def"}}
+
+
+# --- review 2026-11-11 fix 3: the window runs to the next session's open, not midnight -----------
+
+
+@pytest.mark.parametrize("created_at", [
+    "2026-11-10T00:05:00-05:00",  # just after midnight, queued for the next session
+    "2026-11-10T09:29:59-05:00",  # last second before the open
+])
+def test_an_overnight_order_before_the_next_open_blocks(root, tmp_path, created_at):
+    verdicts = _classify(root, _envelope(tmp_path, [_order("night", created_at)]))
+    assert {v.status for v in verdicts.values()} == {gap.BLOCKED}
+    assert "2026-11-09 14:00 ET - 2026-11-10 09:30 ET" in verdicts[PAIR_1430].reason
+
+
+def test_the_next_sessions_own_orders_do_not_block(root, tmp_path):
+    verdicts = _classify(root, _envelope(tmp_path, [_order("open", "2026-11-10T09:30:00-05:00"),
+                                                    _order("next", "2026-11-10T09:40:00-05:00")]))
+    assert {v.status for v in verdicts.values()} == {gap.EXCUSED}
+
+
+def test_a_fridays_window_runs_through_the_weekend_to_mondays_open(tmp_path):
+    friday = date(2026, 11, 6)
+    base = tmp_path / "cron"
+    _write_markers(base, "1430", _marker("1430", day=friday), day=friday)
+    start, end = gap.order_window(friday)
+    assert (start.isoformat(), end.isoformat()) == ("2026-11-06T14:00:00-05:00", "2026-11-09T09:30:00-05:00")
+    envelope = _envelope(tmp_path, [_order("sun", "2026-11-08T20:00:00-05:00")], trading_day="2026-11-06")
+    verdict = gap.classify_missing_pairs([(friday, "14:30")], claimed_pairs=set(), marker_root=base,
+                                         orders_envelope=envelope, account_number=ACCOUNT)[(friday, "14:30")]
+    assert verdict.status == gap.BLOCKED
+
+
 # --- the live prompt block, executed end to end ---------------------------------------------------
 
 
@@ -271,12 +388,12 @@ def outage_tree(tmp_path):
     return cron
 
 
-def _run_block(cron: Path, orders_file: Path | None = None) -> subprocess.CompletedProcess:
+def _run_block(cron: Path, orders_file: Path | None = None, *, clock: str = _FROZEN_CLOCK) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k != "KILL_SWITCH_GAP_ORDERS"}
     env.update(DCA_CRON_TRACKING_ROOT=str(cron), DCA_DISABLE_DOTENV="1", ROBINHOOD_AGENTIC_ACCOUNT_NUMBER=ACCOUNT)
     if orders_file is not None:
         env["KILL_SWITCH_GAP_ORDERS"] = str(orders_file)
-    return subprocess.run([sys.executable, "-c", _FROZEN_CLOCK + _prompt_block()], cwd=REPO, env=env,
+    return subprocess.run([sys.executable, "-c", clock + _prompt_block()], cwd=REPO, env=env,
                           capture_output=True, text=True, timeout=120)
 
 
@@ -313,3 +430,29 @@ def test_prompt_block_aborts_without_a_marker_exactly_as_before(outage_tree):
     assert result.returncode == 1
     assert "2026-11-09 15:30: no run_state.json" in result.stderr
     assert result.stdout == ""
+
+
+def _add_11_10_afternoon(cron: Path, order_id: str) -> None:
+    """11-10 fully evidenced, its 15:30 run recording one placed order, so a 2026-11-11 12:30 run
+    has a later known order to cross-check the 11-09 fetch boundary against."""
+    for slot, sub in (("14:30", "intraday_dca"), ("15:30", "ce16ba6b/scheduled_runs")):
+        state = _afternoon_state("2026-11-10", slot, 10.0)
+        if slot == "15:30":
+            state["buy_candidates"][0]["order_id"] = order_id
+        run = cron / sub / f"20261110_{slot.replace(':', '')}ET"
+        run.mkdir(parents=True)
+        (run / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_prompt_block_blocks_an_orders_file_that_omits_a_known_11_10_order(outage_tree, tmp_path):
+    _add_11_10_afternoon(outage_tree, NEXT_DAY_ORDER["id"])
+    clock = _FROZEN_CLOCK.replace("2026, 11, 10, 12, 30", "2026, 11, 11, 12, 30")
+    result = _run_block(outage_tree, _save_envelope(tmp_path, []), clock=clock)
+    assert result.returncode == 1
+    assert f"orders file does not contain known order {NEXT_DAY_ORDER['id']}; fetch boundary unproven" in result.stderr
+    assert result.stdout == ""
+    # The same history WITH that order excuses both pairs and prints the unchanged figure.
+    result = _run_block(outage_tree, _save_envelope(tmp_path, [NEXT_DAY_ORDER]), clock=clock)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "60.0"  # 11-05, 11-06, 11-10 at $10 each (11-04 left the window); 11-09 adds $0
+    assert result.stderr.count("known_later_orders_present=1") == 2

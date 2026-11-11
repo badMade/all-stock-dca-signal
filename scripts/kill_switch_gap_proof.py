@@ -250,7 +250,7 @@ def broker_absence(
 
     # The envelope's trading_day is self-reported. Cross-check it against orders this repo already
     # knows were placed after D: a later-starting fetch would be missing the earliest of them.
-    later_ids = sorted({oid for d, ids in (known_order_ids or {}).items() if d > day for oid in ids})
+    later_ids = sorted({str(oid).strip().lower() for d, ids in (known_order_ids or {}).items() if d > day for oid in ids})
     present = {str(order.order_id).lower() for order in snapshot.orders}
     for order_id in later_ids:
         if order_id not in present:
