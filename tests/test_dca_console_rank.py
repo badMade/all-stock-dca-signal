@@ -74,3 +74,39 @@ def test_corrupt_inputs_become_warnings_not_errors(tmp_path: Path):
     snap = build_rank_snapshot(tmp_path)
     assert snap["available"] and snap["threshold"] == 80.0
     assert any("corrupt" in w for w in snap["warnings"])
+
+
+def test_trade_list_and_shadow_views(tmp_path: Path):
+    _write_run(tmp_path, "2026-11-04", ["A", "B", "C", "D"], held=frozenset({"A"}))
+    root = tmp_path / "artifacts" / "composite_rank"
+    (root / "latest_trade_list.csv").write_text(
+        "date,ticker,rank,score,reason,params_version\n2026-11-04,A,2,85.0,above_eval_held,v1\n")
+    (root / "trade_list_history.csv").write_text(
+        "date,ticker,rank,score,reason,params_version\n2026-11-03,A,1,90,above_eval,v1\n"
+        "2026-11-04,A,2,85,above_eval_held,v1\n2026-11-04,B,1,90,above_eval,v1\n")
+    (root / "latest_tickers_proposal.md").write_text("# Proposed ticker change\n")
+    (root / "shadow_octopus_history.csv").write_text(
+        "origin_date,ticker,exp_ret,p10_ret,p90_ret,expected_target_date,fwd_pct,model\n"
+        "2026-11-04,A,0.004,-0.01,0.02,2026-11-05,90,octopus\n"
+        "2026-11-04,B,-0.002,-0.02,0.01,2026-11-05,40,octopus\n"
+        "2026-11-04,ZZZZ,0.05,-0.1,0.2,2026-11-05,100,octopus\n")  # micro-cap outside the ranked universe
+    (root / "shadow_ml_history.csv").write_text(
+        "date,ticker,tilt,fwd_pct,status,model_version\n"
+        "2026-11-04,A,0.2,50,blocked_regression,m\n2026-11-04,B,-0.1,50,blocked_regression,m\n")
+    snap = build_rank_snapshot(tmp_path)
+    trade = snap["trade"]
+    assert trade["latest"][0]["held"] is True and trade["params_version"] == "v1"
+    assert trade["history"][0] == {"date": "2026-11-04", "names": 2, "added": 1, "removed": 0}
+    assert trade["proposal_markdown"].startswith("# Proposed")
+    octopus = snap["shadow"]["octopus"]
+    assert [r["ticker"] for r in octopus["top"]] == ["A", "B"]  # ZZZZ is not a ranked name
+    assert octopus["dates"][0]["tickers"] == 3 and octopus["weight"] == 0
+    ml = snap["shadow"]["ml"]
+    assert ml["top"][0]["ticker"] == "A" and ml["dates"][0]["status"] == {"blocked_regression": 2}
+
+
+def test_missing_shadow_files_are_not_an_error(tmp_path: Path):
+    _write_run(tmp_path, "2026-11-04", ["A", "B"])
+    snap = build_rank_snapshot(tmp_path)
+    assert snap["trade"]["latest"] == [] and snap["shadow"]["octopus"]["available"] is False
+    assert snap["shadow"]["ml"]["available"] is False

@@ -5,6 +5,12 @@ Covers `console/` and `dca_console*.py`. Newest first. Every change to a file un
 `ASSET_DIGEST` in `dca_console_release.py` (`tests/test_console_release.py` enforces it).
 Process: `docs/local_console.md#release-process-stable-vs-sandbox`.
 
+## 1.2.0
+
+- Composite rank page: adds the daily trade list (with how it changed day to day), the review-first ticker proposal,
+  and the zero-weight shadow logs for Octopus (next-day forecast, S&P 500 names) and ml-forecaster (sizing tilt).
+  Read-only; the realised-return scorecards stay a CLI command (`shadow-scorecard`).
+
 ## 1.1.0
 
 - New Composite rank page (read-only): the daily S&P 500 composite ranking written by the scheduled
