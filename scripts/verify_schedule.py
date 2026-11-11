@@ -217,7 +217,7 @@ def classify_slot_evidence(
     else:
         status = STATUS_NO_EVIDENCE
         reasons.append("no run directory for this slot")
-        # The finalizer accepts a start EARLY_START_MINUTES before the nominal time (never for 0935),
+        # The finalizer accepts a start EARLY_START_MINUTES before the nominal time (0935 instead opens at 9:31),
         # so a marker in that interval is a slot that fired and crashed, not a scheduler miss
         # (Copilot review, PR #1874). Imported here because finalize_run_evidence imports this module.
         from scripts.finalize_run_evidence import acceptance_window

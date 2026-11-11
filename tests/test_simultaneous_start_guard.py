@@ -105,7 +105,7 @@ def test_partially_filled_dead_order_still_blocks_the_ticker():
 
 def test_order_from_an_earlier_slot_window_does_not_block():
     calls = []
-    earlier = datetime(2026, 7, 28, 9, 31, tzinfo=ET)  # before the 0935 window opens
+    earlier = datetime(2026, 7, 28, 9, 20, tzinfo=ET)  # before the 0935 window opens (9:31)
     refetch = lambda: [_other_writer_order("MSFT", at=earlier)]  # noqa: E731
     result = _run(["AAPL", "MSFT"], calls, refetch=refetch)
     assert calls == ["AAPL", "MSFT"]

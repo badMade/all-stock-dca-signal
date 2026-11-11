@@ -421,7 +421,10 @@ MARKET_OPEN_STREAM = "market_open"
 MARKET_OPEN_LIVE_CRON_ID = "2ba19526"
 MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
 MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
-MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET = "09:35"
+# Window opens 09:31 from 2026-11-05 (decision still 09:35); earlier artifacts carry 09:35,
+# so both stay valid or historical runs would reclassify as invalid.
+MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET = "09:31"
+MARKET_OPEN_LEGACY_SCHEDULED_WINDOW_START_ET = "09:35"
 MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET = "09:50"
 INTRADAY_STREAM = "intraday"
 INTRADAY_LIVE_CRON_ID = "7be82b97"
@@ -1592,7 +1595,8 @@ def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult
                 )
             is_market_open_identity = (
                 scheduled_for_et == MARKET_OPEN_LIVE_SCHEDULED_FOR_ET
-                and window_start_et == MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET
+                and window_start_et
+                in (MARKET_OPEN_LIVE_SCHEDULED_WINDOW_START_ET, MARKET_OPEN_LEGACY_SCHEDULED_WINDOW_START_ET)
                 and run_id_is_str
                 and bool(MARKET_OPEN_LIVE_RUN_ID_RE.match(run_id))
             )

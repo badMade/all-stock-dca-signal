@@ -2905,7 +2905,7 @@ def test_gate1_jittered_fire_time_still_passes():
     "when",
     [
         datetime(2026, 7, 28, 9, 30, tzinfo=ET),      # the old window start
-        datetime(2026, 7, 28, 9, 34, 59, tzinfo=ET),  # a second before 9:35: never fires early
+        datetime(2026, 7, 28, 9, 30, 59, tzinfo=ET),  # a second before 9:31: never fires early
         datetime(2026, 7, 28, 10, 20, 1, tzinfo=ET),  # a second after the 10:20 close
         datetime(2026, 7, 28, 15, 30, tzinfo=ET),     # another slot's window
     ],
@@ -2919,10 +2919,13 @@ def test_gate1_0935_window_closes_at_1020_to_absorb_scheduler_lateness():
     """2026-10-27: the 9:35 fire started at about 9:53 ET (18 minutes late) and the
     run aborted with the 10:00 close too close to finish Gates 6 through 7 for 32
     candidates, so nothing was placed. The close moves to 10:20 ET (operator
-    decision 2026-10-28); the open stays at 9:35 and the end stays exclusive."""
+    decision 2026-10-28); the open moved to 9:31 on 2026-11-05 (decision time still
+    9:35) and the end stays exclusive."""
     spec = dca_runner.SLOTS["0935"]
-    assert spec.window_start_et == (9, 35)
+    assert spec.nominal_et == (9, 35)
+    assert spec.window_start_et == (9, 31)
     assert spec.window_end_et == (10, 20)
+    assert dca_runner.gate_time_sanity(datetime(2026, 11, 5, 9, 31, 0, tzinfo=ET), spec)  # the new early start
     assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 9, 53, 34, tzinfo=ET), spec)  # the late fire
     assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 0, 1, tzinfo=ET), spec)  # was a second late
     assert dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 19, 59, tzinfo=ET), spec)

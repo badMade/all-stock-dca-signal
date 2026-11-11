@@ -826,7 +826,7 @@ see the note at the top of this section for why that ordering is load-bearing.
 
 | ET | Task | ID | Cadence | Cron (ET) | Trades | Status |
 |---|---|---|---|---|---|---|
-| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 9 * * 1-5` | **yes** | active |
+| 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `31 9 * * 1-5` (fires 9:31; decision time stays 9:35) | **yes** | active |
 | 10:30 AM | Morning DCA live Robinhood execution | `42173154` | Weekdays | `30 10 * * 1-5` | **yes** | active |
 | 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 11,13,14 * * 1-5` | **yes** | active |
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 12 * * 1-5` | **yes** | active |

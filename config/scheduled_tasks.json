@@ -3076,7 +3076,7 @@
       "type": "trading",
       "status": "active",
       "cron_utc": "35 13 * * 1-5",
-      "et_equivalent": "9:35 AM ET weekdays (EDT)",
+      "et_equivalent": "9:35 AM ET weekdays (EDT) decision; the routine fires at 9:31 to prep (window opens 9:31, 2026-11-05)",
       "trades": true,
       "added_to_manifest_on_et": "2026-07-27",
       "added_reason": "Present in the canonical live schedule verified on 2026-07-27 but previously absent from this manifest.",
