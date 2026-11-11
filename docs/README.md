@@ -23,6 +23,7 @@ environment (see the repository README).
 | [local_console.md](local_console.md) | `python3 from.py`: checkout-only local interface, real-data by default with an opt-in demo sandbox, daily summaries, timing and Octopus predictions; authenticated LAN/proxy access and launchd runbooks; never places brokerage orders |
 | [console_changelog.md](console_changelog.md) | Versioned changelog for `console/` and `dca_console*.py`; every UI change needs an entry and a version bump |
 | [robinhood_payload.md](robinhood_payload.md) | Prebuilt Robinhood slot payload: Codex on the Mac builds the market-data payload ahead of a live slot so the session does not have to pull it live |
+| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up on the 2026-11-10 9:35 payload coverage-floor refusal: rate limits, partial coverage, and bounded retry |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [gate6_history_completeness_abort_2026-10-22.md](gate6_history_completeness_abort_2026-10-22.md) | 2026-10-22 live-slot abort on unproven weekly-history completeness, the log-and-continue decision, its risk and a revisit trigger |
 | [incident_2026-10-26_0935_unrecognized_orders.md](incident_2026-10-26_0935_unrecognized_orders.md) | 2026-10-26 refused 0935 payload and the 25 buys the Perplexity backup placed on its own cloud-computed plan, the cap check, why no evidence was forged, and open items |
