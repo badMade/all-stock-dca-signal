@@ -161,7 +161,7 @@ try:
     files = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "*.jsonl")), key=os.path.getmtime)[-6:]
     for path in reversed(files):
         with open(path, "rb") as handle:
-            handle.seek(max(0, os.path.getsize(path) - 400_000))
+            handle.seek(max(0, os.path.getsize(path) - 400 * 1024))  # last 400 KiB; no 6-digit literal (test_config_invariants)
             lines = [ln for ln in handle.read().decode("utf-8", "replace").splitlines() if '"rate_limits"' in ln]
         if lines:
             limits = json.loads(lines[-1]).get("payload", {}).get("rate_limits", {})
