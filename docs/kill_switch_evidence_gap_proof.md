@@ -49,9 +49,13 @@ missing and the slot aborts exactly as today:
    `get_equity_orders` with `created_at_gte` at or before `D 00:00 ET`, following pagination to
    completion (same discipline as Gate 4; the 2026-10-22 completeness carve-out does **not** apply
    here, because this is a proof of absence — unproven completeness ⇒ not excused). In that file,
-   **no order of any side or state** has `created_at` inside `[D 14:00 ET, D+1 00:00 ET)`.
+   **no order of any side or state** has `created_at` inside `[D 14:00 ET, next market day 09:30 ET)`.
    - The window is wider than both acceptance windows on purpose: it covers a late in-window fire,
-     the 19:24-style off-window fire if it had got past Gate 1, and after-hours queued orders.
+     the 19:24-style off-window fire if it had got past Gate 1, after-hours queued orders, and an
+     order stamped just after midnight and queued for the next session (review 2026-11-11: the first
+     draft ended at D+1 00:00 and let that through). It ends at the next market day's 09:30 ET open,
+     from Gate 0's own calendar, so a Friday's window runs to Monday's open; that session's own
+     orders belong to its own slots and do not block.
    - It ignores `placed_agent` and side on purpose, same reasoning as `gate_sole_executor`: we
      cannot attribute rows to "afternoon-scheduled", so any row at all is ambiguous ⇒ block. A
      manual buy that afternoon therefore keeps 12:30 blocked; that is the safe direction.
@@ -71,7 +75,7 @@ historical and settled in time.
 
 Exactly `$0` to `seven_day_deployed`, and it counts as coverage. The command still prints one scalar;
 each excused pair is also printed to **stderr** as
-`KILL_SWITCH_GAP_EXCUSED <D> <S> gate1/GATE1_OFF_WINDOW broker_orders_in_window=0` so the run's
+`KILL_SWITCH_GAP_EXCUSED <D> <S> gate1/GATE1_OFF_WINDOW … broker_orders_in_window=0; …` so the run's
 evidence and alert text record it. It is never written into any artifact that sizes or caps.
 
 ## Implementation
@@ -88,9 +92,23 @@ evidence and alert text record it. It is never written into any artifact that si
   pages again through `broker_reconciliation.same_day_order_snapshot` + `_PageReplayer` (the same
   chain `same_day_top_up_gate` trusts), so a hand-built or truncated file is refused rather than
   trusted for having the right keys. It must be pinned to `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` and its
-  `trading_day` must be on or before D. Residual trust: the request's own `created_at_gte` is not
-  visible in the pages, so a fetch started later than D would look complete — the same trust Gate 4
-  and Gate 6.5 already place in the session's fetch parameters.
+  `trading_day` must be on or before D.
+- **Provenance (review 2026-11-11).** The replay proves the chain's shape, not its origin: a
+  hand-built `{"pages": [{"orders": []}]}` replays as complete. So the envelope's `ingest` block must
+  be there and still match: `tool` is `scripts.assemble_order_pages`, `payload_sha256` recomputes
+  from the canonical pages, `order_count` equals the replayed count, and `pages_sha256` has one
+  sha256 per page (it hashes the raw page bytes the assembler read, which the envelope no longer
+  holds, so only its shape can be checked). This catches a hand-built file and any edit after
+  assembly (a row removed, a timestamp moved). It does **not** stop a forger who recomputes the
+  hashes; that trust stays with the session, as below.
+- **Fetch boundary (review 2026-11-11).** `trading_day` is self-reported, and the request's own
+  `created_at_gte` is not visible in the pages, so a fetch actually started on D+1 would read as an
+  empty D afternoon. The block therefore passes every broker order id the validated afternoon
+  run_states recorded (`buy_candidates[].order_id`) on a day after D and before today, and each one
+  must be in the envelope; a missing one blocks with `orders file does not contain known order <id>;
+  fetch boundary unproven`. When there is no later known order to check, the proof still passes but
+  says so in its reason (`no known later order to cross-check the fetch boundary`). In that case the
+  residual trust is the same Gate 4 and Gate 6.5 already place in the session's fetch parameters.
 - 12:30 prompt, Gate 5 block: after `missing_pairs`, any `blocked` verdict raises the existing
   `incomplete trailing-7-day afternoon evidence` SystemExit (exit 1), naming each reason. If the only
   gaps need broker proof, it prints `KILL_SWITCH_GAP_NEEDS_BROKER_PROOF <earliest D>` and exits 3; the
