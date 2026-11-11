@@ -127,6 +127,77 @@ def _movement(history: list[dict[str, str]], threshold: float) -> dict[str, Any]
     }
 
 
+SHADOW_TOP = 15
+SHADOW_DATES = 10
+
+
+def _trade_views(reader: BoundedReader, held: set[str]) -> dict[str, Any]:
+    """Latest daily trade list plus how its size and membership moved across recent days (review-first, read-only)."""
+    latest = [
+        {"rank": _int(r.get("rank")), "ticker": r.get("ticker", ""), "score": _float(r.get("score")),
+         "reason": r.get("reason", ""), "held": r.get("ticker", "") in held}
+        for r in _csv_rows(reader.text("latest_trade_list.csv"))[:MAX_TABLE_ROWS]
+    ]
+    by_date: dict[str, set[str]] = {}
+    version = ""
+    for r in _csv_rows(reader.text("trade_list_history.csv")):
+        if iso_date(r.get("date")):
+            by_date.setdefault(r["date"], set()).add(r.get("ticker", ""))
+            version = r.get("params_version", "") or version
+    days, previous = [], None
+    for day in sorted(by_date)[-SHADOW_DATES:]:
+        now = by_date[day]
+        days.append({"date": day, "names": len(now),
+                     "added": None if previous is None else len(now - previous),
+                     "removed": None if previous is None else len(previous - now)})
+        previous = now
+    proposal = reader.text("latest_tickers_proposal.md") or ""
+    return {"latest": latest, "history": list(reversed(days)), "params_version": version, "proposal_markdown": proposal}
+
+
+def _shadow_views(reader: BoundedReader, rank_tickers: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Shadow logs for the forward models. They are logged at zero weight, so this only shows coverage and the latest
+    forecasts; the realised-return scorecards need prices and stay a CLI command (``shadow-scorecard``)."""
+    octo_by_date: dict[str, list[dict[str, str]]] = {}
+    for r in _csv_rows(reader.text("shadow_octopus_history.csv")):
+        if iso_date(r.get("origin_date")):
+            octo_by_date.setdefault(r["origin_date"], []).append(r)
+    octo_dates = sorted(octo_by_date)
+    octopus: dict[str, Any] = {"available": bool(octo_dates), "weight": 0, "dates": []}
+    if octo_dates:
+        for day in reversed(octo_dates[-SHADOW_DATES:]):
+            rets = [v for v in (_float(r.get("exp_ret")) for r in octo_by_date[day]) if v is not None]
+            octopus["dates"].append({"date": day, "tickers": len(octo_by_date[day]),
+                                     "mean_exp_ret": round(statistics.fmean(rets), 5) if rets else None})
+        latest_rows = octo_by_date[octo_dates[-1]]
+        top = []
+        for r in latest_rows:
+            ticker, exp_ret = r.get("ticker", ""), _float(r.get("exp_ret"))
+            if ticker in rank_tickers and exp_ret is not None:  # S&P 500 / scored names only: micro-caps are noise here
+                top.append({"ticker": ticker, "exp_ret": exp_ret, "p10": _float(r.get("p10_ret")), "p90": _float(r.get("p90_ret")),
+                            "target": r.get("expected_target_date", ""), "rank": rank_tickers[ticker]["rank"],
+                            "held": rank_tickers[ticker]["held"]})
+        top.sort(key=lambda t: -t["exp_ret"])
+        octopus.update({"as_of": octo_dates[-1], "top": top[:SHADOW_TOP], "bottom": list(reversed(top[-SHADOW_TOP:]))})
+    ml_by_date: dict[str, list[dict[str, str]]] = {}
+    for r in _csv_rows(reader.text("shadow_ml_history.csv")):
+        if iso_date(r.get("date")):
+            ml_by_date.setdefault(r["date"], []).append(r)
+    ml_dates = sorted(ml_by_date)
+    ml: dict[str, Any] = {"available": bool(ml_dates), "weight": 0, "dates": []}
+    if ml_dates:
+        for day in reversed(ml_dates[-SHADOW_DATES:]):
+            statuses: dict[str, int] = {}
+            for r in ml_by_date[day]:
+                statuses[r.get("status", "")] = statuses.get(r.get("status", ""), 0) + 1
+            ml["dates"].append({"date": day, "tickers": len(ml_by_date[day]), "status": statuses})
+        rows = [{"ticker": r.get("ticker", ""), "tilt": _float(r.get("tilt")), "status": r.get("status", "")}
+                for r in ml_by_date[ml_dates[-1]] if _float(r.get("tilt")) is not None]
+        rows.sort(key=lambda t: -t["tilt"])
+        ml.update({"as_of": ml_dates[-1], "top": rows[:SHADOW_TOP], "bottom": list(reversed(rows[-SHADOW_TOP:]))})
+    return {"octopus": octopus, "ml": ml}
+
+
 def build_rank_snapshot(repo: Path) -> dict[str, Any]:
     """Compile the page payload from ``<repo>/artifacts/composite_rank``; never raises for missing data."""
     warnings: list[str] = []
@@ -184,5 +255,7 @@ def build_rank_snapshot(repo: Path) -> dict[str, Any]:
         "evaluation": above,
         "ranked": table,
         "movement": _movement(history, threshold),
+        "trade": _trade_views(reader, {row["ticker"] for row in table if row["held"]}),
+        "shadow": _shadow_views(reader, {row["ticker"]: row for row in table}),
     })
     return snapshot

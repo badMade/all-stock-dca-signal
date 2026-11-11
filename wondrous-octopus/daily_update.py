@@ -535,6 +535,37 @@ def _write_next_day_forecasts(
     return path
 
 
+def _write_horizon_forecasts(run_dir: Path) -> list[Path]:
+    """Dated copies of each model's full 1..H forecast (multi-horizon runs only).
+
+    ``horizons/<model>.csv`` is overwritten by every step, so on its own it
+    keeps only the newest origin's 90-day projection and yesterday's is gone
+    the moment today's lands -- leaving nothing to compare against what the
+    market later did. Each copy is named for the file's OWN ``origin_date``
+    (not the invocation's last_date) so a NOOP-recovery re-run rewrites the
+    same name with the same bytes instead of minting a second one. Values are
+    log-returns vs ``ref_close`` (dollars = ref_close * exp(value)), exactly
+    as exported by HorizonTracker.write_latest. Single-horizon runs have no
+    ``horizons/`` directory, so this returns an empty list.
+    """
+    source_dir = run_dir / "horizons"
+    if not source_dir.is_dir():
+        return []
+    written: list[Path] = []
+    daily_dir = run_dir / "daily"
+    for source in sorted(source_dir.glob("*.csv")):
+        text = source.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if len(lines) < 2:
+            continue
+        origin = lines[1].split(",")[1]
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        path = daily_dir / f"{origin}_horizon_forecasts_{source.stem}.csv"
+        _atomic_write_text(path, text)
+        written.append(path)
+    return written
+
+
 def _day_scores(
     run_dir: Path, harness: Any, last_date: str, *, records: list[dict] | None = None
 ) -> dict:
@@ -632,6 +663,7 @@ def _emit_daily_artifacts(
     scores = _day_scores(run_dir, harness, last_date, records=new_records)
     health = _encoder_health(run_dir, harness)
     forecasts_path = _write_next_day_forecasts(run_dir, harness, last_date, calendar_path=calendar_path)
+    horizon_paths = _write_horizon_forecasts(run_dir)
     # Same selection as _write_next_day_forecasts(): a recovered or newly
     # warmed-up ticker's forecast deliberately keeps its OWN (older)
     # origin_date, not today's last_date, and the CSV already counts it as
@@ -651,6 +683,7 @@ def _emit_daily_artifacts(
         "models": scores,
         "encoder_health": health,
         "next_day_forecasts_csv": str(forecasts_path) if forecasts_path else None,
+        "horizon_forecasts_csvs": [str(path) for path in horizon_paths],
         "predicted_tickers": n_predicted,
     }
     daily_dir = run_dir / "daily"

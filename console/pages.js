@@ -1307,7 +1307,66 @@ if (Array.isArray(view.warnings) && view.warnings.length) container.append(warni
           text("p", "compact", `Not scored (too little history or stale): ${(data.not_scored_or_stale || []).join(", ") || "none"}`),
         ]);
 
-        mount(rankSection, metrics, changes, evaluation, moves, movers, allPanel, gaps, warnings(data.warnings));
+        /* Forward-looking, review-first views: today's trade list, the ticker proposal, and the zero-weight shadow logs */
+        const trade = data.trade || {};
+        const reasonLabel = { above_eval: "Above threshold", above_eval_held: "Above threshold (held)", held_above_floor: "Held above floor" };
+        const tradePanel = panel(`Daily trade list (params ${trade.params_version || "n/a"})`, [
+          text("p", "muted compact", "Names to evaluate today: everything above the threshold plus anything you hold above the held floor. Nothing here is applied automatically."),
+          table([
+            { label: "#", get: (r) => r.rank, numeric: true },
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Score", get: (r) => score1(r.score), numeric: true },
+            { label: "Held", get: (r) => (r.held ? "Yes" : "No") },
+            { label: "Why", get: (r) => reasonLabel[r.reason] || r.reason },
+          ], trade.latest || [], "No trade list written yet."),
+          table([
+            { label: "Date", get: (r) => r.date },
+            { label: "Names", get: (r) => r.names, numeric: true },
+            { label: "Added", get: (r) => (r.added === null ? "–" : r.added), numeric: true },
+            { label: "Removed", get: (r) => (r.removed === null ? "–" : r.removed), numeric: true },
+          ], trade.history || [], "No history yet."),
+        ], `${(trade.latest || []).length} names`);
+        const proposalHost = text("div", "");
+        proposalHost.replaceChildren(trade.proposal_markdown && window.ConsoleMarkdown
+          ? window.ConsoleMarkdown.render(trade.proposal_markdown) : text("p", "muted", "No proposal written yet."));
+        const proposalPanel = panel("Ticker proposal (review first)", [proposalHost]);
+
+        const shadow = data.shadow || {};
+        const pctSigned = (value) => (value === null || value === undefined ? "–" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}%`);
+        const shadowPanels = [];
+        const octopus = shadow.octopus || {};
+        shadowPanels.push(octopus.available ? panel(`Octopus shadow forecast (weight ${octopus.weight}; forecast for ${octopus.top?.[0]?.target || "next day"})`, [
+          text("p", "muted compact", "Next-day expected return with a p10-p90 band, S&P 500 names only. Logged at zero weight: it does not change any score until its measured edge earns a weight."),
+          table([
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Comp rank", get: (r) => r.rank, numeric: true },
+            { label: "Held", get: (r) => (r.held ? "Yes" : "No") },
+            { label: "Exp ret", get: (r) => pctSigned(r.exp_ret), numeric: true },
+            { label: "p10", get: (r) => pctSigned(r.p10), numeric: true },
+            { label: "p90", get: (r) => pctSigned(r.p90), numeric: true },
+          ], octopus.top || [], "No forecasts."),
+          table([
+            { label: "Origin date", get: (r) => r.date },
+            { label: "Tickers", get: (r) => r.tickers, numeric: true },
+            { label: "Mean exp ret", get: (r) => pctSigned(r.mean_exp_ret), numeric: true },
+          ], octopus.dates || [], "No history."),
+        ]) : panel("Octopus shadow forecast", "No Octopus shadow rows yet."));
+        const ml = shadow.ml || {};
+        shadowPanels.push(ml.available ? panel(`ml-forecaster shadow tilt (weight ${ml.weight})`, [
+          text("p", "muted compact", "Sizing multiplier minus one (+0.20 is the cap). Status blocked_regression means the model's own regression gate was on, so these are logged only."),
+          table([
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Tilt", get: (r) => signed(Math.round(r.tilt * 100) / 100), numeric: true },
+            { label: "Status", get: (r) => r.status },
+          ], ml.top || [], "No tilts."),
+          table([
+            { label: "Date", get: (r) => r.date },
+            { label: "Tickers", get: (r) => r.tickers, numeric: true },
+            { label: "Status", get: (r) => Object.entries(r.status || {}).map(([k, v]) => `${k}: ${v}`).join(", ") },
+          ], ml.dates || [], "No history."),
+        ]) : panel("ml-forecaster shadow tilt", "No ml-forecaster shadow rows yet."));
+
+        mount(rankSection, metrics, changes, tradePanel, proposalPanel, evaluation, ...shadowPanels, moves, movers, allPanel, gaps, warnings(data.warnings));
       } catch (error) {
         failure(rankSection, error);
       }

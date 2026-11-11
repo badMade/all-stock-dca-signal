@@ -1463,6 +1463,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
         # Share counts, dollar amounts, and token totals quoted in the fetch
         # reports, README_FETCH_SYSTEM, and the credit-usage proxy report.
         "4440195",
+        "400000",
         "46240500",
         "676830",
         "2150000",
