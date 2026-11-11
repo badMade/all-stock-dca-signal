@@ -322,8 +322,11 @@ def _index_root(root: RootSpec, exclusions: Sequence[Path], warnings: list[str])
     by_dir: dict[str, tuple[Path, dict[str, Any]]] = {}
     covered: set[str] = set()
     malformed = 0
+    # ⚡ Bolt Optimization: Deduplicate `path.parent.resolve()` syscalls
+    parents = {p.parent for p in paths}
+    resolved_state_dirs = {p: p.resolve() for p in parents}
     for path in paths:
-        resolved = path.resolve()
+        resolved = resolved_state_dirs[path.parent] / path.name
         if not resolved.is_relative_to(base) or _excluded(resolved, exclusions):
             continue
         relative = resolved.relative_to(base)
