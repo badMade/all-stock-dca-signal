@@ -327,7 +327,8 @@ gap_orders_path = os.environ.get('KILL_SWITCH_GAP_ORDERS')
 verdicts = gap.classify_missing_pairs(
     missing_pairs, claimed_pairs=set(rejected_reasons), marker_root=pathlib.Path(dca_paths.cron_tracking_root()),
     orders_envelope=gap.load_orders_envelope(gap_orders_path) if gap_orders_path else None,
-    account_number=os.environ.get('ROBINHOOD_AGENTIC_ACCOUNT_NUMBER', ''))
+    account_number=os.environ.get('ROBINHOOD_AGENTIC_ACCOUNT_NUMBER', ''),
+    known_order_ids={d: ids for d, ids in gap.known_order_ids_by_day(deployment_evidence_states).items() if d < today})
 blocked = [(pair, v) for pair, v in verdicts.items() if v.status == gap.BLOCKED]
 if blocked:
     detail = '; '.join(f'{day.isoformat()} {slot}: {rejected_reasons.get((day, slot), v.reason)}'
@@ -341,7 +342,7 @@ for (day, slot), v in verdicts.items():
     print(f'KILL_SWITCH_GAP_EXCUSED {day.isoformat()} {slot} gate1/GATE1_OFF_WINDOW {v.reason}', file=sys.stderr)
 print(round(dca_risk.seven_day_deployed(dca_risk.deployed_by_day(deployment_evidence_states), today), 2))
 PY
-KILL-SWITCH EVIDENCE GAP PROOF (2026-11-10, DCA Issues key kill_switch_evidence_incomplete; docs/kill_switch_evidence_gap_proof.md). A missing (market day, 14:30|15:30) pair no longer blocks ONLY in one case: the slot fired, aborted at Gate 1 (GATE1_OFF_WINDOW) before any evidence could exist, and the account's own order history shows no order of any side or state created that day from 14:00 ET to midnight. The abort marker alone never counts: it is not run evidence and proves nothing about dollars. Exit status decides what you do next:
+KILL-SWITCH EVIDENCE GAP PROOF (2026-11-10, DCA Issues key kill_switch_evidence_incomplete; docs/kill_switch_evidence_gap_proof.md). A missing (market day, 14:30|15:30) pair no longer blocks ONLY in one case: the slot fired, aborted at Gate 1 (GATE1_OFF_WINDOW) before any evidence could exist, and the account's own order history shows no order of any side or state created from 14:00 ET that day up to the next market day's 09:30 ET open. The abort marker alone never counts: it is not run evidence and proves nothing about dollars. Exit status decides what you do next:
   - exit 0: use the one printed figure. Any KILL_SWITCH_GAP_EXCUSED lines on stderr name each pair counted as $0; copy every one of them verbatim into this run's alert/evidence text.
   - exit 3 with KILL_SWITCH_GAP_NEEDS_BROKER_PROOF <D> on stderr: every missing pair has a clean Gate-1 marker and the broker must now prove $0. Call get_equity_orders for account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} with created_at_gte <D>T00:00:00 America/New_York (with its UTC offset), following every pagination cursor to completion, saving each page's raw output as its own file in fetch order. Then run, from the repo root: python3 -m scripts.assemble_order_pages --account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER} --trading-day <D> --out $ROOT/kill_switch_gap_orders.json <page file 1> <page file 2> ... . If it exits non-zero, or pagination cannot be followed to completion, abort and alert with key kill_switch_evidence_incomplete -- the 2026-10-22 order-history completeness carve-out does NOT apply here, because this is a proof that orders are absent. Otherwise rerun the SAME command above, unchanged, prefixed with KILL_SWITCH_GAP_ORDERS=$ROOT/kill_switch_gap_orders.json, and apply these same exit rules to that rerun (a second exit 3 is an abort).
   - any other exit: abort and alert with key kill_switch_evidence_incomplete, quoting the SystemExit text. Never hand-edit an abort marker or the orders file, never write a run_state.json to fill a gap, and never pass a figure from a run that did not exit 0.
