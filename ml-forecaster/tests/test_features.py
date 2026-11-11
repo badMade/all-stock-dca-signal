@@ -775,3 +775,25 @@ def test_compute_features_falls_back_to_raw_close_for_an_unanchored_leading_gap(
     expected_row1_drop = ((100.0 - 51.0) / 100.0) * 100.0
     assert features["drop_vs_prior_close_pct"].iloc[1] == pytest.approx(expected_row1_drop)
     assert np.isfinite(features["drop_vs_prior_close_pct"].iloc[1])
+
+
+def _frame_from_closes(closes):
+    n = len(closes)
+    return pd.DataFrame({"Date": pd.bdate_range("2018-06-01", periods=n), "Close": closes, "Adj Close": closes})
+
+
+def test_forward_target_is_blanked_when_its_window_holds_a_corrupt_day():
+    # 3.0 -> 0.015 is a -99.5% day, then 0.015 -> 0.32 is a +2,033% day (the QUBT 2018 shell prints).
+    closes = [6.0, 5.0, 4.0, 3.0, 0.015, 0.32, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0, 4.1]
+    target = compute_forward_return_target(_frame_from_closes(closes), horizon=5)
+    # The -99.5% day is index 4, the +2,033% day is index 5. Rows 0-4 have one of them inside T+1..T+5, so their
+    # labels are blanked; row 5's window (indices 6-10) is clean and keeps its ordinary return.
+    assert target.iloc[:5].isna().all()
+    assert target.iloc[5] == pytest.approx((closes[10] - closes[5]) / closes[5] * 100.0)
+
+
+def test_forward_target_keeps_legitimate_extreme_but_sub_threshold_moves():
+    # +251% in a day (LUNR-style) and -75% are real moves; only >=900% rises / <=-90% drops are treated as corrupt.
+    closes = [10.0, 10.0, 35.1, 35.0, 8.75, 9.0, 9.1, 9.2, 9.3, 9.4, 9.5]
+    target = compute_forward_return_target(_frame_from_closes(closes), horizon=5)
+    assert target.iloc[:6].notna().all()
