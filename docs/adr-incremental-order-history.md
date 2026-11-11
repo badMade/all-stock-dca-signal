@@ -1,7 +1,10 @@
 # ADR: Incremental order history, batched tradability and an audited per-order record (9:35 slot)
 
-Status: accepted by the operator on 2026-10-29 for the 9:35 slot only. The other six slots keep
-the current text until this has run live.
+Status: accepted by the operator on 2026-10-29 for the 9:35 slot. It ran live on 2026-11-05 with 18
+orders (1 `full` and 17 `incremental` per-order records, each with a merge hash, and a clean
+`check_per_order_record`), the batch size at which the old full re-read compacted the session, so
+on 2026-11-06 the same four rules and the Gate 9 audit were added to the other six mirrors
+(10:30, 11:30, 12:30, 1:30, 2:30, 3:30). The live tasks change only when the operator repastes them.
 
 ## Context
 

@@ -309,6 +309,16 @@ and runs a Mac sub-agent just to learn that Claude's slot succeeded. The plan:
    - Nothing posted: a dry run, or a call the finalizer refused.
    - The Mac dispatcher reads the same local document before its heartbeat probe: a slot marked `succeeded` today
      sends no backup.
+   - Pushing (2026-11-04): the live runs execute in a Cowork VM with no GitHub credentials, so their own pushes
+     fail. The Mac's launchd job (`deploy/launchd/com.all-stock-dca.slot-status-publish.plist.template`) pushes the
+     recorded document with the Mac's credentials, on every change and every 120 s.
+   - Running slots (2026-11-05): that job runs `scripts/slot_status_watch.py`, which marks a slot `in_progress`
+     while its dated run folder is being written, with `activity_at` = the newest file time, and never over a final
+     status or a folder that already holds `run_summary.json` (the finalizer writes it before the status). The
+     dispatcher waits while `activity_at` is within `RUNNING_FRESH_MINUTES` (10) and sends after (`primary_stalled`);
+     the cloud watcher sends for an `in_progress` slot silent for more than `CLOUD_STALE_MINUTES` (20)
+     (`mac_stalled`). Without this, the 15-minute check fired while the 9:35 run was still placing orders
+     (2026-11-05: placing until 9:54, `succeeded` at 9:55:04).
    - Where: one small public document, `slot_status.json`, force-pushed to the data-only `slot-status` branch of
      the separate PUBLIC repository `badMade/all-stock-dca-signal` (`config/slot_status.json`). This repository is
      private, so Perplexity cannot read a file here (found 2026-10-31). One-time Mac setup: create that repository,

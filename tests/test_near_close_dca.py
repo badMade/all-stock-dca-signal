@@ -7329,6 +7329,34 @@ def test_plain_no_data_still_allows_robinhood_only_buy():
     assert decision.reason == "Robinhood-only BUY because finance source is unavailable"
 
 
+def test_robinhood_buy_with_finance_no_action_forces_manual_review():
+    """The TRLV demo case: Robinhood clears a ticker's first ladder tier, finance does not.
+
+    The two sources can read bars minutes apart, so a ticker sitting right at its
+    first calibrated tier may BUY on one source and NO_ACTION on the other. That
+    disagreement must fail closed to MANUAL_REVIEW (never a Robinhood-only buy,
+    which is reserved for a genuinely *unavailable* finance source, see
+    test_plain_no_data_still_allows_robinhood_only_buy) -- the mirror of the
+    "finance BUY but Robinhood is ..." branch pinned in test_whole_share_wiring.
+    """
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+    rs = evaluate_source_signal("AAPL", now, StrategyConfig(), rh, 5)
+    assert rs.action == Action.BUY
+
+    # Finance sees a flat tape (no drop vs. the prior close): a real NO_ACTION
+    # signal, not missing data and not a provider error.
+    fin = _FakeData(SourceName.FINANCE, 100.0, 100.0, quote=(100.0, now))
+    fs = evaluate_source_signal("AAPL", now, StrategyConfig(), fin, 15)
+    assert fs.action == Action.NO_ACTION
+    assert fs.provider_error is False
+
+    decision = reconcile_signals("AAPL", fs, rs)
+    assert decision.action == Action.MANUAL_REVIEW
+    assert decision.reason == "Robinhood BUY but finance is NO_ACTION; do not auto-buy"
+    assert decision.suggested_amount_usd == 0.0
+
+
 # --- Slippage calculations ---------------------------------------------------
 
 
@@ -50517,6 +50545,24 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(_Ctx, "AAPL", "REF-AAPL", 2.0)
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
+
+
+def test_a_boolean_reconciled_order_id_is_not_usable():
+    """`True` is an `int` in Python (`isinstance(True, int)` holds and `True == 1`), so without the explicit bool
+    gate a history row whose id is a JSON `true` would read as order id 1, and `false` as a falsy-but-numeric 0.
+    `dca_runner._is_usable_order_id` has pinned this since PR #786 (see `test_dca_runner.py`'s invalid list);
+    this pins the near-close twin the same way. 2026-11-06: PR #2138 claimed to add exactly this check, but it was
+    already present on main and that PR's real diff only rolled back newer work (reverted by PR #2152), so nothing
+    guarded it against a future edit.
+    """
+    import near_close_dca
+
+    for value in (True, False):
+        assert near_close_dca._is_usable_reconciled_order_id(value) is False, value
+
+    # The integers the booleans are equal to stay distinct verdicts: 1 is a usable id, 0 is not.
+    assert near_close_dca._is_usable_reconciled_order_id(1) is True
+    assert near_close_dca._is_usable_reconciled_order_id(0) is False
 
 
 def test_an_unresolved_placement_cannot_halt_without_the_adapter_distinction():
