@@ -25,6 +25,7 @@ environment (see the repository README).
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [gate6_history_completeness_abort_2026-10-22.md](gate6_history_completeness_abort_2026-10-22.md) | 2026-10-22 live-slot abort on unproven weekly-history completeness, the log-and-continue decision, its risk and a revisit trigger |
 | [incident_2026-10-26_0935_unrecognized_orders.md](incident_2026-10-26_0935_unrecognized_orders.md) | 2026-10-26 refused 0935 payload and the 25 buys the Perplexity backup placed on its own cloud-computed plan, the cap check, why no evidence was forged, and open items |
+| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up: the 2026-11-10 9:35 payload was refused on the 95% coverage floor (60/122 tickers validated after 429s), so the slot placed no orders; evidence and next steps |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [yfinance_replacement_plan.md](yfinance_replacement_plan.md) | Where yfinance is allowed (non-buying scheduled tasks only), the `data` extra that declares it, who uses it today, and the plan to replace it |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
