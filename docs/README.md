@@ -85,6 +85,7 @@ environment (see the repository README).
 | [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | [market_open_0932_move.md](market_open_0932_move.md) | Proposal (not implemented) to fire the market-open slot at 09:32 on a live-quote decision price; the full change list and the shadow-only `market_open_quote_shadow` recorder that gathers evidence first |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
+| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up: the 09:35 payload was refused on the 95% coverage floor after 429 rate limits, so the slot placed no orders; the decisions still to make |
 
 ## Machine-readable backup
 
