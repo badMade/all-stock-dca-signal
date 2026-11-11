@@ -181,7 +181,7 @@ def test_an_orders_file_starting_earlier_still_covers_the_day(root, tmp_path):
 
 def test_an_unpinned_or_foreign_account_orders_file_blocks(root, tmp_path):
     envelope = _envelope(tmp_path, [])
-    assert _classify(root, {**envelope, "account_number": "999000222"})[PAIR_1430].status == gap.BLOCKED
+    assert _classify(root, {**envelope, "account_number": "123456789"})[PAIR_1430].status == gap.BLOCKED
     verdicts = gap.classify_missing_pairs([PAIR_1430], claimed_pairs=set(), marker_root=root,
                                           orders_envelope=envelope, account_number="")
     assert verdicts[PAIR_1430].status == gap.BLOCKED

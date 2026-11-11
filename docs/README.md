@@ -16,6 +16,7 @@ environment (see the repository README).
 | [codebase_roadmap.md](codebase_roadmap.md) | End-to-end flow of one live slot, layers with real importer counts, which reliability engines are wired, and where the code differs from older docs |
 | [object_model_roadmap.md](object_model_roadmap.md) | What the plan-first object model changed, where handoffs are still wider than needed, the phased path, and the console's checkout-only Architecture map |
 | [handoff_2026-10-23_payload_and_prompts.md](handoff_2026-10-23_payload_and_prompts.md) | One-time handoff for the 2026-10-21 9:35 payload abort and the backup-prompt fixes: what happened, what merged, and the repaste steps |
+| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Follow-up on payload coverage for live slots |
 | [module_graph.md](module_graph.md) | Generated import graph of the core modules (importers, import counts, line counts, modules nothing imports); refreshed automatically on every push to `main`, never hand-edited |
 | [dead_code_report.md](dead_code_report.md) | Tiered list of unused code, unreferenced files, and duplicated root files, with the method used and its limits |
 | [local_ci.md](local_ci.md) | Running CI locally: `scripts/local_ci.sh` (fast copy of the gates; `scripts/local_ci_status.sh` posts its result as a `local-ci` commit status) and `scripts/run_ci_locally.sh` (the real `ci.yml` under act + Colima: setup, job ids, what differs from GitHub's runners); the measured Actions-minute breakdown, the 2026-10-31 trigger cuts, and the opt-in self-hosted-runner switch (`CI_RUNS_ON`) |
@@ -65,6 +66,7 @@ environment (see the repository README).
 | [intraday_signal_entry.md](intraday_signal_entry.md) | Gate 5 signal generation for the 11:30 AM, 1:30 PM and 2:30 PM intraday slots (`scripts/generate_intraday_candidates.py --slot`) |
 | [GATE5_FIX.md](GATE5_FIX.md) | The Gate 5 failure fix: how signal generation became a real, tested entry point per slot |
 | [risk_management.md](risk_management.md) | Dynamic risk management: the rolling cash-burn report and the 7-day deployment kill switch (`dca_risk.py`) |
+| [kill_switch_evidence_gap_proof.md](kill_switch_evidence_gap_proof.md) | Design for proving missing afternoon evidence represents zero deployment at the midday Gate 5 |
 | [dca_operational_todos.md](dca_operational_todos.md) | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
 | [OPEN_ISSUES_2026-10-22.md](OPEN_ISSUES_2026-10-22.md) | Open issue record: Gate 6 weekly-history completeness aborting the 0935 and 1030 live slots; operator decision is log-and-continue, fix not started |
 | [adr-octopus-ledger-filesystem-boundary.md](adr-octopus-ledger-filesystem-boundary.md) | ADR: the Octopus ledger's descriptor-relative, no-follow filesystem boundary |
