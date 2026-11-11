@@ -687,6 +687,64 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     ), log
 
 
+# -- 429 backoff (2026-11-10: 09:35 and 10:30 refused at 60/122 and 98/122; every dead chunk's log ended "exceeded retry
+# limit, last status: 429 Too Many Requests" after 3-4 s, and its retry fired at once into the same window) -------------
+
+# First call per chunk dies like the 11-10 workers (no reply, a 429 on stderr); the second answers. The counter lives
+# beside the chunk's output file, so it is per chunk.
+_RATE_LIMITED_ONCE = (
+    'n=$(cat "$out.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$out.n"; '
+    'if [ "$n" = 1 ]; then echo "ERROR: exceeded retry limit, last status: 429 Too Many Requests" >&2; exit 1; '
+    'else echo "{}" >"$out"; fi'
+)
+
+
+def test_launcher_backs_off_before_retrying_a_rate_limited_chunk(tmp_path):
+    import re
+
+    done, chunks = _run_launcher(tmp_path, _RATE_LIMITED_ONCE, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "1", "DCA_CODEX_PARALLEL": "64"})
+    log = done.stdout + done.stderr
+    backoffs = re.findall(r"robinhood_payload: rate_limited chunk=(\d+) attempt=1 backoff_seconds=(\d+)", log)
+    assert sorted(int(i) for i, _ in backoffs) == list(range(chunks)), log
+    assert all(int(s) == 1 for _, s in backoffs), backoffs  # 1 s + jitter of at most 1 // 3 == 0
+    # The retry after the wait is what fetched the data: every chunk's second attempt answered cleanly.
+    retried = re.findall(r"robinhood_payload: timing chunk=(\d+) attempt=2 seconds=\d+ errors=0", log)
+    assert sorted(int(i) for i in retried) == list(range(chunks)), log
+
+
+def test_launcher_does_not_wait_after_a_failure_that_is_not_a_rate_limit(tmp_path):
+    reply = (
+        'n=$(cat "$out.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$out.n"; '
+        'if [ "$n" = 1 ]; then echo "ERROR: stream disconnected" >&2; exit 1; else echo "{}" >"$out"; fi'
+    )
+    done, _ = _run_launcher(tmp_path, reply, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "1", "DCA_CODEX_PARALLEL": "64"})
+    assert "rate_limited" not in done.stdout + done.stderr
+
+
+def test_launcher_rate_limit_backoff_zero_turns_the_wait_off(tmp_path):
+    done, _ = _run_launcher(tmp_path, _RATE_LIMITED_ONCE, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "0", "DCA_CODEX_PARALLEL": "64"})
+    assert "rate_limited" not in done.stdout + done.stderr
+
+
+def test_launcher_backoff_never_eats_the_retry_s_minimum_time_before_the_deadline(tmp_path):
+    import re
+
+    # A 600 s wait against a 25 s deadline: the wait shrinks so the retry still starts with MIN_ATTEMPT_SECONDS (20) left.
+    done, _ = _run_launcher(
+        tmp_path, _RATE_LIMITED_ONCE,
+        extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "600", "DCA_BUILD_DEADLINE_SECONDS": "25", "DCA_CODEX_PARALLEL": "64"},
+    )
+    log = done.stdout + done.stderr
+    waits = [int(s) for s in re.findall(r"rate_limited chunk=\d+ attempt=1 backoff_seconds=(\d+)", log)]
+    assert waits and all(s <= 5 for s in waits), log
+
+
+@pytest.mark.parametrize("value", ["x", "-1", "1.5"])
+def test_launcher_rejects_an_unusable_rate_limit_backoff(tmp_path, value):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": value})
+    assert done.returncode == 2 and "DCA_RATE_LIMIT_BACKOFF_SECONDS must be a whole number" in done.stderr
+
+
 # -- a whole dead chunk (2026-10-26 09:35 abort) -----------------------------------------------------------------------
 # Chunks 4 and 10 of the 0935 plan each failed both attempts, so 16 of 91 tickers (two whole chunks) went missing and
 # the 95% floor refused the payload. The floor tolerates 4 misses but the unit that fails is an 8-ticker chunk, so one

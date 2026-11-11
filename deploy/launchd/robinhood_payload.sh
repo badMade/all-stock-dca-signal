@@ -57,8 +57,19 @@ RESCUE_SIZE="${DCA_RESCUE_CHUNK_SIZE:-2}"
 # retries and rescues, and only a rebuild with smaller chunks published, at 15:40, leaving the 3:30 session too little
 # window. Smaller chunks keep each worker's reply under its output cap; the 15:30 plist sets 4.
 CHUNK_SIZE="${DCA_CHUNK_SIZE:-}"
+# Pause before re-asking a rate-limited chunk (2026-11-10). The 09:35 and 10:30 builds that day were refused at 60/122
+# and 98/122: whole chunks answered "exceeded retry limit, last status: 429 Too Many Requests" in 3-4 s, and run_chunk's
+# retry fired at once into the same rate window and died the same way in 3 s, as did the rescue requests after it. The
+# 11:30-14:30 builds with the same 8 workers published, so the limit is a burst, not a ceiling. A no-reply attempt whose
+# worker log names a 429 now waits this many seconds (plus up to a third more as jitter, so eight workers do not return in lock-step)
+# before its next attempt. Bounded by the build deadline: the wait shrinks so the retry still gets MIN_ATTEMPT_SECONDS,
+# and is skipped when it cannot. 0 turns it off. Any other failure (timeout, bad reply) retries immediately as before.
+RATE_LIMIT_BACKOFF="${DCA_RATE_LIMIT_BACKOFF_SECONDS:-30}"
 case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL$RESCUE_SIZE$CHUNK_SIZE" in
   ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS, DCA_CODEX_PARALLEL, DCA_RESCUE_CHUNK_SIZE and DCA_CHUNK_SIZE must be whole numbers" >&2; exit 2 ;;
+esac
+case "$RATE_LIMIT_BACKOFF" in
+  ""|*[!0-9]*) echo "robinhood_payload: DCA_RATE_LIMIT_BACKOFF_SECONDS must be a whole number" >&2; exit 2 ;;
 esac
 [ -z "$CHUNK_SIZE" ] || [ "$CHUNK_SIZE" -gt 0 ] || { echo "robinhood_payload: DCA_CHUNK_SIZE must be at least 1" >&2; exit 2; }
 CHUNK_ARGS=()
@@ -140,6 +151,20 @@ run_chunk() {
       # Best-effort: a log that cannot be kept must never change the build's outcome.
       { mkdir -p "$KEEP_LOGS" && cp "$WORK/chunk_$idx.log" "$KEEP_LOGS/chunk_$idx.attempt$attempt.$BUILD_STARTED.log"; } 2>/dev/null \
         || echo "robinhood_payload: could not keep the log of chunk $idx attempt $attempt" >&2
+      # Rate-limited (see RATE_LIMIT_BACKOFF above): wait before the next attempt instead of retrying into the same
+      # window. Only after a no-reply attempt that is not the last, and only when the log names a 429.
+      if [ "$attempt" -lt 2 ] && [ "$RATE_LIMIT_BACKOFF" -gt 0 ] \
+        && grep -q -E "status: 429|Too Many Requests" "$WORK/chunk_$idx.log" 2>/dev/null; then
+        # Jitter scales with the wait (0-10 s at the default 30), so a short test backoff stays short.
+        local pause=$(( RATE_LIMIT_BACKOFF + RANDOM % (RATE_LIMIT_BACKOFF / 3 + 1) ))
+        left="$(seconds_left)"
+        if [ -n "$left" ] && [ $(( left - pause )) -lt "$MIN_ATTEMPT_SECONDS" ]; then
+          pause=$(( left - MIN_ATTEMPT_SECONDS ))
+          [ "$pause" -lt 0 ] && pause=0
+        fi
+        echo "robinhood_payload: rate_limited chunk=$idx attempt=$attempt backoff_seconds=$pause" >&2
+        [ "$pause" -gt 0 ] && sleep "$pause"
+      fi
     else
       # grep -o exits 1 when a clean reply has no "error"; under set -e + pipefail that silently ended this worker
       # (the reply file survived only because nothing had deleted it yet), so a clean reply is counted as 0 here.
