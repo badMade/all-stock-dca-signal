@@ -786,8 +786,8 @@ def test_forward_target_is_blanked_when_its_window_holds_a_corrupt_day():
     # 3.0 -> 0.015 is a -99.5% day, then 0.015 -> 0.32 is a +2,033% day (the QUBT 2018 shell prints).
     closes = [6.0, 5.0, 4.0, 3.0, 0.015, 0.32, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0, 4.1]
     target = compute_forward_return_target(_frame_from_closes(closes), horizon=5)
-    # Rows 0..4 each have the -99.5% day (index 4) inside T+1..T+5; row 5's window starts after it and the +2,033%
-    # day (index 5) is behind it, so rows 4 and 5 differ: row 4's window holds index 5 (+2,033%), row 5's is clean.
+    # The -99.5% day is index 4, the +2,033% day is index 5. Rows 0-4 have one of them inside T+1..T+5, so their
+    # labels are blanked; row 5's window (indices 6-10) is clean and keeps its ordinary return.
     assert target.iloc[:5].isna().all()
     assert target.iloc[5] == pytest.approx((closes[10] - closes[5]) / closes[5] * 100.0)
 

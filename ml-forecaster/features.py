@@ -468,8 +468,8 @@ def compute_forward_return_target(
     target = ((future_close - close) / close) * 100.0
     # A label whose window contains a corrupt one-day print is not a market return: blank it so build_dataset()'s
     # finite-row filter drops the row from training AND evaluation alike (2026-11-10: one QUBT row from its
-    # pre-2018 OTC-shell history carried a +25,100% "5-day return" that, with 43 other >100% rows, drove the walk-forward
-    # RMSE to ~18 against an MAE of ~3.7).
+    # pre-2018 OTC-shell history carried a +25,100% "5-day return" that, with 43 other >100% rows, drove the
+    # walk-forward RMSE to ~18 against an MAE of ~3.7).
     return target.where(~_corrupt_label_window(close, horizon))
 
 
