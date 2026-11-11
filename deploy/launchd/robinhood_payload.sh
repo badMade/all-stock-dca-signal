@@ -49,6 +49,16 @@ fi
 # tests and direct callers stay silent. Set DCA_NOTIFY_REFUSAL=0 to turn it off.
 export DCA_NOTIFY_REFUSAL="${DCA_NOTIFY_REFUSAL:-1}"
 MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
+# Whole-build retry (2026-11-10). The 09:35 and 10:30 builds were both refused (49% and 80% coverage) because Codex
+# answered nearly every chunk "429 Too Many Requests"; the 11:30-15:30 builds, same settings, published 120-122 of 122.
+# A refusal that clears within minutes is now rebuilt once, after DCA_BUILD_RETRY_WAIT_SECONDS, instead of aborting the
+# slot at Gate 5. DCA_BUILD_RETRIES=0 turns it off. The retry only starts when the first attempt began less than
+# DCA_BUILD_RETRY_BY_SECONDS ago and, when DCA_BUILD_DEADLINE_ET is set, before that cutoff, so it can never push a
+# payload past its slot's window. A retried attempt re-runs this launcher with the slot the first one resolved.
+BUILD_RETRIES="${DCA_BUILD_RETRIES:-1}"
+BUILD_RETRY_WAIT="${DCA_BUILD_RETRY_WAIT_SECONDS:-90}"
+BUILD_RETRY_BY="${DCA_BUILD_RETRY_BY_SECONDS:-900}"
+BUILD_ATTEMPT="${DCA_BUILD_ATTEMPT:-1}"
 # Tickers per request in the rescue pass (2026-10-26, see below): small enough that one rescue request that still dies
 # costs fewer tickers than the 95% floor tolerates (4 of a 91-ticker universe).
 RESCUE_SIZE="${DCA_RESCUE_CHUNK_SIZE:-2}"
@@ -59,6 +69,9 @@ RESCUE_SIZE="${DCA_RESCUE_CHUNK_SIZE:-2}"
 CHUNK_SIZE="${DCA_CHUNK_SIZE:-}"
 case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL$RESCUE_SIZE$CHUNK_SIZE" in
   ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS, DCA_CODEX_PARALLEL, DCA_RESCUE_CHUNK_SIZE and DCA_CHUNK_SIZE must be whole numbers" >&2; exit 2 ;;
+esac
+case "$BUILD_RETRIES$BUILD_RETRY_WAIT$BUILD_RETRY_BY$BUILD_ATTEMPT" in
+  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_RETRIES, DCA_BUILD_RETRY_WAIT_SECONDS, DCA_BUILD_RETRY_BY_SECONDS and DCA_BUILD_ATTEMPT must be whole numbers" >&2; exit 2 ;;
 esac
 [ -z "$CHUNK_SIZE" ] || [ "$CHUNK_SIZE" -gt 0 ] || { echo "robinhood_payload: DCA_CHUNK_SIZE must be at least 1" >&2; exit 2; }
 CHUNK_ARGS=()
@@ -88,6 +101,9 @@ OUT="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["out"])' "$
 # 09:35 refusal (chunks 4 and 10 dead on both attempts) left nothing to say why. Only attempts that returned no reply
 # are kept, so a healthy build writes nothing here. Gitignored like the rest of the cron tree.
 KEEP_LOGS="${OUT%.json}.chunk_logs"
+# One JSON line per failed worker attempt (2026-11-10), kept beside the payload so a 429 can be judged afterwards.
+FAILURES="${OUT%.json}.failures.jsonl"
+SLOT_RESOLVED="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["slot"])' "$WORK/plan.json")"
 if [ -e "$OUT" ]; then
   # Reuse only a payload that is provably fresh for THIS slot (built after the decision time, within the age
   # bound, matching its sidecar checksum). A leftover from an earlier attempt is set aside, never overwritten
@@ -108,6 +124,50 @@ fi
 # chunk starts, and each chunk worker is a subshell that reads it, so every worker measures against the same instant.
 seconds_left() {
   if [ -n "$DEADLINE_EPOCH" ]; then echo $(( DEADLINE_EPOCH - $(date +%s) )); fi
+}
+
+# Diagnostics for a worker attempt that returned nothing (2026-11-10). The kept chunk log says "429" but not whether the
+# build was the cause. This appends what is needed to tell a true rate limit from a transient one: the HTTP status(es),
+# the error lines, how many `codex exec` processes were running at that moment (all, and the read-only payload workers
+# among them), and Codex's last recorded usage snapshot with its age. Best-effort: it never changes the build's outcome.
+record_failure() {
+  "$PY" - "$WORK/chunk_$1.log" "$FAILURES" "$SLOT_RESOLVED" "$1" "$2" "$3" "$PARALLEL" "$BUILD_ATTEMPT" "$BUILD_STARTED" <<'PYEOF' 2>/dev/null || true
+import glob, json, os, re, subprocess, sys, time
+log, out, slot, chunk, attempt, secs, parallel, build, started = sys.argv[1:10]
+try:
+    text = open(log, errors="replace").read()
+except OSError:
+    text = ""
+errors = [ln.strip()[:300] for ln in text.splitlines() if "ERROR" in ln and "rmcp::transport" not in ln][:3]
+try:
+    procs = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True, timeout=5).stdout.splitlines()
+except Exception:
+    procs = []
+execs = [ln for ln in procs if re.search(r"\bcodex\b.* exec\b", ln)]
+snapshot = None
+home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+try:
+    files = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "*.jsonl")), key=os.path.getmtime)[-6:]
+    for path in reversed(files):
+        with open(path, "rb") as handle:
+            handle.seek(max(0, os.path.getsize(path) - 400000))
+            lines = [ln for ln in handle.read().decode("utf-8", "replace").splitlines() if '"rate_limits"' in ln]
+        if lines:
+            limits = json.loads(lines[-1]).get("payload", {}).get("rate_limits", {})
+            snapshot = {"primary_used_pct": (limits.get("primary") or {}).get("used_percent"),
+                        "secondary_used_pct": (limits.get("secondary") or {}).get("used_percent"),
+                        "age_seconds": int(time.time() - os.path.getmtime(path))}
+            break
+except Exception:
+    snapshot = None
+row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "slot": slot, "build_attempt": int(build), "chunk": chunk,
+       "attempt": int(attempt), "seconds": int(secs), "seconds_into_build": int(time.time() - int(started)),
+       "http_status": sorted(set(re.findall(r"last status: (\d{3})", text))), "errors": errors,
+       "parallel_setting": int(parallel), "codex_exec_running": len(execs),
+       "payload_workers_running": sum(1 for ln in execs if "read-only" in ln), "last_usage_snapshot": snapshot}
+with open(out, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\n")
+PYEOF
 }
 
 run_chunk() {
@@ -137,6 +197,7 @@ run_chunk() {
       || echo "robinhood_payload: chunk $idx attempt $attempt failed or timed out" >&2
     if [ ! -s "$out" ]; then
       echo "robinhood_payload: timing chunk=$idx attempt=$attempt seconds=$(( $(date +%s) - started )) errors=n/a" >&2
+      record_failure "$idx" "$attempt" "$(( $(date +%s) - started ))"
       # Best-effort: a log that cannot be kept must never change the build's outcome.
       { mkdir -p "$KEEP_LOGS" && cp "$WORK/chunk_$idx.log" "$KEEP_LOGS/chunk_$idx.attempt$attempt.$BUILD_STARTED.log"; } 2>/dev/null \
         || echo "robinhood_payload: could not keep the log of chunk $idx attempt $attempt" >&2
@@ -272,6 +333,11 @@ MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
 echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS deadline_et=${BUILD_DEADLINE_ET:-none}" >&2
 
+# Failure summary (2026-11-10): one line a person can read without opening the failures file.
+if [ -s "$FAILURES" ]; then
+  echo "robinhood_payload: failed worker attempts=$(wc -l <"$FAILURES" | tr -d ' ') http429=$(grep -c '"429"' "$FAILURES" || true) build_attempt=$BUILD_ATTEMPT details=$FAILURES" >&2
+fi
+
 # Plan-first half (2026-10-26): the retired 5-minute Claude courier's order-history and buying-power read, now a second
 # `codex exec` after the payload is published, followed by `ingest`, which writes the recommendation files. Opt-in
 # (DCA_PLAN_FIRST_INGEST=1) so the six Gate 5 slots are unchanged until the operator has seen one real run. Strictly
@@ -287,5 +353,25 @@ if [ "${DCA_PLAN_FIRST_INGEST:-0}" = "1" ] && [ "$MERGE_STATUS" -eq 0 ]; then
       && "$PY" -m scripts.robinhood_payload ingest --plan "$WORK/plan.json" --broker-reply "$BROKER_REPLY"
   } || INGEST_STATUS=$?
   [ "$INGEST_STATUS" -eq 0 ] || echo "robinhood_payload: plan-first ingest did not complete (status $INGEST_STATUS); the payload is unaffected" >&2
+fi
+
+# Whole-build retry (see BUILD_RETRIES). Only a build that published nothing is retried, once the launcher's own work
+# directory is gone; the child is a fresh run of this script, not an exec, so its trap and ours never overlap.
+if [ "$MERGE_STATUS" -ne 0 ] && [ "$BUILD_ATTEMPT" -le "$BUILD_RETRIES" ] && [ ! -e "$OUT" ]; then
+  RETRY_NOW="$(date +%s)"
+  RETRY_FIRST="${DCA_BUILD_FIRST_STARTED:-$BUILD_STARTED}"
+  if [ $(( RETRY_NOW + BUILD_RETRY_WAIT - RETRY_FIRST )) -ge "$BUILD_RETRY_BY" ]; then
+    echo "robinhood_payload: not retrying: the first attempt began too long ago (limit ${BUILD_RETRY_BY}s)" >&2
+  elif [ -n "${CUTOFF_EPOCH:-}" ] && [ $(( RETRY_NOW + BUILD_RETRY_WAIT + MIN_ATTEMPT_SECONDS )) -ge "$CUTOFF_EPOCH" ]; then
+    echo "robinhood_payload: not retrying: the ${BUILD_DEADLINE_ET} ET cutoff would pass first" >&2
+  else
+    echo "robinhood_payload: build refused (status $MERGE_STATUS); retrying in ${BUILD_RETRY_WAIT}s (attempt $((BUILD_ATTEMPT + 1)) of $((BUILD_RETRIES + 1)))" >&2
+    rm -rf "$WORK"; trap - EXIT
+    sleep "$BUILD_RETRY_WAIT"
+    RETRY_STATUS=0
+    DCA_BUILD_ATTEMPT=$((BUILD_ATTEMPT + 1)) DCA_BUILD_FIRST_STARTED="$RETRY_FIRST" \
+      bash "${BASH_SOURCE[0]}" "$SLOT_RESOLVED" || RETRY_STATUS=$?
+    exit "$RETRY_STATUS"
+  fi
 fi
 exit "$MERGE_STATUS"
