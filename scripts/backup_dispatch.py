@@ -83,9 +83,19 @@ def _hhmm(value: time) -> str:
     return f"{value.hour:02d}:{value.minute:02d}"
 
 
+# 2026-11-09: the final slot's backup fires at 15:40 (docs/schedule_manifest.md) and has only until 16:00, so its check
+# window opens 5 minutes earlier than the 15 (Mac) or 20 (cloud) minutes every other slot waits. Both checkers shift
+# together, which keeps the cloud watcher five minutes behind the Mac as CLOUD_CHECK_AFTER_MINUTES documents.
+EARLIER_CHECK_MINUTES = {"1530": 5}
+
+
 def check_window(slot: str, after_minutes: int = 15) -> tuple[str, str]:
-    """``(start, end)`` ET: from ``after_minutes`` past the slot up to (not including) its latest placement time."""
+    """``(start, end)`` ET: from ``after_minutes`` past the slot up to (not including) its latest placement time.
+
+    The final slot starts ``EARLIER_CHECK_MINUTES`` earlier than that, so its backup keeps time before the close.
+    """
     task_for_slot(slot)
+    after_minutes -= EARLIER_CHECK_MINUTES.get(slot, 0)
     start = datetime.combine(datetime(2000, 1, 1), _slot_time(slot)) + timedelta(minutes=after_minutes)
     return _hhmm(start.time()), dca_order_plan.LATEST_PLACEMENT_ET[slot]
 

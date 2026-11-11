@@ -80,7 +80,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
         "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "sizing_suggestion_history",
-        "sizing_suggestion_compare",
+        "sizing_suggestion_compare", "market_open_quote_shadow",
         "scripts.backup_strategy",
     )),
     ("reporting_ops", "Reporting & monitoring", (
@@ -88,7 +88,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.alert_digest", "scripts.check_live_prompt_drift", "scripts.check_slot_fills",
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
         "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
-        "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
+        "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.claude_liveness", "scripts.scheduled_artifacts",
         "scripts.sync_live_prompts", "scripts.triage_log_summary", "scripts.triage_reconcile_batch", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
         "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.planner_repaste_notice", "scripts.slot_attribution",
         "scripts.abort_markers", "scripts.local_ci_sweep",
@@ -99,6 +99,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.prior_reference_bindings", "scripts.assemble_order_pages", "scripts.adhoc_orders",
         "scripts.emit_order_plan", "scripts.refresh_market_open_candidates", "scripts.backup_gates",
         "scripts.backup_procedure", "scripts.merge_order_pages", "scripts.check_per_order_record",
+        "scripts.reshape_order_pages",
     )),
     ("research", "Research & analysis", (
         "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",

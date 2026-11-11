@@ -1192,6 +1192,187 @@ if (Array.isArray(view.warnings) && view.warnings.length) container.append(warni
     });
   }
 
+  /* Composite rank: the daily S&P 500 ranking written by the scheduled composite-rank task (read-only) */
+  const rankSection = document.querySelector('section.page[data-page="rank"]');
+  if (rankSection) {
+    let lastRank = "";
+    const pct = (value) => (value === null || value === undefined ? "–" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(0)}%`);
+    const plain = (value) => (value === null || value === undefined ? "–" : `${(value * 100).toFixed(0)}%`);
+    const score1 = (value) => (value === null || value === undefined ? "–" : value.toFixed(1));
+    const signed = (value) => (value === null || value === undefined ? "–" : value === 0 ? "0" : `${value > 0 ? "+" : ""}${value}`);
+    const rankColumns = (extra = []) => [
+      { label: "#", get: (r) => r.rank, numeric: true },
+      { label: "Ticker", get: (r) => r.ticker },
+      { label: "Company", get: (r) => r.company || "" },
+      { label: "Held", get: (r) => (r.held ? "Yes" : "No") },
+      { label: "Score", get: (r) => score1(r.score), numeric: true },
+      { label: "Rank chg", get: (r) => signed(r.rank_change), numeric: true },
+      { label: "Vol", get: (r) => plain(r.vol), numeric: true },
+      { label: "Max DD", get: (r) => plain(r.max_dd), numeric: true },
+      ...["1y", "1m", "1w", "3m", "6m", "5y"].map((p) => ({ label: p, get: (r) => pct(r.returns?.[p]), numeric: true })),
+      ...extra,
+    ];
+    register("rank", async () => {
+      try {
+        const data = await fetchJson("/api/rank", { ttl: 20000 });
+        const fingerprint = JSON.stringify(data);
+        if (fingerprint === lastRank && rankSection.querySelector(".metrics-grid, .empty-state")) return;
+        lastRank = fingerprint;
+        if (!data.available) {
+          mount(rankSection, text("div", "panel empty-state", data.message), warnings(data.warnings));
+          return;
+        }
+        const metric = (label, value, note, tone) => {
+          const node = text("article", "metric");
+          node.append(text("div", "metric-label", label), text("div", `metric-value${tone ? ` ${tone}` : ""}`, String(value)), text("p", "", note));
+          return node;
+        };
+        const metrics = text("section", "metrics-grid");
+        metrics.append(
+          metric("Latest run", data.as_of, `${data.run_count} runs on record`),
+          metric("Names scored", data.scored, `Universe: ${data.universe === "sp500" ? "S&P 500" : data.universe}`),
+          metric(`Score above ${data.threshold}`, data.above_threshold, `${data.held_above_threshold} of them you hold`, "green"),
+          metric("Entered / dropped", `${(data.entered || []).length} / ${(data.dropped || []).length}`, data.previous_run ? `Since ${data.previous_run}` : "First run"),
+        );
+
+        const changes = panel("What changed since the previous run", [
+          text("p", "compact", `New on the list: ${(data.entered || []).join(", ") || "none"}`),
+          text("p", "compact", `Dropped off: ${(data.dropped || []).join(", ") || "none"}`),
+        ]);
+
+        const evaluation = panel(`Evaluation list (score above ${data.threshold})`, [
+          table(rankColumns(), data.evaluation || [], "No names are above the threshold."),
+        ], `${(data.evaluation || []).length} names`);
+
+        const movement = data.movement || {};
+        const moves = movement.bands && movement.bands.length ? panel("How far ranks move, by starting rank", [
+          text("p", "muted compact", "Positions moved between consecutive runs. A band is the rank a name started from; a positive average signed move means names there tend to climb."),
+          table([
+            { label: "Starting rank", get: (r) => r.band },
+            { label: "Samples", get: (r) => r.samples, numeric: true },
+            { label: "Avg abs move", get: (r) => r.avg_abs_move, numeric: true },
+            { label: "Median abs move", get: (r) => r.median_abs_move, numeric: true },
+            { label: "% moving 10+", get: (r) => `${r.pct_moved_10_plus}%`, numeric: true },
+            { label: "Avg signed move", get: (r) => signed(r.avg_signed_move), numeric: true },
+          ], movement.bands, "Not enough runs yet."),
+        ]) : panel("How far ranks move", "Movement statistics start with the second run.");
+
+        const moverColumns = [
+          { label: "Ticker", get: (r) => r.ticker },
+          { label: "Rank", get: (r) => r.rank, numeric: true },
+          { label: "1d chg", get: (r) => signed(r.change_1d), numeric: true },
+          { label: "5d chg", get: (r) => signed(r.change_5d), numeric: true },
+          { label: "Avg rank", get: (r) => r.avg_rank, numeric: true },
+          { label: "Best / worst", get: (r) => `${r.best} / ${r.worst}`, numeric: true },
+          { label: "Days above", get: (r) => r.days_above, numeric: true },
+        ];
+        const movers = text("div", "");
+        movers.append(
+          panel("Biggest climbers (last run)", [table(moverColumns, movement.climbers || [], "No history yet.")]),
+          panel("Biggest fallers (last run)", [table(moverColumns, movement.fallers || [], "No history yet.")]),
+        );
+
+        const allPanel = text("section", "panel section-space");
+        const top = text("div", "section-top");
+        const heading = text("div", "");
+        heading.append(text("h3", "", "All ranked names"), text("p", "muted compact", "Every scored name from the latest run."));
+        top.append(heading);
+        const filters = text("div", "filter-group");
+        const search = text("input", "");
+        search.type = "search";
+        search.placeholder = "Filter ticker or company…";
+        search.setAttribute("aria-label", "Filter ranked names");
+        const scope = text("select", "");
+        scope.append(new Option("All names", "all"), new Option("Held only", "held"), new Option("Not held", "not_held"));
+        filters.append(search, scope);
+        top.append(filters);
+        allPanel.append(top);
+        const holder = text("div", "");
+        const renderAll = () => {
+          const q = search.value.trim().toUpperCase();
+          const rows = (data.ranked || []).filter((r) => {
+            if (scope.value === "held" && !r.held) return false;
+            if (scope.value === "not_held" && r.held) return false;
+            return !q || r.ticker.toUpperCase().includes(q) || (r.company || "").toUpperCase().includes(q);
+          });
+          holder.replaceChildren(table(rankColumns(), rows, "No names match the filter."));
+        };
+        search.addEventListener("input", renderAll);
+        scope.addEventListener("change", renderAll);
+        renderAll();
+        allPanel.append(holder);
+
+        const gaps = panel("Data gaps", [
+          text("p", "compact", `No price history: ${(data.no_price_history || []).join(", ") || "none"}`),
+          text("p", "compact", `Not scored (too little history or stale): ${(data.not_scored_or_stale || []).join(", ") || "none"}`),
+        ]);
+
+        /* Forward-looking, review-first views: today's trade list, the ticker proposal, and the zero-weight shadow logs */
+        const trade = data.trade || {};
+        const reasonLabel = { above_eval: "Above threshold", above_eval_held: "Above threshold (held)", held_above_floor: "Held above floor" };
+        const tradePanel = panel(`Daily trade list (params ${trade.params_version || "n/a"})`, [
+          text("p", "muted compact", "Names to evaluate today: everything above the threshold plus anything you hold above the held floor. Nothing here is applied automatically."),
+          table([
+            { label: "#", get: (r) => r.rank, numeric: true },
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Score", get: (r) => score1(r.score), numeric: true },
+            { label: "Held", get: (r) => (r.held ? "Yes" : "No") },
+            { label: "Why", get: (r) => reasonLabel[r.reason] || r.reason },
+          ], trade.latest || [], "No trade list written yet."),
+          table([
+            { label: "Date", get: (r) => r.date },
+            { label: "Names", get: (r) => r.names, numeric: true },
+            { label: "Added", get: (r) => (r.added === null ? "–" : r.added), numeric: true },
+            { label: "Removed", get: (r) => (r.removed === null ? "–" : r.removed), numeric: true },
+          ], trade.history || [], "No history yet."),
+        ], `${(trade.latest || []).length} names`);
+        const proposalHost = text("div", "");
+        proposalHost.replaceChildren(trade.proposal_markdown && window.ConsoleMarkdown
+          ? window.ConsoleMarkdown.render(trade.proposal_markdown) : text("p", "muted", "No proposal written yet."));
+        const proposalPanel = panel("Ticker proposal (review first)", [proposalHost]);
+
+        const shadow = data.shadow || {};
+        const pctSigned = (value) => (value === null || value === undefined ? "–" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}%`);
+        const shadowPanels = [];
+        const octopus = shadow.octopus || {};
+        shadowPanels.push(octopus.available ? panel(`Octopus shadow forecast (weight ${octopus.weight}; forecast for ${octopus.top?.[0]?.target || "next day"})`, [
+          text("p", "muted compact", "Next-day expected return with a p10-p90 band, S&P 500 names only. Logged at zero weight: it does not change any score until its measured edge earns a weight."),
+          table([
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Comp rank", get: (r) => r.rank, numeric: true },
+            { label: "Held", get: (r) => (r.held ? "Yes" : "No") },
+            { label: "Exp ret", get: (r) => pctSigned(r.exp_ret), numeric: true },
+            { label: "p10", get: (r) => pctSigned(r.p10), numeric: true },
+            { label: "p90", get: (r) => pctSigned(r.p90), numeric: true },
+          ], octopus.top || [], "No forecasts."),
+          table([
+            { label: "Origin date", get: (r) => r.date },
+            { label: "Tickers", get: (r) => r.tickers, numeric: true },
+            { label: "Mean exp ret", get: (r) => pctSigned(r.mean_exp_ret), numeric: true },
+          ], octopus.dates || [], "No history."),
+        ]) : panel("Octopus shadow forecast", "No Octopus shadow rows yet."));
+        const ml = shadow.ml || {};
+        shadowPanels.push(ml.available ? panel(`ml-forecaster shadow tilt (weight ${ml.weight})`, [
+          text("p", "muted compact", "Sizing multiplier minus one (+0.20 is the cap). Status blocked_regression means the model's own regression gate was on, so these are logged only."),
+          table([
+            { label: "Ticker", get: (r) => r.ticker },
+            { label: "Tilt", get: (r) => signed(Math.round(r.tilt * 100) / 100), numeric: true },
+            { label: "Status", get: (r) => r.status },
+          ], ml.top || [], "No tilts."),
+          table([
+            { label: "Date", get: (r) => r.date },
+            { label: "Tickers", get: (r) => r.tickers, numeric: true },
+            { label: "Status", get: (r) => Object.entries(r.status || {}).map(([k, v]) => `${k}: ${v}`).join(", ") },
+          ], ml.dates || [], "No history."),
+        ]) : panel("ml-forecaster shadow tilt", "No ml-forecaster shadow rows yet."));
+
+        mount(rankSection, metrics, changes, tradePanel, proposalPanel, evaluation, ...shadowPanels, moves, movers, allPanel, gaps, warnings(data.warnings));
+      } catch (error) {
+        failure(rankSection, error);
+      }
+    });
+  }
+
   /* Training: Neural foundation, ml-forecaster, loss curves, checkpoints, and hardware diagnostics */
   const trainingSection = document.querySelector('section.page[data-page="training"]');
   if (trainingSection) {

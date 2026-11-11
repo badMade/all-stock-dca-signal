@@ -7,7 +7,7 @@ document. Operator approval is required before Phase 2 (tests).
 
 Claude on the Mac Studio is the primary executor for seven slots (09:35, 10:30, 11:30, 12:30,
 13:30, 14:30, 15:30 ET). Perplexity scheduled tasks are delayed backups (09:55, 10:50, 11:50,
-12:50, 13:50 and 14:50, 15:45 ET; see `config/scheduled_tasks.json`
+12:50, 13:50 and 14:50, 15:40 ET; see `config/scheduled_tasks.json`
 `standing_perplexity_backup_policy`). Broker order history is the only evidence of what was
 bought.
 
@@ -196,7 +196,7 @@ primary Claude slots. Status after the follow-up change:
 
 ### Known limitations
 
-- **15:45 ET backup may run out of time before 16:00 ET** because of the Mac-first check. Accepted
+- **15:40 ET backup (was 15:45) may run out of time before 16:00 ET** because of the Mac-first check. Accepted
   by the operator on 2026-10-06. No slot-specific timeout or optimization is added.
 - D6 is open; idempotency on `ref_id` is not relied on.
 - Two engines can still start simultaneously and both see an empty window (accepted risk,

@@ -43,7 +43,7 @@ MONDAY = "2026-10-19"
         (T_1030, "10:50", "1030", "11:30"),
         (T_1130, "11:50", "1130", "12:30"),
         (T_1230, "12:50", "1230", "13:30"),
-        (T_1530, "15:45", "1530", "16:00"),
+        (T_1530, "15:40", "1530", "16:00"),  # 2026-11-09: moved from 15:45 after a 16:03 start skipped the whole run
     ],
 )
 def test_a_single_fire_task_proceeds_at_its_fire_time(task, hhmm, slot, latest):
@@ -60,8 +60,10 @@ def test_a_single_fire_task_proceeds_at_its_fire_time(task, hhmm, slot, latest):
         (T_0935, "10:00", "PROCEED"),
         (T_0935, "10:29", "PROCEED"),
         (T_0935, "10:30", "skipped_outside_window"),  # never at or after the latest placement time
-        (T_1530, "15:44", "skipped_outside_window"),
-        (T_1530, "15:45", "PROCEED"),
+        (T_1530, "15:39", "skipped_outside_window"),
+        (T_1530, "15:40", "PROCEED"),
+        (T_1530, "15:45", "PROCEED"),  # a start five minutes late is still inside the window
+        (T_1530, "15:59", "PROCEED"),
         (T_1530, "16:00", "skipped_outside_window"),
     ],
 )
@@ -110,7 +112,7 @@ def test_an_early_close_day_stops_a_fire_at_or_after_the_early_close_time():
     assert gate(T_0935, day, "10:00")["status"] == "PROCEED"
     assert gate(T_1230, day, "12:50")["status"] == "PROCEED"
     assert gate(T_TWO_FIRE, day, "13:50")["status"] == "skipped_market_closed"
-    assert gate(T_1530, day, "15:45")["status"] == "skipped_market_closed"
+    assert gate(T_1530, day, "15:40")["status"] == "skipped_market_closed"
 
 
 def test_the_clock_is_converted_to_eastern_time_across_the_dst_change():

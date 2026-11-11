@@ -8,8 +8,13 @@
        new one. Saturday 03:00 only: no slot runs on a weekend. The script refuses weekdays, never deletes while
        Claude is running, and never touches sessiondata.img. -->
   <key>ProgramArguments</key>
+  <!-- Started through the checkout's venv Python, not /bin/sh directly (2026-11-07): macOS privacy protection (TCC)
+       grants ~/Documents access per binary, and the first Saturday run of `/bin/sh <script>` failed with
+       "Operation not permitted". Invoke bash directly: /bin/sh re-execs another shell and loses the grant. -->
   <array>
-    <string>/bin/sh</string>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-c</string>
+    <string>import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1]]))</string>
     <string>REPLACE_WITH_REPO_PATH/deploy/launchd/claude_vm_reset.sh</string>
   </array>
   <!-- launchd Weekday: 0 or 7 is Sunday, 6 is Saturday. If the Mac is asleep at 03:00, launchd runs it on wake. -->

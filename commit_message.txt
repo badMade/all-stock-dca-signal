@@ -1,0 +1,33 @@
+### Scope
+Added focused unit tests for `dca_fileio.py` to cover previously untested lines and error branches. This increases the module's test coverage to 100%.
+
+### AI Usage
+I was utilized to identify the untested branches in `dca_fileio.py`, design the tests, implement them using `pytest` and `unittest.mock.patch`, and verify that the tests passed successfully against the pre-existing code.
+
+### Assumptions & Validation
+I assumed that the functions `iter_run_state_files_fast` and `iter_files_by_suffix_fast` should ignore `OSError` (such as permission denied) during directory scanning and just skip those directories. Validation involved injecting `OSError` via mock and asserting that execution continued and skipped the errored paths.
+
+### Design Rationale
+The tests isolate the external interactions (like the filesystem) using `tmp_path` and `patch`. They focus heavily on the untested branches such as `ValueError` handling in `order_csv_covers` and `OSError` ignoring in `_discard` and `os.scandir` usage.
+
+### Testing
+Ran the following commands:
+- `ruff check .` (All checks passed)
+- `.venv/bin/python -m pytest tests/test_dca_fileio.py -q` (Tests ran and passed)
+- `.venv/bin/python -m pytest tests/test_dca_fileio.py --cov=dca_fileio --cov-report=term-missing -q` (Verified 100% test coverage)
+- `.venv/bin/python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo` (Demo dry run executed without regression)
+
+### Risk & Rollback
+The risk is minimal since only test files were added and no production code was altered. Rollback is as simple as reverting the commit that alters `tests/test_dca_fileio.py`.
+
+### Tech Debt
+This PR reduces tech debt by adding missing coverage for potentially flaky filesystem traversal code.
+
+### Known limitations
+When running as root, the tests `test_the_destination_owner_is_preserved` and `test_the_write_aborts_when_ownership_cannot_be_reproduced` in `test_dca_fileio.py` may have known pre-existing mode failures (`0o600` vs `0o620`), which is documented in AGENTS.md.
+
+### Secrets Confirmation
+Confirmed that no account numbers, API keys, or any other secrets were introduced in the code or tests.
+
+### Entry-Point Coverage
+The tested code paths protect all artifact generation processes involved in storing the results of `run_dca.py` and `MorningDCAExecutor`, as they handle safely writing states and output files.

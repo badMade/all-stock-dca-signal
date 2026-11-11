@@ -1011,6 +1011,51 @@ def _cmd_gates(args: argparse.Namespace) -> int:
     return _emit(report, 0)
 
 
+def _read_build_info() -> dict | None:
+    """The BUILD_INFO.json stamped inside the ``backup_planner.pyz`` zipapp this code runs from, or None.
+
+    A checkout (the Mac) has no archive and so no stamp; the prompt only runs ``preflight`` from the sandbox file.
+    The planner reports its build and never judges it: the expected hash cannot live inside the build it names, so
+    the comparison stays in the pasted prompt.
+    """
+    import zipfile
+
+    archive = getattr(getattr(sys.modules[__name__], "__loader__", None), "archive", None)
+    if not archive:
+        return None
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            info = json.loads(bundle.read("BUILD_INFO.json").decode("utf-8"))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    """STEP B in one call (2026-11-09): the stamped build plus the step 1 gates, as one JSON document.
+
+    The 2026-11-09 final backup spent 18 minutes on setup calls before its gates ran and skipped at 16:03 ET. This
+    replaces ``--build-info`` and ``gates`` with one command, and a skip ends the run before part 0 is requested.
+    A skip exits 0 (a recorded status); an unreadable build, an unknown task, or an unusable clock exits 2.
+    """
+    from datetime import timezone
+
+    from scripts import backup_gates  # lazy: it imports backup_procedure, which imports this module
+
+    build = _read_build_info()
+    sha = build.get("content_sha256") if build else None
+    if not isinstance(sha, str) or not sha:
+        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("build_info_unavailable", "no stamped build")])}, 2)
+    try:
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
+        calendar = json.loads((dca_config.get_config_dir() / "market_calendar.json").read_text(encoding="utf-8"))
+        report = backup_gates.evaluate(args.task, now, calendar)
+    except (KeyError, ValueError, OSError) as exc:
+        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("bad_gates_request", str(exc))])}, 2)
+    build_report = {"content_sha256": sha, "source_commit": build.get("source_commit")}
+    return _emit({**report, "build": build_report}, 0)
+
+
 def _cmd_universe(args: argparse.Namespace) -> int:
     """The buyable symbols from the packaged config: the task fetches exactly these, so no prompt names a stock."""
     directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
@@ -1259,6 +1304,9 @@ def _build_parser() -> argparse.ArgumentParser:
     gates = sub.add_parser("gates", help="Step 1 as code: slot, market day and window from the real clock.")
     gates.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
     gates.add_argument("--now", default=None, help="TESTS ONLY: an offset-aware ISO instant instead of the clock.")
+    preflight = sub.add_parser("preflight", help="STEP B in one call: the stamped build and the step 1 gates.")
+    preflight.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
+    preflight.add_argument("--now", default=None, help="TESTS ONLY: an offset-aware ISO instant instead of the clock.")
     universe = sub.add_parser("universe", help="Print the buyable symbols from config; the task fetches exactly these.")
     universe.add_argument("--config-dir", type=Path, default=None)
     finalize = sub.add_parser("finalize", help="Reconcile and re-validate a plan; print what to place.")
@@ -1285,6 +1333,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "gates":
         try:
             return _cmd_gates(args)
+        except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
+            return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
+    if args.command == "preflight":
+        try:
+            return _cmd_preflight(args)
         except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
             return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
     if args.command == "procedure":

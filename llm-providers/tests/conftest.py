@@ -6,7 +6,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 
 MESSAGES = [
@@ -25,13 +25,13 @@ def _scrub_provider_env(monkeypatch):
     assert "LLM_PROVIDER" not in os.environ
 
 
-def http_response(status: int) -> httpx.Response:
-    """A minimal httpx response for constructing openai/anthropic status errors."""
-    return httpx.Response(status, request=httpx.Request("POST", "https://unit.test/v1"))
+def http_response(status: int) -> httpx2.Response:
+    """A minimal httpx2 response for constructing openai/anthropic status errors."""
+    return httpx2.Response(status, request=httpx2.Request("POST", "https://unit.test/v1"))
 
 
-def http_request() -> httpx.Request:
-    return httpx.Request("POST", "https://unit.test/v1")
+def http_request() -> httpx2.Request:
+    return httpx2.Request("POST", "https://unit.test/v1")
 
 
 def ns(**kwargs):

@@ -64,7 +64,7 @@ Every adapter maps its SDK's exceptions onto one family, each carrying `.provide
 | --- | --- | --- |
 | `LLMAuthError` | `AuthenticationError`, `PermissionDeniedError`, missing env var | `APIError` with code 401/403, missing env var |
 | `LLMRateLimitError` | `RateLimitError` | code 429 |
-| `LLMTimeoutError` | `APITimeoutError` | code 408/504, `TimeoutError`, httpx `*Timeout*` |
+| `LLMTimeoutError` | `APITimeoutError` | code 408/504, `TimeoutError`, httpx2 `*Timeout*` |
 | `LLMProviderError` | any other `APIError` (5xx, connection) | any other `APIError` |
 
 Non-SDK exceptions propagate untouched. Error messages name the env var, never its

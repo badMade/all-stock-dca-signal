@@ -91,9 +91,9 @@ class GeminiClient(LLMClient):
             if code == 408 or code == 504:
                 return LLMTimeoutError(str(exc), provider=self.provider)
             return LLMProviderError(str(exc), provider=self.provider)
-        # google-genai has no timeout class of its own; the underlying httpx
-        # transport raises ``httpx.TimeoutException`` subclasses. Match on the
-        # class name so we do not import httpx (a transitive dep, not ours).
+        # google-genai has no timeout class of its own; the underlying httpx2
+        # transport raises ``httpx2.TimeoutException`` subclasses. Match on the
+        # class name so we do not import httpx2 (a transitive dep, not ours).
         if isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__:
             return LLMTimeoutError(str(exc), provider=self.provider)
         return None

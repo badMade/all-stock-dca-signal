@@ -55,6 +55,7 @@
   "dca_ticker_paths": "Says where the shared folder of daily price history files lives on this computer.",
   "dca_weekly_dashboard": "Builds the weekly performance dashboard from all the run files.",
   "sizing_suggestion_history": "The shared notebook where each sizing idea (the ML model, the octopus forecaster) writes what it recommends, one dated line per run, never erased. Neither idea can change real buy sizes; this record is what you compare over the months.",
+  "market_open_quote_shadow": "A record-only side log for the proposed earlier market-open buy. For each stock it notes how far the live price sits below yesterday's close next to the same figure from the first five-minute bar, so you can see how much they differ. It never changes real buy sizes or places orders.",
   "sizing_suggestion_compare": "The scorecard for the sizing ideas. It reads each idea's dated recommendations and the real price moves that followed, and shows which idea (or an even blend of them) did better. It only reads and reports; it never changes real buy sizes.",
   "dca_whole_share_accumulator": "For stocks that cannot be bought in fractions (like BYDDY). It tracks the dollars it would have bought and places one whole-share order once they add up to a share's price.",
   "find_issues": "A tiny developer tool that lists unused imports in a Python file.",
@@ -121,6 +122,7 @@
   "scripts.backup_cost_ledger": "A private log of how many Perplexity credits each backup run cost, with a daily total against the target.",
   "scripts.local_heartbeat": "The Mac's \"I'm alive\" signal for a slot, and the check the backup uses to see whether it must step in.",
   "scripts.merge_order_pages": "Adds the newest orders to a saved order history without re-reading the whole day, and refuses if anything could have been missed.",
+  "scripts.reshape_order_pages": "Turns a saved, checked order history into the flat order list the 12:30 run's checks read, so nobody retypes 150 orders by hand; it refuses any order it cannot copy exactly.",
   "scripts.model_usage_log": "Writes one line per run recording which AI model was used, for the usage audit.",
   "scripts.order_refetch": "Re-reads today's orders from the broker so a second buyer can tell whether the first one already placed them.",
   "scripts.plan_first_slot": "Helper the buying agent uses in the plan-first design to fetch what it may buy.",
@@ -147,6 +149,7 @@
   "scripts.abort_markers": "Reads the small marker a slot leaves when it aborts before writing any evidence, so the watchdog can say it fired instead of calling it missed.",
   "scripts.local_ci_sweep": "Every 30 minutes on the Mac, runs the local checks on each open pull request that has no result yet and posts pass or fail on its latest commit.",
   "scripts.schedule_watchdog": "An independent watcher that raises an alarm when a slot that should have run left no evidence.",
+  "scripts.claude_liveness": "Checks before each DCA slot that Claude Desktop is running, reopens it when needed, and records an alert.",
   "scripts.scheduled_artifacts": "Defines which files every scheduled run must write, and checks them.",
   "scripts.scheduler_lease": "A lease so a scheduled run and a recovery run for the same window can never run at the same time.",
   "scripts.self_heal": "Repair routine for the self-healing workflow: rebuild, auto-fix lint, and re-check health.",
@@ -164,5 +167,6 @@
   "scripts.workflow_policy": "Checks the GitHub workflow files follow house rules, such as a time limit on every job.",
   "scripts.workspace_probe": "Tests whether the cloud workspace keeps its files between runs.",
   "sizing_adjustment_reader": "Reads the optional sizing-adjustment files from the forecasting tools and combines them into one answer for the strategy.",
-  "snap": "A scratch file holding a few sample price lists. Not part of normal operation."
+  "snap": "A scratch file holding a few sample price lists. Not part of normal operation.",
+  "dca_console_rank": "Feeds the Composite rank page: reads the daily composite-rank job's output (the ranked S&P 500 list, who entered or left the above-80 list, and how ranks move) and only displays it."
 }

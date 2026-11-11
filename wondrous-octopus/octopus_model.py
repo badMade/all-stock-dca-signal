@@ -71,17 +71,20 @@ import numpy as np
 import pandas as pd
 import torch  # type: ignore[import-not-found,import-untyped]
 from data import COMPONENTS, TrainingPanel
+from horizons import horizon_targets
 from market_encoder import MarketDayEncoder
 from model_interface import (
     QUANTILE_KEYS,
     QUANTILES,
     ForecastRequest,
+    HorizonForecast,
     OHLCForecast,
     RepairCounts,
     RevealedDay,
     finalize_forecast,
     load_arrays,
     read_metadata,
+    repair_horizon_arrays,
     save_arrays,
     write_metadata,
 )
@@ -130,9 +133,11 @@ class _OctopusNet(nn.Module):
         n_latents: int,
         market_summary_dim: int,
         n_clusters: int = _MAX_CLUSTERS,
+        max_horizon: int = 1,
     ) -> None:
         super().__init__()
         self.window_len = window_len
+        self.max_horizon = max_horizon
         self.feat_proj = nn.Linear(n_features, d_model)
         self.market_proj = nn.Linear(d_model, d_model)
         self.position_embedding = nn.Parameter(torch.randn(window_len, d_model) * 0.02)
@@ -180,6 +185,20 @@ class _OctopusNet(nn.Module):
         self.cluster_embedding = nn.Embedding(n_clusters + 1, d_model)
         causal = torch.triu(torch.ones(window_len, window_len, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal)
+        # Multi-horizon extension head (horizons 2..max_horizon; horizon 1 is
+        # the legacy forward_head), constructed after everything else for the
+        # same RNG-stream reason as cluster_embedding: a single-horizon model
+        # (max_horizon == 1) owns no extra parameter and initializes exactly
+        # as before. DIRECT multi-horizon with a learned horizon embedding:
+        # one shared trunk summary z, then hidden_h = GELU(W z + E[h]),
+        # out_h = V hidden_h. See docs/wondrous_octopus.md for why not
+        # recursive rollouts. Outputs live in per-sqrt(h) units (the caller
+        # multiplies by sqrt(h)) so every horizon's loss is on a comparable
+        # scale instead of the longest horizon dominating it.
+        if max_horizon > 1:
+            self.horizon_embedding = nn.Embedding(max_horizon - 1, ffn)
+            self.horizon_in = nn.Linear(d_model, ffn)
+            self.horizon_out = nn.Linear(ffn, len(COMPONENTS) * (1 + len(QUANTILES)))
 
     def tokens(
         self,
@@ -231,6 +250,21 @@ class _OctopusNet(nn.Module):
         hidden = self.trunk(tok, mask=self.causal_mask, src_key_padding_mask=padding)
         return self.forward_head(hidden[:, -1, :])  # last position = day t (front padding)
 
+    def causal_forward_all(
+        self, tok: torch.Tensor, padding: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One trunk pass -> (horizon-1 head ``(B, 16)``, horizons 2..H ``(B, H-1, 16)`` or None).
+
+        The extension output is in per-sqrt(h) units (see ``__init__``).
+        """
+        hidden = self.trunk(tok, mask=self.causal_mask, src_key_padding_mask=padding)
+        summary = hidden[:, -1, :]
+        legacy = self.forward_head(summary)
+        if self.max_horizon <= 1:
+            return legacy, None
+        mixed = self.horizon_in(summary).unsqueeze(1) + self.horizon_embedding.weight.unsqueeze(0)
+        return legacy, self.horizon_out(nn.functional.gelu(mixed))
+
     def bidirectional_recon(self, tok: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
         hidden = self.trunk(tok, src_key_padding_mask=padding)
         return self.recon_head(hidden)  # (B, L, 4)
@@ -262,6 +296,8 @@ class OctopusModel:
         fit_sample_cap: int = 200_000,
         mask_fraction: float = 0.15,
         device: str = "auto",
+        max_horizon: int = 1,
+        horizon_weight: float = 0.5,
     ) -> None:
         self.hyper = {
             "window_len": window_len,
@@ -283,7 +319,16 @@ class OctopusModel:
             "fit_epochs": fit_epochs,
             "fit_sample_cap": fit_sample_cap,
             "mask_fraction": mask_fraction,
+            "max_horizon": max_horizon,
+            "horizon_weight": horizon_weight,
         }
+        self.max_horizon = max_horizon
+        #: Revealed-through date for the horizon embargo: a horizon-h target
+        #: of origin row i is trainable only if row i+h is dated on/before
+        #: this. None = nothing beyond horizon 1 is usable (the safe default
+        #: for an external loop that never declared its cutoff).
+        self._asof: np.datetime64 | None = None
+        self.last_horizon_repairs: RepairCounts | None = None
         self.device = resolve_device(device)
         self._net: _OctopusNet | None = None
         self._optimizer: torch.optim.AdamW | None = None
@@ -327,6 +372,7 @@ class OctopusModel:
             n_latents=self.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
             n_clusters=_MAX_CLUSTERS,
+            max_horizon=self.max_horizon,
         ).to(self.device)
         self._optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.hyper["lr_fit"])
         self._replay = ReservoirBuffer(self.hyper["replay_capacity"], _derive(seed, "replay"))
@@ -334,6 +380,10 @@ class OctopusModel:
         self._market_cache = {}
 
         cutoff = self._normalization.get("window_end")
+        # The horizon embargo's revealed-through date for this fit: the fit
+        # cutoff, or -- when there is none, meaning "every row is trainable"
+        # (the horizon-1 convention) -- the archive's newest date.
+        self._asof = np.datetime64(cutoff, "D") if cutoff else self._panel_last_date()
         # A full-history recovery retrain over the whole archive can have
         # ~39M trainable (ticker, row) pairs; materializing that list before
         # fit_sample_cap ever applies is a multi-gigabyte peak on top of the
@@ -445,12 +495,75 @@ class OctopusModel:
         self.last_repairs = repairs
         return forecasts
 
+    def predict_horizons(self, requests: Sequence[ForecastRequest], *, max_horizon: int) -> list[HorizonForecast]:
+        """Forecast EVERY horizon 1..``max_horizon`` for each request (direct heads).
+
+        Horizon 1 is the legacy head (so the h=1 row equals what ``predict``
+        returns); horizons 2..H come from the horizon-embedding head and are
+        rescaled by sqrt(h) out of the per-sqrt(h) units they train in. Every
+        row is then geometry-repaired (counts in ``last_horizon_repairs``).
+        """
+        assert self._net is not None
+        if max_horizon != self.max_horizon:
+            raise ValueError(f"octopus was built for max_horizon={self.max_horizon}, asked for {max_horizon}")
+        self._net.eval()
+        slots = len(COMPONENTS)
+        scale = np.sqrt(np.arange(2, max_horizon + 1, dtype=np.float32))[None, :, None, None]
+        forecasts: list[HorizonForecast] = []
+        totals = RepairCounts()
+        with torch.no_grad():
+            for begin in range(0, len(requests), _PREDICT_CHUNK):
+                chunk = requests[begin : begin + _PREDICT_CHUNK]
+                tensors = self._tensors_from_requests(chunk)
+                market = self._market_tensor(tensors["cal_pos"], in_graph_final=False)
+                tok = self._net.tokens(
+                    tensors["windows"],
+                    market,
+                    tensors["ticker_ids"],
+                    tensors["day_of_week"],
+                    tensors["cluster_id"],
+                )
+                legacy, extension = self._net.causal_forward_all(tok, tensors["padding"])
+                grid = legacy.view(len(chunk), 1, slots, 1 + len(QUANTILES)).cpu().numpy()
+                if extension is not None:
+                    ext = extension.view(len(chunk), max_horizon - 1, slots, 1 + len(QUANTILES)).cpu().numpy()
+                    grid = np.concatenate([grid, ext * scale], axis=1)
+                point, quantiles, counts = repair_horizon_arrays(
+                    grid[..., 0].astype(np.float64), grid[..., 1:].astype(np.float64)
+                )
+                totals.quantile_crossings += counts.quantile_crossings
+                totals.bar_repairs += counts.bar_repairs
+                for position, request in enumerate(chunk):
+                    forecasts.append(
+                        HorizonForecast(
+                            ticker=request.ticker,
+                            origin_date=request.origin_date,
+                            point=point[position],
+                            quantiles=quantiles[position],
+                            ref_close=request.ref_close,
+                            adj_ratio=request.adj_ratio,
+                        )
+                    )
+        self.last_horizon_repairs = totals
+        return forecasts
+
+    def _panel_last_date(self) -> np.datetime64:
+        assert self._panel is not None
+        return max(series.dates[-1] for series in self._panel.series.values() if len(series.dates)).astype(
+            "datetime64[D]"
+        )
+
     def update(self, revealed: Sequence[RevealedDay], *, step_index: int) -> dict[str, Any]:
         assert self._net is not None and self._panel is not None and self._replay is not None
         by_date: dict[str, list[tuple[str, str]]] = {}
         for day in revealed:
             by_date.setdefault(day.origin_date, []).append((day.ticker, day.origin_date))
             self._replay.add(day.ticker, day.origin_date)
+            # Revealed-through date for the horizon embargo only ever moves
+            # to a target date the harness has actually revealed.
+            target = np.datetime64(day.target_date, "D")
+            if self._asof is None or target > self._asof:
+                self._asof = target
         # One deque element per DISTINCT calendar date, not per update()
         # call: with update_every > 1 a single call's revealed batch can
         # span several dates, and appending the whole batch as one element
@@ -606,6 +719,7 @@ class OctopusModel:
                 "replay": self._replay.to_state(),
                 "recent": [list(map(list, day_list)) for day_list in self._recent],
                 "update_rounds": self._update_rounds,
+                "asof": str(self._asof) if self._asof is not None else None,
             },
         )
 
@@ -658,6 +772,7 @@ class OctopusModel:
             n_latents=model.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
             n_clusters=_MAX_CLUSTERS,
+            max_horizon=model.max_horizon,
         ).to(model.device)
         state = {
             key[len("net.") :]: torch.from_numpy(np.array(value))
@@ -698,6 +813,9 @@ class OctopusModel:
             maxlen=model.hyper["recent_days"],
         )
         model._update_rounds = metadata["update_rounds"]
+        # .get(): checkpoints written before the horizon embargo existed.
+        saved_asof = metadata.get("asof")
+        model._asof = np.datetime64(saved_asof, "D") if saved_asof else None
         # bind_panel AFTER vocab restore: a panel with new tickers expands here.
         model.bind_panel(panel)
         return model
@@ -793,6 +911,17 @@ class OctopusModel:
             [self._panel.series[ticker].targets[row] for ticker, row in refs]
         ).astype(np.float32)
         tensors["targets"] = torch.from_numpy(targets).to(self.device)
+        if self.max_horizon > 1:
+            # Horizons 2..H, every one gated by the embargo against the
+            # revealed-through date -- NEVER by "is the target finite": the
+            # replay panel holds the whole archive, so a future bar always
+            # exists in memory. No declared asof => no extension targets.
+            extension = np.full((len(refs), self.max_horizon - 1, len(COMPONENTS)), np.nan, dtype=np.float32)
+            if self._asof is not None:
+                for position, (ticker, row) in enumerate(refs):
+                    full = horizon_targets(self._panel.series[ticker], row, self.max_horizon, self._asof)
+                    extension[position] = full[1:]
+            tensors["horizon_targets"] = torch.from_numpy(extension).to(self.device)
         market_targets = np.full((len(refs), self._panel.market_summary.shape[1]), np.nan, dtype=np.float32)
         for position, (ticker, row) in enumerate(refs):
             series = self._panel.series[ticker]
@@ -896,7 +1025,31 @@ class OctopusModel:
         error = target - predicted
         return torch.maximum(quantile * error, (quantile - 1.0) * error).mean()
 
-    def train_step(self, refs: Sequence[tuple[str, int]], *, lr: float) -> tuple[float, dict[str, float]]:
+    def _horizon_loss(self, raw: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Masked point + pinball loss over horizons 2..H, in per-sqrt(h) units.
+
+        ``targets`` is ``(B, H-1, 4)`` with NaN wherever the horizon is
+        embargoed (or past the archive's end); those entries carry no
+        gradient. Both sides are divided by sqrt(h) so a t+90 residual (~9x a
+        daily one) does not drown the short horizons' loss.
+        """
+        valid = torch.isfinite(targets)
+        if not valid.any():
+            return torch.zeros((), device=self.device)
+        steps = torch.sqrt(torch.arange(2, self.max_horizon + 1, device=self.device, dtype=raw.dtype))
+        standardized = torch.where(valid, targets, torch.zeros_like(targets)) / steps.view(1, -1, 1)
+        weight = valid.to(raw.dtype)
+        count = weight.sum()
+        point = (nn.functional.smooth_l1_loss(raw[..., 0], standardized, reduction="none") * weight).sum() / count
+        pinball = raw.new_zeros(())
+        for index, quantile in enumerate(QUANTILES):
+            error = standardized - raw[..., 1 + index]
+            pinball = pinball + (torch.maximum(quantile * error, (quantile - 1.0) * error) * weight).sum() / count
+        return point + pinball
+
+    def train_step(
+        self, refs: Sequence[tuple[str, int]], *, lr: float, asof: np.datetime64 | None = None
+    ) -> tuple[float, dict[str, float]]:
         """Run one multi-task gradient step and return ``(total, components)``.
 
         The public face of :meth:`_train_batch` for external training loops
@@ -906,6 +1059,11 @@ class OctopusModel:
         non-finite loss/gradient guards; ``components`` still carries the
         per-task breakdown that produced it.
         """
+        if asof is not None:
+            # An external curriculum declares how far the world is revealed
+            # for this step; without it the horizon head simply gets no
+            # targets (horizon 1 is trainable by the caller's own guard).
+            self._asof = np.datetime64(asof, "D")
         total = self._train_batch(list(refs), lr=lr)
         return total, dict(self._last_loss_components or {})
 
@@ -926,13 +1084,21 @@ class OctopusModel:
             tensors["day_of_week"],
             tensors["cluster_id"],
         )
-        raw = self._net.causal_forward(tok, tensors["padding"]).view(batch, len(COMPONENTS), 1 + len(QUANTILES))
+        legacy_out, extension_out = self._net.causal_forward_all(tok, tensors["padding"])
+        raw = legacy_out.view(batch, len(COMPONENTS), 1 + len(QUANTILES))
         targets = tensors["targets"]
         point_loss = nn.functional.smooth_l1_loss(raw[:, :, 0], targets)
         pinball_loss = sum(
             self._pinball(raw[:, :, 1 + index], targets, quantile) for index, quantile in enumerate(QUANTILES)
         )
         forward_loss = point_loss + pinball_loss
+        horizon_loss = torch.zeros((), device=self.device)
+        if extension_out is not None:
+            horizon_loss = self._horizon_loss(
+                extension_out.view(batch, self.max_horizon - 1, len(COMPONENTS), 1 + len(QUANTILES)),
+                tensors["horizon_targets"],
+            )
+            forward_loss = forward_loss + self.hyper["horizon_weight"] * horizon_loss
 
         # -- reconstruction (bidirectional) loss ----------------------------
         real = ~tensors["padding"]

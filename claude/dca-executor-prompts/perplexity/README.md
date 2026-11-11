@@ -9,7 +9,7 @@ Six generated prompts for the standing Perplexity backup executor, one per sched
 | `1150ET-1130-backup.txt` | `e3590042` | 11:50 | 1130 |
 | `1250ET-1230-backup.txt` | `062605c6` | 12:50 | 1230 |
 | `1350-1450ET-1330-1430-backup.txt` | `54ab24d2` | 13:50 and 14:50 | 1330 and 1430 (the clock decides) |
-| `1545ET-1530-backup.txt` | `f83b8d62` | 15:45 | 1530 |
+| `1540ET-1530-backup.txt` | `f83b8d62` | 15:40 | 1530 |
 
 Design: `docs/adr-plan-first-backup-executor.md`. These files are generated, never hand-edited:
 
@@ -40,7 +40,7 @@ says when a repaste is due.
 2. **CLOSED 2026-10-08: the sandbox build exists, and these prompts now use it.** `python -m scripts.build_backup_planner
    --out PATH` builds `backup_planner.pyz` (about 1.4 MB, deterministic, stamped with the source commit; `--check`
    reports drift). The prompts run it in the sandbox (`python3 backup_planner.pyz ...`), verify it with
-   `--build-info` first, and record the build in the state record. **How the file reaches the task is still
+   `preflight` first (2026-11-09; it prints the same build info `--build-info` does, plus the step 1 gates), and record the build in the state record. **How the file reaches the task is still
    undecided**: the prompts assume it is attached to the task's project files, a setup step you must confirm.
 
 ## Plan-first recommendations (needs PR #1667)
@@ -127,6 +127,7 @@ The prompts no longer contain an account number. Before pasting, set these in th
 | `${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}` | Last 4 digits the account lookup must match; the run stops if not exactly one tradable account ends in them |
 | `${PPLX_RUN_STATE_DIR}` | Directory for the run-state JSON and `submitted_orders.csv` (the project files `cron_tracking/<task id>` folder) |
 | `${DCA_ALERT_EMAIL_ADDRESS}` | Alert address, unchanged |
+| `${PPLX_PROJECT_FILES_DIR}` | Absolute folder that holds `backup_planner.pyz` (the task's project files). Added 2026-11-09 so the run can `cd` there instead of searching the disk |
 
 ### Filling them from local values (never in the repo)
 
@@ -148,6 +149,7 @@ Pass `--folder <task id>=<folder name>` only to move a task to a different folde
 |---|---|
 | `${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}` | `ROBINHOOD_AGENTIC_ACCOUNT_LAST4`, else the last four digits of `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` |
 | `${DCA_ALERT_EMAIL_ADDRESS}` | `DCA_ALERT_EMAIL_ADDRESS` |
+| `${PPLX_PROJECT_FILES_DIR}` | `PPLX_PROJECT_FILES_DIR`: an absolute path of plain characters with no `..`; a prompt that names it fails closed when it is unset or malformed |
 | `${PPLX_RUN_STATE_DIR}` | `--state-root` (default `cron_tracking`) plus the `--folder` name for that prompt's task, so no two tasks share a folder |
 
 Environment variables win; otherwise the gitignored local `.env` is read (`docs/local_env_file.md`). The script
@@ -203,9 +205,9 @@ Perplexity's Instructions box keeps only the first 20,000 characters. The full g
 so every pasted prompt was cut inside step 6 and the agent never saw the finalize arguments, order placement, the state
 record or the notifications.
 
-The committed `*-backup.txt` files are the PASTEABLE prompts (under 3,500 characters). They first read the public
+The committed `*-backup.txt` files are the PASTEABLE prompts (under 5,200 characters since 2026-11-09, up from 3,500 for the preflight skip record). They first read the public
 `slot_status.json` signal and stand down only when the market is closed or the backed-up slot succeeded today. Otherwise
-they verify the attached planner's build stamp, fetch part 0, and require its token before requesting part 1. No broker
+they `cd` to `${PPLX_PROJECT_FILES_DIR}`, run `preflight` once (the build stamp and the step 1 gates in one call; a skipped status ends the run there, with its state record, before part 0 is requested), compare the stamp, fetch part 0, and require its token before requesting part 1. No broker
 or Mac tool is named in the pasteable prompt.
 
 ```
@@ -216,10 +218,20 @@ Part 0 carries the hard rules, calendar, universe check and stand-down gate. Par
 and part 3 is steps 7-9. All four parts live in `scripts/backup_procedure.py`, which ships inside the `.pyz`, so they are
 covered by the same `content_sha256` stamp the prompt checks. The full reference text (rules plus steps, for reading in
 one place) is `gen.build_prompts()`; the pasteable files are `gen.build_instructions()`, which is what `--write` and
-`--check` use. `scripts/tests/test_backup_signal_prompt.py` keeps the pasted prompts under 3,500 characters. Changing
+`--check` use. `scripts/tests/test_backup_signal_prompt.py` keeps the pasted prompts under 5,200 characters. Changing
 any served part changes the planner stamp, so rebuild the `.pyz`, regenerate the prompts and re-run the pair check in
 "Checking the pair before you paste it".
 
 Step 1 is code too: `backup_planner gates --task <id>` reads the real clock, picks the slot, applies the holiday and
 early-close calendar and the window, and prints PROCEED / skipped_market_closed / skipped_outside_window
 (`scripts/backup_gates.py`, rules unchanged from the old step 1 text). `--now` exists for tests only.
+
+### `preflight` (2026-11-09)
+
+`backup_planner preflight --task <id>` replaces `--build-info` and the first `gates` call with one command. It prints the
+`gates` fields (`status`, `slot`, `latest_placement_et`, `now_et`) plus `build` (`content_sha256`, `source_commit`) read
+from the stamp inside the `.pyz`. It reports the build and never judges it: the expected hash cannot live inside the
+build it names, so the comparison stays in the pasted prompt. A skip exits 0; an unreadable build, unknown task or
+offset-less clock exits 2 (place nothing). Why: the 2026-11-09 15:45 fire reached `gates` at 16:03 ET, after five or six
+sequential setup calls (build-info three times, a `find /`, part 0, universe, gates), and skipped. A skipped fire now
+costs one planner call, and `preflight_at_et` in the state record shows when setup finished.

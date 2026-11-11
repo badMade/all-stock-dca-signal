@@ -367,6 +367,169 @@ class ConformalCalibrator:
 
 
 # --------------------------------------------------------------------------
+# Multi-horizon forecasts (t+1 .. t+H) and per-horizon calibration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HorizonForecast:
+    """One (ticker, origin day t) forecast for EVERY horizon h = 1..H.
+
+    ``point`` is ``(H, 4)`` log-returns of the day-(t+h) bar vs day t's close
+    (component order = ``COMPONENTS``); ``quantiles`` is ``(H, 4, 3)`` with
+    the last axis p10/p50/p90. Row ``h-1`` is horizon h. Values are RAW
+    (pre-calibration) but already geometry-repaired.
+    """
+
+    ticker: str
+    origin_date: str
+    point: np.ndarray
+    quantiles: np.ndarray
+    ref_close: float
+    adj_ratio: float
+
+
+def repair_horizon_arrays(point: np.ndarray, quantiles: np.ndarray) -> tuple[np.ndarray, np.ndarray, RepairCounts]:
+    """Vectorized :func:`finalize_forecast` over a leading ``(..., H)`` axis.
+
+    ``point`` is ``(..., 4)``, ``quantiles`` ``(..., 4, 3)``. Quantiles are
+    sorted along the last axis; the point bar and each quantile-level bar are
+    forced to high >= max(open, close) and low <= min(open, close). Counts
+    (one per repaired quantile triple / bar, matching the scalar function's
+    accounting) are returned, never discarded.
+    """
+    counts = RepairCounts()
+    ordered = np.sort(quantiles, axis=-1)
+    counts.quantile_crossings = int((ordered != quantiles).any(axis=-1).sum())
+    open_i, high_i, low_i, close_i = (COMPONENTS.index(name) for name in ("open", "high", "low", "close"))
+
+    def bar(values: np.ndarray) -> tuple[np.ndarray, int]:
+        fixed = values.copy()
+        fixed[..., high_i] = np.maximum(values[..., high_i], np.maximum(values[..., open_i], values[..., close_i]))
+        fixed[..., low_i] = np.minimum(values[..., low_i], np.minimum(values[..., open_i], values[..., close_i]))
+        return fixed, int((fixed != values).any(axis=-1).sum())
+
+    point_fixed, changed = bar(point)
+    counts.bar_repairs += changed
+    levels = []
+    for index in range(ordered.shape[-1]):
+        level, changed = bar(ordered[..., index])
+        counts.bar_repairs += changed
+        levels.append(level)
+    return point_fixed, np.stack(levels, axis=-1), counts
+
+
+@dataclass
+class HorizonConformalCalibrator:
+    """Per-horizon adaptive conformal calibration.
+
+    One :class:`ConformalCalibrator` per EVALUATED horizon (the checkpoints
+    whose forecasts actually mature and score), each with its own per-
+    component width multiplier and its own once-per-target-day watermark. A
+    t+20 band must not be widened because t+5 missed, and the miss rate of a
+    horizon is only observable once that horizon's target has been revealed,
+    so each horizon learns from its own scored history only.
+
+    Horizons that are EMITTED but not evaluated use the scale interpolated
+    (geometrically, linear in log h) between the nearest evaluated horizons,
+    clamped to the nearest end beyond them. That is a stated assumption --
+    width miscalibration varies smoothly with horizon -- not a measurement;
+    widening the evaluated set is how it gets replaced by one.
+    """
+
+    horizons: tuple[int, ...]
+    target: float = 0.8
+    lr: float = 0.02
+    min_scale: float = 0.25
+    max_scale: float = 4.0
+    calibrators: dict[int, ConformalCalibrator] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.horizons = tuple(sorted(set(int(h) for h in self.horizons)))
+        if not self.horizons:
+            raise ValueError("HorizonConformalCalibrator needs at least one evaluated horizon")
+        for horizon in self.horizons:
+            self.calibrators.setdefault(
+                horizon,
+                ConformalCalibrator(
+                    target=self.target, lr=self.lr, min_scale=self.min_scale, max_scale=self.max_scale
+                ),
+            )
+
+    def scales_for(self, horizon: int) -> np.ndarray:
+        """``(4,)`` width multipliers for ``horizon`` (interpolated off-checkpoint)."""
+
+        def vector(h: int) -> np.ndarray:
+            scales = self.calibrators[h].scales
+            return np.array([scales[component] for component in COMPONENTS], dtype=np.float64)
+
+        if horizon <= self.horizons[0]:
+            return vector(self.horizons[0])
+        if horizon >= self.horizons[-1]:
+            return vector(self.horizons[-1])
+        if horizon in self.calibrators:
+            return vector(horizon)
+        upper_index = next(index for index, h in enumerate(self.horizons) if h > horizon)
+        low, high = self.horizons[upper_index - 1], self.horizons[upper_index]
+        weight = (np.log(horizon) - np.log(low)) / (np.log(high) - np.log(low))
+        return np.exp((1.0 - weight) * np.log(vector(low)) + weight * np.log(vector(high)))
+
+    def scales_matrix(self, max_horizon: int) -> np.ndarray:
+        """``(max_horizon, 4)``; row ``h-1`` is horizon h."""
+        return np.stack([self.scales_for(h) for h in range(1, max_horizon + 1)])
+
+    @staticmethod
+    def apply(quantiles: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        """Scale p10/p90 around p50 by ``scales`` (broadcast over a leading axis).
+
+        ``quantiles`` is ``(..., H, 4, 3)``; ``scales`` is ``(H, 4)`` (or any
+        shape broadcastable against ``(..., H, 4)``). The result is NOT
+        geometry-repaired; callers pass it through :func:`repair_horizon_arrays`.
+        """
+        p50 = quantiles[..., 1]
+        scaled = np.empty_like(quantiles)
+        scaled[..., 0] = p50 + (quantiles[..., 0] - p50) * scales
+        scaled[..., 1] = p50
+        scaled[..., 2] = p50 + (quantiles[..., 2] - p50) * scales
+        return scaled
+
+    def observe_batch(
+        self,
+        horizon: int,
+        observations: list[tuple[dict[str, dict[str, float]], dict[str, float]]],
+        *,
+        target_date: str,
+    ) -> None:
+        """One nudge for ``horizon`` from the batch's aggregate miss rate (see
+        :meth:`ConformalCalibrator.observe_batch` for the once-per-day rule)."""
+        self.calibrators[horizon].observe_batch(observations, target_date=target_date)
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "horizons": list(self.horizons),
+            "target": self.target,
+            "lr": self.lr,
+            "min_scale": self.min_scale,
+            "max_scale": self.max_scale,
+            "calibrators": {str(h): calibrator.to_state() for h, calibrator in self.calibrators.items()},
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "HorizonConformalCalibrator":
+        calibrator = cls(
+            horizons=tuple(state["horizons"]),
+            target=float(state["target"]),
+            lr=float(state["lr"]),
+            min_scale=float(state["min_scale"]),
+            max_scale=float(state["max_scale"]),
+        )
+        calibrator.calibrators = {
+            int(h): ConformalCalibrator.from_state(payload) for h, payload in state["calibrators"].items()
+        }
+        return calibrator
+
+
+# --------------------------------------------------------------------------
 # No-pickle artifact helpers
 # --------------------------------------------------------------------------
 

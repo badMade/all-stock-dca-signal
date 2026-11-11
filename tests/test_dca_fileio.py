@@ -1,14 +1,22 @@
-
 """Tests for the atomic file-write helpers in dca_fileio."""
 
 import csv
 import os
 import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from dca_fileio import _preserve_ownership, atomic_open_w, atomic_write_text, order_csv_covers
+from dca_fileio import (
+    _discard,
+    _preserve_ownership,
+    atomic_open_w,
+    atomic_write_text,
+    iter_files_by_suffix_fast,
+    iter_run_state_files_fast,
+    order_csv_covers,
+)
 
 
 def test_atomic_write_text_creates_file(tmp_path):
@@ -98,6 +106,7 @@ def test_atomic_open_w_matches_plain_open_permissions(tmp_path):
 # 0640 for a monitoring group, or 0600 for sensitive run data, must not have that
 # reset to the umask default by the first atomic rewrite (Codex review, PR #219).
 
+
 @pytest.mark.parametrize("mode", [0o600, 0o640, 0o604, 0o660])
 def test_rewriting_an_existing_file_preserves_its_mode(tmp_path, mode):
     target = tmp_path / "artifact.json"
@@ -137,6 +146,7 @@ def test_mode_preservation_survives_repeated_rewrites(tmp_path):
 # other thread creating a file or directory between the two calls gets it with
 # no mask applied (Codex review, PR #219). The temp file is now opened with an
 # explicit 0666 so the kernel applies the umask itself.
+
 
 @pytest.mark.parametrize("umask_value", [0o022, 0o077, 0o002])
 def test_a_new_file_lands_at_the_mode_a_plain_open_would_produce(tmp_path, umask_value):
@@ -191,11 +201,7 @@ def test_the_temp_file_is_never_more_permissive_than_its_destination(tmp_path):
         observed: list[int] = []
         with atomic_open_w(target) as handle:
             handle.write('{"sensitive": true}')
-            observed = [
-                stat.S_IMODE(p.stat().st_mode)
-                for p in tmp_path.iterdir()
-                if p.name.endswith(".tmp")
-            ]
+            observed = [stat.S_IMODE(p.stat().st_mode) for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
 
         assert observed == [0o600], f"temp file was {[oct(m) for m in observed]} mid-write"
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
@@ -209,6 +215,7 @@ def test_the_temp_file_is_never_more_permissive_than_its_destination(tmp_path):
 # monitoring group keeps 0640 but lands under the writer's primary group, so
 # monitoring loses read access and an unrelated group gains it (Codex review,
 # PR #219).
+
 
 def _a_foreign_gid() -> int | None:
     """A gid this process can set but that is not its own, or None."""
@@ -499,6 +506,7 @@ def test_a_chmod_failure_that_changed_nothing_still_proceeds(tmp_path, monkeypat
 # that window was invisible, and the swap silently undid it (Codex review,
 # PR #219).
 
+
 def test_a_destination_tightened_mid_write_is_not_clobbered(tmp_path):
     previous = os.umask(0o022)
     try:
@@ -580,10 +588,12 @@ def test_fsync_dir_success(tmp_path):
     from unittest import mock
 
     from dca_fileio import _fsync_dir
-    with mock.patch("os.open", return_value=42) as m_open, \
-         mock.patch("os.fsync") as m_fsync, \
-         mock.patch("os.close") as m_close:
 
+    with (
+        mock.patch("os.open", return_value=42) as m_open,
+        mock.patch("os.fsync") as m_fsync,
+        mock.patch("os.close") as m_close,
+    ):
         _fsync_dir(tmp_path)
 
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
@@ -595,10 +605,12 @@ def test_fsync_dir_open_oserror(tmp_path):
     from unittest import mock
 
     from dca_fileio import _fsync_dir
-    with mock.patch("os.open", side_effect=OSError) as m_open, \
-         mock.patch("os.fsync") as m_fsync, \
-         mock.patch("os.close") as m_close:
 
+    with (
+        mock.patch("os.open", side_effect=OSError) as m_open,
+        mock.patch("os.fsync") as m_fsync,
+        mock.patch("os.close") as m_close,
+    ):
         _fsync_dir(tmp_path)
 
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
@@ -610,15 +622,19 @@ def test_fsync_dir_fsync_oserror(tmp_path):
     from unittest import mock
 
     from dca_fileio import _fsync_dir
-    with mock.patch("os.open", return_value=42) as m_open, \
-         mock.patch("os.fsync", side_effect=OSError) as m_fsync, \
-         mock.patch("os.close") as m_close:
 
+    with (
+        mock.patch("os.open", return_value=42) as m_open,
+        mock.patch("os.fsync", side_effect=OSError) as m_fsync,
+        mock.patch("os.close") as m_close,
+    ):
         _fsync_dir(tmp_path)
 
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
         m_fsync.assert_called_once_with(42)
         m_close.assert_called_once_with(42)
+
+
 def test_preserve_ownership_matches_returns_true(tmp_path):
     p = tmp_path / "test.txt"
     p.touch()
@@ -626,6 +642,7 @@ def test_preserve_ownership_matches_returns_true(tmp_path):
     with open(p, "w") as f:
         stat = os.fstat(f.fileno())
         assert _preserve_ownership(f.fileno(), stat.st_uid, stat.st_gid) is True
+
 
 def test_preserve_ownership_fchown_called(tmp_path, monkeypatch):
     p = tmp_path / "test.txt"
@@ -645,6 +662,7 @@ def test_preserve_ownership_fchown_called(tmp_path, monkeypatch):
         assert res is True
         assert called_with == (f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
 
+
 def test_preserve_ownership_fchown_oserror_returns_false(tmp_path, monkeypatch):
     p = tmp_path / "test.txt"
     p.touch()
@@ -658,6 +676,7 @@ def test_preserve_ownership_fchown_oserror_returns_false(tmp_path, monkeypatch):
         stat = os.fstat(f.fileno())
         res = _preserve_ownership(f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
         assert res is False
+
 
 def test_preserve_ownership_no_fchown_returns_false(tmp_path, monkeypatch):
     p = tmp_path / "test.txt"
@@ -679,14 +698,13 @@ def test_preserve_ownership_already_matches():
     mock_stat.st_uid = 1000
     mock_stat.st_gid = 1000
 
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
+    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, mock.patch("os.fchown", create=True) as m_fchown:
         result = _preserve_ownership(42, 1000, 1000)
 
         assert result is True
         m_fstat.assert_called_once_with(42)
         m_fchown.assert_not_called()
+
 
 def test_preserve_ownership_changes_ownership():
     from unittest import mock
@@ -695,26 +713,24 @@ def test_preserve_ownership_changes_ownership():
     mock_stat.st_uid = 999
     mock_stat.st_gid = 999
 
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
+    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, mock.patch("os.fchown", create=True) as m_fchown:
         result = _preserve_ownership(42, 1000, 1000)
 
         assert result is True
         m_fstat.assert_called_once_with(42)
         m_fchown.assert_called_once_with(42, 1000, 1000)
 
+
 def test_preserve_ownership_fstat_oserror():
     from unittest import mock
 
-    with mock.patch("os.fstat", side_effect=OSError) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
+    with mock.patch("os.fstat", side_effect=OSError) as m_fstat, mock.patch("os.fchown", create=True) as m_fchown:
         result = _preserve_ownership(42, 1000, 1000)
 
         assert result is False
         m_fstat.assert_called_once_with(42)
         m_fchown.assert_not_called()
+
 
 def test_preserve_ownership_fchown_oserror():
     from unittest import mock
@@ -723,14 +739,16 @@ def test_preserve_ownership_fchown_oserror():
     mock_stat.st_uid = 999
     mock_stat.st_gid = 999
 
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", side_effect=OSError, create=True) as m_fchown:
-
+    with (
+        mock.patch("os.fstat", return_value=mock_stat) as m_fstat,
+        mock.patch("os.fchown", side_effect=OSError, create=True) as m_fchown,
+    ):
         result = _preserve_ownership(42, 1000, 1000)
 
         assert result is False
         m_fstat.assert_called_once_with(42)
         m_fchown.assert_called_once_with(42, 1000, 1000)
+
 
 def test_preserve_ownership_no_fchown(monkeypatch):
     from unittest import mock
@@ -764,3 +782,112 @@ def test_base_exception_during_replace_cleans_up_tmp_path(tmp_path, monkeypatch)
     # The temp file should have been cleaned up
     files = list(tmp_path.iterdir())
     assert files == [target]
+
+
+def test_discard_oserror(tmp_path):
+    target = tmp_path / "dummy.txt"
+    with patch.object(Path, "unlink", side_effect=OSError):
+        _discard(target)
+
+
+def test_iter_run_state_files_fast_success(tmp_path):
+    f1 = tmp_path / "run_state_1.json"
+    f1.write_text("{}")
+    d1 = tmp_path / "subdir"
+    d1.mkdir()
+    f2 = d1 / "run_state_2.json"
+    f2.write_text("{}")
+    f3 = d1 / "other.json"
+    f3.write_text("{}")
+
+    result = list(iter_run_state_files_fast(tmp_path))
+    assert set(result) == {f1, f2}
+
+
+def test_iter_run_state_files_fast_not_dir(tmp_path):
+    f1 = tmp_path / "file.txt"
+    f1.write_text("")
+    assert list(iter_run_state_files_fast(f1)) == []
+
+
+def test_iter_run_state_files_fast_oserror(tmp_path):
+    d1 = tmp_path / "subdir"
+    d1.mkdir()
+    f1 = tmp_path / "run_state_1.json"
+    f1.write_text("{}")
+
+    original_scandir = os.scandir
+
+    def mock_scandir(path):
+        if str(path) == str(d1):
+            raise OSError("Permission denied")
+        return original_scandir(path)
+
+    with patch("os.scandir", side_effect=mock_scandir):
+        result = list(iter_run_state_files_fast(tmp_path))
+        assert result == [f1]
+
+
+def test_iter_files_by_suffix_fast_success(tmp_path):
+    f1 = tmp_path / "file1.txt"
+    f1.write_text("")
+    d1 = tmp_path / "subdir"
+    d1.mkdir()
+    f2 = d1 / "file2.txt"
+    f2.write_text("")
+    f3 = d1 / "file3.json"
+    f3.write_text("")
+
+    result = list(iter_files_by_suffix_fast(tmp_path, ".txt"))
+    assert set(result) == {f1, f2}
+
+
+def test_iter_files_by_suffix_fast_not_dir(tmp_path):
+    f1 = tmp_path / "file.txt"
+    f1.write_text("")
+    assert list(iter_files_by_suffix_fast(f1, ".txt")) == []
+
+
+def test_iter_files_by_suffix_fast_oserror(tmp_path):
+    d1 = tmp_path / "subdir"
+    d1.mkdir()
+    f1 = tmp_path / "file1.txt"
+    f1.write_text("")
+
+    original_scandir = os.scandir
+
+    def mock_scandir(path):
+        if str(path) == str(d1):
+            raise OSError("Permission denied")
+        return original_scandir(path)
+
+    with patch("os.scandir", side_effect=mock_scandir):
+        result = list(iter_files_by_suffix_fast(tmp_path, ".txt"))
+        assert result == [f1]
+
+
+def test_order_csv_covers_valueerror(tmp_path, monkeypatch):
+    target = tmp_path / "test.csv"
+    target.write_text("order_id,ticker\n1,AAPL\n", encoding="utf-8")
+
+    class MockList(list):
+        def index(self, value):
+            raise ValueError("mocked error")
+
+    original_reader = csv.reader
+
+    def mock_reader(*args, **kwargs):
+        it = original_reader(*args, **kwargs)
+        header = next(it)
+        mock_header = MockList(header)
+
+        def gen():
+            yield mock_header
+            yield from it
+
+        return gen()
+
+    monkeypatch.setattr(csv, "reader", mock_reader)
+
+    # Should catch ValueError and return false since expected set has items and present will be empty
+    assert not order_csv_covers(target, [{"order_id": "1", "ticker": "AAPL"}])

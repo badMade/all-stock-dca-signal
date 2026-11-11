@@ -4,7 +4,7 @@ This file tracks follow-up work from live DCA incidents so the same failure mode
 
 ## Handoff - 2026-10-31 Perplexity backup fires reduced
 
-- Status: operator decision (Perplexity credit plan step 5, `docs/cost_tracking.md`). Only the 10:00 (`4412c3c4`, moved from 09:55 on 2026-11-05), 12:50 (`062605c6`) and 15:45 (`f83b8d62`) backup fires stay scheduled. `e028361e` (10:50), `e3590042` (11:50) and `54ab24d2` (13:50/14:50) are paused.
+- Status: operator decision (Perplexity credit plan step 5, `docs/cost_tracking.md`). Only the 09:55 (`4412c3c4`), 12:50 (`062605c6`) and 15:40 (`f83b8d62`, was 15:45 until 2026-11-09) backup fires stay scheduled. `e028361e` (10:50), `e3590042` (11:50) and `54ab24d2` (13:50/14:50) are paused.
 - This amends the 2026-09-08 standing policy below: the policy still never lapses, but each slot now records `backup_status` in `config/scheduled_tasks.json`.
 - Operator step: pause the three tasks in Perplexity's scheduler; this repo cannot. To re-enable one, set it back to active in the config and resume the task.
 

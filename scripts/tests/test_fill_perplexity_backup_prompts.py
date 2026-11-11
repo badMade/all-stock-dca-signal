@@ -31,6 +31,7 @@ REAL_PROMPTS = ROOT / "claude" / "dca-executor-prompts" / "perplexity"
 LAST4 = "4321"
 EMAIL = "ops@example.test"
 ACCOUNT = "7" * 5 + LAST4  # synthetic; built so no account-shaped literal sits in this file
+PROJECT_DIR = "/work/projects/dca-synthetic-0001/files"  # synthetic; the real folder is the operator's own
 
 TEMPLATE = """STANDING BACKUP EXECUTOR - slot {slot}
 Task {task}. Fires 09:55 ET on trading days.
@@ -59,7 +60,8 @@ def out(tmp_path):
 
 
 def _env(**over):
-    base = {"DCA_ALERT_EMAIL_ADDRESS": EMAIL, "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER": ACCOUNT, "DCA_DISABLE_DOTENV": "1"}
+    base = {"DCA_ALERT_EMAIL_ADDRESS": EMAIL, "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER": ACCOUNT, "DCA_DISABLE_DOTENV": "1",
+            "PPLX_PROJECT_FILES_DIR": PROJECT_DIR}
     base.update(over)
     return {k: v for k, v in base.items() if v is not None}
 
@@ -286,3 +288,35 @@ def test_the_committed_prompts_hold_no_private_values():
     for path in REAL_PROMPTS.glob("*-backup.txt"):
         text = path.read_text(encoding="utf-8")
         assert "@" not in text.replace("${DCA_ALERT_EMAIL_ADDRESS}", ""), path.name
+
+
+# -- 2026-11-09: PPLX_PROJECT_FILES_DIR, the folder that holds backup_planner.pyz ------------------------------------------
+# The run searched the whole disk (`find /`) for the planner file; the prompt now names the folder, filled from a
+# local value so the Perplexity project id never lands in the repo.
+
+
+def test_the_project_files_folder_is_filled_into_every_committed_prompt(out):
+    assert _run(REAL_PROMPTS, out, _env()) == 0
+    for path in sorted(out.glob("*-backup.txt")):
+        text = path.read_text(encoding="utf-8")
+        assert f"cd {PROJECT_DIR}" in text, path.name
+        assert "${PPLX_PROJECT_FILES_DIR}" not in text, path.name
+
+
+def test_a_prompt_that_names_the_folder_fails_closed_when_no_folder_is_given(out, capsys):
+    assert _run(REAL_PROMPTS, out, _env(PPLX_PROJECT_FILES_DIR=None)) == 2
+    assert not out.exists() or not list(out.iterdir())
+    assert "PPLX_PROJECT_FILES_DIR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["files", "./files", "/work/../etc", "/work/my files", "/work/$(x)", ""])
+def test_a_malformed_project_files_folder_is_rejected_and_not_echoed(out, capsys, bad):
+    assert _run(REAL_PROMPTS, out, _env(PPLX_PROJECT_FILES_DIR=bad)) == 2
+    assert not out.exists() or not list(out.iterdir())
+    printed = capsys.readouterr()
+    if bad:
+        assert bad not in printed.out + printed.err
+
+
+def test_a_prompt_without_the_folder_placeholder_still_fills_when_a_folder_is_given(src, out):
+    assert _run(src, out, _env()) == 0  # the old three-placeholder prompts keep working

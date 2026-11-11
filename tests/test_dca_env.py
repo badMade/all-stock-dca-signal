@@ -83,3 +83,12 @@ def test_importing_dca_paths_triggers_the_loader(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, env=env,
                          capture_output=True, text=True)
     assert out.stdout.strip() == "ops@example.com", out.stderr
+
+
+def test_loads_pplx_project_files_dir(tmp_path):
+    # 2026-11-11: the Perplexity prompts name the planner folder, and the fill script failed closed when the
+    # variable was only in .env because it was not allowlisted here.
+    f = _write(tmp_path / ".env", "PPLX_PROJECT_FILES_DIR=/home/user/workspace\n")
+    env = {}
+    assert dca_env.load_dotenv(f, environ=env) == ["PPLX_PROJECT_FILES_DIR"]
+    assert env["PPLX_PROJECT_FILES_DIR"] == "/home/user/workspace"

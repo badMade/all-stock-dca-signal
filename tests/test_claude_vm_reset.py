@@ -49,26 +49,37 @@ def mac(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # Claude "runs" while state/running exists; quitting removes it unless state/stuck exists.
-    _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; [ -e "{state}/stuck" ] || rm -f "{state}/running"')
+    _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; '
+          f'if [ -e "{state}/denied" ]; then echo "execution error: Not authorized to send Apple events to Claude. (-1743)" >&2; exit 1; fi; '
+          f'if [ -e "{state}/late" ]; then (sleep 3; rm -f "{state}/running"; touch "{state}/late_quit") & '
+          f'elif [ ! -e "{state}/stuck" ]; then rm -f "{state}/running"; fi')
     _stub(bin_dir, "pgrep", f'echo "pgrep $*" >> "{calls}"; [ -e "{state}/running" ]')
-    _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; touch "{state}/running"')
+    _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; '
+          f'if [ -e "{state}/late" ]; then while [ ! -e "{state}/late_quit" ]; do sleep 0.1; done; fi; '
+          f'touch "{state}/running"')
     _stub(bin_dir, "date", f'if [ "$1" = "+%u" ]; then cat "{state}/weekday"; else /bin/date "$@"; fi')
     (state / "running").touch()
     (state / "weekday").write_text("6\n", encoding="utf-8")  # Saturday
 
-    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True):
+    def run(*args: str, weekday: int = 6, stuck: bool = False, running: bool = True, denied: bool = False,
+            late: bool = False):
         (state / "weekday").write_text(f"{weekday}\n", encoding="utf-8")
+        if denied:
+            (state / "denied").touch()
+        if late:
+            (state / "late").touch()
         if stuck:
             (state / "stuck").touch()
         if not running:
             (state / "running").unlink(missing_ok=True)
         env = {**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin", "CLAUDE_VM_DISK": str(bundle / "rootfs.img"),
                "CLAUDE_VM_QUIT_WAIT": "2"}
-        done = subprocess.run(["/bin/sh", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30)
+        done = subprocess.run(["/bin/bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30)
         log = calls.read_text(encoding="utf-8") if calls.exists() else ""
         return done, log
 
     run.bundle = bundle
+    run.state = state
     return run
 
 
@@ -88,7 +99,17 @@ def test_it_never_deletes_the_disk_while_claude_is_still_running(mac):
     assert done.returncode == 1
     assert "refused: claude_still_running" in done.stdout
     assert (mac.bundle / "rootfs.img").exists()
-    assert "open -a Claude" not in log  # it is still running: nothing to reopen
+    assert "open -a Claude" in log
+    assert log.index("osascript") < log.index("open -a Claude")
+
+
+def test_late_quit_reopens_claude_without_deleting_the_disk(mac):
+    done, log = mac(late=True)
+    assert done.returncode == 1
+    assert "refused: claude_still_running" in done.stdout
+    assert "open -a Claude" in log
+    assert (mac.state / "running").exists()
+    assert (mac.bundle / "rootfs.img").exists()
 
 
 def test_it_refuses_on_a_weekday_so_it_can_never_interrupt_a_slot(mac):
@@ -98,6 +119,16 @@ def test_it_refuses_on_a_weekday_so_it_can_never_interrupt_a_slot(mac):
         assert "refused: weekday" in done.stdout
         assert (mac.bundle / "rootfs.img").exists()
         assert "osascript" not in log  # did not even quit Claude
+
+
+def test_refusal_status_lines_include_timestamps(mac):
+    timestamp = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+    weekday, _ = mac(weekday=3)
+    still_running, _ = mac(stuck=True)
+    for result, status in ((weekday, "refused: weekday"),
+                           (still_running, "refused: claude_still_running")):
+        line = next(line for line in result.stdout.splitlines() if status in line)
+        assert timestamp.search(line), line
 
 
 def test_force_allows_a_weekday_run_for_a_manual_reset(mac):
@@ -140,7 +171,14 @@ def _agent() -> dict:
 def test_agent_runs_the_script_every_saturday_at_three_am():
     agent = _agent()
     assert agent["Label"] == "com.all-stock-dca.claude-vm-reset"
-    assert agent["ProgramArguments"] == ["/bin/sh", "/repo/deploy/launchd/claude_vm_reset.sh"]
+    # 2026-11-07: the first Saturday run failed with "/bin/sh: ...claude_vm_reset.sh: Operation not permitted".
+    # macOS privacy protection (TCC) grants ~/Documents access per binary; /bin/sh run straight from launchd has none.
+    # Start it through the checkout's venv Python like the payload agent does: a child inherits the parent's access.
+    assert agent["ProgramArguments"] == [
+        "/repo/.venv/bin/python", "-c",
+        'import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1]]))',
+        "/repo/deploy/launchd/claude_vm_reset.sh",
+    ]
     assert agent["StartCalendarInterval"] == {"Weekday": 6, "Hour": 3, "Minute": 0}
     assert "StartInterval" not in agent and "RunAtLoad" not in agent  # never on install, never on a timer
 
@@ -152,3 +190,47 @@ def test_agent_logs_to_tmp_and_holds_no_secret():
     assert not re.search(r"\d{8,}", text)
     assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in text
     assert "CLAUDE_VM_DISK" not in text  # the agent uses the script's default path, not an override
+
+
+def test_every_launchd_agent_starts_through_the_checkout_venv_python():
+    # The same TCC failure must not come back with the next agent: none may launch a shell (or anything else) on a
+    # file under ~/Documents directly. Every template's first program is the checkout's venv Python.
+    for template in sorted((REPO / "deploy/launchd").glob("*.plist.template")):
+        text = template.read_text(encoding="utf-8")
+        for placeholder in ("REPLACE_WITH_REPO_PATH", "REPLACE_WITH_CRON_TRACKING_ROOT", "REPLACE_WITH_CODEX_PATH"):
+            text = text.replace(placeholder, "/repo")
+        program = plistlib.loads(text.encode("utf-8"))["ProgramArguments"][0]
+        assert program == "/repo/.venv/bin/python", (template.name, program)
+
+
+# -- 2026-11-08: what the Saturday runs taught us ----------------------------------------------------------------------
+# With the venv-Python wrapper the script was still refused ("Operation not permitted") while it ran under /bin/sh,
+# and ran once it ran under /bin/bash, the shell the payload agents use: /bin/sh on macOS is a launcher that re-execs
+# another shell, and that hop loses the ~/Documents grant. Then it stopped at "refused: claude_still_running" with no
+# reason, because the script threw away osascript's output. A refused quit must say why in the agent's log.
+
+
+def test_the_agent_runs_the_script_with_bash_not_sh():
+    args = _agent()["ProgramArguments"]
+    assert '"/bin/bash"' in args[2] and '"/bin/sh"' not in args[2]
+
+
+def test_a_refused_quit_writes_osascripts_reason_to_the_log(mac):
+    done, _ = mac(denied=True)
+    assert done.returncode == 1
+    out = done.stdout + done.stderr  # launchd sends both to /tmp/dca-claude-vm-reset.log
+    assert "refused: claude_still_running" in out
+    assert "Not authorized to send Apple events" in out  # the reason, not just the outcome
+    assert (mac.bundle / "rootfs.img").exists()
+
+
+def test_a_successful_quit_logs_nothing_extra_from_osascript(mac):
+    done, _ = mac()
+    assert done.returncode == 0
+    assert "osascript" not in done.stdout + done.stderr
+
+
+def test_claude_is_detected_even_when_the_script_runs_under_a_claude_session():
+    # 2026-11-09: macOS pgrep drops its own ancestors from the match list, so from a shell a Claude session started a
+    # plain `pgrep -x Claude` misses the open app and the script would delete a live VM disk. -a keeps ancestors in.
+    assert "pgrep -a -x Claude" in SCRIPT.read_text(encoding="utf-8")

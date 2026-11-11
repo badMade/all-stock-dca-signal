@@ -26,12 +26,12 @@ CONFIG = REPO / "config"
 
 # (file stem prefix, backup task id, fire times ET, slot ids it backs up, latest placement ET)
 EXPECTED = [
-    ("1000ET", "4412c3c4", ("10:00",), ("0935",), "10:30"),
+    ("0955ET", "4412c3c4", ("09:55",), ("0935",), "10:30"),
     ("1050ET", "e028361e", ("10:50",), ("1030",), "11:30"),
     ("1150ET", "e3590042", ("11:50",), ("1130",), "12:30"),
     ("1250ET", "062605c6", ("12:50",), ("1230",), "13:30"),
     ("1350-1450ET", "54ab24d2", ("13:50", "14:50"), ("1330", "1430"), "14:30 for the 13:50 fire, 15:30 for the 14:50 fire"),
-    ("1545ET", "f83b8d62", ("15:45",), ("1530",), "16:00"),
+    ("1540ET", "f83b8d62", ("15:40",), ("1530",), "16:00"),
 ]
 
 
@@ -75,9 +75,9 @@ def test_each_prompt_names_its_task_fire_times_slots_and_deadline(prompts, prefi
 
 
 def test_only_the_final_prompt_carries_the_accepted_time_limitation(prompts):
-    final = _by_prefix(prompts, "1545ET")
+    final = _by_prefix(prompts, "1540ET")
     assert "KNOWN LIMITATION (accepted 2026-10-06)" in final
-    for prefix in ("1000ET", "1050ET", "1150ET", "1250ET", "1350-1450ET"):
+    for prefix in ("0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET"):
         assert "KNOWN LIMITATION" not in _by_prefix(prompts, prefix)
 
 
@@ -275,7 +275,7 @@ def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
 
     task_id = next(e[1] for e in EXPECTED if e[0] == prefix)
     pasted = _by_prefix(gen.build_instructions(), prefix)
-    assert pasted.index("--build-info") < pasted.index(f"procedure --task {task_id} --part 0")
+    assert pasted.index("preflight --task") < pasted.index(f"procedure --task {task_id} --part 0")
     text = backup_procedure.render_part(task_id, 0)
     heading = text.find("\nSTAND-DOWN GATE")
     assert heading != -1, "part 0 has no STAND-DOWN GATE section"
@@ -313,6 +313,9 @@ def test_stand_down_gate_runs_after_setup_before_procedure_fetch(prefix):
 def test_no_em_dash_no_account_shaped_literal_no_secret(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     assert "—" not in text
+    # No exemption for the part tokens: since 2026-11-05 backup_procedure.part_token() prefixes its eight hex digits
+    # with "t", so a token can never read as a bare number. #2175 had stripped `--token <8 hex>` before this check,
+    # which would also have hidden an 8-digit account number placed after `--token`; the check sees the raw text.
     assert not re.search(r"(?<![.\w])\d{6,12}(?![\w.])", text)
     assert "@" not in text.replace("${DCA_ALERT_EMAIL_ADDRESS}", "")  # no literal email address
 
@@ -437,8 +440,8 @@ def _gated():
 
 
 def _is_gated_prompt(prefix):
-    slots = {"1000ET": {"0935"}, "1050ET": {"1030"}, "1150ET": {"1130"}, "1250ET": {"1230"}, "1350-1450ET": {"1330", "1430"},
-             "1545ET": {"1530"}}[prefix]
+    slots = {"0955ET": {"0935"}, "1050ET": {"1030"}, "1150ET": {"1130"}, "1250ET": {"1230"}, "1350-1450ET": {"1330", "1430"},
+             "1540ET": {"1530"}}[prefix]
     return slots <= _gated()
 
 
@@ -447,7 +450,7 @@ def test_the_cloud_planner_is_the_stamped_sandbox_file_not_a_vendored_script(pro
     text = _by_prefix(prompts, prefix)
     assert "backup_planner.pyz" in text
     assert "python3 backup_planner.py " not in text and "vendored single-file" not in text
-    assert "--build-info" in text and "source_commit" in text  # the state record names the exact build that ran
+    assert "preflight" in text and "source_commit" in text  # the state record names the exact build that ran
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
@@ -457,7 +460,7 @@ def test_the_task_does_no_sizing_of_its_own_and_says_so(prompts, prefix):
     assert "--deployed-last-7d-usd auto" in text or not _is_gated_prompt(prefix)  # the figure is derived, never summed by hand
 
 
-@pytest.mark.parametrize("prefix", ["1000ET", "1150ET", "1350-1450ET", "1545ET"])
+@pytest.mark.parametrize("prefix", ["0955ET", "1150ET", "1350-1450ET", "1540ET"])
 def test_a_gated_slot_dumps_raw_responses_and_lets_the_assembler_build_the_payload(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     assert _is_gated_prompt(prefix)
@@ -536,7 +539,7 @@ def test_every_prompt_embeds_the_expected_build_stamp(prompts, prefix, built_sta
 def test_step_b_compares_the_stamp_before_fetching_part_0(prompts, prefix, built_stamp):
     text = _by_prefix(prompts, prefix)
     step_b = text[text.index("STEP B"):text.index("PROCEDURE FOR TASK")]
-    assert step_b.index("--build-info") < step_b.index(built_stamp) < step_b.index("--part 0")
+    assert step_b.index("preflight --task") < step_b.index(built_stamp) < step_b.index("--part 0")
     assert text.index("--part 0") < text.index("backup_planner.pyz universe"), "check first, then request part 0"
     assert "content_sha256" in step_b and "exactly" in step_b
     compare = step_b[step_b.index(built_stamp):step_b.index("--part 0")]
@@ -599,7 +602,7 @@ def test_claim_is_unconfirmed_and_confirm_follows_the_first_accepted_order(promp
     assert "the claim expires and a later run may claim again" in text
 
 
-@pytest.mark.parametrize("prefix", ["1000ET", "1050ET", "1150ET", "1250ET", "1350-1450ET", "1545ET"])
+@pytest.mark.parametrize("prefix", ["0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET", "1540ET"])
 def test_the_task_also_fetches_the_previous_sessions_daily_bar_and_saves_it_under_daily(prompts, prefix):
     """Copilot's review of #1643: without the daily bar the assembled payload has no real prior low."""
     text = _by_prefix(prompts, prefix)

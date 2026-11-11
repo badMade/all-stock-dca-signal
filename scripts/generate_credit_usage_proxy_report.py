@@ -435,9 +435,21 @@ def _measure_path_bytes(path: Path) -> Any:
     try:
         if path.is_dir():
             total = 0
-            for p in path.rglob("*"):
-                if p.is_file():
-                    total += p.stat().st_size
+            import os
+            stack = [path]
+            while stack:
+                current = stack.pop()
+                try:
+                    for entry in os.scandir(current):
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                total += entry.stat().st_size
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
             return total
         return path.stat().st_size
     except OSError:
@@ -452,7 +464,23 @@ def _expand_artifact_path(path: Path) -> List[str]:
     """
     try:
         if path.is_dir():
-            return sorted(p.as_posix() for p in path.rglob("*") if p.is_file())
+            paths = []
+            import os
+            stack = [path]
+            while stack:
+                current = stack.pop()
+                try:
+                    for entry in os.scandir(current):
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                paths.append(Path(entry.path).as_posix())
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            return sorted(paths)
         if path.is_file():
             return [path.as_posix()]
     except OSError:

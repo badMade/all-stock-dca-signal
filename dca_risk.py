@@ -132,12 +132,13 @@ STREAM_MIDDAY = "midday"
 
 def find_run_state_files(root: str | Path) -> List[Path]:
     """Return every ``run_state*.json`` at or below ``root`` (sorted)."""
+    from dca_fileio import iter_run_state_files_fast
     root_path = Path(root)
     if root_path.is_file():
         return [root_path]
     if not root_path.exists():
         return []
-    return sorted(root_path.rglob("run_state*.json"))
+    return sorted(iter_run_state_files_fast(root_path))
 
 
 def _parse_iso_et(text: object) -> Optional[datetime]:
