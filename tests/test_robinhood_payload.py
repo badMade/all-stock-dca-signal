@@ -647,6 +647,9 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
         "DCA_TRADING_DAY": "2026-10-20",
         "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct"),
         "DCA_CODEX_PARALLEL": "3",
+        # The stub publishes nothing by design, which the launcher would otherwise retry after its 90 s wait (2026-11-10);
+        # the retry tests below switch it back on.
+        "DCA_BUILD_RETRIES": "0",
         "TMPDIR": str(tmp_path),
         **(extra_env or {}),
     }
@@ -1441,3 +1444,56 @@ def test_thin_quiet_names_leave_the_denominator_while_liquid_empties_count(tmp_p
     published = json.loads((tmp_path / "out" / "payload.json").read_text())
     assert published["ticker_errors"] == {"robinhood": sorted(tickers[:13])}  # every name stays listed for Gate 5
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+# -- whole-build retry and failure diagnostics (2026-11-10: 09:35 and 10:30 refused with Codex "429 Too Many Requests") --
+
+#: A worker that fails the way the 11-10 ones did: the 429 text on stderr, no reply file, a non-zero exit.
+_ALWAYS_429 = 'echo "ERROR: exceeded retry limit, last status: 429 Too Many Requests" >&2; exit 1'
+
+
+def _failure_rows(tmp_path):
+    import glob
+
+    rows = []
+    for path in glob.glob(str(tmp_path / "ct" / "**" / "*.failures.jsonl"), recursive=True):
+        rows += [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    return rows
+
+
+def test_a_refused_build_is_retried_once_and_every_failed_attempt_is_recorded(tmp_path):
+    done, chunks = _run_launcher(tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "1", "DCA_BUILD_RETRY_WAIT_SECONDS": "0"})
+    log = done.stdout + done.stderr
+    assert "retrying in 0s (attempt 2 of 2)" in log, log
+    assert log.count("robinhood_payload: timing total") == 2, log  # exactly one rebuild, never a loop
+    rows = _failure_rows(tmp_path)
+    assert rows and all(r["http_status"] == ["429"] for r in rows), rows[:2]
+    assert {r["build_attempt"] for r in rows} == {1, 2}
+    assert {"codex_exec_running", "payload_workers_running", "parallel_setting", "seconds_into_build"} <= set(rows[0])
+    assert rows[0]["parallel_setting"] == 3 and rows[0]["slot"] == "0935"
+    assert "http429=" in log and "failed worker attempts=" in log, log
+
+
+def test_the_retry_can_be_turned_off(tmp_path):
+    done, _ = _run_launcher(tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "0"})
+    log = done.stdout + done.stderr
+    assert "retrying" not in log and log.count("robinhood_payload: timing total") == 1, log
+
+
+def test_no_retry_when_the_first_attempt_began_too_long_ago(tmp_path):
+    done, _ = _run_launcher(
+        tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "1", "DCA_BUILD_RETRY_WAIT_SECONDS": "0", "DCA_BUILD_RETRY_BY_SECONDS": "0"}
+    )
+    log = done.stdout + done.stderr
+    assert "not retrying: the first attempt began too long ago" in log and log.count("timing total") == 1, log
+
+
+def test_a_healthy_build_writes_no_failure_file_and_never_retries(tmp_path):
+    done, _ = _run_launcher(tmp_path)
+    log = done.stdout + done.stderr
+    assert _failure_rows(tmp_path) == [] and "retrying" not in log and "failed worker attempts" not in log, log
+
+
+def test_retry_settings_must_be_whole_numbers(tmp_path):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_RETRIES": "once"})
+    assert done.returncode == 2 and "DCA_BUILD_RETRIES" in done.stderr
