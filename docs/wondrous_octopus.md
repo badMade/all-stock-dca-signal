@@ -121,7 +121,10 @@ therefore measured against real archived closes continuously, with no hand-writt
 Limits to know: the model is *adjusted* online, not re-optimized to an "optimal match" -- it is a
 small online learner scored honestly, and a recovery retrain stays an operator decision.
 `daily_update.py`'s own `*_next_day_forecasts.csv` is still horizon-1 only; the 1..N forecast is
-`horizons/<model>.csv`. Research artifacts only; nothing reads or writes `config/` or live sizing.
+`horizons/<model>.csv`, which each step overwrites. `daily_update.py` therefore also keeps a dated
+copy per model, `daily/<origin_date>_horizon_forecasts_<model>.csv` (log-returns vs `ref_close`;
+dollars = `ref_close * exp(value)`), so every day's full 1..N projection stays on disk to compare
+with later prices. Research artifacts only; nothing reads or writes `config/` or live sizing.
 
 ## Models compared on identical metrics
 
