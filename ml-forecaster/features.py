@@ -465,7 +465,29 @@ def compute_forward_return_target(
     _require_positive_horizon(horizon)
     close = _preferred_price_series(frame)
     future_close = close.shift(-horizon)
-    return ((future_close - close) / close) * 100.0
+    target = ((future_close - close) / close) * 100.0
+    # A label whose window contains a corrupt one-day print is not a market return: blank it so build_dataset()'s
+    # finite-row filter drops the row from training AND evaluation alike (2026-11-10: one QUBT row from its
+    # pre-2018 OTC-shell history carried a +25,100% "5-day return" that, with 43 other >100% rows, drove the walk-forward
+    # RMSE to ~18 against an MAE of ~3.7).
+    return target.where(~_corrupt_label_window(close, horizon))
+
+
+# A single adjusted-close day that falls 90% or more, or rises 900% or more, is a data artifact in this universe's
+# archive (penny-stock shell prints, bad ticks), not a market move: the legitimate extreme days in the active
+# universe (LUNR 2023, DXYZ 2024) are a +250% day and a +96% day, well inside the bounds.  The test reads only the
+# price path inside the label window, so it is applied identically to training and test rows.
+CORRUPT_DAILY_DROP = -0.90
+CORRUPT_DAILY_RISE = 9.0
+
+
+def _corrupt_label_window(close: pd.Series, horizon: int) -> pd.Series:
+    """True for each row whose forward `horizon`-day label window (days T+1..T+horizon) holds a corrupt daily move."""
+    daily = close.pct_change()
+    bad_day = ((daily <= CORRUPT_DAILY_DROP) | (daily >= CORRUPT_DAILY_RISE)).astype(float)
+    # Reverse rolling max over [T, T+horizon-1], then shift one so the window is T+1..T+horizon.
+    forward_any = bad_day[::-1].rolling(horizon, min_periods=1).max()[::-1].shift(-1)
+    return forward_any.fillna(0.0).astype(bool)
 
 
 def compute_label_end_date(frame: pd.DataFrame, horizon: int = FORWARD_RETURN_HORIZON_DAYS) -> pd.Series:
