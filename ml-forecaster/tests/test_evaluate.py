@@ -92,6 +92,7 @@ def test_evaluate_walk_forward_reports_every_fold_with_finite_baselines(dip_data
             "model_mae",
             "model_rmse",
             "model_hit_rate",
+            "model_rank_ic",
             "baseline_zero_mae",
             "baseline_zero_rmse",
             "baseline_zero_hit_rate",

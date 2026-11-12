@@ -95,6 +95,12 @@ the primary ladder, never as a replacement for it. Consumption is entirely read-
 ticker's factor is 1.0) on a missing, malformed, stale, or out-of-bounds publish — see that
 function's docstring for the exact fail-closed contract.
 
+Publish gate (2026-11-11, operator decision): a model must beat the naive MAE baselines **or** pass the
+rank-IC path -- every walk-forward fold's Spearman rank IC > 0, at least 3 folds, mean >= 0.02
+(`ml-forecaster/publish.py`, `MIN_RANK_IC_FOLDS` / `MIN_MEAN_RANK_IC`). Sizing only needs the model to order dip
+days, and the 2026-11 retrain had rank IC +0.04 in all five folds while MAE trailed the baseline. The
+incumbent comparison is unchanged.
+
 This is a distinct mechanism from the ticker-advisory composite score above (different model,
 different config file, different consumption point), built to the same design principles this
 section already laid out: bounded, offline, guard-published, fail-closed. Like the accumulator
