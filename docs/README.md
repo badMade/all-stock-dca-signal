@@ -16,18 +16,16 @@ environment (see the repository README).
 | [codebase_roadmap.md](codebase_roadmap.md) | End-to-end flow of one live slot, layers with real importer counts, which reliability engines are wired, and where the code differs from older docs |
 | [object_model_roadmap.md](object_model_roadmap.md) | What the plan-first object model changed, where handoffs are still wider than needed, the phased path, and the console's checkout-only Architecture map |
 | [handoff_2026-10-23_payload_and_prompts.md](handoff_2026-10-23_payload_and_prompts.md) | One-time handoff for the 2026-10-21 9:35 payload abort and the backup-prompt fixes: what happened, what merged, and the repaste steps |
-| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Follow-up on payload coverage for live slots |
+| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | The 2026-11-10 9:35 and 10:30 payloads were refused on the 95% coverage floor after Codex 429s; the three decisions made 2026-11-11 (mitigations live, keep the floor, no executor rebuild) and the clean-day count still being watched |
 | [module_graph.md](module_graph.md) | Generated import graph of the core modules (importers, import counts, line counts, modules nothing imports); refreshed automatically on every push to `main`, never hand-edited |
 | [dead_code_report.md](dead_code_report.md) | Tiered list of unused code, unreferenced files, and duplicated root files, with the method used and its limits |
 | [local_ci.md](local_ci.md) | Running CI locally: `scripts/local_ci.sh` (fast copy of the gates; `scripts/local_ci_status.sh` posts its result as a `local-ci` commit status) and `scripts/run_ci_locally.sh` (the real `ci.yml` under act + Colima: setup, job ids, what differs from GitHub's runners); the measured Actions-minute breakdown, the 2026-10-31 trigger cuts, and the opt-in self-hosted-runner switch (`CI_RUNS_ON`) |
 | [local_console.md](local_console.md) | `python3 from.py`: checkout-only local interface, real-data by default with an opt-in demo sandbox, daily summaries, timing and Octopus predictions; authenticated LAN/proxy access and launchd runbooks; never places brokerage orders |
 | [console_changelog.md](console_changelog.md) | Versioned changelog for `console/` and `dca_console*.py`; every UI change needs an entry and a version bump |
 | [robinhood_payload.md](robinhood_payload.md) | Prebuilt Robinhood slot payload: Codex on the Mac builds the market-data payload ahead of a live slot so the session does not have to pull it live |
-| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up on the 2026-11-10 9:35 payload coverage-floor refusal: rate limits, partial coverage, and bounded retry |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [gate6_history_completeness_abort_2026-10-22.md](gate6_history_completeness_abort_2026-10-22.md) | 2026-10-22 live-slot abort on unproven weekly-history completeness, the log-and-continue decision, its risk and a revisit trigger |
 | [incident_2026-10-26_0935_unrecognized_orders.md](incident_2026-10-26_0935_unrecognized_orders.md) | 2026-10-26 refused 0935 payload and the 25 buys the Perplexity backup placed on its own cloud-computed plan, the cap check, why no evidence was forged, and open items |
-| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up: the 2026-11-10 9:35 payload was refused on the 95% coverage floor (60/122 tickers validated after 429s), so the slot placed no orders; evidence and next steps |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [yfinance_replacement_plan.md](yfinance_replacement_plan.md) | Where yfinance is allowed (non-buying scheduled tasks only), the `data` extra that declares it, who uses it today, and the plan to replace it |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
@@ -86,11 +84,9 @@ environment (see the repository README).
 | [adr-tax-loss-sale.md](adr-tax-loss-sale.md) | ADR (proposed): the only allowed sell type, an operator-approved tax-loss sale of specific lots with a 31-day buy pause before and after the sale; never automatic, fail closed on any lookback doubt; design only |
 | [price_source_poc_report.md](price_source_poc_report.md) | The opt-in live PoC report for that price source (20 tickers x 60 sessions vs Yahoo) |
 | [verified_sizing_and_backup_facts.md](verified_sizing_and_backup_facts.md) | Re-checkable repo facts found during the backup-executor work: live per-ticker sizing and the $16 cap, stale "$10"/"5x" prose, same-day repeats, where sources disagree |
-| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Follow up |
 | [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | [market_open_0932_move.md](market_open_0932_move.md) | Proposal (not implemented) to fire the market-open slot at 09:32 on a live-quote decision price; the full change list and the shadow-only `market_open_quote_shadow` recorder that gathers evidence first |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
-| [follow_up_2026-11-10_payload_coverage.md](follow_up_2026-11-10_payload_coverage.md) | Open follow-up: the 09:35 payload was refused on the 95% coverage floor after 429 rate limits, so the slot placed no orders; the decisions still to make |
 
 ## Machine-readable backup
 
