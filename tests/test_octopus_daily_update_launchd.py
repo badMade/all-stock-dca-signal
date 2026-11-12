@@ -12,6 +12,7 @@ TEMPLATE = Path(__file__).resolve().parent.parent / "deploy/launchd/com.all-stoc
 def _load() -> dict:
     text = TEMPLATE.read_text(encoding="utf-8")
     text = text.replace("REPLACE_WITH_REPO_PATH", "/repo").replace("REPLACE_WITH_OCTOPUS_RUN_DIR", "/run")
+    text = text.replace("REPLACE_WITH_TICKER_ARCHIVE_DIR", "/archive")
     assert "REPLACE_WITH_" not in text
     return plistlib.loads(text.encode("utf-8"))
 
@@ -21,8 +22,14 @@ def test_runs_daily_update_through_the_checkout_venv():
     assert agent["Label"] == "com.all-stock-dca.octopus-daily-update"
     assert agent["ProgramArguments"] == [
         "/repo/.venv/bin/python", "/repo/wondrous-octopus/daily_update.py", "--run-dir", "/run",
+        "--history-dir", "/archive",
     ]
     assert agent["StandardOutPath"].startswith("/tmp/")
+
+
+def test_path_includes_sbin_so_joblib_finds_sysctl():
+    path = _load()["EnvironmentVariables"]["PATH"].split(":")
+    assert "/usr/sbin" in path and "/sbin" in path
 
 
 def test_fires_each_weekday_after_the_close():
