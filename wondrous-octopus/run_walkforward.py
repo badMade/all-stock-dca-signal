@@ -198,6 +198,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gamma", type=_nonnegative_finite_float, default=0.1, help="market-head loss weight (octopus)"
     )
+    parser.add_argument(
+        "--horizon-weight",
+        type=_nonnegative_finite_float,
+        default=0.5,
+        help="loss weight on the h>=2 horizon heads (octopus; only with --max-horizon > 1)",
+    )
     parser.add_argument("--online-steps", type=_positive_int, default=4, help="gradient steps per update (octopus)")
     parser.add_argument("--replay-capacity", type=_positive_int, default=50_000)
     parser.add_argument("--update-every", type=_positive_int, default=None)
@@ -284,6 +290,7 @@ def _build_models(names: tuple[str, ...], args: argparse.Namespace, knobs: dict)
                 replay_capacity=args.replay_capacity,
                 device=args.device,
                 max_horizon=getattr(args, "max_horizon", 1),
+                horizon_weight=getattr(args, "horizon_weight", 0.5),
             )
     return models
 
@@ -1116,6 +1123,7 @@ def _model_hyper(args: argparse.Namespace, knobs: dict) -> dict:
         "alpha": args.alpha,
         "beta": args.beta,
         "gamma": args.gamma,
+        "horizon_weight": getattr(args, "horizon_weight", 0.5),
         "online_steps": args.online_steps,
         "replay_capacity": args.replay_capacity,
         "refit_every": int(knobs["refit_every"]),
