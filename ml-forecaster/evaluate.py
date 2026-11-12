@@ -74,6 +74,10 @@ class FoldResult:
     model_mae: float
     model_rmse: float
     model_hit_rate: float
+    # Spearman rank correlation of predicted vs actual forward return over the fold's test rows
+    # (0.0 when either side is constant). Sizing only needs the model to ORDER dip days, so publish.py's
+    # rank-IC pass path (2026-11-11) reads this next to the MAE-vs-naive-baseline check.
+    model_rank_ic: float
     baseline_zero_mae: float
     baseline_zero_rmse: float
     baseline_zero_hit_rate: float
@@ -197,6 +201,14 @@ def _hit_rate(actual: np.ndarray, predicted: np.ndarray) -> float:
     return float(np.mean(np.sign(actual) == np.sign(predicted)))
 
 
+def _rank_ic(actual: np.ndarray, predicted: np.ndarray) -> float:
+    """Spearman rank correlation; 0.0 (no skill) when either side is constant or too short."""
+    if len(actual) < 3 or np.ptp(actual) == 0 or np.ptp(predicted) == 0:
+        return 0.0
+    value = float(pd.Series(actual).rank().corr(pd.Series(predicted).rank()))
+    return value if np.isfinite(value) else 0.0
+
+
 def evaluate_walk_forward(
     dataset: pd.DataFrame, *, n_splits: int = DEFAULT_N_SPLITS, alpha: float = model_module.DEFAULT_ALPHA
 ) -> dict[str, Any]:
@@ -250,6 +262,7 @@ def evaluate_walk_forward(
                 model_mae=_mae(actual, predicted),
                 model_rmse=_rmse(actual, predicted),
                 model_hit_rate=_hit_rate(actual, predicted),
+                model_rank_ic=_rank_ic(actual, predicted),
                 baseline_zero_mae=_mae(actual, zero_baseline),
                 baseline_zero_rmse=_rmse(actual, zero_baseline),
                 baseline_zero_hit_rate=_hit_rate(actual, zero_baseline),
@@ -359,6 +372,7 @@ def evaluate_ticker_holdout(
                 model_mae=_mae(actual, predicted),
                 model_rmse=_rmse(actual, predicted),
                 model_hit_rate=_hit_rate(actual, predicted),
+                model_rank_ic=_rank_ic(actual, predicted),
                 baseline_zero_mae=_mae(actual, zero_baseline),
                 baseline_zero_rmse=_rmse(actual, zero_baseline),
                 baseline_zero_hit_rate=_hit_rate(actual, zero_baseline),

@@ -1630,3 +1630,37 @@ def test_guarded_publish_invalid_input_records_nothing(tmp_path):
     )
     assert result["status"] == "blocked_invalid_adjustments"
     assert not history.exists()
+
+
+def _ic_folds(*ics):
+    return [{"model_rank_ic": ic} for ic in ics]
+
+
+def _blocked_by_baseline(summary):
+    reasons = publish.blocking_reasons(
+        new_mae=summary["overall"]["model_mae"], eval_summary=summary, current=None, new_horizon_trading_days=5
+    )
+    return any("naive walk-forward baseline" in r for r in reasons)
+
+
+def test_rank_ic_pass_path_lets_a_positive_ic_model_past_the_mae_baseline():
+    # MAE 3.9 does not beat baseline 1.8, but all five folds order dip days correctly.
+    summary = _eval_summary(3.9, folds=_ic_folds(0.03, 0.04, 0.05, 0.02, 0.04))
+    assert not _blocked_by_baseline(summary)
+
+
+@pytest.mark.parametrize(
+    "ics",
+    [
+        (0.05, -0.01, 0.06, 0.05, 0.04),  # one negative fold
+        (0.01, 0.01, 0.01, 0.01, 0.01),  # mean below MIN_MEAN_RANK_IC
+        (0.05, 0.05),  # too few folds
+        (0.05, float("nan"), 0.05, 0.05),  # non-finite fold
+    ],
+)
+def test_rank_ic_pass_path_still_blocks_weak_or_unreliable_ic(ics):
+    assert _blocked_by_baseline(_eval_summary(3.9, folds=_ic_folds(*ics)))
+
+
+def test_no_rank_ic_at_all_keeps_the_old_mae_gate():
+    assert _blocked_by_baseline(_eval_summary(3.9))
