@@ -39,7 +39,9 @@ to correct both states by hand. Now, when a marker exists at
 The marker file is read strictly: exactly one well-formed pre-broker (Gate 1 or Gate 2) marker
 for that day and slot, or the fire is refused. With no marker file the old Gate 2 labels and the
 nominal time are kept. The broker history must then cover the acceptance window AND the fire
-time plus :data:`FIRE_ORDER_ALLOWANCE`, and an order anywhere in that span needs attribution.
+time plus :data:`FIRE_ORDER_ALLOWANCE`, checked as two separate intervals, and ANY order in either
+refuses: a Gate 1/2 abort runs before the broker read, so it cannot have placed one, and
+``--attribute-order`` stays available only for the legacy no-marker path (PR #2234 review).
 
 Usage (from the repo root)::
 
@@ -115,8 +117,11 @@ class AbortMarker:
     fired_at: datetime  # ET
     path: Path
 
-    def outcome(self, attributed: bool) -> str:
-        return f"BACKFILL_{self.reason_code}_{'ATTRIBUTED_ORDERS' if attributed else 'ZERO_DEPLOYMENT'}"
+    @property
+    def outcome(self) -> str:
+        # Zero deployment only: a pre-broker abort cannot have placed an order, so there is no
+        # ATTRIBUTED_ORDERS form for a marker fire (_check_fire refuses any order near one).
+        return f"BACKFILL_{self.reason_code}_ZERO_DEPLOYMENT"
 
     @property
     def error_class(self) -> str:
@@ -170,17 +175,26 @@ def read_abort_marker(root: Path, day: date, slot: str) -> Optional[AbortMarker]
     return AbortMarker(gate=gate, reason_code=reason, fired_at=fired, path=path)
 
 
-def order_span(slot: str, day: date, marker: Optional[AbortMarker]) -> tuple[datetime, datetime]:
-    """The span the broker history must cover and show empty: the acceptance window, widened to the fire.
+Span = tuple[datetime, datetime]
+
+
+def order_spans(slot: str, day: date, marker: Optional[AbortMarker]) -> List[Span]:
+    """The intervals the broker history must cover and show empty: the window, plus the fire's own.
 
     Without a marker the fire is assumed to have been inside the window, as before. With one, an
-    off-window fire (19:24 ET on 2026-11-09) and :data:`FIRE_ORDER_ALLOWANCE` after it are added, so an
-    order that fire could have placed is never outside the checked span.
+    off-window fire (19:24 ET on 2026-11-09) and :data:`FIRE_ORDER_ALLOWANCE` after it are added as a
+    SECOND interval, never merged into one hull with the window: a late 14:30 marker at 16:10 ET would
+    otherwise swallow the whole 15:30 acceptance window, and the 15:30 slot's real orders would block
+    the 14:30 backfill or be attributed to it (PR #2234 review).
     """
-    start, end = acceptance_window(slot, day)
-    if marker is None:
-        return start, end
-    return min(start, marker.fired_at), max(end, marker.fired_at + FIRE_ORDER_ALLOWANCE)
+    spans = [acceptance_window(slot, day)]
+    if marker is not None:
+        spans.append((marker.fired_at, marker.fired_at + FIRE_ORDER_ALLOWANCE))
+    return spans
+
+
+def _in_spans(order: Dict[str, Any], spans: Sequence[Span]) -> bool:
+    return any(orders_in_window([order], start, end) for start, end in spans)
 
 
 def parse_fire(value: str) -> tuple[date, str]:
@@ -282,17 +296,26 @@ def _check_fire(
     marker: Optional[AbortMarker],
 ) -> Dict[str, Any]:
     window_start, window_end = acceptance_window(slot, day)
-    start, end = order_span(slot, day, marker)
+    spans = order_spans(slot, day, marker)
     state = stream_dir(root, slot) / f"{day:%Y%m%d}_{slot}ET" / "run_state.json"
     if state.exists():
         raise BackfillRefused(f"{day} {slot}: run_state.json already exists ({state}); never overwritten")
-    if not (covers_from <= start and covers_through >= end):
+    # One contiguous broker query has to reach every interval; each is checked so the message names it.
+    for (start, end), label in zip(spans, ("the acceptance window", "the marker fire time"), strict=False):
+        if not (covers_from <= start and covers_through >= end):
+            raise BackfillRefused(
+                f"{day} {slot}: broker history covers {covers_from.isoformat()}..{covers_through.isoformat()}, "
+                f"which does not span {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ET ({label})"
+            )
+    inside = [order for order in orders if _in_spans(order, spans)]
+    if marker is not None and inside:
+        # Even an order passed with --attribute-order: Gate 1/2 run before Gate 4's broker read, so the
+        # fire that wrote this marker placed nothing, and an order here belongs to something else.
+        ids = ", ".join(str(o.get("id")) for o in inside)
         raise BackfillRefused(
-            f"{day} {slot}: broker history covers {covers_from.isoformat()}..{covers_through.isoformat()}, "
-            f"which does not span {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ET "
-            f"(the acceptance window{' and the marker fire time' if marker else ''})"
+            f"{day} {slot}: broker shows {len(inside)} order(s) near a {marker.gate} {marker.reason_code} abort "
+            f"({ids}); a pre-broker abort cannot have placed them, so a human must investigate"
         )
-    inside = orders_in_window(orders, start, end)
     unattributed = [o for o in inside if o.get("id") not in attributed_order_ids]
     if unattributed:
         ids = ", ".join(str(o.get("id")) for o in unattributed)
@@ -329,7 +352,7 @@ def _check_fire(
         "broker_orders_in_window": len(inside),
         "broker_history_covers": [covers_from.isoformat(), covers_through.isoformat()],
         "window_et": [window_start.isoformat(), window_end.isoformat()],
-        "broker_checked_et": [start.isoformat(), end.isoformat()],
+        "broker_checked_et": [[start.isoformat(), end.isoformat()] for start, end in spans],
         **({"attributed_order_ids": [o["id"] for o in inside], "attributed_by": "operator"} if inside else {}),
     }
 
@@ -406,6 +429,9 @@ def write_fire(
     orders: Optional[List[Dict[str, Any]]] = None,
     marker: Optional[AbortMarker] = None,
 ) -> int:
+    if marker is not None and orders:
+        # _check_fire already refuses this; never let a caller write deployment under a pre-broker abort.
+        raise BackfillRefused(f"{day} {slot}: a {marker.gate} abort marker cannot carry attributed orders")
     pointer = pointer_path(root, slot)
     before = pointer.read_bytes() if pointer.is_file() else None
     # The nominal time names the run and passes finalize's window check; a marker's real fire time
@@ -421,7 +447,7 @@ def write_fire(
             result = finalize(
                 slot,
                 start,
-                outcome=marker.outcome(bool(orders)) if marker else (ATTRIBUTED_OUTCOME if orders else OUTCOME),
+                outcome=marker.outcome if marker else (ATTRIBUTED_OUTCOME if orders else OUTCOME),
                 reconstructed_orders=bool(orders),
                 order_submit_status="submitted" if orders else "not_submitted_error",
                 orders=orders,
@@ -475,11 +501,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if order_id not in ids:
                 raise BackfillRefused(f"order {order_id}: not in the order file")
             order = next(o for o in orders if o.get("id") == order_id)
-            if not any(
-                orders_in_window([order], *order_span(slot, day, markers[(day, slot)]))
-                for day, slot in fires
-            ):
+            claimed_by = [
+                f"{day}:{slot}" for day, slot in fires if _in_spans(order, order_spans(slot, day, markers[(day, slot)]))
+            ]
+            if not claimed_by:
                 raise BackfillRefused(f"order {order_id}: not inside this fire's window")
+            if len(claimed_by) > 1:
+                # Each fire records every attributed order inside its intervals, so one order in two
+                # fires' intervals would be written into both run_states and counted twice as deployment.
+                raise BackfillRefused(
+                    f"order {order_id}: inside more than one fire's checked intervals ({', '.join(claimed_by)}); "
+                    "attribute it by hand"
+                )
         # All-or-nothing: prove every fire before writing any of them.
         plans = [
             (day, slot, _check_fire(

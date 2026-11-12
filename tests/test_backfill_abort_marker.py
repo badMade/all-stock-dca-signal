@@ -213,19 +213,78 @@ def test_order_near_the_off_window_fire_needs_a_human(tmp_path, capsys):
 
     assert _run(tmp_path, "1430", [NEAR_FIRE]) == 2
 
-    assert "needs a human" in json.loads(capsys.readouterr().out)["refused"]
+    assert "human must investigate" in json.loads(capsys.readouterr().out)["refused"]
 
 
-def test_order_near_the_fire_can_be_attributed_and_is_labelled_by_the_marker(tmp_path):
+def test_order_near_a_pre_broker_abort_refuses_even_when_attributed(tmp_path, capsys):
+    """PR #2234 review: a Gate 1/2 abort runs before the broker read, so it cannot have placed an order."""
     _write_markers(tmp_path, "1430", _marker("1430"))
 
-    assert _run(tmp_path, "1430", [NEAR_FIRE], *_attribute("order-near-fire")) == 0
+    assert _run(tmp_path, "1430", [NEAR_FIRE], *_attribute("order-near-fire")) == 2
 
-    state = _state(tmp_path, "1430")
-    assert state["status"] == "BACKFILL_GATE1_OFF_WINDOW_ATTRIBUTED_ORDERS"
-    assert state["error_class"] == "backfill_gate1_off_window"
-    assert state["orders_submitted_count"] == 1
-    assert state["budget"] == {"budget_evaluated": False}
+    refused = json.loads(capsys.readouterr().out)["refused"]
+    assert "pre-broker abort cannot have placed" in refused and "human must investigate" in refused
+    assert not (tmp_path / RUN_DIR["1430"]).exists()
+
+
+def test_order_in_the_acceptance_window_of_a_marker_fire_refuses_even_when_attributed(tmp_path, capsys):
+    _write_markers(tmp_path, "1430", _marker("1430"))
+    in_window = _order("order-in-window", "MA", "2026-11-09T19:40:00.000000Z", "1.000000")  # 14:40 ET
+
+    assert _run(tmp_path, "1430", [in_window], *_attribute("order-in-window")) == 2
+
+    assert "pre-broker abort cannot have placed" in json.loads(capsys.readouterr().out)["refused"]
+
+
+def test_a_marker_has_no_attributed_outcome():
+    marker = bf.AbortMarker("gate1", "GATE1_OFF_WINDOW", datetime(2026, 11, 9, 19, 24, tzinfo=ET), Path("m"))
+    assert marker.outcome == "BACKFILL_GATE1_OFF_WINDOW_ZERO_DEPLOYMENT"
+    with pytest.raises(bf.BackfillRefused, match="cannot carry attributed orders"):
+        bf.write_fire(Path("unused"), marker.fired_at.date(), "1430", {}, [{"order_id": "x"}], marker)
+
+
+def test_late_marker_does_not_swallow_the_next_slots_window(tmp_path):
+    """PR #2234 review: the window and the fire's interval are checked apart, never as one hull.
+
+    A 14:30 marker at 16:10 ET used to make the checked span 14:25-17:10, which covers the whole 15:30
+    window, so the 15:30 slot's own order blocked the 14:30 backfill (or could be attributed to it).
+    """
+    _write_markers(tmp_path, "1430", _marker("1430", fired_at_utc="2026-11-09T21:10:00Z"))  # 16:10 ET
+    slot_1530_order = _order("order-1530", "MA", "2026-11-09T20:35:00.000000Z", "1.000000")  # 15:35 ET
+
+    assert _run(tmp_path, "1430", [slot_1530_order]) == 0
+
+    reconstruction = _state(tmp_path, "1430")["gate9_report"]["reconstruction"]
+    assert reconstruction["broker_orders_in_window"] == 0
+    window, fire = reconstruction["broker_checked_et"]
+    assert [datetime.fromisoformat(t) for t in fire] == [
+        datetime(2026, 11, 9, 16, 10, tzinfo=ET), datetime(2026, 11, 9, 17, 10, tzinfo=ET)]
+    assert datetime.fromisoformat(window[1]) <= datetime(2026, 11, 9, 15, 0, tzinfo=ET)
+
+
+def test_order_inside_the_late_fires_own_interval_still_refuses(tmp_path):
+    _write_markers(tmp_path, "1430", _marker("1430", fired_at_utc="2026-11-09T21:10:00Z"))  # 16:10 ET
+    near = _order("order-near-late", "MA", "2026-11-09T21:30:00.000000Z", "1.000000")  # 16:30 ET
+    assert _run(tmp_path, "1430", [near]) == 2
+
+
+def test_an_order_in_two_fires_intervals_is_never_attributed_twice(tmp_path, monkeypatch, capsys):
+    """PR #2234 review: one order in two fires' intervals would be written into both run_states."""
+    shared = (datetime(2026, 11, 9, 19, 0, tzinfo=ET), datetime(2026, 11, 9, 20, 0, tzinfo=ET))
+    monkeypatch.setattr(bf, "order_spans", lambda slot, day, marker: [shared])
+    for slot in ("1430", "1530"):
+        alert = tmp_path / ALERT[slot]
+        alert.parent.mkdir(parents=True, exist_ok=True)
+        alert.write_text("abort", encoding="utf-8")
+    orders = tmp_path / "orders.json"
+    orders.write_text(json.dumps([NEAR_FIRE]), encoding="utf-8")
+
+    rc = bf.main(["--fire", f"{DAY}:1430", "--fire", f"{DAY}:1530", "--orders-json", str(orders), *COVER,
+                  "--root", str(tmp_path), *_attribute("order-near-fire")])
+
+    assert rc == 2
+    assert "inside more than one fire's checked intervals" in json.loads(capsys.readouterr().out)["refused"]
+    assert not (tmp_path / RUN_DIR["1430"]).exists() and not (tmp_path / RUN_DIR["1530"]).exists()
 
 
 def test_order_long_after_the_fire_does_not_block(tmp_path):
