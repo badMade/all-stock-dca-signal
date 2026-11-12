@@ -5069,3 +5069,55 @@ def test_live_mirror_payload_floor_numbers_follow_the_publisher():
         if fixed_count.search(text):
             offenders.append(f"{path.name}: states a fixed ticker count, which goes stale when the universe changes")
     assert not offenders, "\n".join(offenders)
+def test_0935_payload_wait_covers_the_launchers_rebuild():
+    """The 9:35 session must still be waiting when the payload launcher's one rebuild can publish.
+
+    2026-11-12: the launcher (deploy/launchd/robinhood_payload.sh) rebuilds a refused payload once, after
+    DCA_BUILD_RETRY_WAIT_SECONDS, and each attempt may run DCA_BUILD_DEADLINE_SECONDS. For 0935 that is a 09:36
+    start, up to 600 s, a 90 s pause and up to 600 s more: a rebuilt payload can land near 09:57:30. The prompt
+    re-checked for only 12 minutes (to about 09:48), so a slow first failure was rebuilt after the session had
+    already aborted with market_data_unavailable, and the rebuild added on 2026-11-10 could never rescue it. The
+    wait is now an absolute ET deadline that must cover that worst case (plus a minute for the merge) and still
+    end inside the slot's own window.
+    """
+    from datetime import time as dtime
+
+    from dca_runner import SLOTS
+
+    plist = (REPO_ROOT / "deploy" / "launchd" / "com.all-stock-dca.robinhood-payload.plist.template").read_text(
+        encoding="utf-8"
+    )
+    launcher = (REPO_ROOT / "deploy" / "launchd" / "robinhood_payload.sh").read_text(encoding="utf-8")
+
+    def plist_int(key: str) -> int | None:
+        found = re.search(rf"<key>{key}</key><string>(\d+)</string>", plist)
+        return int(found.group(1)) if found else None
+
+    def launcher_default(var: str) -> int:
+        found = re.search(rf'"\$\{{{var}:-(\d+)\}}"', launcher)
+        assert found, f"robinhood_payload.sh has no numeric default for {var}"
+        return int(found.group(1))
+
+    def setting(key: str) -> int:
+        value = plist_int(key)
+        return launcher_default(key) if value is None else value
+
+    start = re.search(r"<key>Hour</key><integer>9</integer><key>Minute</key><integer>(\d+)</integer>", plist)
+    assert start, "the payload plist no longer schedules a 09:xx build for 0935"
+    attempt = setting("DCA_BUILD_DEADLINE_SECONDS")
+    pause = setting("DCA_BUILD_RETRY_WAIT_SECONDS")
+    retries = setting("DCA_BUILD_RETRIES")
+    assert attempt > 0, "0935 has no per-attempt build deadline, so its worst case is unbounded"
+    merge_margin = 60
+    worst = 9 * 3600 + int(start.group(1)) * 60 + attempt * (retries + 1) + pause * retries + merge_margin
+
+    text = (PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt").read_text(encoding="utf-8")
+    waited = re.search(r"keep re-checking every 30 seconds until (\d{1,2}):(\d{2}) AM ET", text)
+    assert waited, "the 0935 prompt must keep waiting for the payload until an absolute ET time, past the shared 12 minutes"
+    deadline = int(waited.group(1)) * 3600 + int(waited.group(2)) * 60
+    window_end = dtime(*SLOTS["0935"].window_end_et)
+    assert deadline >= worst, (
+        f"the 0935 prompt stops waiting at {waited.group(1)}:{waited.group(2)} ET, before the launcher's worst-case "
+        f"rebuild can publish ({worst // 3600}:{worst % 3600 // 60:02d}:{worst % 60:02d} ET)"
+    )
+    assert deadline < window_end.hour * 3600 + window_end.minute * 60, "the wait must end inside the 0935 window"

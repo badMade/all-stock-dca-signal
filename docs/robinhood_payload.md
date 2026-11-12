@@ -49,9 +49,10 @@ time, and is no older than 45 minutes (`--max-age-minutes`). The launcher sets a
 
 **What the live prompts do.** Gate 5 (six `live-mirror` prompts) runs `plan` then `check`; on success it copies
 the payload to `$ROOT/market_data_<day>_<slot>.json` and skips the hand fetch. If the file is missing or fails
-`check` after 12 minutes of re-checking, the run aborts with `market_data_unavailable`. It never hand-fetches.
+`check` after 12 minutes of re-checking (0935: until 10:00 ET, so the launcher's one rebuild of a refused build
+can still land, 2026-11-12), the run aborts with `market_data_unavailable`. It never hand-fetches.
 It then reads `ticker_errors.robinhood` (2026-10-23, to match the 95% floor from #1878): more than 5% of the universe errored
-(more than 4 of 90) aborts with `market_data_unavailable`; up to that, the run continues, names every errored ticker in its
+(worked out from the plan's `tickers` list, not a fixed count) aborts with `market_data_unavailable`; up to that, the run continues, names every errored ticker in its
 evidence, and the generator scores each one `NO_DATA` (reported as `provider_error_tickers`, never a BUY). The existing
 zero-candidates rule still applies: with any `provider_error_count` above 0 a run that places nothing alerts instead of ending silently.
 
