@@ -3,7 +3,7 @@
 Status: research input only. Not an ADR, not a decision, not wired into anything.
 Date: 2026-11-11
 Origin: Claude research task (session https://claude.ai/code/session_01KWTqCe24973qRoX66Rbqmc)
-Feeds: the proposed ADR [`docs/adr-overnight-futures-tracker.md`](../adr-overnight-futures-tracker.md) (written 2026-11-12; its "What the research assumed" table corrects four assumptions below against the code).
+Feeds: the accepted ADR [`docs/adr-overnight-futures-tracker.md`](../adr-overnight-futures-tracker.md) (written 2026-11-12; its "What the research assumed" table corrects four assumptions below against the code).
 
 **Bottom line:** Build the overnight futures tracker as a new, suggest-only `ForecastProvider` that forecasts open-gap size and early-session volatility. Do not build it as a directional alpha signal. The evidence is strong that E-mini futures lead price discovery and that overnight information is already mostly priced in by 9:30 AM ET. Evidence that overnight moves predict anything a 9:35 AM buy-only DCA order can exploit is weak and fragile. Parts 2 and 3 are mostly institutional background. Three things carry over to a retail DCA: fair-value-adjusted gap context, awareness of expiry and rebalance days, and ex-dividend date awareness.
 

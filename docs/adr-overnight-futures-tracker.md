@@ -1,7 +1,8 @@
 # ADR: Overnight futures tracker as an observe-only gap forecast
 
-- **Status:** Proposed (2026-11-12). Not wired into any live path. Open questions carry labeled
-  proposed defaults; nothing is implemented by this ADR.
+- **Status:** Accepted (2026-11-12, operator "accept the ADR with the proposed defaults"; every open
+  question takes its proposed default). Not wired into any live path. Implementation follows the plan
+  below, one draft PR per phase.
 - **Scope:** research and reporting only, inside `dca-sizing-signals/`. The stdlib-only core, the
   ladder, `config/`, the live prompts, `sizing_adjustment_reader.py` and all three entry points
   (`run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy, `dca_runner.py`) are untouched. Nothing
@@ -35,7 +36,7 @@
 | The store uses idempotent upserts | `market_data_ingest/prices/store.py` is append-only and point-in-time (`as_of`, `ingested_at`, `run_id`, `content_hash`) | D5: follow the existing append-only convention |
 | Ex-dividend dates need a new source | `corporate_actions` already stores `cash_dividend` rows with `ex_date` | D7: read ex-dates from the existing store |
 
-## Decision (proposed)
+## Decision
 
 ### D1. Purpose: gap-size and dispersion context, not direction
 
@@ -179,7 +180,7 @@ over.
 
 ## Open questions
 
-| # | Question | Proposed default |
+| # | Question | Decision (accepted proposed default) |
 |---|---|---|
 | 1 | How is "same session, 9:35 slot" expressed through `ForecastResult`? | `horizon_trading_days = 0`; slot in the provider table (D2) |
 | 2 | Vendor for history, and how to load it without a new Python dependency? | Databento batch download in CSV encoding, loaded with DuckDB's CSV reader; the `databento` client only if a later need justifies it |
@@ -191,7 +192,7 @@ over.
 | 8 | Weekends and holidays? | `hours_in_window` as a feature; flag and evaluate weekend gaps separately |
 | 9 | Live shadow length? | 6 months minimum (D8) |
 
-## Implementation plan (after acceptance, one draft PR per phase)
+## Implementation plan (one draft PR per phase)
 
 1. **Boundaries first:** add `overnight_futures` to the architecture-boundary test, with an empty
    package, so the rules hold before any code lands.
