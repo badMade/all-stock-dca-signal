@@ -230,7 +230,8 @@ catches up automatically if days were missed. Scheduling it is the operator's ch
 ### Scheduling it (launchd)
 
 ```bash
-sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_OCTOPUS_RUN_DIR|$HOME/octopus/quick|g" \
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_OCTOPUS_RUN_DIR|$HOME/octopus/run1|g" \
+  -e "s|REPLACE_WITH_TICKER_ARCHIVE_DIR|<live ticker archive>|g" \
   deploy/launchd/com.all-stock-dca.octopus-daily-update.plist.template \
   > ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.octopus-daily-update.plist
@@ -238,7 +239,10 @@ launchctl kickstart gui/$(id -u)/com.all-stock-dca.octopus-daily-update    # run
 ```
 
 Runs 18:30 Mon-Fri local time (after the close and the archive refresh); log at
-`/tmp/dca-octopus-daily-update.log`. Needs an existing run directory with a checkpoint.
+`/tmp/dca-octopus-daily-update.log`. Needs an existing run directory with a checkpoint. Point
+`--history-dir` at the LIVE archive: a replay run is usually built on a frozen snapshot, and the daily
+job must read the archive that keeps getting new days. After rewriting a plist, run `xattr -c` on it
+before `launchctl bootstrap`.
 
 ### Recovery retrains
 

@@ -980,6 +980,21 @@ def test_preset_knobs_resolve_with_explicit_flag_override():
     assert knobs["max_tickers"] == 500
 
 
+def test_horizon_weight_flag_defaults_and_reaches_the_octopus_model():
+    parser = run_walkforward.build_parser()
+    assert parser.parse_args([]).horizon_weight == 0.5  # the OctopusModel default
+    args = parser.parse_args(["--horizon-weight", "2.0", "--max-horizon", "90"])
+    assert args.horizon_weight == 2.0
+    knobs = run_walkforward._apply_preset(args)
+    assert run_walkforward._model_hyper(args, knobs)["horizon_weight"] == 2.0
+
+
+def test_horizon_weight_rejects_negative_values():
+    parser = run_walkforward.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--horizon-weight", "-1"])
+
+
 class TestDefaultRunRootIsolation:
     """Regression guard for the run-directory leak fixed on 2026-09-13.
 
