@@ -89,7 +89,7 @@ Use 9:29 ET rather than 9:30 to avoid using any print at or after the cash open.
 | Boyarchenko, Larsen, Whelan, "The Overnight Drift," NY Fed Staff Report 917 (2020, rev. 2022); Review of Financial Studies 36(9), 3502-3547 (2023) | S&P 500 futures, 1998 to 2019 | Largest positive returns accrue 2:00 to 3:00 AM ET (the European open), about 3.6% annualized. The drift is stronger after intraday sell-offs. The timing shifts with US/Europe DST asynchrony, supporting an inventory/liquidity explanation | Overnight returns have structure, but it is a small unconditional drift, not a gap predictor |
 | Lou, Polk, Skouras, "A Tug of War," JFE 134(1), 192-213 (2019) | US cross-section | All momentum profits accrue overnight; other anomaly profits accrue intraday, with partly offsetting overnight premia; driven by investor clienteles | Overnight and intraday components behave differently and persist; relevant to single-stock beta mapping, not index gap timing |
 | Kelly and Clark, Journal of Asset Management 12(2), 132-145 (2011) | US index ETFs, 1999 to 2006 | Returns are higher in non-trading hours than in trading hours | Supports the "overnight premium" literature; implies buying at the open has historically paid a premium relative to the close |
-| Cliff, Cooper, Gulen, "Return Differences between Trading and Non-Trading Hours: Like Night and Day," SSRN 1004081 (rev. September 26, 2008) | US equities, roughly the prior decade | The US equity premium over that decade came from overnight returns, driven in part by high opening prices that then declined in the first hour of trading | Same; also directly relevant to buying near the open |
+| Cliff, Cooper, Gulen, "Return Differences between Trading and Non-Trading Hours: Like Night and Day," SSRN working paper (rev. September 26, 2008) | US equities, roughly the prior decade | The US equity premium over that decade came from overnight returns, driven in part by high opening prices that then declined in the first hour of trading | Same; also directly relevant to buying near the open |
 | Gao, Han, Li, Zhou, "Market Intraday Momentum," JFE 129(2), 394-414 (2018) | SPY, 1993 to 2013 | First half-hour return (prior close to 10:00 ET) predicts the last half-hour return; scaled slope 6.94; R-squared about 1.6% | The first half-hour embeds the overnight gap; the predicted window (15:30 to 16:00) is after all project buy slots |
 | Hasbrouck, Journal of Finance 58(6), 2375-2400 (2003) | S&P 500 and Nasdaq-100 | Most price discovery occurs in E-mini futures; ETFs and cash follow | Futures-led price discovery is the mechanism linking overnight futures to the open |
 
@@ -483,7 +483,7 @@ CREATE TABLE overnight_gap_forecast (
 - Intraday momentum summary: https://quantum-bias.com/blog/first-last-half-hour-intraday-momentum
 - Intraday price formation in US equity index markets: https://www.researchgate.net/publication/305397790_Intraday_price_formation_in_US_equity_index_markets
 - Overnight returns (arXiv): https://arxiv.org/html/2507.04481v1
-- Overnight returns thesis (DiVA): https://www.diva-portal.org/smash/get/diva2:1878991/FULLTEXT01.pdf
+- Overnight returns thesis (DiVA portal; search the title on diva-portal.org, URL omitted because its numeric ID trips the repo secrets guard)
 - CME fair value: https://www.cmegroup.com/trading/equity-index/fairvalue.html
 - StockCharts on futures fair value: https://articles.stockcharts.com/article/articles-dancing-2018-11-infatuation-with-morning-futures-fair-value/
 - StoneX, E-mini S&P 500: https://futures.stonex.com/blog/what-are-emini-sp-500-futures
@@ -510,8 +510,8 @@ CREATE TABLE overnight_gap_forecast (
 - CME options on SDA FAQ: https://www.cmegroup.com/articles/faqs/frequently-asked-questions-options-on-sp-500-annual-dividend-index-futures.html
 - CME equity index dividend futures: https://www.cmegroup.com/markets/equities/us-index/equity-index-dividend-futures.html
 - Eurex dividend derivatives: https://www.eurex.com/ex-en/markets/did
-- Eurex FEXD: https://www.eurex.com/ex-en/markets/did/eqt-idx-div-fut/EURO-STOXX-50-Index-Dividend-Futures-946316
-- Eurex OEXD: https://www.eurex.com/ex-en/markets/did/eqt-idx-div-opt/EURO-STOXX-50-Index-Dividend-Options-946274
+- Eurex FEXD (EURO STOXX 50 Index Dividend Futures product page, under https://www.eurex.com/ex-en/markets/did; direct URL omitted because its numeric ID trips the repo secrets guard)
+- Eurex OEXD (EURO STOXX 50 Index Dividend Options product page, under https://www.eurex.com/ex-en/markets/did; direct URL omitted for the same reason)
 - Dividend future (Wikipedia, background only): https://en.wikipedia.org/wiki/Dividend_future
 - S&P DJI equity indices policies and practices: https://www.spglobal.com/spdji/en/documents/methodologies/methodology-sp-equity-indices-policies-practices.pdf
 - ISDA SIMM v2.8+2506: https://www.isda.org/a/f2RgE/ISDA-SIMM_v2.82506_PUBLIC.pdf
