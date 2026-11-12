@@ -31,7 +31,7 @@ TODAY = datetime.date(2026, 10, 20)  # Tuesday; Oct 14-19 are all full market da
 
 def _gate5_script() -> str:
     text = PROMPT.read_text(encoding="utf-8")
-    match = re.search(r"python3 - <<'PY'\n(import datetime, glob, json, zoneinfo.*?)\nPY\n", text, re.S)
+    match = re.search(r"python3 - <<'PY'\n(import datetime, glob, json, os.*?)\nPY\n", text, re.S)
     assert match, "Gate 5 deployment heredoc not found in the 12:30 prompt"
     return match.group(1)
 
@@ -56,6 +56,8 @@ def _run_gate5(monkeypatch, tmp_path, states: dict[str, dict]) -> str:
     for module_name in ("dca_risk", "dca_runner"):
         __import__(module_name)
     monkeypatch.setattr(dca_paths, "stream_root", lambda cron, *rest: scheduled if cron == "ce16ba6b" else intraday)
+    monkeypatch.setattr(dca_paths, "cron_tracking_root", lambda: tmp_path)
+    monkeypatch.delenv("KILL_SWITCH_GAP_ORDERS", raising=False)
     monkeypatch.setattr(datetime, "datetime", _FrozenDateTime)
     with pytest.raises(SystemExit) as excinfo:
         exec(compile(_gate5_script(), "<gate5>", "exec"), {"__name__": "__gate5__"})

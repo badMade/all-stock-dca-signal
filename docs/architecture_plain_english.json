@@ -147,6 +147,7 @@
   "scripts.same_day_pointer": "Checks and refreshes the \"latest run\" pointer files so they never point at a stale or invalid run.",
   "scripts.same_day_top_up_gate": "Enforces the same-day top-up rule using the broker's own order history: a later slot may buy the same ticker, sized down.",
   "scripts.abort_markers": "Reads the small marker a slot leaves when it aborts before writing any evidence, so the watchdog can say it fired instead of calling it missed.",
+  "scripts.kill_switch_gap_proof": "Checks whether missing afternoon run evidence can be counted as zero deployment using abort markers and complete broker order history.",
   "scripts.local_ci_sweep": "Every 30 minutes on the Mac, runs the local checks on each open pull request that has no result yet and posts pass or fail on its latest commit.",
   "scripts.schedule_watchdog": "An independent watcher that raises an alarm when a slot that should have run left no evidence.",
   "scripts.claude_liveness": "Checks before each DCA slot that Claude Desktop is running, reopens it when needed, and records an alert.",
