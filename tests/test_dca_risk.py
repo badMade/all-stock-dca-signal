@@ -1040,6 +1040,13 @@ def _finalized_state(triggered_at_utc: Any, scheduled_for_et: Any = "15:30", gen
         ("2026-09-22T18:25:00+00:00", "14:30", (14, 30)),  # 14:25 ET
         ("2026-09-22T19:30:00Z", "15:30", (15, 30)),  # on time: unchanged
         ("2026-09-22T19:40:00Z", "15:30", (15, 40)),  # late: never moved earlier
+        # 2026-11-11: a backfill from a Gate 1 off-window abort marker carries the REAL fire time (the
+        # 2026-11-09 outage fired both afternoon slots at 19:24 ET, past midnight UTC). The nominal time
+        # is only a floor, so it is kept as 19:24/20:24 ET, still at/after the 14:30 afternoon floor.
+        ("2026-09-22T23:24:28Z", "14:30", (19, 24)),
+        ("2026-09-23T00:24:58Z", "15:30", (20, 24)),
+        # ...and an off-window fire BEFORE the slot is floored up to its nominal time.
+        ("2026-09-22T18:00:00Z", "14:30", (14, 30)),  # 14:00 ET
     ],
 )
 def test_finalizer_state_early_start_counts_at_its_nominal_time(triggered_at_utc, scheduled_for_et, expected_hhmm):
