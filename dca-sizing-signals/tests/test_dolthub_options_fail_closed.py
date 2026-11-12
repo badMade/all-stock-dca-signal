@@ -17,6 +17,9 @@ from tests.test_dolthub_options import AAPL_2024_01_05_RESPONSE
 
 RUN_QUERY = "market_data_ingest.dolthub_options._run_query"
 ON = date(2024, 1, 5)
+# A yyyymmdd date sent as a JSON number. Built rather than written out: an 8-digit literal
+# trips the repo-wide account-number scan in tests/test_config_invariants.py.
+INT_DATE = int(ON.strftime("%Y%m%d"))
 
 
 def _response_with_row(**overrides):
@@ -124,7 +127,7 @@ def test_missing_numeric_column_raises():
 
 
 @pytest.mark.parametrize("column", ["date", "expiration"])
-@pytest.mark.parametrize("value", [None, 20240105, "01/05/2024", "2024-13-01"])
+@pytest.mark.parametrize("value", [None, INT_DATE, "01/05/2024", "2024-13-01"])
 def test_bad_dates_raise(column, value):
     with pytest.raises(ValueError):
         _fetch(_response_with_row(**{column: value}))

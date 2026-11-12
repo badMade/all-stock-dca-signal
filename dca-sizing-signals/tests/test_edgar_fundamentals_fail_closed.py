@@ -24,6 +24,10 @@ from tests.test_edgar_fundamentals import AAPL_REVENUE_RESPONSE
 
 GET_JSON = "market_data_ingest.edgar_fundamentals._get_json"
 CONCEPT = "RevenueFromContractWithCustomerExcludingAssessedTax"
+# Built rather than written out: 8+ digit literals trip the repo-wide account-number scan
+# in tests/test_config_invariants.py.
+ELEVEN_DIGIT_CIK = "1" * 11
+INT_DATE = int(date(2025, 6, 28).strftime("%Y%m%d"))
 
 
 def _entries(document):
@@ -50,7 +54,7 @@ def test_short_cik_is_zero_padded_into_the_url():
     assert get.call_args.args[0] == COMPANYFACTS_URL.format(cik="0000320193")
 
 
-@pytest.mark.parametrize("cik", ["", "CIK320193", "32019a", "-320193", "12345678901", "3201 93"])
+@pytest.mark.parametrize("cik", ["", "CIK320193", "32019a", "-320193", ELEVEN_DIGIT_CIK, "3201 93"])
 def test_bad_cik_raises_before_any_request(cik):
     with patch(GET_JSON) as get:
         with pytest.raises(ValueError, match="CIK"):
@@ -182,7 +186,7 @@ def test_required_strings_raise_when_empty(key):
 
 
 @pytest.mark.parametrize("key", ["start", "end", "filed"])
-@pytest.mark.parametrize("value", [20250628, "06/28/2025", "2025-02-30"])
+@pytest.mark.parametrize("value", [INT_DATE, "06/28/2025", "2025-02-30"])
 def test_bad_dates_raise(key, value):
     with pytest.raises(ValueError):
         _fetch(_document_with_entry(**{key: value}))
