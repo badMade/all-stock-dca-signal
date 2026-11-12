@@ -52,3 +52,7 @@
 ## 2026-11-10 - [Avoid Path.rglob() in tight loops for artifact scanning]
 **Learning:** `Path.rglob()` requires resolving entire directory trees and instantiating costly Path objects before yielding any results. This causes severe I/O bottlenecks when repeatedly iterating over large numbers of artifacts in reporting logic.
 **Action:** Directly import `iter_run_state_files_fast` (or similar scandir-based utilities) from `dca_fileio.py` when identifying specific artifact subsets. This provides a single-pass traversal that bypasses O(N) `stat` calls while avoiding duplicating manual `os.scandir` logic.
+
+## 2026-11-12 - [Avoid Path.resolve() inside loop in _index_root]
+**Learning:** Resolving parent directories or identical directories for multiple files inside a loop executes duplicate `stat` syscalls. We observed this in `dca_console_runs.py` where multiple run states often exist in the same run directory.
+**Action:** Always deduplicate parent directories via a `set` before calling `.resolve()` inside the directory iteration loop to guarantee each unique directory is resolved exactly once, reducing I/O overhead.
