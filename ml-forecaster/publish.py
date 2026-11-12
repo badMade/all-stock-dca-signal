@@ -174,6 +174,23 @@ def _is_finite_number(value: Any) -> TypeGuard[float | int]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+#: Rank-IC pass path (2026-11-11, operator decision): a model that does not beat the naive MAE baselines
+#: may still publish if it reliably ORDERS dip days -- sizing only uses the ordering. Requires every
+#: walk-forward fold's rank IC > 0, at least MIN_RANK_IC_FOLDS folds, and a mean >= MIN_MEAN_RANK_IC.
+MIN_RANK_IC_FOLDS = 3
+MIN_MEAN_RANK_IC = 0.02
+
+
+def _rank_ic_passes(eval_summary: dict[str, Any]) -> bool:
+    folds = eval_summary.get("folds")
+    if not isinstance(folds, list) or len(folds) < MIN_RANK_IC_FOLDS:
+        return False
+    ics = [f.get("model_rank_ic") if isinstance(f, dict) else None for f in folds]
+    if not all(_is_finite_number(v) and v > 0.0 for v in ics):
+        return False
+    return sum(ics) / len(ics) >= MIN_MEAN_RANK_IC
+
+
 def _baseline_mae(eval_summary: dict[str, Any]) -> float:
     """The better (lower) of this run's two naive walk-forward baseline MAEs.
 
@@ -544,10 +561,12 @@ def blocking_reasons(
 
     if baseline_mae is None:
         reasons.append(baseline_mae_error or "unable to determine baseline MAE")
-    elif new_mae >= baseline_mae:
+    elif new_mae >= baseline_mae and not _rank_ic_passes(eval_summary):
         reasons.append(
             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the naive "
-            f"walk-forward baseline MAE {baseline_mae:.6f} (best of predict-zero / predict-trailing-mean)"
+            f"walk-forward baseline MAE {baseline_mae:.6f} (best of predict-zero / predict-trailing-mean), "
+            f"and the rank-IC pass path (every fold > 0, >= {MIN_RANK_IC_FOLDS} folds, mean >= "
+            f"{MIN_MEAN_RANK_IC}) is not met either"
         )
 
     return reasons

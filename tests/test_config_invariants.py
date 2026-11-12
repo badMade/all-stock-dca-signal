@@ -1463,6 +1463,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
         # Share counts, dollar amounts, and token totals quoted in the fetch
         # reports, README_FETCH_SYSTEM, and the credit-usage proxy report.
         "4440195",
+        "400000",
         "46240500",
         "676830",
         "2150000",
@@ -2026,7 +2027,7 @@ _SLOT_FILES = [
 # filename, so a copy-pasted neighbor's window landing in the wrong file is
 # caught even though nothing at runtime ever reads these files as config.
 _SLOT_TIME_WINDOWS = {
-    "1-executor-0935-cron_35_13.txt": "9:35-10:20 AM ET",
+    "1-executor-0935-cron_35_13.txt": "9:31-10:20 AM ET",
     "2-executor-1030-cron_30_14.txt": "10:30-11:00 AM ET",
     "3-executor-1130-cron_30_15.txt": "11:30 AM-12:00 PM ET",
     "4-executor-1230-cron_30_16.txt": "12:30-1:00 PM ET",
@@ -2523,7 +2524,11 @@ def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
         "if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):"
         in text
     )
-    assert "if missing_pairs:" in text
+    # 2026-11-10: the bare `if missing_pairs:` abort became a per-pair verdict from
+    # scripts.kill_switch_gap_proof; a BLOCKED verdict still raises the same SystemExit.
+    assert "missing_pairs = sorted(expected_pairs - observed_pairs)" in text
+    assert "if v.status == gap.BLOCKED" in text
+    assert "raise SystemExit(f'incomplete trailing-7-day afternoon evidence; missing scheduled fires: {detail}')" in text
 
 
 def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
@@ -2721,7 +2726,15 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
         "deployment_evidence_states.append(state)",
         "observed_pairs.add((trading_day, scheduled_for))",
         "scheduled_for in ('14:30', '15:30')",
-        "if missing_pairs:",
+        # 2026-11-10 (kill_switch_evidence_incomplete): a missing pair is no longer an abort by
+        # itself -- scripts.kill_switch_gap_proof decides, and every verdict but EXCUSED still aborts.
+        "verdicts = gap.classify_missing_pairs(",
+        "claimed_pairs=set(rejected_reasons)",
+        "if v.status == gap.BLOCKED",
+        "KILL_SWITCH_GAP_NEEDS_BROKER_PROOF",
+        "raise SystemExit(3)",
+        "KILL-SWITCH EVIDENCE GAP PROOF",
+        "completeness carve-out does NOT apply here",
     ):
         assert required in text
     assert "prints exactly one scalar: the deployment figure" in text

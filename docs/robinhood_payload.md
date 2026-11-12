@@ -80,6 +80,12 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   spent its deadline on retries and rescues and refused at 15/84. The 15:30 and live plist templates set `DCA_CODEX_PARALLEL=8`
   (it was 6 until the 122-symbol universe of 2026-11-06 made 31 chunks, 6 waves at 6 workers; reload the plists on the Mac
   after a change), since 4-ticker chunks mean more worker calls.
+- A rate-limited attempt waits before it is retried (2026-11-10: the 09:35 and 10:30 builds refused at 60/122 and
+  98/122 because whole chunks died in 3-4 s with `429 Too Many Requests`, and each retry and rescue fired at once into
+  the same window). When an attempt returns no reply and its worker log names a 429, the launcher logs
+  `rate_limited chunk=<i> attempt=1 backoff_seconds=<s>` and sleeps `DCA_RATE_LIMIT_BACKOFF_SECONDS` (default 30, `0`
+  turns it off) plus up to a third more as jitter. The wait shrinks under a build deadline so the retry still gets
+  `DCA_MIN_ATTEMPT_SECONDS`. Other failures retry at once, as before. Takes effect on the next build, no plist reload.
 - A chunk that returns no reply on both attempts is rescued (2026-10-26: the 09:35 run lost chunks 4 and 10 whole,
   16 of 91 tickers, and refused at 75/91 although every other chunk validated). The floor tolerates 4 misses but a
   chunk holds 8, so one dead worker used to cost the slot. Its tickers are now asked for again in requests of

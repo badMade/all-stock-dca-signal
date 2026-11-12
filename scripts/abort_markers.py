@@ -9,8 +9,11 @@ marker FIRST on those paths, through a shell script that needs no Python 3.11, a
 it into a distinct triage key.
 
 A marker is never run evidence. It does not verify a slot or excuse a failing one -- the row's status
-stays ``no_evidence`` and still alerts -- and nothing that sizes, caps or allocates reads it. It only
-changes the triage key, and only for a marker whose fire time falls inside the slot's acceptance
+stays ``no_evidence`` and still alerts -- and nothing that sizes, caps or allocates reads it as a dollar
+figure. The one reader outside triage (2026-11-10) is ``scripts.kill_switch_gap_proof``, the 12:30 Gate 5
+kill-switch coverage check: there a clean Gate-1 marker is only a PRECONDITION for asking the broker,
+and the $0 proof is a replayed, complete order history showing no order that afternoon -- see
+``docs/kill_switch_evidence_gap_proof.md``. Here it only changes the triage key, and only for a marker whose fire time falls inside the slot's acceptance
 window through its grace deadline (the same interval ``verify_schedule`` already credits a
 failed-start marker with). An off-window marker -- a manual night-time "Run now", or a scheduler fire
 hours late -- keeps ``slot_did_not_fire``: the slot's scheduled fire is still unaccounted for, and a

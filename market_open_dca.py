@@ -103,8 +103,9 @@ MARKET_OPEN_LIVE_MODE = "live"
 MARKET_OPEN_LIVE_CRON_ID = "2ba19526"
 MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
 MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
-# Opens AT the 9:35 decision time, never before it (the decision reads the completed 9:30 bar).
-MARKET_OPEN_LIVE_WINDOW_START_ET = "09:35"
+# Opens at 9:31 (2026-11-05) so startup is absorbed early, but the DECISION is still 9:35 and
+# must not read data before the completed 9:30 bar / 9:36 payload exists.
+MARKET_OPEN_LIVE_WINDOW_START_ET = "09:31"
 MARKET_OPEN_LIVE_WINDOW_END_ET = "09:50"
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 

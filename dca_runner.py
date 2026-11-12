@@ -710,13 +710,17 @@ class SlotSpec:
 
 # Authoritative roster: docs/safeguards.md "Live execution roster".
 SLOTS: dict[str, SlotSpec] = {
-    # The window opens AT nominal (9:35), never before: the 9:35 decision reads the
-    # completed 9:30 bar, so an earlier fire has no decision bar to trade on.
-    # It closes at 10:20, not 10:00 (operator decision 2026-10-28): on 2026-10-27 the
+    # The window opens at 9:31 but the DECISION stays nominal 9:35 (operator decision
+    # 2026-11-05): the 9:35 decision reads the completed 9:30 bar, so a 9:31 session
+    # only front-loads startup (context, config, account state) and must wait for the
+    # 9:36 prebuilt payload before reading data or deciding -- a 9:31 decision itself
+    # would anchor on the pre-market 9:26 bar and return NO_DATA for every ticker.
+    # The earlier start widens the gap to the 10:00 Perplexity backup when the run
+    # goes long. It closes at 10:20, not 10:00 (operator decision 2026-10-28): on 2026-10-27 the
     # scheduler fired this slot about 18 minutes late and the run aborted for lack of
     # time with 32 candidates unplaced. The close stays before the 10:30 slot's open,
     # and Gate 4's interlock reads the same bounds, so it widens with the window.
-    "0935": SlotSpec("0935", (9, 35), (9, 35), (10, 20), "market-open"),
+    "0935": SlotSpec("0935", (9, 35), (9, 31), (10, 20), "market-open"),
     "1030": SlotSpec("1030", (10, 30), (10, 30), (11, 0), "morning"),
     "1130": SlotSpec("1130", (11, 30), (11, 30), (12, 0), "intraday"),
     "1230": SlotSpec("1230", (12, 30), (12, 30), (13, 0), "midday"),

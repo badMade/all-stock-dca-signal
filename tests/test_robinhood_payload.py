@@ -647,6 +647,12 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
         "DCA_TRADING_DAY": "2026-10-20",
         "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct"),
         "DCA_CODEX_PARALLEL": "3",
+        # The stub publishes nothing by design, which the launcher would otherwise retry after its 90 s wait (2026-11-10);
+        # the retry tests below switch it back on.
+        "DCA_BUILD_RETRIES": "0",
+        # Likewise the 30 s wait before re-asking a rate-limited chunk (2026-11-10): the 429 stubs would sleep on every
+        # chunk. The backoff tests switch it back on with a short wait.
+        "DCA_RATE_LIMIT_BACKOFF_SECONDS": "0",
         "TMPDIR": str(tmp_path),
         **(extra_env or {}),
     }
@@ -685,6 +691,64 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     assert sorted(seen) == sorted(
         [(str(i), "1", "1") for i in range(chunks)] + [(str(i), "2", "0") for i in range(chunks)]
     ), log
+
+
+# -- 429 backoff (2026-11-10: 09:35 and 10:30 refused at 60/122 and 98/122; every dead chunk's log ended "exceeded retry
+# limit, last status: 429 Too Many Requests" after 3-4 s, and its retry fired at once into the same window) -------------
+
+# First call per chunk dies like the 11-10 workers (no reply, a 429 on stderr); the second answers. The counter lives
+# beside the chunk's output file, so it is per chunk.
+_RATE_LIMITED_ONCE = (
+    'n=$(cat "$out.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$out.n"; '
+    'if [ "$n" = 1 ]; then echo "ERROR: exceeded retry limit, last status: 429 Too Many Requests" >&2; exit 1; '
+    'else echo "{}" >"$out"; fi'
+)
+
+
+def test_launcher_backs_off_before_retrying_a_rate_limited_chunk(tmp_path):
+    import re
+
+    done, chunks = _run_launcher(tmp_path, _RATE_LIMITED_ONCE, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "1", "DCA_CODEX_PARALLEL": "64"})
+    log = done.stdout + done.stderr
+    backoffs = re.findall(r"robinhood_payload: rate_limited chunk=(\d+) attempt=1 backoff_seconds=(\d+)", log)
+    assert sorted(int(i) for i, _ in backoffs) == list(range(chunks)), log
+    assert all(int(s) == 1 for _, s in backoffs), backoffs  # 1 s + jitter of at most 1 // 3 == 0
+    # The retry after the wait is what fetched the data: every chunk's second attempt answered cleanly.
+    retried = re.findall(r"robinhood_payload: timing chunk=(\d+) attempt=2 seconds=\d+ errors=0", log)
+    assert sorted(int(i) for i in retried) == list(range(chunks)), log
+
+
+def test_launcher_does_not_wait_after_a_failure_that_is_not_a_rate_limit(tmp_path):
+    reply = (
+        'n=$(cat "$out.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$out.n"; '
+        'if [ "$n" = 1 ]; then echo "ERROR: stream disconnected" >&2; exit 1; else echo "{}" >"$out"; fi'
+    )
+    done, _ = _run_launcher(tmp_path, reply, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "1", "DCA_CODEX_PARALLEL": "64"})
+    assert "rate_limited" not in done.stdout + done.stderr
+
+
+def test_launcher_rate_limit_backoff_zero_turns_the_wait_off(tmp_path):
+    done, _ = _run_launcher(tmp_path, _RATE_LIMITED_ONCE, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "0", "DCA_CODEX_PARALLEL": "64"})
+    assert "rate_limited" not in done.stdout + done.stderr
+
+
+def test_launcher_backoff_never_eats_the_retry_s_minimum_time_before_the_deadline(tmp_path):
+    import re
+
+    # A 600 s wait against a 25 s deadline: the wait shrinks so the retry still starts with MIN_ATTEMPT_SECONDS (20) left.
+    done, _ = _run_launcher(
+        tmp_path, _RATE_LIMITED_ONCE,
+        extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "600", "DCA_BUILD_DEADLINE_SECONDS": "25", "DCA_CODEX_PARALLEL": "64"},
+    )
+    log = done.stdout + done.stderr
+    waits = [int(s) for s in re.findall(r"rate_limited chunk=\d+ attempt=1 backoff_seconds=(\d+)", log)]
+    assert waits and all(s <= 5 for s in waits), log
+
+
+@pytest.mark.parametrize("value", ["x", "-1", "1.5"])
+def test_launcher_rejects_an_unusable_rate_limit_backoff(tmp_path, value):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": value})
+    assert done.returncode == 2 and "DCA_RATE_LIMIT_BACKOFF_SECONDS must be a whole number" in done.stderr
 
 
 # -- a whole dead chunk (2026-10-26 09:35 abort) -----------------------------------------------------------------------
@@ -1441,3 +1505,56 @@ def test_thin_quiet_names_leave_the_denominator_while_liquid_empties_count(tmp_p
     published = json.loads((tmp_path / "out" / "payload.json").read_text())
     assert published["ticker_errors"] == {"robinhood": sorted(tickers[:13])}  # every name stays listed for Gate 5
     assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+# -- whole-build retry and failure diagnostics (2026-11-10: 09:35 and 10:30 refused with Codex "429 Too Many Requests") --
+
+#: A worker that fails the way the 11-10 ones did: the 429 text on stderr, no reply file, a non-zero exit.
+_ALWAYS_429 = 'echo "ERROR: exceeded retry limit, last status: 429 Too Many Requests" >&2; exit 1'
+
+
+def _failure_rows(tmp_path):
+    import glob
+
+    rows = []
+    for path in glob.glob(str(tmp_path / "ct" / "**" / "*.failures.jsonl"), recursive=True):
+        rows += [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    return rows
+
+
+def test_a_refused_build_is_retried_once_and_every_failed_attempt_is_recorded(tmp_path):
+    done, chunks = _run_launcher(tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "1", "DCA_BUILD_RETRY_WAIT_SECONDS": "0"})
+    log = done.stdout + done.stderr
+    assert "retrying in 0s (attempt 2 of 2)" in log, log
+    assert log.count("robinhood_payload: timing total") == 2, log  # exactly one rebuild, never a loop
+    rows = _failure_rows(tmp_path)
+    assert rows and all(r["http_status"] == ["429"] for r in rows), rows[:2]
+    assert {r["build_attempt"] for r in rows} == {1, 2}
+    assert {"codex_exec_running", "payload_workers_running", "parallel_setting", "seconds_into_build"} <= set(rows[0])
+    assert rows[0]["parallel_setting"] == 3 and rows[0]["slot"] == "0935"
+    assert "http429=" in log and "failed worker attempts=" in log, log
+
+
+def test_the_retry_can_be_turned_off(tmp_path):
+    done, _ = _run_launcher(tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "0"})
+    log = done.stdout + done.stderr
+    assert "retrying" not in log and log.count("robinhood_payload: timing total") == 1, log
+
+
+def test_no_retry_when_the_first_attempt_began_too_long_ago(tmp_path):
+    done, _ = _run_launcher(
+        tmp_path, _ALWAYS_429, extra_env={"DCA_BUILD_RETRIES": "1", "DCA_BUILD_RETRY_WAIT_SECONDS": "0", "DCA_BUILD_RETRY_BY_SECONDS": "0"}
+    )
+    log = done.stdout + done.stderr
+    assert "not retrying: the first attempt began too long ago" in log and log.count("timing total") == 1, log
+
+
+def test_a_healthy_build_writes_no_failure_file_and_never_retries(tmp_path):
+    done, _ = _run_launcher(tmp_path)
+    log = done.stdout + done.stderr
+    assert _failure_rows(tmp_path) == [] and "retrying" not in log and "failed worker attempts" not in log, log
+
+
+def test_retry_settings_must_be_whole_numbers(tmp_path):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_RETRIES": "once"})
+    assert done.returncode == 2 and "DCA_BUILD_RETRIES" in done.stderr
