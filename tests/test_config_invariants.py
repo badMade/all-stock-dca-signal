@@ -5038,3 +5038,34 @@ def test_every_live_slot_bridge_protocol_exports_the_account_number_for_shell_co
         if "print(" in exported:
             offenders.append(f"{mirror.name}: the export line prints the account number (SECRET RULE)")
     assert not offenders, "\n".join(offenders)
+
+
+def test_live_mirror_payload_floor_numbers_follow_the_publisher():
+    """The live prompts restate the payload publisher's limits, so they must not drift from its constants.
+
+    2026-11-12: all seven live-mirror prompts still said the payload check "capped [quiet names] at 10% of the
+    universe" and allowed "more than 4 of the 90 tickers today", after MAX_QUIET_SHARE had moved to 25%
+    (2026-11-03) and the universe had grown to 122 symbols (2026-11-06). A session that trusted the written count
+    would abort a valid payload at 5 errors instead of 7. The quiet cap must match the constant, and the error
+    allowance must be worked out from the plan's ticker list rather than written as a fixed count that goes stale
+    with every universe change.
+    """
+    from scripts.robinhood_payload import DEFAULT_MIN_COVERAGE, MAX_QUIET_SHARE
+
+    quiet_cap = f"capped them at {MAX_QUIET_SHARE:.0%} of the universe"
+    error_floor = f"holds more than {1 - DEFAULT_MIN_COVERAGE:.0%} of the universe"
+    fixed_count = re.compile(r"more than \d+ of the \d+ tickers today")
+    offenders = []
+    for path in sorted((PROMPTS_DIR / "live-mirror").glob("*.txt")):
+        if path.name.startswith("."):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "PREBUILT ROBINHOOD PAYLOAD" not in text:
+            continue
+        if quiet_cap not in text:
+            offenders.append(f"{path.name}: quiet cap is not stated as {MAX_QUIET_SHARE:.0%} (MAX_QUIET_SHARE)")
+        if error_floor not in text:
+            offenders.append(f"{path.name}: error allowance is not stated as {1 - DEFAULT_MIN_COVERAGE:.0%}")
+        if fixed_count.search(text):
+            offenders.append(f"{path.name}: states a fixed ticker count, which goes stale when the universe changes")
+    assert not offenders, "\n".join(offenders)
