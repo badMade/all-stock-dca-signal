@@ -42,22 +42,34 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 # connector_signals/ and market_data_ingest/ ship inside THIS package, so they
 # resolve against the package root rather than the wider repo root.
-_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals"}
+# overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
+_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # comovement_signals is forbidden to every other package too (review round 1 on
     # PR #2106): independence must hold both ways, so only SizingAdjustmentReader may ever
-    # know it exists.
-    "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "near_close_dca"},
-    "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "near_close_dca"},
-    "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "near_close_dca"},
+    # know it exists. overnight_futures gets the same two-way rule
+    # (docs/adr-overnight-futures-tracker.md, D3) -- and unlike comovement_signals, not even
+    # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
+    "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
+                      "near_close_dca"},
+    "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
+                         "near_close_dca"},
+    "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
+                          "near_close_dca"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "near_close_dca"},
+                           "overnight_futures", "near_close_dca"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                           "market_data_ingest", "near_close_dca"},
+                           "market_data_ingest", "overnight_futures", "near_close_dca"},
+    # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
+    # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
+    # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
+    # any suggester. dca_shared_interfaces is the only sibling it may import.
+    "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                          "market_data_ingest", "near_close_dca"},
 }
 
 
@@ -140,10 +152,80 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     shared = this_package_root / "dca_shared_interfaces"
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                 "market_data_ingest", "comovement_signals", "near_close_dca"}
+                 "market_data_ingest", "comovement_signals", "overnight_futures", "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden
         if hit:
             violations.append(f"{py_file.relative_to(this_package_root)} imports forbidden {sorted(hit)}")
     assert not violations, "dca_shared_interfaces boundary violated:\n" + "\n".join(violations)
+
+
+# --- overnight_futures (docs/adr-overnight-futures-tracker.md) -------------------------------
+#
+# test_no_forbidden_cross_imports skips a package it cannot find, so registering
+# overnight_futures above would pass vacuously while the package does not exist. The tests
+# below make the registration bite: the package must be on disk, the two-way rule must be
+# complete, the live side must never import it, and it must never grow a sizing path.
+
+_OVERNIGHT = "overnight_futures"
+
+
+def test_overnight_futures_package_exists() -> None:
+    """D3: the package ships inside dca-sizing-signals/, beside comovement_signals/."""
+    package_dir = _resolve_package_dir(_OVERNIGHT)
+    assert package_dir is not None, f"{_OVERNIGHT}/ not found under {PACKAGE_ROOT}"
+    assert package_dir.parent == PACKAGE_ROOT, f"{_OVERNIGHT}/ must live in {PACKAGE_ROOT}, not {package_dir}"
+    assert (package_dir / "__init__.py").is_file(), f"{_OVERNIGHT}/__init__.py is missing"
+
+
+def test_overnight_futures_is_forbidden_to_every_other_package() -> None:
+    """D3: independence holds both ways. A new sibling added to FORBIDDEN_IMPORTS later
+    without overnight_futures in its set fails here, not silently."""
+    missing = sorted(pkg for pkg, forbidden in FORBIDDEN_IMPORTS.items()
+                     if pkg != _OVERNIGHT and _OVERNIGHT not in forbidden)
+    assert not missing, f"{_OVERNIGHT} is not forbidden to: {missing}"
+
+
+def test_live_side_never_imports_overnight_futures() -> None:
+    """D2: no repo-root module -- the core, the three entry points and, unlike every other
+    suggester, sizing_adjustment_reader.py -- may import overnight_futures. The ADR's
+    verification step ("a grep shows no import ... from the core or from
+    sizing_adjustment_reader.py"), as a test rather than a one-off grep."""
+    root_modules = sorted(REPO_ROOT.glob("*.py"))
+    assert (REPO_ROOT / "sizing_adjustment_reader.py") in root_modules, (
+        f"sizing_adjustment_reader.py not found at REPO_ROOT={REPO_ROOT}; point DCA_REPO_ROOT at the repo root"
+    )
+    violations = [str(_display_path(f)) for f in root_modules if _OVERNIGHT in _imported_module_names(f)]
+    assert not violations, f"live-side modules import {_OVERNIGHT}: {violations}"
+
+
+def test_overnight_futures_has_no_sizing_path() -> None:
+    """D2: a ForecastProvider only. It must never import SizingSuggester or
+    SuggestionPublisher, and never define suggest()/publish() -- so it cannot satisfy the
+    SizingSuggester Protocol or write a suggestion file even by accident. Wiring it into
+    sizing needs its own later ADR (D8)."""
+    package_dir = _resolve_package_dir(_OVERNIGHT)
+    assert package_dir is not None, f"{_OVERNIGHT}/ not found under {PACKAGE_ROOT}"
+    banned_names = {"SizingSuggester", "SuggestionPublisher", "SizingSuggestion"}
+    banned_defs = {"suggest", "publish"}
+    violations: list[str] = []
+    for py_file in package_dir.rglob("*.py"):
+        tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                hit = {alias.name for alias in node.names} & banned_names
+                if hit:
+                    violations.append(f"{_display_path(py_file)} imports {sorted(hit)}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in banned_defs:
+                violations.append(f"{_display_path(py_file)}:{node.lineno} defines {node.name}()")
+            elif isinstance(node, ast.Attribute) and node.attr in banned_names:
+                violations.append(f"{_display_path(py_file)}:{node.lineno} references {node.attr}")
+    assert not violations, f"{_OVERNIGHT} grew a sizing path:\n" + "\n".join(violations)
+
+
+def test_overnight_futures_is_packaged() -> None:
+    """Same lesson as the root pyproject's py-modules trail: a package missing from
+    packages.find works from a checkout and ImportErrors from an installed wheel."""
+    pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
+    assert f'"{_OVERNIGHT}*"' in pyproject, f'add "{_OVERNIGHT}*" to [tool.setuptools.packages.find] include'
