@@ -28,6 +28,21 @@ Without attribution the written state records ``order_submit_status`` of
 distinguishable from a live one. Writes only under the cron-tracking root; no broker,
 no network, no orders. ``--dry-run`` checks everything and writes nothing.
 
+The abort's gate and fire time (2026-11-11): the 2026-11-09 app outage pushed the 14:30 and
+15:30 fires to 19:24 ET, where Gate 1 refused them as off-window and
+``scripts/record_evidence_free_abort.sh`` wrote an evidence-free abort marker for each. The
+backfill used to label every fire a Gate 2 abort at the slot's nominal time, so the operator had
+to correct both states by hand. Now, when a marker exists at
+``<cron root>/abort_markers/<YYYYMMDD>/<slot>.jsonl``, its gate, ``reason_code`` and
+``fired_at_utc`` name the abort (e.g. ``BACKFILL_GATE1_OFF_WINDOW_ZERO_DEPLOYMENT`` /
+``backfill_gate1_off_window``) and the fire time becomes ``run_classification.triggered_at_utc``.
+The marker file is read strictly: exactly one well-formed pre-broker (Gate 1 or Gate 2) marker
+for that day and slot, or the fire is refused. With no marker file the old Gate 2 labels and the
+nominal time are kept. The broker history must then cover the acceptance window AND the fire
+time plus :data:`FIRE_ORDER_ALLOWANCE`, checked as two separate intervals, and ANY order in either
+refuses: a Gate 1/2 abort runs before the broker read, so it cannot have placed one, and
+``--attribute-order`` stays available only for the legacy no-marker path (PR #2234 review).
+
 Usage (from the repo root)::
 
     python -m scripts.backfill_afternoon_evidence --fire 2026-10-13:1430 --fire 2026-10-13:1530 \\
@@ -42,11 +57,15 @@ import json
 import os
 import re
 import sys
-from datetime import date, datetime, time, timezone
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from dca_paths import cron_tracking_root
+from scripts import finalize_run_evidence
+from scripts.abort_markers import MARKER_KIND, marker_path
 from scripts.finalize_run_evidence import (
     ET,
     SLOT_EVIDENCE_LAYOUT,
@@ -59,8 +78,21 @@ from scripts.finalize_run_evidence import (
 )
 
 AFTERNOON_SLOTS = ("1430", "1530")
+# The labels for a fire with NO abort marker: the 2026-10-13..16 Gate 2 aborts this script was built
+# for predate the markers (2026-10-29), so their absence still means "assume Gate 2".
 OUTCOME = "BACKFILL_GATE2_ABORT_ZERO_DEPLOYMENT"
+ATTRIBUTED_OUTCOME = "BACKFILL_GATE2_ABORT_ATTRIBUTED_ORDERS"
 ERROR_CLASS = "backfill_gate2_abort"
+# Only an evidence-free abort from a gate that runs before Gate 4's broker read is backfilled from a
+# marker: the writer is only ever called on those two paths, and a later-gate marker would mean the
+# fire got far enough to need a human, not a reconstruction.
+MARKER_GATES = ("gate1", "gate2")
+# How long after a marker's fire time an order it placed could still appear. A Gate 1/2 abort places
+# nothing, but the marker only covers the fire that wrote it, so an off-window fire's own neighbourhood
+# is checked as well as the acceptance window (2026-11-11).
+FIRE_ORDER_ALLOWANCE = timedelta(hours=1)
+_GATE_TOKEN = re.compile(r"^gate[0-9]+$")
+_REASON_CODE = re.compile(r"^[A-Z0-9_]+$")
 _ALERT_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{4})(?:et)?-.*\.txt$", re.IGNORECASE)
 
 
@@ -74,6 +106,95 @@ def _parse_instant(value: str, label: str) -> datetime:
     except ValueError as exc:
         raise BackfillRefused(f"{label} {value!r} is not ISO-8601") from exc
     return (parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed).astimezone(ET)
+
+
+@dataclass(frozen=True)
+class AbortMarker:
+    """The one evidence-free abort marker a fire left, read by :func:`read_abort_marker`."""
+
+    gate: str  # "gate1"
+    reason_code: str  # "GATE1_OFF_WINDOW"
+    fired_at: datetime  # ET
+    path: Path
+
+    @property
+    def outcome(self) -> str:
+        # Zero deployment only: a pre-broker abort cannot have placed an order, so there is no
+        # ATTRIBUTED_ORDERS form for a marker fire (_check_fire refuses any order near one).
+        return f"BACKFILL_{self.reason_code}_ZERO_DEPLOYMENT"
+
+    @property
+    def error_class(self) -> str:
+        return f"backfill_{self.reason_code.lower()}"
+
+
+def read_abort_marker(root: Path, day: date, slot: str) -> Optional[AbortMarker]:
+    """The fire's abort marker, ``None`` when there is no marker file, or BackfillRefused.
+
+    Deliberately stricter than ``scripts.abort_markers.read_abort_markers``, which SKIPS bad lines so
+    the watchdog degrades toward ``slot_did_not_fire``. Here the marker names the gate and time the
+    evidence will claim, so a skipped line could hide a different abort: the file must hold exactly one
+    line, and that line must be a well-formed pre-broker marker for this day and slot (the same rules
+    the kill-switch gap proof applies). Two markers, even identical ones, are two fires and need a human.
+    """
+    path = marker_path(root, day, slot)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise BackfillRefused(f"{day} {slot}: abort marker {path} unreadable ({type(exc).__name__})") from exc
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise BackfillRefused(
+            f"{day} {slot}: abort marker file {path} holds {len(lines)} marker lines; exactly one is needed"
+        )
+    try:
+        marker = json.loads(lines[0], object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as exc:
+        raise BackfillRefused(f"{day} {slot}: abort marker {path} is malformed") from exc
+    if not isinstance(marker, dict) or marker.get("kind") != MARKER_KIND:
+        raise BackfillRefused(f"{day} {slot}: {path} is not an evidence-free abort marker")
+    if marker.get("slot_id") != slot or marker.get("trading_day") != day.isoformat():
+        raise BackfillRefused(f"{day} {slot}: abort marker {path} is for another slot or day")
+    gate, reason = marker.get("gate"), marker.get("reason_code")
+    if not isinstance(gate, str) or not _GATE_TOKEN.match(gate) or gate not in MARKER_GATES:
+        raise BackfillRefused(f"{day} {slot}: abort marker gate {gate!r} is not a pre-broker {MARKER_GATES} abort")
+    if not isinstance(reason, str) or not _REASON_CODE.match(reason) or not reason.startswith(f"{gate.upper()}_"):
+        raise BackfillRefused(f"{day} {slot}: abort marker reason_code {reason!r} does not belong to {gate}")
+    raw = marker.get("fired_at_utc")
+    try:
+        fired = datetime.fromisoformat(raw.replace("Z", "+00:00")) if isinstance(raw, str) else None
+    except ValueError:
+        fired = None
+    if fired is None or fired.tzinfo is None:
+        raise BackfillRefused(f"{day} {slot}: abort marker has no timezone-aware fired_at_utc")
+    fired = fired.astimezone(ET)
+    if fired.date() != day:
+        raise BackfillRefused(f"{day} {slot}: abort marker fired_at {fired.isoformat()} is not on {day} ET")
+    return AbortMarker(gate=gate, reason_code=reason, fired_at=fired, path=path)
+
+
+Span = tuple[datetime, datetime]
+
+
+def order_spans(slot: str, day: date, marker: Optional[AbortMarker]) -> List[Span]:
+    """The intervals the broker history must cover and show empty: the window, plus the fire's own.
+
+    Without a marker the fire is assumed to have been inside the window, as before. With one, an
+    off-window fire (19:24 ET on 2026-11-09) and :data:`FIRE_ORDER_ALLOWANCE` after it are added as a
+    SECOND interval, never merged into one hull with the window: a late 14:30 marker at 16:10 ET would
+    otherwise swallow the whole 15:30 acceptance window, and the 15:30 slot's real orders would block
+    the 14:30 backfill or be attributed to it (PR #2234 review).
+    """
+    spans = [acceptance_window(slot, day)]
+    if marker is not None:
+        spans.append((marker.fired_at, marker.fired_at + FIRE_ORDER_ALLOWANCE))
+    return spans
+
+
+def _in_spans(order: Dict[str, Any], spans: Sequence[Span]) -> bool:
+    return any(orders_in_window([order], start, end) for start, end in spans)
 
 
 def parse_fire(value: str) -> tuple[date, str]:
@@ -156,16 +277,45 @@ def check_fire(
     attributed_order_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Return the reconstruction block for one fire, or raise BackfillRefused."""
-    start, end = acceptance_window(slot, day)
+    return _check_fire(
+        root, day, slot, orders, covers_from, covers_through, allow_no_alert, attributed_order_ids,
+        marker=read_abort_marker(root, day, slot),
+    )
+
+
+def _check_fire(
+    root: Path,
+    day: date,
+    slot: str,
+    orders: List[Dict[str, Any]],
+    covers_from: datetime,
+    covers_through: datetime,
+    allow_no_alert: bool,
+    attributed_order_ids: Sequence[str],
+    *,
+    marker: Optional[AbortMarker],
+) -> Dict[str, Any]:
+    window_start, window_end = acceptance_window(slot, day)
+    spans = order_spans(slot, day, marker)
     state = stream_dir(root, slot) / f"{day:%Y%m%d}_{slot}ET" / "run_state.json"
     if state.exists():
         raise BackfillRefused(f"{day} {slot}: run_state.json already exists ({state}); never overwritten")
-    if not (covers_from <= start and covers_through >= end):
+    # One contiguous broker query has to reach every interval; each is checked so the message names it.
+    for (start, end), label in zip(spans, ("the acceptance window", "the marker fire time"), strict=False):
+        if not (covers_from <= start and covers_through >= end):
+            raise BackfillRefused(
+                f"{day} {slot}: broker history covers {covers_from.isoformat()}..{covers_through.isoformat()}, "
+                f"which does not span {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ET ({label})"
+            )
+    inside = [order for order in orders if _in_spans(order, spans)]
+    if marker is not None and inside:
+        # Even an order passed with --attribute-order: Gate 1/2 run before Gate 4's broker read, so the
+        # fire that wrote this marker placed nothing, and an order here belongs to something else.
+        ids = ", ".join(str(o.get("id")) for o in inside)
         raise BackfillRefused(
-            f"{day} {slot}: broker history covers {covers_from.isoformat()}..{covers_through.isoformat()}, "
-            f"which does not span the {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ET window"
+            f"{day} {slot}: broker shows {len(inside)} order(s) near a {marker.gate} {marker.reason_code} abort "
+            f"({ids}); a pre-broker abort cannot have placed them, so a human must investigate"
         )
-    inside = orders_in_window(orders, start, end)
     unattributed = [o for o in inside if o.get("id") not in attributed_order_ids]
     if unattributed:
         ids = ", ".join(str(o.get("id")) for o in unattributed)
@@ -177,14 +327,32 @@ def check_fire(
     alerts = find_alerts(root, day, slot)
     if not alerts and not allow_no_alert:
         raise BackfillRefused(f"{day} {slot}: no durable alert found; pass --allow-no-alert {day}:{slot} to accept")
+    if marker is None:
+        abort: Dict[str, Any] = {
+            "reason": "Gate 2 abort before finalize_run_evidence could run (bridge shell had no Python 3.11)",
+            "abort_source": "assumed_gate2_no_marker",
+        }
+    else:
+        abort = {
+            "reason": (
+                f"{marker.gate.capitalize()} {marker.reason_code} abort at {marker.fired_at:%H:%M} ET, before "
+                "finalize_run_evidence could run (from the fire's evidence-free abort marker)"
+            ),
+            "abort_source": "abort_marker",
+            "abort_marker_file": str(marker.path.relative_to(root)),
+            "abort_gate": marker.gate,
+            "abort_reason_code": marker.reason_code,
+            "fired_at_et": marker.fired_at.isoformat(),
+        }
     return {
         "backfilled": True,
-        "reason": "Gate 2 abort before finalize_run_evidence could run (bridge shell had no Python 3.11)",
+        **abort,
         "alert_found": bool(alerts),
         "alert_files": [p.name for p in alerts],
         "broker_orders_in_window": len(inside),
         "broker_history_covers": [covers_from.isoformat(), covers_through.isoformat()],
-        "window_et": [start.isoformat(), end.isoformat()],
+        "window_et": [window_start.isoformat(), window_end.isoformat()],
+        "broker_checked_et": [[start.isoformat(), end.isoformat()] for start, end in spans],
         **({"attributed_order_ids": [o["id"] for o in inside], "attributed_by": "operator"} if inside else {}),
     }
 
@@ -227,32 +395,69 @@ def restore_newer_pointer(path: Path, before: Optional[bytes], written_day: date
     return True
 
 
+@contextmanager
+def _stamped_trigger_time(fired_at: Optional[datetime]) -> Iterator[None]:
+    """For one finalize() call, stamp ``fired_at`` as ``run_classification.triggered_at_utc``.
+
+    finalize() names the run, passes its window check, and builds the classification from one
+    ``started``; a 19:24 ET start is rightly refused as off-window, so the backfill passes the nominal
+    time and swaps only the trigger time in here. This wraps finalize's own ``build_classification``
+    instead of adding a ``fired_at`` keyword to finalize_run_evidence because that file ships inside the
+    Perplexity ``backup_planner.pyz``: changing it forces a planner rebuild and a repaste of every
+    backup prompt (scripts/tests/test_build_backup_planner.py). Wrapping, not editing the state after
+    the write, keeps run_summary.json, the pointer and finalize's own verification on the same value.
+    """
+    if fired_at is None:
+        yield
+        return
+    original = finalize_run_evidence.build_classification
+
+    def stamped(slot: str, started: datetime) -> Dict[str, Any]:
+        classification = original(slot, started)
+        classification["triggered_at_utc"] = finalize_run_evidence._utc_iso(fired_at)
+        return classification
+
+    finalize_run_evidence.build_classification = stamped
+    try:
+        yield
+    finally:
+        finalize_run_evidence.build_classification = original
+
+
 def write_fire(
     root: Path, day: date, slot: str, reconstruction: Dict[str, Any],
     orders: Optional[List[Dict[str, Any]]] = None,
+    marker: Optional[AbortMarker] = None,
 ) -> int:
+    if marker is not None and orders:
+        # _check_fire already refuses this; never let a caller write deployment under a pre-broker abort.
+        raise BackfillRefused(f"{day} {slot}: a {marker.gate} abort marker cannot carry attributed orders")
     pointer = pointer_path(root, slot)
     before = pointer.read_bytes() if pointer.is_file() else None
+    # The nominal time names the run and passes finalize's window check; a marker's real fire time
+    # becomes triggered_at_utc (_stamped_trigger_time). dca_risk.run_timestamp_et floors
+    # that at the nominal time, so a pre-window fire still counts and an off-window 19:24 one stays
+    # afternoon evidence. Keep the actual write clock in generated_at/finalized_at as well as the
+    # reconstruction audit trail.
     start = nominal_start(slot, day)
-    # Risk accounting uses the classification's fire time. Keep the actual write
-    # clock in generated_at/finalized_at as well as the reconstruction audit trail.
     written_at = datetime.now(ET)
     reconstruction = {**reconstruction, "backfilled_at": written_at.isoformat()}
     try:
-        result = finalize(
-            slot,
-            start,
-            outcome="BACKFILL_GATE2_ABORT_ATTRIBUTED_ORDERS" if orders else OUTCOME,
-            reconstructed_orders=bool(orders),
-            order_submit_status="submitted" if orders else "not_submitted_error",
-            orders=orders,
-            budget={"budget_evaluated": False},
-            error_class=ERROR_CLASS,
-            error_detail=f"backfilled {'operator-attributed' if orders else 'zero-deployment'} evidence for {day} {slot} ET",
-            report={"reconstruction": reconstruction},
-            root=root,
-            now=written_at,
-        )
+        with _stamped_trigger_time(marker.fired_at if marker else None):
+            result = finalize(
+                slot,
+                start,
+                outcome=marker.outcome if marker else (ATTRIBUTED_OUTCOME if orders else OUTCOME),
+                reconstructed_orders=bool(orders),
+                order_submit_status="submitted" if orders else "not_submitted_error",
+                orders=orders,
+                budget={"budget_evaluated": False},
+                error_class=marker.error_class if marker else ERROR_CLASS,
+                error_detail=f"backfilled {'operator-attributed' if orders else 'zero-deployment'} evidence for {day} {slot} ET",
+                report={"reconstruction": reconstruction},
+                root=root,
+                now=written_at,
+            )
     except FinalizeRefused as exc:
         print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))
         code = 2
@@ -285,6 +490,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         allowed = {parse_fire(f) for f in args.allow_no_alert}
         if len(set(fires)) != len(fires):
             raise BackfillRefused("duplicate --fire")
+        # Read once per fire: the marker proven below is the one written, never a re-read.
+        markers = {(day, slot): read_abort_marker(root, day, slot) for day, slot in fires}
         ids = [order.get("id") for order in orders if order.get("id") is not None]
         if any(not isinstance(order_id, str) or not order_id.strip() for order_id in ids) or len(set(ids)) != len(ids):
             raise BackfillRefused("broker order IDs must be nonblank and unique")
@@ -294,12 +501,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if order_id not in ids:
                 raise BackfillRefused(f"order {order_id}: not in the order file")
             order = next(o for o in orders if o.get("id") == order_id)
-            if not any(order in orders_in_window([order], *acceptance_window(slot, day)) for day, slot in fires):
+            claimed_by = [
+                f"{day}:{slot}" for day, slot in fires if _in_spans(order, order_spans(slot, day, markers[(day, slot)]))
+            ]
+            if not claimed_by:
                 raise BackfillRefused(f"order {order_id}: not inside this fire's window")
+            if len(claimed_by) > 1:
+                # Each fire records every attributed order inside its intervals, so one order in two
+                # fires' intervals would be written into both run_states and counted twice as deployment.
+                raise BackfillRefused(
+                    f"order {order_id}: inside more than one fire's checked intervals ({', '.join(claimed_by)}); "
+                    "attribute it by hand"
+                )
         # All-or-nothing: prove every fire before writing any of them.
         plans = [
-            (day, slot, check_fire(
+            (day, slot, _check_fire(
                 root, day, slot, orders, covers_from, covers_through, (day, slot) in allowed, args.attribute_order,
+                marker=markers[(day, slot)],
             ))
             for day, slot in fires
         ]
@@ -317,7 +535,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         attributed = [
             order for order in orders if order.get("id") in reconstruction.get("attributed_order_ids", [])
         ]
-        worst = max(worst, write_fire(root, day, slot, reconstruction, attributed_rows(attributed) or None))
+        worst = max(worst, write_fire(
+            root, day, slot, reconstruction, attributed_rows(attributed) or None, markers[(day, slot)],
+        ))
     return worst
 
 
