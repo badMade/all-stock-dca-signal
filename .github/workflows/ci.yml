@@ -88,6 +88,7 @@ jobs:
       ticker-market-breadth: ${{ steps.diff.outputs.ticker-market-breadth }}
       llm-providers: ${{ steps.diff.outputs.llm-providers }}
       yfinance-prefetch: ${{ steps.diff.outputs.yfinance-prefetch }}
+      dca-sizing-signals: ${{ steps.diff.outputs.dca-sizing-signals }}
       deps: ${{ steps.diff.outputs.deps }}
     steps:
       - id: diff
@@ -99,7 +100,7 @@ jobs:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
         run: |
-          projects="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch"
+          projects="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch dca-sizing-signals"
           all=false
           files=""
           if [ "$EVENT" = "pull_request" ]; then
@@ -275,6 +276,7 @@ jobs:
             ticker-market-breadth/requirements.txt \
             llm-providers/requirements.txt \
             yfinance-prefetch/requirements.txt \
+            dca-sizing-signals/requirements.txt \
             trading-strategies/requirements.txt \
             analysis/market-graph-3d/requirements.txt; do
             scope="${manifest%/requirements.txt}"
@@ -549,4 +551,42 @@ jobs:
 
       - name: Run tests
         working-directory: yfinance-prefetch
+        run: python -m pytest tests/
+
+  # Added 2026-11-13. Until then nothing ran this suite automatically (AGENTS.md said
+  # "you are its only gate"), so its pyproject `prices` extra sat on duckdb 1.5.6 for
+  # two weeks after Dependabot moved requirements.txt to 2.0.0 (PR #2244). It is the
+  # only sibling that may make network calls (market_data_ingest/), but its tests are
+  # offline: the live price-source PoC under tests/prices/contract skips itself without
+  # credentials. RED TDD tests awaiting approval live in tests/pending/, whose conftest
+  # keeps them out of collection. 3.12 like the other stdlib-plus-light-deps siblings.
+  dca-sizing-signals:
+    name: Lint & test (dca-sizing-signals)
+    needs: changes
+    if: needs.changes.outputs.dca-sizing-signals == 'true'
+    runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            dca-sizing-signals/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt -r dca-sizing-signals/requirements.txt
+
+      - name: Ruff lint
+        run: ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals
+
+      - name: Run tests
+        working-directory: dca-sizing-signals
         run: python -m pytest tests/

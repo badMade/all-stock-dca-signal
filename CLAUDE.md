@@ -78,6 +78,8 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ruff check --isolated --select=E,F,B --line-length=120 llm-providers
 (cd yfinance-prefetch && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
+(cd dca-sizing-signals && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (requests, duckdb)
+ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals
 ```
 
 **Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
@@ -97,7 +99,10 @@ see `ticker-market-breadth/README.md`), `llm-providers` (one provider-agnostic c
 interface over the `openai`/`anthropic`/`google-genai` SDKs, not wired into any live
 path -- see `llm-providers/README.md`), and `yfinance-prefetch` (pre-fetches a labeled
 yfinance fallback payload for the market-data source policy's fallback ahead of a live
-slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`)
+slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`),
+and `dca-sizing-signals` (structurally-boundaried sizing suggesters plus the
+Massive/Alpaca price-source ingest, see `dca-sizing-signals/README.md`; RED TDD tests
+awaiting approval sit in its `tests/pending/`, out of collection)
 suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
 The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and

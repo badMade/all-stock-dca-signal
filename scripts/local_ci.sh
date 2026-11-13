@@ -54,7 +54,7 @@ fi
 
 # Every sibling job in ci.yml, in its order there. tests/test_local_ci.py fails if this list
 # and ci.yml's `changes` job drift apart, so a new sibling job cannot silently go unrun here.
-SIBLINGS="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch"
+SIBLINGS="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch dca-sizing-signals"
 # Sibling venvs live OUTSIDE the checkout: pytest's testpaths is "." (it would collect every
 # test_*.py in their site-packages), ruff would lint them, and Google Drive mirrors ~/Documents,
 # so a CPU-torch venv in the tree would sync gigabytes. Override with DCA_LOCAL_CI_VENVS.
@@ -179,7 +179,7 @@ run_step() {
 # Python version each sibling's CI job pins.
 sibling_python() {
   case "$1" in
-    ticker-market-breadth|llm-providers|yfinance-prefetch) echo 3.12 ;;
+    ticker-market-breadth|llm-providers|yfinance-prefetch|dca-sizing-signals) echo 3.12 ;;
     *) echo 3.11 ;;
   esac
 }
@@ -251,6 +251,7 @@ research_audit_step() {
     ticker-market-breadth/requirements.txt \
     llm-providers/requirements.txt \
     yfinance-prefetch/requirements.txt \
+    dca-sizing-signals/requirements.txt \
     trading-strategies/requirements.txt \
     analysis/market-graph-3d/requirements.txt; do
     [ "$status" -eq 0 ] || break

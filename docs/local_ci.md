@@ -124,7 +124,7 @@ scripts/run_ci_locally.sh -l                     # list job ids
 
 Job ids are `changes`, `test`, `audit`, `research-audit`, and one per sibling project
 (`production-safe-agent-loop`, `ticker-advisor`, `ml-forecaster`, `wondrous-octopus`,
-`ticker-market-breadth`, `llm-providers`, `yfinance-prefetch`). Any other argument goes straight to act,
+`ticker-market-breadth`, `llm-providers`, `yfinance-prefetch`, `dca-sizing-signals`). Any other argument goes straight to act,
 for example `--matrix python-version:3.11`.
 
 Exit status is act's: 0 when every job that ran succeeded.
