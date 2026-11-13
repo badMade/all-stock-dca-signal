@@ -78,6 +78,8 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ruff check --isolated --select=E,F,B --line-length=120 llm-providers
 (cd yfinance-prefetch && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
+(cd dca-sizing-signals && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (requests, duckdb)
+ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals
 ```
 
 **Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
@@ -95,9 +97,12 @@ from `uv.lock` plus each independent research manifest, and the `production-safe
 `ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
 see `ticker-market-breadth/README.md`), `llm-providers` (one provider-agnostic chat
 interface over the `openai`/`anthropic`/`google-genai` SDKs, not wired into any live
-path -- see `llm-providers/README.md`), and `yfinance-prefetch` (pre-fetches a labeled
+path -- see `llm-providers/README.md`), `yfinance-prefetch` (pre-fetches a labeled
 yfinance fallback payload for the market-data source policy's fallback ahead of a live
-slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`)
+slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`), and
+`dca-sizing-signals` (independent sizing suggesters plus the `market_data_ingest` fetchers;
+its `tests/test_architecture_boundaries.py` keeps suggesters from importing each other or
+`near_close_dca` -- see `dca-sizing-signals/README.md`)
 suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
 The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and
