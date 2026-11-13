@@ -243,3 +243,72 @@ def test_store_records_ingested_at_from_its_clock(store, staging_dir):
     ingest(store, staging_dir, PRE_OPEN_BARS)
     stamps = {r["ingested_at"] for r in store.raw_rows("futures_bar_1m")}
     assert stamps == {FIXED_NOW}
+
+
+# --- PR #2264 review regressions ------------------------------------------------------------
+
+
+def test_vendor_revert_to_an_earlier_value_is_kept(store, staging_dir):
+    """A -> B -> A: the revert is a new version, not a duplicate of the first A."""
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6030.0)], run_id="run-a", as_of=FIRST_SEEN)
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6031.0)], run_id="run-b", as_of=LATER)
+    reverted_at = datetime(2026, 11, 13, 1, 30, tzinfo=UTC)
+    assert ingest(store, staging_dir, [fbar(minute(14, 28), 6030.0)], run_id="run-c", as_of=reverted_at) == 1
+    assert store.close_at("ESZ26", minute(14, 29)) == pytest.approx(6030.0)
+    assert store.close_at("ESZ26", minute(14, 29), known_at=LATER) == pytest.approx(6031.0)
+
+
+def test_reingest_with_an_older_as_of_than_the_correction_adds_nothing(store, staging_dir):
+    """Re-sending A with an as_of whose newest known version is already A is still a no-op."""
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6030.0)], run_id="run-a", as_of=FIRST_SEEN)
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6031.0)], run_id="run-b", as_of=LATER)
+    between = datetime(2026, 11, 12, 12, 0, tzinfo=UTC)
+    assert ingest(store, staging_dir, [fbar(minute(14, 28), 6030.0)], run_id="run-c", as_of=between) == 0
+
+
+def test_integer_and_float_prices_are_the_same_content(store, staging_dir):
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6031.0)], run_id="run-a")
+    as_ints = fbar(minute(14, 28), 6031, open=6031, high=6032, low=6030)
+    assert ingest(store, staging_dir, [as_ints], run_id="run-b", as_of=LATER) == 0
+    assert store.row_count("futures_bar_1m") == 1
+
+
+def test_integer_multiplier_is_the_same_contract(store, tmp_path):
+    as_int = FuturesContract("ESZ26", "ES", "SPX", datetime(2026, 12, 18, 14, 30, tzinfo=UTC), 50, "databento")
+    assert store.ingest_contracts([as_int], run_id="c2", as_of=LATER, staging_dir=tmp_path / "s") == 0
+
+
+def test_a_second_source_never_replaces_the_first(store, staging_dir):
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6031.0)], run_id="run-a")
+    ingest(store, staging_dir, [fbar(minute(14, 28), 6100.0, source="other")], run_id="run-b", as_of=LATER)
+    assert store.close_at("ESZ26", minute(14, 29), source="databento") == pytest.approx(6031.0)
+    assert store.close_at("ESZ26", minute(14, 29), source="other") == pytest.approx(6100.0)
+    with pytest.raises(ValueError, match="more than one source"):
+        store.close_at("ESZ26", minute(14, 29))
+    with pytest.raises(ValueError, match="more than one source"):
+        store.bars("ESZ26", start_utc=minute(14, 0), end_utc=minute(15, 0))
+    assert [b.close for b in store.bars("ESZ26", start_utc=minute(14, 0), end_utc=minute(15, 0), source="other")] == [
+        pytest.approx(6100.0)
+    ]
+
+
+def test_two_sources_in_one_batch_are_not_a_conflict(store, staging_dir):
+    batch = [fbar(minute(14, 28), 6031.0), fbar(minute(14, 28), 6100.0, source="other")]
+    assert ingest(store, staging_dir, batch) == 2
+
+
+def test_contract_from_two_sources_needs_a_source(store, tmp_path):
+    other = FuturesContract("ESZ26", "ES", "SPX", datetime(2026, 12, 18, 14, 30, tzinfo=UTC), 50.0, "other")
+    store.ingest_contracts([other], run_id="c2", as_of=LATER, staging_dir=tmp_path / "s")
+    with pytest.raises(ValueError, match="more than one source"):
+        store.contract("ESZ26")
+    assert store.contract("ESZ26", source="databento") == ESZ26
+
+
+def test_conflicting_contract_versions_in_one_batch_write_nothing(tmp_path):
+    a = FuturesContract("ESZ26", "ES", "SPX", datetime(2026, 12, 18, 14, 30, tzinfo=UTC), 5.0, "databento")
+    b = FuturesContract("ESZ26", "ES", "SPX", datetime(2026, 12, 18, 14, 30, tzinfo=UTC), 500.0, "databento")
+    with FuturesStore(tmp_path / "f.duckdb", clock=lambda: FIXED_NOW) as s:
+        with pytest.raises(ValidationError):
+            s.ingest_contracts([a, b], run_id="c", as_of=FIRST_SEEN, staging_dir=tmp_path / "s")
+        assert s.row_count("futures_contract") == 0

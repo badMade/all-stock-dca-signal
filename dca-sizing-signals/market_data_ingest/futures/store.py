@@ -2,9 +2,16 @@
 
 Same write and read rules as market_data_ingest/prices/store.py:
 
-* Rows are never updated or deleted in place. Each primary key includes a content_hash of the row's values, so
-  re-ingesting identical data is dropped (ON CONFLICT DO NOTHING) and a vendor correction lands
-  as a new row with a later as_of.
+* Rows are never updated or deleted in place. A row is inserted only when its content_hash
+  differs from the newest version already known for that key as of the batch's as_of, so
+  re-ingesting identical data adds nothing and a vendor correction lands as a new row with a
+  later as_of. The primary key includes as_of (PR #2264 review): with content_hash alone, a
+  vendor that corrects A to B and then reverts to A had the revert dropped as a duplicate of
+  the first A, and the store kept serving B. Prices and the multiplier are coerced to float
+  before hashing, so 6031 and 6031.0 are the same content.
+* Every read keeps sources apart. Pass ``source=`` to pick one; without it, a minute (or a
+  contract) that more than one source has stored is ambiguous and the read raises rather than
+  letting whichever vendor arrived last win.
 * One batch is validated, staged to <staging_dir>/<run_id>/<name>.parquet, counted, and inserted
   in one transaction. A failure anywhere writes nothing.
 * known_at reads return the newest version whose as_of <= known_at.
@@ -37,7 +44,7 @@ CREATE TABLE IF NOT EXISTS futures_contract (
     expiry_utc TIMESTAMP NOT NULL, multiplier DOUBLE NOT NULL,
     source VARCHAR NOT NULL, content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, contract_id, content_hash)
+    PRIMARY KEY (source, contract_id, content_hash, as_of)
 );
 CREATE TABLE IF NOT EXISTS futures_bar_1m (
     contract_id VARCHAR NOT NULL, bar_start_utc TIMESTAMP NOT NULL,
@@ -45,7 +52,7 @@ CREATE TABLE IF NOT EXISTS futures_bar_1m (
     volume BIGINT NOT NULL,
     source VARCHAR NOT NULL, content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, contract_id, bar_start_utc, content_hash)
+    PRIMARY KEY (source, contract_id, bar_start_utc, content_hash, as_of)
 );
 """
 
@@ -60,14 +67,24 @@ _BAR_COLUMNS = {
 }
 _TABLES = frozenset({"futures_contract", "futures_bar_1m"})
 
-# Newest known version per bar, as of known_at. ingested_at then content_hash break exact ties
-# deterministically, the same ordering bars_known_at uses in the price store.
+# Newest known version per (source, bar), as of known_at. ingested_at then content_hash break
+# exact ties deterministically, the same ordering bars_known_at uses in the price store. Source is
+# in the partition (PR #2264 review): without it a second vendor's later bar silently replaced
+# the primary feed's close. The optional source filter is NULL-safe: NULL means every source.
 _LATEST_BARS = """
 SELECT * FROM (
     SELECT *, row_number() OVER (
-        PARTITION BY contract_id, bar_start_utc
+        PARTITION BY source, contract_id, bar_start_utc
         ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn
-    FROM futures_bar_1m WHERE contract_id = ? AND as_of <= ?)
+    FROM futures_bar_1m WHERE contract_id = ? AND as_of <= ? AND (CAST(? AS VARCHAR) IS NULL OR source = ?))
+WHERE rn = 1
+"""
+_LATEST_CONTRACTS = """
+SELECT * FROM (
+    SELECT *, row_number() OVER (
+        PARTITION BY source, contract_id
+        ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn
+    FROM futures_contract WHERE contract_id = ? AND as_of <= ? AND (CAST(? AS VARCHAR) IS NULL OR source = ?))
 WHERE rn = 1
 """
 
@@ -145,6 +162,31 @@ class FuturesStore:
 
     # --- writes ---------------------------------------------------------------------------------
 
+    def _unchanged(self, table: str, keys: list[str], rows: list[dict[str, Any]], as_of: datetime) -> set[tuple]:
+        """Keys (plus content_hash) whose newest version known at ``as_of`` already has that hash.
+
+        This replaces the old PRIMARY KEY (..., content_hash) dedupe: it drops a true re-ingest
+        but keeps a revert to an earlier value, which the newest version no longer matches.
+        """
+        contract_ids = sorted({r["contract_id"] for r in rows})
+        partition = ", ".join(keys)
+        found = self.con.execute(
+            f"SELECT {partition}, content_hash FROM (SELECT *, row_number() OVER ("
+            f"PARTITION BY {partition} ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn "
+            f"FROM {self._check_table(table)} WHERE as_of <= ? AND list_contains(?, contract_id)) WHERE rn = 1",
+            [to_utc_naive(as_of), contract_ids],
+        ).fetchall()
+        return {tuple(_from_db(v) for v in row) for row in found}
+
+    def _new_rows(self, table: str, keys: list[str], rows: list[dict[str, Any]], as_of: datetime) -> list[dict]:
+        if not rows:
+            return []
+        unchanged = self._unchanged(table, keys, rows, as_of)
+        # Stored timestamps come back aware (from _from_db); compare on that form.
+        def ident(r: dict[str, Any]) -> tuple:
+            return tuple(_from_db(r[k]) for k in keys) + (r["content_hash"],)
+        return [r for r in rows if ident(r) not in unchanged]
+
     def ingest_contracts(
         self, contracts: Iterable[FuturesContract], *, run_id: str, as_of: datetime, staging_dir: Path
     ) -> int:
@@ -153,16 +195,20 @@ class FuturesStore:
         rows = []
         for c in batch:
             expiry = to_utc_naive(c.expiry_utc)
-            values = [c.contract_id, c.root, c.underlying_index, expiry.isoformat(), c.multiplier]
+            # float(): the hash is JSON of the values, so 50 and 50.0 would otherwise differ.
+            multiplier = float(c.multiplier)
+            values = [c.contract_id, c.root, c.underlying_index, expiry.isoformat(), multiplier]
             rows.append({
                 "contract_id": c.contract_id, "root": c.root, "underlying_index": c.underlying_index,
-                "expiry_utc": expiry, "multiplier": c.multiplier, "source": c.source,
+                "expiry_utc": expiry, "multiplier": multiplier, "source": c.source,
                 **self._provenance(values, run_id, as_of),
             })
-        name = f"contracts_{_hash([r['content_hash'] for r in rows])[:12]}.parquet" if rows else ""
-        return self._bulk_insert(
-            "futures_contract", _CONTRACT_COLUMNS, rows, Path(staging_dir) / safe_name(run_id) / (name or "empty")
-        )
+        rows = self._new_rows("futures_contract", ["source", "contract_id"], rows, as_of)
+        if not rows:
+            return 0
+        name = f"contracts_{_hash([r['content_hash'] for r in rows])[:12]}.parquet"
+        path = Path(staging_dir) / safe_name(run_id) / name
+        return self._bulk_insert("futures_contract", _CONTRACT_COLUMNS, rows, path)
 
     def _known_contract_ids(self) -> set[str]:
         return {r[0] for r in self.con.execute("SELECT DISTINCT contract_id FROM futures_contract").fetchall()}
@@ -173,12 +219,15 @@ class FuturesStore:
         rows = []
         for b in batch:
             start = to_utc_naive(b.bar_start_utc)
-            values = [b.contract_id, start.isoformat(), b.open, b.high, b.low, b.close, b.volume]
+            # float(): 6031 and 6031.0 are the same price, and must hash the same (PR #2264 review).
+            o, h, lo, c = (float(p) for p in (b.open, b.high, b.low, b.close))
+            values = [b.contract_id, start.isoformat(), o, h, lo, c, b.volume]
             rows.append({
-                "contract_id": b.contract_id, "bar_start_utc": start, "open": b.open, "high": b.high,
-                "low": b.low, "close": b.close, "volume": b.volume, "source": b.source,
+                "contract_id": b.contract_id, "bar_start_utc": start, "open": o, "high": h,
+                "low": lo, "close": c, "volume": b.volume, "source": b.source,
                 **self._provenance(values, run_id, as_of),
             })
+        rows = self._new_rows("futures_bar_1m", ["source", "contract_id", "bar_start_utc"], rows, as_of)
         if not rows:
             return 0
         first = min(r["bar_start_utc"] for r in rows).strftime("%Y%m%dT%H%M")
@@ -190,14 +239,31 @@ class FuturesStore:
     def _known_at(self, known_at: datetime | None) -> datetime:
         return to_utc_naive(known_at if known_at is not None else self._clock())
 
+    @staticmethod
+    def _one_source_per(rows: list[dict[str, Any]], key: str, what: str) -> None:
+        """Without an explicit source, two sources for one key are ambiguous: fail closed."""
+        sources: dict[Any, set[str]] = {}
+        for r in rows:
+            sources.setdefault(r[key], set()).add(r["source"])
+        clashes = sorted(str(k) for k, s in sources.items() if len(s) > 1)
+        if clashes:
+            raise ValueError(f"{what} stored by more than one source ({', '.join(clashes[:3])}); pass source=")
+
     def bars(
-        self, contract_id: str, *, start_utc: datetime, end_utc: datetime, known_at: datetime | None = None
+        self,
+        contract_id: str,
+        *,
+        start_utc: datetime,
+        end_utc: datetime,
+        known_at: datetime | None = None,
+        source: str | None = None,
     ) -> list[FuturesBar]:
         """Latest known version of each bar with start_utc <= bar_start_utc < end_utc."""
         rows = self._rows(
             f"SELECT * FROM ({_LATEST_BARS}) WHERE bar_start_utc >= ? AND bar_start_utc < ? ORDER BY bar_start_utc",
-            [contract_id, self._known_at(known_at), to_utc_naive(start_utc), to_utc_naive(end_utc)],
+            [contract_id, self._known_at(known_at), source, source, to_utc_naive(start_utc), to_utc_naive(end_utc)],
         )
+        self._one_source_per(rows, "bar_start_utc", "bar")
         return [
             FuturesBar(
                 contract_id=r["contract_id"], bar_start_utc=r["bar_start_utc"], open=r["open"], high=r["high"],
@@ -206,21 +272,23 @@ class FuturesStore:
             for r in rows
         ]
 
-    def close_at(self, contract_id: str, at_utc: datetime, *, known_at: datetime | None = None) -> float | None:
+    def close_at(
+        self, contract_id: str, at_utc: datetime, *, known_at: datetime | None = None, source: str | None = None
+    ) -> float | None:
         """Close of the bar ending at ``at_utc``, or None. No lookahead, no fill-forward."""
         start = to_utc_naive(at_utc) - ONE_MINUTE  # raises ValueError on a naive time
         rows = self._rows(
-            f"SELECT close FROM ({_LATEST_BARS}) WHERE bar_start_utc = ?",
-            [contract_id, self._known_at(known_at), start],
+            f"SELECT source, bar_start_utc, close FROM ({_LATEST_BARS}) WHERE bar_start_utc = ?",
+            [contract_id, self._known_at(known_at), source, source, start],
         )
+        self._one_source_per(rows, "bar_start_utc", "bar")
         return float(rows[0]["close"]) if rows else None
 
-    def contract(self, contract_id: str, *, known_at: datetime | None = None) -> FuturesContract | None:
-        rows = self._rows(
-            "SELECT * FROM futures_contract WHERE contract_id = ? AND as_of <= ? "
-            "ORDER BY as_of DESC, ingested_at DESC, content_hash LIMIT 1",
-            [contract_id, self._known_at(known_at)],
-        )
+    def contract(
+        self, contract_id: str, *, known_at: datetime | None = None, source: str | None = None
+    ) -> FuturesContract | None:
+        rows = self._rows(_LATEST_CONTRACTS, [contract_id, self._known_at(known_at), source, source])
+        self._one_source_per(rows, "contract_id", "contract")
         if not rows:
             return None
         r = rows[0]
