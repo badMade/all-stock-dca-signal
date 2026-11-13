@@ -41,7 +41,7 @@ missing and the slot aborts exactly as today:
 1. **No `run_state.json` claims the pair at all** — not even a rejected one. A rejected/mismatched
    artifact is a different defect (`rejected_reasons` today) and keeps blocking.
 2. **A marker file exists for `(D, S)`** and **every** line in it is a well-formed
-   `evidence_free_abort` marker (`read_abort_markers` rules) whose `gate` is `gate1` and
+   `evidence_free_abort` marker (`read_markers_strict` rules) whose `gate` is `gate1` and
    `reason_code` is `GATE1_OFF_WINDOW`. Any other gate (`gate2`, a later gate, a typo), any other
    reason, or a malformed line in that file ⇒ not excused (ambiguous ⇒ block). An empty or missing
    file ⇒ not excused.
@@ -87,6 +87,9 @@ evidence and alert text record it. It is never written into any artifact that si
   skips bad lines so the watchdog degrades toward `slot_did_not_fire`; here a skipped line could hide
   a later-gate marker, so any malformed, foreign, duplicate-key or non-`gate1/GATE1_OFF_WINDOW` line
   blocks the pair. `gate2/GATE2_ABORT_NO_PYTHON311` is pre-broker too but is left out on purpose.
+  The per-line rules live in `scripts.abort_markers.read_markers_strict` (2026-11-12), shared with
+  `scripts/backfill_afternoon_evidence.py` so the two strict readers cannot drift; only the gate
+  policy above is this module's own.
 - **Broker proof is a `scripts.assemble_order_pages` envelope, re-replayed.** The prompt builds it with
   the existing assembler (`--trading-day <D>`, `created_at_gte` = D 00:00 ET). The module replays the
   pages again through `broker_reconciliation.same_day_order_snapshot` + `_PageReplayer` (the same

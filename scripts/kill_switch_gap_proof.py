@@ -44,7 +44,7 @@ from zoneinfo import ZoneInfo
 
 import dca_runner
 from dca_config import _reject_duplicate_keys
-from scripts.abort_markers import MARKER_KIND, marker_path
+from scripts.abort_markers import MarkerFileInvalid, read_markers_strict
 from scripts.assemble_order_pages import TOOL as ASSEMBLER_TOOL
 from scripts.assemble_order_pages import _canonical
 from scripts.broker_reconciliation import same_day_order_snapshot
@@ -103,32 +103,22 @@ def marker_precondition(marker_root: Path, day: date, scheduled_for: str) -> Tup
     slot_id = SLOT_IDS.get(scheduled_for)
     if slot_id is None:
         return False, f"not an afternoon slot: {scheduled_for!r}"
-    path = marker_path(marker_root, day, slot_id)
+    # The per-line rules (parse, kind, slot/day, tz-aware fire time) are the shared strict reader's;
+    # only the gate policy below is this module's own (2026-11-12 consolidation).
     try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+        markers = read_markers_strict(marker_root, day, slot_id)
+    except MarkerFileInvalid as exc:
+        return False, str(exc)
+    if markers is None:
         return False, "no run_state.json and no evidence-free abort marker"
-    except (OSError, UnicodeError) as exc:
-        return False, f"abort marker unreadable ({type(exc).__name__})"
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
+    if not markers:
         return False, "no run_state.json and an empty abort-marker file"
-    for number, line in enumerate(lines, start=1):
-        try:
-            marker = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
-        except ValueError:
-            return False, f"abort marker line {number} is malformed"
-        if not isinstance(marker, dict) or marker.get("kind") != MARKER_KIND:
-            return False, f"abort marker line {number} is not an evidence-free abort marker"
-        if marker.get("slot_id") != slot_id or marker.get("trading_day") != day.isoformat():
-            return False, f"abort marker line {number} is for another slot or day"
-        if _parse_aware(marker.get("fired_at_utc")) is None:
-            return False, f"abort marker line {number} has no timezone-aware fire time"
-        gate_reason = (marker.get("gate"), marker.get("reason_code"))
+    for marker in markers:
+        gate_reason = (marker.gate, marker.reason_code)
         if gate_reason not in EXCUSABLE_MARKERS:
-            return False, (f"abort marker line {number} is {gate_reason[0]}/{gate_reason[1]}, "
+            return False, (f"abort marker line {marker.line} is {gate_reason[0]}/{gate_reason[1]}, "
                            "not a pre-broker gate1/GATE1_OFF_WINDOW abort")
-    return True, f"{len(lines)} gate1/GATE1_OFF_WINDOW marker(s)"
+    return True, f"{len(markers)} gate1/GATE1_OFF_WINDOW marker(s)"
 
 
 def order_window(day: date) -> Tuple[datetime, datetime]:
