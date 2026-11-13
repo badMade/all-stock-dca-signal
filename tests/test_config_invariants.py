@@ -1420,7 +1420,7 @@ _CVE_ID_PREFIX = re.compile(r"\bCVE-\d{4}-$")
 
 
 def _is_cve_id_suffix(line: str, match: re.Match) -> bool:
-    """True when ``match`` is the 6-7 digit suffix of a CVE id."""
+    """True when ``match`` is the 6-7 digit suffix of a ``CVE-YYYY-NNNNNN`` id."""
     return len(match.group(0)) <= 7 and bool(_CVE_ID_PREFIX.search(line[: match.start()]))
 
 
@@ -1725,9 +1725,12 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
                 # (Copilot review, PR #1597).
                 if rel.endswith(".css") and _is_css_hex_colour_value(css_lines, lineno - 1, match):
                     continue
-                # CVE numeric suffixes are vulnerability references, not accounts.
-                # Keep the exemption length-bounded so a nine-digit account
-                # following the same prefix is still rejected.
+                # The numeric suffix of a CVE id ("CVE-2026-<digits>") is a
+                # vulnerability reference, not an account (2026-11-13: #2259's
+                # soupsieve audit comments in ci.yml and local_ci.sh turned
+                # main's core job red). Length-bounded like the hex-colour
+                # rules above: CVE suffixes run 4-7 digits in practice, so a
+                # nine-digit account pasted after "CVE-YYYY-" is still caught.
                 if _is_cve_id_suffix(line, match):
                     continue
                 offenders.append(f"{rel}:{lineno}: {match.group(0)}")
@@ -5149,12 +5152,11 @@ def test_0935_payload_wait_covers_the_launchers_rebuild():
 
 
 def test_a_cve_id_suffix_is_not_an_account_but_a_nine_digit_one_still_is():
-    # Assemble probes from fragments so this file does not itself contain account-shaped literals.
-    cve_suffix = "CVE-2026-" + "4" + "12345"
-    account_suffix = "CVE-2026-" + "1112" + "22333"
-    ordinary_number = " " + "4" + "12345"
-
-    for text, expected in ((cve_suffix, True), (account_suffix, False), (ordinary_number, False)):
+    # 2026-11-13: CVE ids quoted in CI audit comments tripped the account guard.
+    # Probes are assembled from fragments so this file never holds the literals.
+    six = "CVE-2026-" + "4" + "12345"
+    nine = "CVE-2026-" + "1112" + "22333"
+    for text, expected in ((six, True), (nine, False), ("build " + "4" + "12345", False)):
         match = _ACCOUNT_SHAPED.search(text)
         assert match is not None
-        assert _is_cve_id_suffix(text, match) is expected
+        assert _is_cve_id_suffix(text, match) is expected, text

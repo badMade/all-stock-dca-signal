@@ -554,3 +554,25 @@ def test_a_placeholder_only_live_slot_still_blocks_inference_when_its_mirror_has
     scheduled = _live_with_placeholder_only_slot(tmp_path, mirror_dir)
 
     assert drift.shared_live_account(mirror_dir, scheduled) is None
+
+
+def test_the_config_default_resolves_when_run_as_a_script_path(tmp_path):
+    # 2026-11-12: ``python3 scripts/check_live_prompt_drift.py`` put scripts/
+    # first on sys.path, dca_config failed to import, and the run exited 2
+    # with "no window end date" despite a valid config/trading_window.json.
+    # Pytest puts the repo root on sys.path, so only a real script-path run
+    # (no PYTHONPATH) reproduces it.
+    import os
+    import subprocess
+    import sys
+
+    scheduled = tmp_path / "Scheduled"
+    scheduled.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "DCA_CONFIG_DIR")}
+    result = subprocess.run(
+        [sys.executable, str(drift.REPO_ROOT / "scripts" / "check_live_prompt_drift.py"), "--json",
+         "--mirror-dir", str(_full_mirror_dir(tmp_path)), "--scheduled-dir", str(scheduled)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert "no window end date" not in result.stderr
+    assert json.loads(result.stdout)["window_end_date"]

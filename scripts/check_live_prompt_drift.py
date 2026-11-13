@@ -425,6 +425,17 @@ def mirror_set_problem(mirror_dir: Path) -> Optional[str]:
 
 
 def _window_end_date_from_config() -> Optional[str]:
+    # Run as ``python3 scripts/check_live_prompt_drift.py`` (the form every
+    # doc and repaste note gives), sys.path[0] is scripts/, not the repo root,
+    # so ``import dca_config`` raised ImportError, this returned None, and
+    # main() exited 2 with "no window end date" although
+    # config/trading_window.json was fine (2026-11-12, after the #2224 12:30
+    # repaste check). Bootstrap the root the way scripts/drift_detection.py
+    # and scripts/purchase_history.py already do, here rather than at import
+    # so a caller that only wants findings_for() never touches sys.path.
+    repo_root = str(REPO_ROOT)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     try:
         import dca_config
     except ImportError:
