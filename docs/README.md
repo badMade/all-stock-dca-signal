@@ -38,6 +38,7 @@ environment (see the repository README).
 | [slos.md](slos.md) | Proposed service level objectives (slot fires, orders reconcile, no over-deployment, alerts delivered, missed fires detected) with error-budget rules; measurement only, no runtime change |
 | [emergency_stop.md](emergency_stop.md) | How to halt all live trading in layers (pause scheduled tasks, fail live runs closed, revoke broker access), what the code already does, and a rehearsal checklist |
 | [artifact_retention.md](artifact_retention.md) | Proposed run-artifact retention policy and the rules any future prune job must follow; no pruning code exists |
+| [opt_in_hardening_tools.md](opt_in_hardening_tools.md) | Unwired building blocks for the readiness roadmap: `dca_retry` (retry/backoff that never resends a possibly-landed order), cap-parity tests across the three entry points, and a derived SQLite run-state index; what was deliberately not done |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, retired entries, and the expired dated scheduler overrides (kept as historical record, authorizing nothing today) |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
