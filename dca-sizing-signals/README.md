@@ -28,14 +28,13 @@ type system and a CI test, not by convention alone:
   `wondrous_octopus/` may optionally implement `ForecastProvider` from
   `dca_shared_interfaces` for future ensembling; it deliberately does not implement
   `SizingSuggester`, matching its own README's "does not influence live DCA sizing."
-- `edgar_fundamentals.py` and `dolthub_options.py` under `market_data_ingest/` do not exist
-  yet. Their tests (`tests/pending/test_edgar_fundamentals.py`,
-  `tests/pending/test_dolthub_options.py`) are written and currently fail on import, per this
-  repo's TDD-first policy. `tests/pending/conftest.py` keeps pytest from collecting them, so
-  the CI job stays green; move each back to `tests/` once its module passes. Built from
-  live-verified fixtures (SEC EDGAR CIK0000320193 companyfacts, DoltHub
-  post-no-preference/options), not fabricated. Implementation is pending explicit
-  approval; do not write it without that.
+- `market_data_ingest/edgar_fundamentals.py` (SEC EDGAR companyfacts, point-in-time XBRL facts)
+  and `market_data_ingest/dolthub_options.py` (DoltHub `post-no-preference/options` daily
+  chains) were specified first by `tests/test_edgar_fundamentals.py` and
+  `tests/test_dolthub_options.py` (live-verified fixtures, 2026-08-22) and implemented
+  2026-11-12 on operator approval. Both use stdlib `urllib.request` only. EDGAR needs a
+  contact-identifying User-Agent: pass `user_agent=` or set `SEC_EDGAR_USER_AGENT`; there is
+  no default. Neither is called by any scheduled job yet.
 - Does not integrate SimFin or Sharadar. Both require a registered API key this build
   environment did not have; SEC EDGAR alone already covers free, unregistered,
   point-in-time fundamentals history, so they're deferred, not abandoned.
@@ -55,6 +54,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest tests/
 ```
+
+CI runs this suite in its own job, `Lint & test (dca-sizing-signals)`, on Python 3.12 when a
+file under `dca-sizing-signals/` changes (plus the weekday scheduled run). It installs
+`requirements.txt` (the `prices` tests need `requests` and `duckdb`) and runs
+`ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals`. Locally:
+`scripts/local_ci.sh dca-sizing-signals`, or `scripts/local_ci.sh --changed`.
 
 ## Co-movement signals (research only)
 

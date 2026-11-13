@@ -151,9 +151,7 @@ widening the change.
 `dca-sizing-signals/` is excluded from the root pytest sweep *and* from root
 `ruff` (`extend-exclude`). Until 2026-11-13 `ci.yml` had no job for it either,
 which is how its `pyproject.toml` extra drifted from `requirements.txt`
-unnoticed. It now has one (`Lint & test (dca-sizing-signals)`). Its RED TDD
-tests awaiting approval live in `tests/pending/`, which its `conftest.py` keeps
-out of collection; run one with `python -m pytest --noconftest <path>`.
+unnoticed. It now has one (`Lint & test (dca-sizing-signals)`, added in #2242).
 
 **Root-only tests CI cannot see.**
 `tests/test_dca_fileio.py::test_the_destination_owner_is_preserved` and

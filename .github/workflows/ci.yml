@@ -553,16 +553,13 @@ jobs:
         working-directory: yfinance-prefetch
         run: python -m pytest tests/
 
-  # Added 2026-11-13. Until then nothing ran this suite automatically (AGENTS.md said
-  # "you are its only gate"), so its pyproject `prices` extra sat on duckdb 1.5.6 for
-  # two weeks after Dependabot moved requirements.txt to 2.0.0 (PR #2244). It is the
-  # only sibling that may make network calls (market_data_ingest/), but its tests are
-  # offline: the live price-source PoC under tests/prices/contract skips itself without
-  # credentials. RED TDD tests awaiting approval live in tests/pending/, whose conftest
-  # keeps them out of collection. 3.12 like the other stdlib-plus-light-deps siblings.
   dca-sizing-signals:
     name: Lint & test (dca-sizing-signals)
     needs: changes
+    # Until 2026-11-12 no job ran this suite (the root addopts --ignore it), so
+    # tests/test_architecture_boundaries.py -- suggester packages never import each other
+    # or near_close_dca -- was only ever checked by hand. 3.12 only, path-filtered, per
+    # the 2026-10-31 Actions-spend cut (docs/local_ci.md).
     if: needs.changes.outputs.dca-sizing-signals == 'true'
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10

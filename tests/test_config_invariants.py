@@ -1501,7 +1501,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "20260732",
         "199900",
         # SEC EDGAR Apple revenue fixture figures and mock CIKs in
-        # dca-sizing-signals/tests/pending/test_edgar_fundamentals.py
+        # dca-sizing-signals/tests/test_edgar_fundamentals.py
         "313695000000",
         "94036000000",
         "364357000000",
