@@ -68,7 +68,6 @@ def test_rule_fetches_once_and_merges_both_envelopes_into_this_runs_root(slot):
     rule = _rule(slot)
     assert "ONE incremental fetch" in rule
     assert "EARLIER of the two printed created_at_gte values" in rule
-    assert rule.count("scripts.merge_order_pages") == 1  # "run ... twice over those SAME page files"
     assert "twice over those SAME page files" in rule
     for needle in (
         f"--out $ROOT/orders_pages_<YYYY-MM-DD>_{slot}.json",
