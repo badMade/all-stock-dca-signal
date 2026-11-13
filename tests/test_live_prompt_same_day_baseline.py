@@ -57,26 +57,43 @@ def test_rule_supersedes_the_day_fetch_is_small_sentence(slot):
     assert "ABORT_GATE6_HISTORY_NOT_PERSISTABLE" in rule
 
 
-def test_rule_runs_the_finder_for_this_slot_for_both_kinds(slot):
+def test_rule_runs_the_finder_once_in_plan_mode_for_this_slot(slot):
     rule = _rule(slot)
-    assert f"scripts.find_order_baseline --kind day --slot {slot} --trading-day <YYYY-MM-DD>" in rule
-    assert "`--kind week`" in rule
-    assert "never by transcription" in rule
+    assert f"scripts.find_order_baseline --kind plan --slot {slot} --trading-day <YYYY-MM-DD>" in rule
+    assert "--kind day" not in rule and "--kind week" not in rule
+    assert "never transcribe" in rule
 
 
-def test_rule_fetches_once_and_merges_both_envelopes_into_this_runs_root(slot):
+def test_rule_takes_the_fetch_boundary_from_the_script_not_from_a_comparison(slot):
+    # Review of PR 2246: "the EARLIER of the two printed created_at_gte values" let a stale week
+    # base enlarge the day increment, and asked the model to compare two offsets as text.
+    rule = _rule(slot)
+    assert "EARLIER of the two" not in rule
+    assert "created_at_gte set to the printed fetch_created_at_gte" in rule
+    assert "--created-at-gte <the printed fetch_created_at_gte>" in rule
+    assert "set by the DAY base, so a stale week base can never enlarge the day increment" in rule
+    assert "never compare, convert or retype a timestamp yourself" in rule
+
+
+def test_rule_fetches_once_and_merges_each_planned_kind_into_this_runs_root(slot):
     rule = _rule(slot)
     assert "ONE incremental fetch" in rule
-    assert "EARLIER of the two printed created_at_gte values" in rule
-    assert "twice over those SAME page files" in rule
+    assert "for each kind in `merge`" in rule
+    assert "over those SAME page files" in rule
     for needle in (
+        "--base <that kind's printed base>",
         f"--out $ROOT/orders_pages_<YYYY-MM-DD>_{slot}.json",
         f"--out $ROOT/orders_pages_week_<Monday YYYY-MM-DD>_{slot}.json",
         "--overlap-seconds 120",
-        "--created-at-gte <the gte you fetched with>",
         "--snapshot-at <offset-aware instant right after the last page>",
     ):
         assert needle in rule, needle
+
+
+def test_a_kind_in_fallback_full_is_fetched_in_full_on_its_own(slot):
+    rule = _rule(slot)
+    assert "a kind is listed in fallback_full" in rule
+    assert "the other kind's successful merge still stands" in rule
 
 
 def test_rule_never_writes_another_slots_file(slot):
@@ -105,6 +122,7 @@ def test_rule_records_the_modes_in_gate_9(slot):
     assert "day_history_mode baseline_merge" in rule
     assert "day_history_sha256" in rule
     assert "week_history_mode baseline_merge" in rule
+    assert "fetch_created_at_gte, and each base path in the Gate 9" in rule
 
 
 def test_gate_6_5_full_day_fetch_points_back_to_the_chain(slot):

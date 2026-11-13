@@ -45,6 +45,26 @@ Exit 0 prints ``{"ok": true, "base", "base_slot", "snapshot_at", "created_at_gte
 ``created_at_gte`` is ``snapshot_at`` minus ``--overlap-seconds`` (default 120, the merge's
 own default). Exit 2 prints ``{"ok": false, "reason", "detail", "rejected"}``. The account
 number is never printed.
+
+``--kind plan`` (2026-11-12 review of PR 2246) is what the live prompts run. It does both
+lookups and makes the two decisions a session must never make by eye:
+
+* **One fetch boundary, set by the DAY base.** An earlier draft told the session to fetch from
+  the EARLIER of the two ``created_at_gte`` values. Then a stale week base (say only the 9:35
+  file survived) dragged the shared fetch back to 9:35, which is again the whole day's ~35 KB
+  page, and both kinds fell back to the full fetch: the same abort. Now the boundary is the day
+  base's ``created_at_gte`` (the week base's only when there is no day base). A week base older
+  than that boundary is NOT merged; the week alone falls back to its full fetch, so it can never
+  enlarge the day increment.
+* **One instant, normalized to UTC.** The two bases can carry different offsets (``Z`` from one
+  writer, ``-05:00`` from another), and comparing them as text gets the order wrong. The script
+  compares parsed instants and prints ``fetch_created_at_gte`` once, as UTC with a ``Z``; the
+  prompt uses that string verbatim for both the fetch and every merge's ``--created-at-gte``.
+
+It prints ``{"ok": true, "fetch_created_at_gte", "boundary_kind", "merge": {kind: {"base",
+"envelope_trading_day", ...}}, "fallback_full": [kinds], "lookups": {"day": ..., "week": ...}}``.
+A kind in ``fallback_full`` is fetched in full exactly as before. No usable base for either kind
+is exit 2.
 """
 
 from __future__ import annotations
@@ -69,6 +89,7 @@ ET = ZoneInfo("America/New_York")
 # written (assemble replays the chain; merge only ever extends a proven envelope).
 TRUSTED_WRITERS = ("scripts.assemble_order_pages", "scripts.merge_order_pages")
 KINDS = ("day", "week")
+PLAN = "plan"
 
 
 class BaselineRejected(Exception):
@@ -225,9 +246,73 @@ def find_baseline(
     }
 
 
+def _utc_z(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def fetch_plan(
+    *,
+    slot: str,
+    trading_day: str,
+    account: str,
+    now: Optional[datetime] = None,
+    overlap_seconds: int = 120,
+    root: Optional[Path] = None,
+) -> dict:
+    """Both lookups, the single UTC fetch boundary, and which kinds may merge from it."""
+    lookups = {
+        kind: find_baseline(
+            kind=kind, slot=slot, trading_day=trading_day, account=account,
+            now=now, overlap_seconds=overlap_seconds, root=root,
+        )
+        for kind in KINDS
+    }
+    usable = {kind: result for kind, result in lookups.items() if result["ok"]}
+    if not usable:
+        return {
+            "ok": False,
+            "reason": "no_valid_baseline",
+            "detail": f"no usable day or week envelope from a slot earlier than {slot} today",
+            "fallback_full": list(KINDS),
+            "lookups": lookups,
+        }
+    # The day base sets the boundary: it is the increment that must stay small. Parse, never
+    # compare the printed strings -- their offsets can differ.
+    boundary_kind = "day" if "day" in usable else "week"
+    boundary = _aware(usable[boundary_kind]["created_at_gte"])
+    merge: dict = {}
+    fallback: List[str] = []
+    for kind in KINDS:
+        result = usable.get(kind)
+        # merge_order_pages refuses a fetch that starts later than base snapshot minus overlap,
+        # i.e. it needs boundary <= this base's created_at_gte. An older base fails that, so it
+        # falls back on its own instead of widening the shared fetch.
+        if result is not None and boundary <= _aware(result["created_at_gte"]):
+            merge[kind] = {
+                key: result[key]
+                for key in ("base", "base_slot", "envelope_trading_day", "snapshot_at", "payload_sha256", "order_count")
+            }
+        else:
+            fallback.append(kind)
+    return {
+        "ok": True,
+        "tool": TOOL,
+        "kind": PLAN,
+        "fetch_created_at_gte": _utc_z(boundary),
+        "boundary_kind": boundary_kind,
+        "overlap_seconds": overlap_seconds,
+        "merge": merge,
+        "fallback_full": fallback,
+        "lookups": lookups,
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--kind", required=True, choices=KINDS, help="day: today's envelope; week: the ISO week's.")
+    parser.add_argument(
+        "--kind", required=True, choices=(*KINDS, PLAN),
+        help="day: today's envelope; week: the ISO week's; plan: both, plus the one fetch boundary (live prompts).",
+    )
     parser.add_argument("--slot", required=True, choices=sorted(SLOT_EVIDENCE_LAYOUT), help="THIS run's slot (HHMM).")
     parser.add_argument("--trading-day", required=True, help="Today, YYYY-MM-DD (not the Monday, even for --kind week).")
     parser.add_argument("--account", required=True, help="Account number; must match the envelope. Never printed.")
@@ -242,6 +327,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except ValueError:
             print(json.dumps({"ok": False, "reason": "bad_now", "detail": "--now is not ISO-8601", "rejected": []}))
             return 2
+    if args.kind == PLAN:
+        result = fetch_plan(
+            slot=args.slot, trading_day=args.trading_day, account=args.account,
+            now=now, overlap_seconds=args.overlap_seconds,
+        )
+        print(json.dumps(result))
+        return 0 if result["ok"] else 2
     result = find_baseline(
         kind=args.kind,
         slot=args.slot,

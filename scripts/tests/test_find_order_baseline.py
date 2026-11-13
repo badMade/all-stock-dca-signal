@@ -172,7 +172,7 @@ def test_snapshot_date_is_judged_in_eastern_time_not_utc(tmp_path):
 
 
 def test_another_account_is_rejected(tmp_path):
-    _assembled(tmp_path, "1330", [_order("a", "14:44:00")], snapshot_at=f"{DAY}T13:52:41-05:00", account="999000222")
+    _assembled(tmp_path, "1330", [_order("a", "14:44:00")], snapshot_at=f"{DAY}T13:52:41-05:00", account="OTHER-ACCOUNT")
     result = _find(tmp_path)
     assert result["ok"] is False and result["rejected"][0]["reason"] == "account_mismatch"
 
@@ -269,3 +269,93 @@ def test_an_increment_that_omits_a_base_order_in_the_overlap_still_fails_closed(
     ])
     assert code == 2
     assert not (tmp_path / "out.json").exists()
+
+
+# --- --kind plan: one UTC fetch boundary set by the DAY base (review of PR 2246) ---------------
+
+
+def _plan(root, **kw):
+    return fob.fetch_plan(slot=kw.pop("slot", "1430"), trading_day=DAY, account=ACCOUNT, now=NOW, root=root, **kw)
+
+
+def test_plan_merges_both_kinds_from_one_utc_boundary_when_both_bases_are_fresh(tmp_path):
+    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], snapshot_at=f"{DAY}T13:52:41-05:00")
+    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:41-05:00")
+
+    plan = _plan(tmp_path)
+
+    assert plan["ok"] and plan["boundary_kind"] == "day"
+    assert plan["fetch_created_at_gte"] == "2026-11-12T18:50:41Z"  # 13:52:41 ET - 120 s, in UTC
+    assert sorted(plan["merge"]) == ["day", "week"] and plan["fallback_full"] == []
+
+
+def test_a_stale_week_base_never_widens_the_fetch_it_falls_back_alone(tmp_path):
+    # Only the 9:35 week file survived; the 1:30 day file is fresh. The old rule fetched from the
+    # EARLIER gte -- 9:35 -- which is the whole day's page again and the 11-12 abort.
+    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], snapshot_at=f"{DAY}T13:52:41-05:00")
+    _assembled(tmp_path, "0935", [_order("a", "14:44:00")], kind="week", snapshot_at=f"{DAY}T09:49:07-05:00")
+
+    plan = _plan(tmp_path)
+
+    assert plan["fetch_created_at_gte"] == "2026-11-12T18:50:41Z"  # still the day base's
+    assert list(plan["merge"]) == ["day"]
+    assert plan["fallback_full"] == ["week"]
+
+
+def test_a_week_base_fresher_than_the_day_base_still_merges(tmp_path):
+    _assembled(tmp_path, "1130", [_order("a", "14:44:00")], snapshot_at=f"{DAY}T11:46:02-05:00")
+    _assembled(tmp_path, "1330", [_order("a", "14:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:41-05:00")
+    plan = _plan(tmp_path)
+    assert plan["fetch_created_at_gte"] == "2026-11-12T16:44:02Z"
+    assert sorted(plan["merge"]) == ["day", "week"]
+
+
+def test_mixed_offsets_are_compared_as_instants_not_text(tmp_path):
+    # Day base written with 'Z', week base with '-05:00'. As TEXT "2026-11-12T18:..Z" sorts after
+    # "2026-11-12T13:..-05:00", so a text comparison would call the week base newer than it is.
+    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], snapshot_at="2026-11-12T18:52:41Z")
+    _assembled(tmp_path, "1230", [_order("a", "18:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:40-05:00")
+
+    plan = _plan(tmp_path)
+
+    assert plan["fetch_created_at_gte"] == "2026-11-12T18:50:41Z"
+    # The week snapshot is ONE second older in real time, so it cannot cover the boundary.
+    assert list(plan["merge"]) == ["day"] and plan["fallback_full"] == ["week"]
+
+    # One second the other way and it merges, whatever its offset says as text.
+    _assembled(tmp_path, "1230", [_order("a", "18:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:42-05:00")
+    assert sorted(_plan(tmp_path)["merge"]) == ["day", "week"]
+
+
+def test_plan_without_a_day_base_takes_the_week_boundary_and_day_falls_back(tmp_path):
+    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:41-05:00")
+    plan = _plan(tmp_path)
+    assert plan["boundary_kind"] == "week" and list(plan["merge"]) == ["week"]
+    assert plan["fallback_full"] == ["day"]
+
+
+def test_plan_with_no_base_at_all_is_exit_2_and_both_fall_back(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fob.dca_paths, "cron_tracking_root", lambda: str(tmp_path))
+    code = fob.main(["--kind", "plan", "--slot", "1430", "--trading-day", DAY, "--account", ACCOUNT,
+                     "--now", NOW.isoformat()])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 2 and out["reason"] == "no_valid_baseline" and out["fallback_full"] == ["day", "week"]
+
+
+def test_plan_boundary_feeds_both_merges_end_to_end(tmp_path):
+    in_overlap = _order("p1", "18:51:30")
+    _assembled(tmp_path, "1330", [_order("o1", "15:00:00"), in_overlap], snapshot_at="2026-11-12T18:52:41Z")
+    _assembled(tmp_path, "1330", [_order("m", "15:00:00", day=MONDAY), _order("o1", "15:00:00"), in_overlap],
+               kind="week", snapshot_at=f"{DAY}T13:52:41-05:00")
+    plan = _plan(tmp_path)
+    increment = tmp_path / "inc.json"
+    increment.write_text(json.dumps({"orders": [_order("p2", "19:31:00"), in_overlap]}), encoding="utf-8")
+    for kind, env_day, count in (("day", DAY, 3), ("week", MONDAY, 4)):
+        out = tmp_path / f"{kind}.json"
+        code = merge.main([
+            "--base", plan["merge"][kind]["base"], "--account", ACCOUNT, "--trading-day", env_day,
+            "--created-at-gte", plan["fetch_created_at_gte"], "--snapshot-at", f"{DAY}T14:33:00-05:00",
+            "--overlap-seconds", "120", "--out", str(out), str(increment),
+        ])
+        assert code == 0, kind
+        assert json.loads(out.read_text())["ingest"]["order_count"] == count

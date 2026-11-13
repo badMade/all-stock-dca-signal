@@ -113,10 +113,18 @@ all of these hold:
 * it is for this account and this day (or this ISO week's Monday);
 * its `snapshot_at` falls on that day in ET and is not in the future.
 
-Every other file is listed and skipped. The 1:30, 2:30 and 3:30 prompts now run it for the day
-and for the week, make ONE fetch from the earlier of the two `created_at_gte` values, and merge
-that fetch into both envelopes in their own `$ROOT`. If either kind cannot be merged, that kind
-falls back to the full fetch exactly as before. Replayed against the live tree for 2026-11-12, the
+Every other file is listed and skipped. The 1:30, 2:30 and 3:30 prompts run it once as
+`--kind plan`, make ONE fetch from the `fetch_created_at_gte` it prints, and merge that fetch into
+each planned envelope in their own `$ROOT`. Any kind it lists in `fallback_full`, or whose merge
+fails, falls back to the full fetch exactly as before; the other kind's merge still stands.
+
+Review of PR 2246 changed how the boundary is chosen. The first draft fetched from the EARLIER of
+the day and week `created_at_gte` values. A stale week base (only the 9:35 file left) then dragged
+the shared fetch back to 9:35, which is the whole day's page again, so both kinds fell back and the
+run hit the 11-12 abort. It also asked the model to compare two timestamps printed in different
+offsets (`Z` and `-05:00`), which goes wrong when they are compared as text. Now the script sets
+the boundary from the DAY base, compares parsed instants, and prints the boundary once in UTC. A
+week base older than that boundary is not merged, and only the week falls back to a full fetch. Replayed against the live tree for 2026-11-12, the
 2:30 run would have merged onto the 1:30 envelopes (37 day orders, 168 week orders, snapshot
 13:52 ET), and the increment would have held about one order. The 10:30 and 11:30 prompts keep
 the plain rule, because their day pages are still small.
