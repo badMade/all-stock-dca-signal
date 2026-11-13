@@ -1,0 +1,46 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:08:27+00:00",
+    "method": "GET",
+    "url": "https://data-api.polymarket.com/v2/prices-history?tokenId=103008858512874391365224101227560355649163684508142667207968746328052141056510&interval=1d&bucketSeconds=3600&limit=5",
+    "request_body": null,
+    "http_status": 200,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Data API v2 history; rows carry resolution_seconds. First page only (pagination.next_cursor kept as served)."
+  },
+  "response": {
+    "data": [
+      {
+        "timestamp": 1794452400,
+        "price": 0.3045,
+        "resolution_seconds": 3600
+      },
+      {
+        "timestamp": 1794456000,
+        "price": 0.2815,
+        "resolution_seconds": 3600
+      },
+      {
+        "timestamp": 1794459600,
+        "price": 0.2785,
+        "resolution_seconds": 3600
+      },
+      {
+        "timestamp": 1794463200,
+        "price": 0.2715,
+        "resolution_seconds": 3600
+      },
+      {
+        "timestamp": 1794466800,
+        "price": 0.19,
+        "resolution_seconds": 3600
+      }
+    ],
+    "pagination": {
+      "limit": 5,
+      "offset": 0,
+      "has_more": true,
+      "next_cursor": "eyJkYXRhIjp7InR5cGUiOiJwcmljZXNfaGlzdG9yeSIsInBhcmFtcyI6eyJsIjo1LCJ0cyI6MTc5NDQ2NjgwMCwic3EiOiIzNjAwIiwiZCI6NX19LCJzaWciOiI1MDA4N2QwODRmODMzOTIxNDI3Y2MxMWJkOWU5OTFlZCJ9"
+    }
+  }
+}

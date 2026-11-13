@@ -1,0 +1,43 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:08:06+00:00",
+    "method": "GET",
+    "url": "https://clob.polymarket.com/prices-history?market=103008858512874391365224101227560355649163684508142667207968746328052141056510&interval=max&fidelity=720",
+    "request_body": null,
+    "http_status": 200,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "12-hour points (fidelity=720 minutes)."
+  },
+  "response": {
+    "history": [
+      {
+        "t": 1794312032,
+        "p": 0.445
+      },
+      {
+        "t": 1794355220,
+        "p": 0.0255
+      },
+      {
+        "t": 1794398422,
+        "p": 0.0495
+      },
+      {
+        "t": 1794441624,
+        "p": 0.185
+      },
+      {
+        "t": 1794484824,
+        "p": 0.231
+      },
+      {
+        "t": 1794528024,
+        "p": 0.151
+      },
+      {
+        "t": 1794539057,
+        "p": 0.1545
+      }
+    ]
+  }
+}

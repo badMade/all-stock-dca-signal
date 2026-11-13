@@ -1589,6 +1589,18 @@ _ALLOWED = {
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_count_mismatch.json",
     # Holds a microsecond-precision timestamp literal (.500000) in an assertion.
     "dca-sizing-signals/tests/prices/test_alpaca_provider.py",
+    # Real Polymarket responses captured 2026-11-13 (docs/adr-prediction-markets.md, Phase 5a): unix-second
+    # timestamps, Gamma/US market ids and share quantities are account-shaped digit runs but are venue market
+    # data, captured with no credentials. Named individually under the same rule as the price fixtures above;
+    # every one carries _provenance (tests/prediction_markets/test_pm_boundaries.py enforces it).
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_clob_batch_prices_history_2_tokens.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_clob_prices_history_kress_yes_1d_f60.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_clob_prices_history_kress_yes_max_f720.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_data_v2_prices_history_kress_yes.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_data_v2_trades_kress.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/intl_gamma_event_next-ceo-of-nvidia.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/us_gateway_event_nvidiaceo-2028-12-31.json",
+    "dca-sizing-signals/tests/prediction_markets/fixtures/us_gateway_price_history_colkre_1d.json",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text

@@ -1,0 +1,46 @@
+{
+  "_comment": "Prediction-market ingestion (docs/adr-prediction-markets.md). Research only; never read by a live buying slot. No credentials here: credential_env names environment variables only. Budgets are requests per 10 s (ADR section 4); the Polymarket US gateway limit is undocumented, so 100 is a conservative start to tighten after measuring (D3).",
+  "liquidity_threshold_usd": 50000,
+  "cadence": {
+    "default_interval_s": 3600,
+    "watchlist_interval_s": 300
+  },
+  "watchlist": [
+    {"venue": "polymarket_intl", "market_id": "0xa82699004214aa3f755ede5d9e6d5c4850e3f69ec821a3b15433a1bd6a3a19aa"},
+    {"venue": "polymarket_intl", "market_id": "0xd940515f5526f103b1aa4d3b297792d22ee82c24953c5e2ad3ae9687403f7f00"},
+    {"venue": "polymarket_us", "market_id": "nphc-nvidiaceo-2028-12-31-colkre"},
+    {"venue": "polymarket_us", "market_id": "nphc-nvidiaceo-2028-12-31-ianbuc"}
+  ],
+  "db_path_env": "DCA_PM_DB_PATH",
+  "sources": {
+    "polymarket_intl": {
+      "license_scope": "store_ok",
+      "hosts": {
+        "gamma": "https://gamma-api.polymarket.com",
+        "clob": "https://clob.polymarket.com",
+        "data": "https://data-api.polymarket.com"
+      },
+      "budgets_per_10s": {
+        "gamma": {"*": 4000, "/markets": 300},
+        "clob": {"*": 9000, "/prices-history": 1000},
+        "data": {"*": 1000, "/v2/prices-history": 200}
+      },
+      "max_history_batch": 20
+    },
+    "polymarket_us": {
+      "license_scope": "live_only",
+      "hosts": {
+        "gateway": "https://gateway.polymarket.us",
+        "api": "https://api.polymarket.us"
+      },
+      "budgets_per_10s": {
+        "gateway": {"*": 100},
+        "api": {"*": 250}
+      },
+      "credential_env": {
+        "key_id": "POLYMARKET_US_KEY_ID",
+        "secret_key": "POLYMARKET_US_SECRET_KEY"
+      }
+    }
+  }
+}

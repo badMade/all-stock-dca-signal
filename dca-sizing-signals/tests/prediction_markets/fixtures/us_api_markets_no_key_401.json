@@ -1,0 +1,12 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:10:47+00:00",
+    "method": "GET",
+    "url": "https://api.polymarket.us/v1/markets",
+    "request_body": null,
+    "http_status": 401,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Authenticated Retail API called with no X-PM-* headers: real 401 plain-text body."
+  },
+  "response": "Missing required API key headers\n"
+}

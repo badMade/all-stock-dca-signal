@@ -1,0 +1,16 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:08:27+00:00",
+    "method": "GET",
+    "url": "https://data-api.polymarket.com/trades?market=0xa82699004214aa3f755ede5d9e6d5c4850e3f69ec821a3b15433a1bd6a3a19aa&limit=5",
+    "request_body": null,
+    "http_status": 410,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Data API v1 retirement response (HTTP 410). Adapters must not call v1."
+  },
+  "response": {
+    "error": "Data API v1 has been retired",
+    "migration": "https://data-api.polymarket.com/v2/",
+    "docs": "https://docs.polymarket.com/api-reference/data-api/overview"
+  }
+}

@@ -87,21 +87,27 @@ Before buying any vendor feed, confirm it carries the event-contract product cod
 
 ## 4) Endpoint and limit details
 
-Per the research report; verify against live docs during fixture capture.
+Polymarket rows verified against the captured fixtures (2026-11-13, `dca-sizing-signals/tests/prediction_markets/fixtures/`); Kalshi rows are still per the research report.
 
 ### Polymarket International
 
-| API | Purpose | Notes |
+| API | Purpose | Notes (verified 2026-11-13) |
 |---|---|---|
-| Gamma (`gamma-api.polymarket.com`) | Discovery and metadata | `outcomePrices`, `outcomes`, `clobTokenIds` are double-encoded JSON strings. |
-| CLOB (`clob.polymarket.com`) | Live book, price, `/prices-history` | Batches up to 20 tokens; reportedly back to 2022 at 12-hour resolution. No historical order-book endpoint. |
-| Data API v2 | Trades, positions, `/v2/prices-history` | |
+| Gamma (`gamma-api.polymarket.com`) | Discovery and metadata | `GET /events/slug/{slug}`. `outcomePrices`, `outcomes`, `clobTokenIds` are double-encoded JSON strings. `conditionId` is the stored `market_id`; per-market `description` is the rules text. `bestBid`/`bestAsk`/`liquidityNum` are the Yes side. |
+| CLOB (`clob.polymarket.com`) | Live book, price, history | `GET /book?token_id=`, `GET /prices-history?market=<token>&interval=&fidelity=<minutes>`, `POST /batch-prices-history` with `{"markets": [...], "interval", "fidelity"}`. More than 20 ids returns HTTP 400. History gives no resolution field, so it is derived from `fidelity`. No historical order-book endpoint. |
+| Data API v2 (`data-api.polymarket.com`) | Trades, history | v1 returns 410 "retired". `GET /v2/trades?conditionId=` (not `market=`); `GET /v2/prices-history?tokenId=&bucketSeconds=` returns `resolution_seconds` per row and a `next_cursor`. |
 
 Limits per 10 seconds: Gamma 4,000 (300 on `/markets`); CLOB 9,000 (1,000 on `/prices-history`); Data v2 `/v2/prices-history` 200.
 
 ### Polymarket US
 
-Endpoints, auth scheme and limits not yet verified (docs behind account). First task after account approval: capture real responses for public and authenticated endpoints as fixtures. Until then, only public-endpoint fixtures.
+| Item | Detail (verified 2026-11-13 from docs.polymarket.us and captures) |
+|---|---|
+| Public API | `gateway.polymarket.us/v1`, no key: `/events/slug/{slug}`, `/markets/{slug}/bbo`, `/markets/{slug}/book`, `/price-history?symbol=&fixedInterval=INTERVAL_*&fidelity=`, `/search`. `market_id` is the market slug. |
+| Authenticated API | `api.polymarket.us/v1`; headers `X-PM-Access-Key`, `X-PM-Timestamp` (ms, within 30 s), `X-PM-Signature` = Ed25519 over `timestamp + method + path`. Without them: 401 "Missing required API key headers". |
+| Signing | Ed25519 is not in the standard library. Decision 2026-11-12: no new dependency yet; the adapter takes an injected signer and fails closed without one. Revisit (`cryptography` or `PyNaCl`) when open item 2 is done. |
+| Limits | Retail (authenticated) API 25 req/s, per source IP. Gateway limit undocumented; config starts at 100 per 10 s, to tighten after measuring (D3). |
+| Quirk | A market's `outcomePrices` is the Yes bid/ask pair (e.g. `["0.1400","0.1500"]` with `bestBidQuote` 0.14, `bestAskQuote` 0.15), not `[P(Yes), P(No)]` as on Gamma. Never store it as outcome prices. |
 
 ### Kalshi
 
@@ -235,7 +241,7 @@ Terms bar AI/ML training or evaluation without prior written permission.
 - Order of work: real fixtures, then tests (wait for approval), then implementation.
 - Work runs on the Mac Studio.
 
-## 13) Tests first (awaiting approval)
+## 13) Tests first (approved 2026-11-12; Phase 5a implemented)
 
 | Test | Checks |
 |---|---|
@@ -279,3 +285,20 @@ Terms bar AI/ML training or evaluation without prior written permission.
 | `test_metaculus_history_filtered_by_end_time` | history entries used only if `end_time <= as_of` |
 
 Fixtures: real captured responses only. Polymarket US authenticated fixtures wait for account approval.
+
+Phase 5a status (2026-11-13): implemented in `dca-sizing-signals/market_data_ingest/prediction_markets/` with config at `dca-sizing-signals/config/prediction_markets.json`. Kalshi, index-binary and Metaculus tests belong to later phases.
+
+## 14) Proposed snapshot schedule (not scheduled; needs approval)
+
+Nothing below exists as a scheduled job. It is the proposal §12 asks for.
+
+| Item | Proposal |
+|---|---|
+| Where | Mac Studio, a launchd agent beside the existing ones in `deploy/launchd/`, running from a checkout's `dca-sizing-signals` venv. No cloud routine. |
+| Entry point | A thin `python -m market_data_ingest.prediction_markets.snapshot` (to be written) that loads config, then for each configured event calls the adapter and `run_ingestion`. It never imports a live-slot module (§13 `test_live_slots_never_import_pm`). |
+| Default cadence | Hourly at :07 for all configured events (D3 `default_interval_s` 3600). |
+| Watchlist cadence | Every 5 minutes (`watchlist_interval_s` 300), quotes plus order-book snapshots, for the watchlist markets only. |
+| Keep clear of buying slots | Skip any run starting within 3 minutes of 09:35, 10:30, 11:30, 12:30, 13:30, 14:30, 15:30 ET, so ingestion never competes with a slot for network or CPU. D5 already forbids slots from reading this data; this also keeps the two apart in time. |
+| Database | `$DCA_PM_DB_PATH`, defaulting to `$DCA_CRON_TRACKING_ROOT/prediction_markets/pm.duckdb` (gitignored run output, never the repo). One writer at a time, via a lock file. |
+| Persistence | Only `store_ok` sources write rows (D7). Polymarket US stays `live_only` (fetch and parse, zero rows) until open item 2. |
+| Monitoring | Each run is one `ingestion_runs` row. A later console page can read failed-run streaks; no alerts until the job has run for a week. |
