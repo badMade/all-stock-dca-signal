@@ -122,7 +122,7 @@ pip install -r requirements.txt          # requests, duckdb, pytest (pinned); or
 python -m pytest tests/prices            # offline; the live PoC under tests/prices/contract skips itself
 ```
 
-Dependencies: `requests==2.34.2` and `duckdb==1.5.6`. Nothing else, and nothing in the
+Dependencies: `requests==2.34.2` and `duckdb==2.0.0`. Nothing else, and nothing in the
 stdlib-only core.
 
 ### Environment variables

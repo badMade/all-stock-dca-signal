@@ -60,7 +60,8 @@ this repo allowed to make network calls", so the new code goes there.
 
 ## Dependencies
 
-`requests==2.34.2` and `duckdb==1.5.6` (released 2026-09-28), declared in
+`requests==2.34.2` and `duckdb==2.0.0` (adopted at `1.5.6`, released 2026-09-28; Dependabot
+bumped it to 2.0.0 on 2026-10-27 in commit `fee088b`), declared in
 `dca-sizing-signals/requirements.txt` and as the package's `prices` extra. `duckdb` is new
 to this repository (`all_stock_dca/backtest.py` writes a `.duckdb`-named file with
 `sqlite3`). Neither touches the stdlib-only core. Parquet is written by DuckDB itself, so
