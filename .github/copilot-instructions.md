@@ -9,7 +9,7 @@ Prioritize these repository-specific risks:
 - **State transitions:** check retry safety, atomicity, ownership, and idempotency for releases, settlements, and persisted state changes.
 - **Network destinations and errors:** route operator-supplied URLs through `dca_net_utils.assert_safe_destination`. Preserve existing `# noqa: S310` suppressions when editing nearby code. Never log raw external error responses, which may echo credentials.
 - **Financial execution paths:** distinguish candidates, simulated orders, submitted orders, and confirmed fills. `run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy, and `dca_runner.py` are separate entry points; verify which paths the change covers and flag likely gaps where behavior should be consistent.
-- **Coverage boundaries:** consult `AGENTS.md` for companion packaging/config updates, excluded subproject checks, and other repository-specific validation gaps. Do not assume root CI covers excluded projects, especially `dca-sizing-signals/`.
+- **Coverage boundaries:** consult `AGENTS.md` for companion packaging/config updates, excluded subproject checks, and other repository-specific validation gaps. Do not assume root CI covers excluded projects: each sibling subproject has its own CI job, and none of them runs on draft PRs.
 - **Secrets and operational artifacts:** flag credentials, account identifiers, or `.env` contents added to tracked files. Treat generated operational reports and protected data files as read-only unless the change explicitly requires otherwise.
 
 Never approve or merge a pull request. Do not recommend editing `.github/workflows/`; this repository prohibits agent-driven PRs from changing workflow files. Describe any workflow concern as a proposed change instead.

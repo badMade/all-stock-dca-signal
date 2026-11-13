@@ -136,23 +136,22 @@ test. `scripts/tests/` needs no separate command: `testpaths = ["."]` and the
 `addopts` ignore list does not exclude `scripts/`, so a bare `pytest` already
 collects it (39 cases at the time of writing).
 
-What the root sweep genuinely does not cover is the seven directories named in
-that ignore list, each excluded because it carries its own heavy dependencies:
+What the root sweep genuinely does not cover is the eight subproject directories
+named in that ignore list, each excluded because it carries its own dependencies:
 
 | Subproject | Own CI job |
 | --- | --- |
-| `production-safe-agent-loop/`, `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/` | yes |
-| `dca-sizing-signals/` | **no** |
+| `production-safe-agent-loop/`, `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/`, `yfinance-prefetch/`, `dca-sizing-signals/` | yes |
 
 Install that subproject's `requirements.txt` and run its `tests/` from inside
 it, and only for the one your diff touches. A CI failure isolated to a sibling
 suite your diff does not touch is very likely not yours; say so rather than
 widening the change.
 
-`dca-sizing-signals/` is the exception worth knowing: it is excluded from the
-root pytest sweep *and* from root `ruff` (`extend-exclude`), and `ci.yml`
-contains no job for it, so nothing validates it automatically. If you touch it,
-you are its only gate. Run its suite yourself and say so in the pull request.
+`dca-sizing-signals/` is excluded from the root pytest sweep *and* from root
+`ruff` (`extend-exclude`). Until 2026-11-13 `ci.yml` had no job for it either,
+which is how its `pyproject.toml` extra drifted from `requirements.txt`
+unnoticed. It now has one (`Lint & test (dca-sizing-signals)`, added in #2242).
 
 **Root-only tests CI cannot see.**
 `tests/test_dca_fileio.py::test_the_destination_owner_is_preserved` and
