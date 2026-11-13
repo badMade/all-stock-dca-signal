@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import tempfile
 from collections.abc import Callable, Iterable, Sequence
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -31,7 +30,7 @@ from typing import Any
 
 import duckdb
 
-from .errors import ValidationError
+from ..duckdb_batch import bulk_insert
 from .models import AdjustedBar, CorporateAction, DailyBar, Quote, ReconciliationResult
 from .validate import validate_actions, validate_bars
 
@@ -233,18 +232,6 @@ def _hash(values: Sequence[Any]) -> str:
     return hashlib.sha256(json.dumps(list(values), default=str, separators=(",", ":")).encode()).hexdigest()
 
 
-def _json_value(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ")
-    if isinstance(value, date):
-        return value.isoformat()
-    return value
-
-
-def _sql_path(path: Path) -> str:
-    return str(path).replace("'", "''")
-
-
 def safe_name(value: str) -> str:
     """A run id or batch name usable as one path component."""
     cleaned = _SAFE_NAME.sub("_", value)
@@ -312,36 +299,8 @@ class PriceStore:
     def _bulk_insert(
         self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], *, parquet_path: Path | None
     ) -> int:
-        """Write ``rows`` to a file, optionally stage them as Parquet, insert in one transaction."""
-        if not rows:
-            return 0
-        cols = ", ".join(columns)
-        struct = "{" + ", ".join(f"'{k}': '{v}'" for k, v in columns.items()) + "}"
-        with tempfile.TemporaryDirectory() as tmp:
-            ndjson = Path(tmp) / "batch.ndjson"
-            with ndjson.open("w") as fh:
-                for row in rows:
-                    fh.write(json.dumps({k: _json_value(row.get(k)) for k in columns}, allow_nan=False) + "\n")
-            source = f"read_json('{_sql_path(ndjson)}', format = 'newline_delimited', columns = {struct})"
-            if parquet_path is not None:
-                parquet_path.parent.mkdir(parents=True, exist_ok=True)
-                self.con.execute(f"COPY (SELECT {cols} FROM {source}) TO '{_sql_path(parquet_path)}' (FORMAT parquet)")
-                source = f"read_parquet('{_sql_path(parquet_path)}')"
-            staged = self.con.execute(f"SELECT count(*) FROM {source}").fetchone()
-            if not staged or int(staged[0]) != len(rows):
-                raise ValidationError(f"staged {staged[0] if staged else 0} rows for a {len(rows)}-row batch")
-            self.con.execute("BEGIN TRANSACTION")
-            try:
-                before = self.row_count(table)
-                self.con.execute(
-                    f"INSERT INTO {table} ({cols}) SELECT DISTINCT {cols} FROM {source} ON CONFLICT DO NOTHING"
-                )
-                inserted = self.row_count(table) - before
-                self.con.execute("COMMIT")
-            except BaseException:
-                self.con.execute("ROLLBACK")
-                raise
-        return inserted
+        """Check the table against this store's allowlist, then run the shared batch insert."""
+        return bulk_insert(self.con, self._check_table(table), columns, rows, parquet_path=parquet_path)
 
     # --- bars and corporate actions ------------------------------------------------------------
 
