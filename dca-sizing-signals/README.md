@@ -260,6 +260,21 @@ holdings, open shadow puts and earlier picks in the same run; a sector missing f
 holdings map, or `paused_tickers=None` (pause list unknown), yields no candidates. The
 thresholds are proposed defaults in `CspShadowConfig`, not operator-approved.
 
+## Prediction markets (Phase 5a, research only)
+
+`market_data_ingest/prediction_markets/` ingests Polymarket International and Polymarket US
+prices as point-in-time research inputs (`docs/adr-prediction-markets.md`, methods in
+`docs/adr-prediction-markets-methods.md`). Config: `config/prediction_markets.json`.
+
+- One adapter per venue on a `PredictionMarketSource` base; `run_ingestion` is the only path
+  to the DuckDB store and never raises: each run is one `ingestion_runs` row.
+- `license_scope` gates persistence: Polymarket International is `store_ok`; Polymarket US is
+  `live_only` (fetched and parsed, zero rows) until its account and terms are approved.
+- Polymarket US authenticated calls need an injected Ed25519 signer; there is no dependency
+  for it, and without one the call fails closed before any request.
+- Not scheduled and not read by any live buying slot. The proposed snapshot job is ADR §14.
+- Tests: `tests/prediction_markets/`, all against real responses captured 2026-11-13.
+
 ## Status
 
 Architecture and boundary tests are real and passing. `edgar_fundamentals.py` and
