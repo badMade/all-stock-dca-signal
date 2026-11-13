@@ -265,7 +265,7 @@ jobs:
       # PEP 751 locks; it does not directly read uv.lock.
       # Manifests resolve for this runner's exact interpreter (e.g. 3.11.14), not the bare
       # matrix value: uv reads "3.11" as 3.11.0, and on 2026-11-13 that picked soupsieve 2.10
-      # (CVE-2026-126190, fixed only in 4.x, which needs Python >= 3.11.5) for every manifest
+      # (GHSA-mmhr-3c5m-f64f, fixed only in 4.x, which needs Python >= 3.11.5) for every manifest
       # that pulls in beautifulsoup4, although no CI job installs on a 3.11.0 interpreter.
       # Operator decision (PR #2252): audit what CI's interpreter actually installs.
       - name: Audit runtime and research dependency trees

@@ -241,7 +241,7 @@ research_audit_step() {
   local audit_dir pyver manifest scope status=0
   audit_dir="$(mktemp -d)"
   # Full patch version, as ci.yml's step does: a bare "3.11" reads as 3.11.0 and resolves
-  # soupsieve 2.10 (CVE-2026-126190; 4.x needs Python >= 3.11.5) for the bs4 manifests.
+  # soupsieve 2.10 (GHSA-mmhr-3c5m-f64f; 4.x needs Python >= 3.11.5) for the bs4 manifests.
   pyver="$("$PY" -c 'import platform; print(platform.python_version())')"
   uv export --locked --all-extras --no-emit-project --format pylock.toml \
     --output-file "$audit_dir/pylock.root.toml" || status=$?
