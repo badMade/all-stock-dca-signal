@@ -84,12 +84,14 @@ def validate_contracts(contracts: Sequence[FuturesContract]) -> None:
         _raise("contracts", problems)
 
 
-def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[str]) -> list[str]:
+def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[tuple[str, str]]) -> list[str]:
     problems: list[str] = []
     if not _text(b.source):
         problems.append(f"#{i} missing source")
-    if b.contract_id not in known_contracts:
-        problems.append(f"#{i} unknown contract")
+    # Keyed by (source, contract_id) (PR #2265 review): a bar from one vendor against a contract
+    # only another vendor stored would have no contract (or multiplier) under its own source.
+    if (b.source, b.contract_id) not in known_contracts:
+        problems.append(f"#{i} unknown contract for its source")
     if not _aware(b.bar_start_utc):
         problems.append(f"#{i} bar start is not timezone-aware")
     elif b.bar_start_utc.second or b.bar_start_utc.microsecond:
@@ -104,7 +106,8 @@ def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[str]) -> lis
     return problems
 
 
-def validate_bars(bars: Sequence[FuturesBar], known_contracts: Iterable[str]) -> None:
+def validate_bars(bars: Sequence[FuturesBar], known_contracts: Iterable[tuple[str, str]]) -> None:
+    """Refuse the batch unless every bar is valid and belongs to a known (source, contract_id)."""
     known = frozenset(known_contracts)
     problems: list[str] = []
     seen: dict[tuple[str, str, datetime], FuturesBar] = {}

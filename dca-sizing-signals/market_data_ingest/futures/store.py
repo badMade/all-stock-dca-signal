@@ -5,13 +5,18 @@ Same write and read rules as market_data_ingest/prices/store.py:
 * Rows are never updated or deleted in place. A row is inserted only when its content_hash
   differs from the newest version already known for that key as of the batch's as_of, so
   re-ingesting identical data adds nothing and a vendor correction lands as a new row with a
-  later as_of. The primary key includes as_of (PR #2264 review): with content_hash alone, a
-  vendor that corrects A to B and then reverts to A had the revert dropped as a duplicate of
-  the first A, and the store kept serving B. Prices and the multiplier are coerced to float
-  before hashing, so 6031 and 6031.0 are the same content.
-* Every read keeps sources apart. Pass ``source=`` to pick one; without it, a minute (or a
-  contract) that more than one source has stored is ambiguous and the read raises rather than
-  letting whichever vendor arrived last win.
+  later as_of. The primary key includes as_of and run_id (PR #2264 and #2265 reviews): with
+  content_hash alone, a vendor that corrects A to B and then reverts to A had the revert dropped
+  as a duplicate of the first A, and with as_of but not run_id the same happened when the revert
+  carried the same as_of as the first A. The dedupe itself is duckdb_batch.drop_unchanged, and
+  the insert refuses (require_all_new) rather than let an older file's key swallow a revert.
+  Prices and the multiplier are coerced to float before hashing, so 6031 and 6031.0 are the
+  same content.
+* Every read keeps sources apart. Pass ``source=`` to pick one; without it, a read whose result
+  spans more than one source raises, whether the sources share a minute or only sit side by
+  side in one window (PR #2265 review: non-overlapping minutes stitched two feeds silently).
+* A bar must belong to a contract its own source has stored, so every source= read of bars has
+  a contract (and multiplier) under the same source.
 * One batch is validated, staged to <staging_dir>/<run_id>/<name>.parquet, counted, and inserted
   in one transaction. A failure anywhere writes nothing.
 * known_at reads return the newest version whose as_of <= known_at.
@@ -31,7 +36,7 @@ from typing import Any
 
 import duckdb
 
-from market_data_ingest.duckdb_batch import bulk_insert
+from market_data_ingest.duckdb_batch import bulk_insert, drop_unchanged
 from market_data_ingest.prices.store import _from_db, _hash, safe_name, to_utc_naive
 
 from .models import FuturesBar, FuturesContract, validate_bars, validate_contracts
@@ -44,7 +49,7 @@ CREATE TABLE IF NOT EXISTS futures_contract (
     expiry_utc TIMESTAMP NOT NULL, multiplier DOUBLE NOT NULL,
     source VARCHAR NOT NULL, content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, contract_id, content_hash, as_of)
+    PRIMARY KEY (source, contract_id, content_hash, as_of, run_id)
 );
 CREATE TABLE IF NOT EXISTS futures_bar_1m (
     contract_id VARCHAR NOT NULL, bar_start_utc TIMESTAMP NOT NULL,
@@ -52,7 +57,7 @@ CREATE TABLE IF NOT EXISTS futures_bar_1m (
     volume BIGINT NOT NULL,
     source VARCHAR NOT NULL, content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, contract_id, bar_start_utc, content_hash, as_of)
+    PRIMARY KEY (source, contract_id, bar_start_utc, content_hash, as_of, run_id)
 );
 """
 
@@ -70,13 +75,14 @@ _TABLES = frozenset({"futures_contract", "futures_bar_1m"})
 # Newest known version per (source, bar), as of known_at. ingested_at then content_hash break
 # exact ties deterministically, the same ordering bars_known_at uses in the price store. Source is
 # in the partition (PR #2264 review): without it a second vendor's later bar silently replaced
-# the primary feed's close. The optional source filter is NULL-safe: NULL means every source.
+# the primary feed's close. The optional source filter binds once: coalesce(NULL, source) is
+# source itself (the column is NOT NULL), so NULL means every source.
 _LATEST_BARS = """
 SELECT * FROM (
     SELECT *, row_number() OVER (
         PARTITION BY source, contract_id, bar_start_utc
         ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn
-    FROM futures_bar_1m WHERE contract_id = ? AND as_of <= ? AND (CAST(? AS VARCHAR) IS NULL OR source = ?))
+    FROM futures_bar_1m WHERE contract_id = ? AND as_of <= ? AND source = coalesce(?, source))
 WHERE rn = 1
 """
 _LATEST_CONTRACTS = """
@@ -84,7 +90,7 @@ SELECT * FROM (
     SELECT *, row_number() OVER (
         PARTITION BY source, contract_id
         ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn
-    FROM futures_contract WHERE contract_id = ? AND as_of <= ? AND (CAST(? AS VARCHAR) IS NULL OR source = ?))
+    FROM futures_contract WHERE contract_id = ? AND as_of <= ? AND source = coalesce(?, source))
 WHERE rn = 1
 """
 
@@ -150,7 +156,9 @@ class FuturesStore:
     def _bulk_insert(self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], parquet_path: Path) -> int:
         """Check the table against this store's allowlist, then run the shared batch insert
         (market_data_ingest.duckdb_batch, the same code PriceStore uses)."""
-        return bulk_insert(self.con, self._check_table(table), columns, rows, parquet_path=parquet_path)
+        return bulk_insert(
+            self.con, self._check_table(table), columns, rows, parquet_path=parquet_path, require_all_new=True
+        )
 
     def _provenance(self, values: list[Any], run_id: str, as_of: datetime) -> dict[str, Any]:
         return {
@@ -162,30 +170,9 @@ class FuturesStore:
 
     # --- writes ---------------------------------------------------------------------------------
 
-    def _unchanged(self, table: str, keys: list[str], rows: list[dict[str, Any]], as_of: datetime) -> set[tuple]:
-        """Keys (plus content_hash) whose newest version known at ``as_of`` already has that hash.
-
-        This replaces the old PRIMARY KEY (..., content_hash) dedupe: it drops a true re-ingest
-        but keeps a revert to an earlier value, which the newest version no longer matches.
-        """
-        contract_ids = sorted({r["contract_id"] for r in rows})
-        partition = ", ".join(keys)
-        found = self.con.execute(
-            f"SELECT {partition}, content_hash FROM (SELECT *, row_number() OVER ("
-            f"PARTITION BY {partition} ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn "
-            f"FROM {self._check_table(table)} WHERE as_of <= ? AND list_contains(?, contract_id)) WHERE rn = 1",
-            [to_utc_naive(as_of), contract_ids],
-        ).fetchall()
-        return {tuple(_from_db(v) for v in row) for row in found}
-
     def _new_rows(self, table: str, keys: list[str], rows: list[dict[str, Any]], as_of: datetime) -> list[dict]:
-        if not rows:
-            return []
-        unchanged = self._unchanged(table, keys, rows, as_of)
-        # Stored timestamps come back aware (from _from_db); compare on that form.
-        def ident(r: dict[str, Any]) -> tuple:
-            return tuple(_from_db(r[k]) for k in keys) + (r["content_hash"],)
-        return [r for r in rows if ident(r) not in unchanged]
+        """Drop rows whose newest stored version at ``as_of`` already has their hash (a re-ingest)."""
+        return drop_unchanged(self.con, self._check_table(table), keys, rows, as_of=to_utc_naive(as_of))
 
     def ingest_contracts(
         self, contracts: Iterable[FuturesContract], *, run_id: str, as_of: datetime, staging_dir: Path
@@ -210,12 +197,14 @@ class FuturesStore:
         path = Path(staging_dir) / safe_name(run_id) / name
         return self._bulk_insert("futures_contract", _CONTRACT_COLUMNS, rows, path)
 
-    def _known_contract_ids(self) -> set[str]:
-        return {r[0] for r in self.con.execute("SELECT DISTINCT contract_id FROM futures_contract").fetchall()}
+    def _known_contracts(self) -> set[tuple[str, str]]:
+        # (source, contract_id): a bar is only known against a contract its own source stored.
+        rows = self.con.execute("SELECT DISTINCT source, contract_id FROM futures_contract").fetchall()
+        return {(r[0], r[1]) for r in rows}
 
     def ingest_bars(self, bars: Iterable[FuturesBar], *, run_id: str, as_of: datetime, staging_dir: Path) -> int:
         batch = list(bars)
-        validate_bars(batch, self._known_contract_ids())
+        validate_bars(batch, self._known_contracts())
         rows = []
         for b in batch:
             start = to_utc_naive(b.bar_start_utc)
@@ -240,14 +229,11 @@ class FuturesStore:
         return to_utc_naive(known_at if known_at is not None else self._clock())
 
     @staticmethod
-    def _one_source_per(rows: list[dict[str, Any]], key: str, what: str) -> None:
-        """Without an explicit source, two sources for one key are ambiguous: fail closed."""
-        sources: dict[Any, set[str]] = {}
-        for r in rows:
-            sources.setdefault(r[key], set()).add(r["source"])
-        clashes = sorted(str(k) for k, s in sources.items() if len(s) > 1)
-        if clashes:
-            raise ValueError(f"{what} stored by more than one source ({', '.join(clashes[:3])}); pass source=")
+    def _one_source(rows: list[dict[str, Any]], what: str) -> None:
+        """Without an explicit source, a result spanning two sources is ambiguous: fail closed."""
+        sources = sorted({r["source"] for r in rows})
+        if len(sources) > 1:
+            raise ValueError(f"{what} stored by more than one source ({', '.join(sources)}); pass source=")
 
     def bars(
         self,
@@ -261,9 +247,9 @@ class FuturesStore:
         """Latest known version of each bar with start_utc <= bar_start_utc < end_utc."""
         rows = self._rows(
             f"SELECT * FROM ({_LATEST_BARS}) WHERE bar_start_utc >= ? AND bar_start_utc < ? ORDER BY bar_start_utc",
-            [contract_id, self._known_at(known_at), source, source, to_utc_naive(start_utc), to_utc_naive(end_utc)],
+            [contract_id, self._known_at(known_at), source, to_utc_naive(start_utc), to_utc_naive(end_utc)],
         )
-        self._one_source_per(rows, "bar_start_utc", "bar")
+        self._one_source(rows, "bars")
         return [
             FuturesBar(
                 contract_id=r["contract_id"], bar_start_utc=r["bar_start_utc"], open=r["open"], high=r["high"],
@@ -278,17 +264,17 @@ class FuturesStore:
         """Close of the bar ending at ``at_utc``, or None. No lookahead, no fill-forward."""
         start = to_utc_naive(at_utc) - ONE_MINUTE  # raises ValueError on a naive time
         rows = self._rows(
-            f"SELECT source, bar_start_utc, close FROM ({_LATEST_BARS}) WHERE bar_start_utc = ?",
-            [contract_id, self._known_at(known_at), source, source, start],
+            f"SELECT source, close FROM ({_LATEST_BARS}) WHERE bar_start_utc = ?",
+            [contract_id, self._known_at(known_at), source, start],
         )
-        self._one_source_per(rows, "bar_start_utc", "bar")
+        self._one_source(rows, "bars")
         return float(rows[0]["close"]) if rows else None
 
     def contract(
         self, contract_id: str, *, known_at: datetime | None = None, source: str | None = None
     ) -> FuturesContract | None:
-        rows = self._rows(_LATEST_CONTRACTS, [contract_id, self._known_at(known_at), source, source])
-        self._one_source_per(rows, "contract_id", "contract")
+        rows = self._rows(_LATEST_CONTRACTS, [contract_id, self._known_at(known_at), source])
+        self._one_source(rows, "contract")
         if not rows:
             return None
         r = rows[0]

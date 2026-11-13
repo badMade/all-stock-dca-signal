@@ -309,3 +309,40 @@ def test_last_session_symbols_come_from_the_latest_session_of_that_source(store,
     ingest(store, staging_dir, [bar("NVDA", date(2024, 6, 4), 1.0), bar("AAPL", date(2024, 6, 4), 1.0)], run_id="b")
 
     assert sorted(store.last_session_symbols("massive")) == ["AAPL", "NVDA"]
+
+
+# --- PR #2265 review: versioned dedupe for daily bars ------------------------------------------
+
+
+def test_a_vendor_revert_to_an_earlier_close_is_kept(store, staging_dir):
+    """A -> B -> A: the revert is a new version, not a duplicate of the first A."""
+    session = date(2026, 10, 16)
+    ingest(store, staging_dir, [bar("AAPL", session, 250.00)], run_id="run-a", as_of=utc(2026, 10, 17, 1))
+    ingest(store, staging_dir, [bar("AAPL", session, 250.40)], run_id="run-b", as_of=utc(2026, 10, 18, 1))
+    assert ingest(store, staging_dir, [bar("AAPL", session, 250.00)], run_id="run-c", as_of=utc(2026, 10, 18, 2)) == 1
+    assert adjusted(store, "AAPL", session, as_of_date=TODAY).close_raw == pytest.approx(250.00)
+
+
+def test_an_older_price_file_key_refuses_a_revert(tmp_path, staging_dir):
+    """A file whose daily_bars_raw key lacks as_of/run_id must fail loudly, not drop the revert."""
+    import duckdb
+
+    from market_data_ingest.prices.store import PriceStore
+
+    path = tmp_path / "old.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute(
+        "CREATE TABLE daily_bars_raw (source VARCHAR NOT NULL, symbol VARCHAR NOT NULL, session DATE NOT NULL, "
+        "open DOUBLE NOT NULL, high DOUBLE NOT NULL, low DOUBLE NOT NULL, close DOUBLE NOT NULL, "
+        "volume DOUBLE NOT NULL, vwap DOUBLE, trades BIGINT, content_hash VARCHAR NOT NULL, "
+        "as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL, "
+        "PRIMARY KEY (source, symbol, session, content_hash))"
+    )
+    con.close()
+    session = date(2026, 10, 16)
+    with PriceStore(path, clock=lambda: utc(2026, 10, 18, 3)) as old:
+        ingest(old, staging_dir, [bar("AAPL", session, 250.00)], run_id="run-a", as_of=utc(2026, 10, 17, 1))
+        ingest(old, staging_dir, [bar("AAPL", session, 250.40)], run_id="run-b", as_of=utc(2026, 10, 18, 1))
+        with pytest.raises(ValidationError, match="collided with the primary key"):
+            ingest(old, staging_dir, [bar("AAPL", session, 250.00)], run_id="run-c", as_of=utc(2026, 10, 18, 2))
+        assert old.row_count("daily_bars_raw") == 2
