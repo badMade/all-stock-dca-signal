@@ -1,0 +1,46 @@
+# Code owners: GitHub requests a review from these owners when a matching path changes, and, once branch
+# protection enables "Require review from Code Owners", blocks merge until they approve.
+#
+# The money path (anything that can size, gate, or place an order) is listed explicitly so a change there
+# is never merged unseen. CLAUDE.md "Three entry points coexist": a fix to one entry point does not reach the
+# others, so all three are owned.
+
+# Default owner for everything not matched below.
+*                                   @badMade
+
+# Strategy core, the three entry points, adapters, risk and ledgers.
+/near_close_dca.py                  @badMade
+/run_dca.py                         @badMade
+/dca_runner.py                      @badMade
+/morning_dca.py                     @badMade
+/market_open_dca.py                 @badMade
+/midday_dca.py                      @badMade
+/intraday_dca.py                    @badMade
+/dca_live_adapters.py               @badMade
+/dca_risk.py                        @badMade
+/dca_cumulative.py                  @badMade
+/dca_inverse_martingale.py          @badMade
+/dca_whole_share_accumulator.py     @badMade
+/dca_config.py                      @badMade
+/dca_paths.py                       @badMade
+/dca_fileio.py                      @badMade
+/dca_alerts.py                      @badMade
+
+# Safety configuration and its schemas (budgets, tickers, trading window, schedule manifest).
+/config/                            @badMade
+/schemas/                           @badMade
+
+# Reliability engines and live-run helpers.
+/scripts/broker_reconciliation.py   @badMade
+/scripts/run_state_machine.py       @badMade
+/scripts/idempotency.py             @badMade
+/scripts/scheduler_lease.py         @badMade
+/scripts/file_lock.py               @badMade
+/scripts/finalize_run_evidence.py   @badMade
+
+# CI, workflows and supply-chain policy: a workflow change runs with repo secrets.
+/.github/                           @badMade
+/SECURITY.md                        @badMade
+/pyproject.toml                     @badMade
+/requirements-dev.txt               @badMade
+/uv.lock                            @badMade

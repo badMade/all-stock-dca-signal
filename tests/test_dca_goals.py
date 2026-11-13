@@ -24,9 +24,8 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
-
 import dca_goals
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = REPO / "schemas" / "goals.schema.json"
