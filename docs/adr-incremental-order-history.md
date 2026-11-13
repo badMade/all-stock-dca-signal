@@ -88,3 +88,35 @@ order id in the 12:30 Gate 4 shape. Row values follow `backup_planner._to_broker
 set, which also holds `expired` -- `backup_planner._DEAD_STATES` omits it, so the two disagree
 only on an expired, partially filled buy. Any row it cannot map exactly is exit 2, nothing
 written, and the prompt falls back to the full Monday fetch.
+
+## Addendum 2026-11-12: same-day baseline chain (`scripts/find_order_baseline.py`)
+
+The 2026-11-12 2:30 PM run aborted `ABORT_GATE6_HISTORY_NOT_PERSISTABLE` / `output_cap_exceeded`
+with 57 BUY candidates and 0 orders. WEEK BASELINE REUSE kept "the day-scoped fetch ... unchanged
+(it is small)", but by mid-afternoon that day's page alone was ~35 KB (37 orders). The session
+could not save it verbatim, and `assemble_order_pages` refused the condensed copy it wrote instead.
+The week increment did not help: it ran from the 9:35 snapshot, so it was that same ~35 KB of
+the day's orders. The 3:30 run that afternoon got through only because its session improvised a
+merge onto the 1:30 run's day envelope (its Gate 9 note: "Day baseline reused from 1330 envelope
+plus incremental merge").
+
+That improvisation is sound, because `merge_order_pages` keeps the safety: it refuses a gap
+between the base snapshot and the increment, and a base order the increment does not repeat,
+and it re-validates every base row. So any complete, unmodified envelope from earlier the same
+day is a valid base, and the newest one keeps the increment smallest.
+`scripts/find_order_baseline.py` picks that envelope and only reads. It accepts a file only if
+all of these hold:
+
+* `scripts.assemble_order_pages` or `scripts.merge_order_pages` wrote it;
+* its pages still hash to the file's own `payload_sha256`;
+* it has no condensed row;
+* it is for this account and this day (or this ISO week's Monday);
+* its `snapshot_at` falls on that day in ET and is not in the future.
+
+Every other file is listed and skipped. The 1:30, 2:30 and 3:30 prompts now run it for the day
+and for the week, make ONE fetch from the earlier of the two `created_at_gte` values, and merge
+that fetch into both envelopes in their own `$ROOT`. If either kind cannot be merged, that kind
+falls back to the full fetch exactly as before. Replayed against the live tree for 2026-11-12, the
+2:30 run would have merged onto the 1:30 envelopes (37 day orders, 168 week orders, snapshot
+13:52 ET), and the increment would have held about one order. The 10:30 and 11:30 prompts keep
+the plain rule, because their day pages are still small.
