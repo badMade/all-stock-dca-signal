@@ -159,9 +159,9 @@ jobs:
         # the 3.11 leg locally.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.11", "3.12"]' || '["3.12"]') }}
     steps:
-      # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
-      # SHA pinning is the stronger posture; the dependabot config in this
-      # directory keeps these current in the meantime.
+      # NOTE: actions are pinned to full commit SHAs (a tag is mutable), with the
+      # version in a trailing comment; the dependabot config in this directory
+      # moves the SHA and the comment together.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -180,6 +180,21 @@ jobs:
 
       - name: Ruff lint (core modules)
         run: ruff check .
+
+      # ADVISORY, NOT A GATE (CLAUDE.md: Pyright is not a CI gate while its repo-wide diagnostics remain
+      # unresolved). `continue-on-error` means a finding here never turns the build red. It type-checks only
+      # the money-path modules, which measured 0 errors when this step was added (2026-11-13), so a new
+      # diagnostic in one of them is visible in the log the day it lands. To make it a gate, delete
+      # `continue-on-error` after the repo owner agrees; grow the file list as other modules are cleaned up.
+      # One Python leg is enough: type errors do not differ between 3.11 and 3.12 here.
+      - name: Pyright (advisory, money-path modules)
+        if: matrix.python-version == '3.12'
+        continue-on-error: true
+        run: >-
+          pyright
+          dca_risk.py dca_live_adapters.py dca_runner.py run_dca.py
+          dca_alerts.py dca_fileio.py dca_config.py dca_paths.py
+          scripts/backup_state_root.py
 
       # --cov-fail-under guards the live decision path against silent erosion.
       # The threshold is set just under the current figure so a genuine drop

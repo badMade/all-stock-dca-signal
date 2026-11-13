@@ -72,6 +72,27 @@ whole share.
    2026-11-01 DST change (fixed-UTC live-task cron); do not extend it past
    2026-10-30 until the external scheduler's cron is confirmed DST-aware.
 
+## Backing up and test-restoring the live state root
+
+The repo backs up code and config; the **live artifact tree** (`cron_tracking/`, including the whole-share
+ledgers above) lives on one machine. `scripts/backup_state_root.py` backs it up without touching it
+(read-only on the source, dry-run by default, standard library only):
+
+```bash
+python scripts/backup_state_root.py --dest-dir ~/dca-backups            # dry run: what would be copied
+python scripts/backup_state_root.py --dest-dir ~/dca-backups --write    # archive + manifest + SHA-256, re-verified
+python scripts/backup_state_root.py --verify ~/dca-backups/dca_state_<ts>.tar.gz
+python scripts/backup_state_root.py --restore-test ~/dca-backups/dca_state_<ts>.tar.gz
+```
+
+- Keep the archive **off the machine** (another disk or cloud folder). A backup next to the state root dies with it.
+- A backup is only reported OK after the archive was re-read and every file's SHA-256 matched; otherwise it exits
+  non-zero and leaves no archive under the final name.
+- Run `--restore-test` once after setting this up and after any change to the state layout, and record the date
+  in your ops notes. Nothing is pruned: retention is a separate decision (`docs/artifact_retention.md`).
+- It warns if no `whole_share_accumulation/<TICKER>/ledger.json` is found, because that balance is not
+  reproducible from run history.
+
 ## Refreshing config from a new thread
 
 When the strategy changes, re-extract from a transcript rather than hand-editing:
