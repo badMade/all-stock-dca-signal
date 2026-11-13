@@ -17,8 +17,6 @@ earlier minute: a missing minute is None, so the tracker refuses that night (D9)
 
 from __future__ import annotations
 
-import json
-import tempfile
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,8 +24,8 @@ from typing import Any
 
 import duckdb
 
-from market_data_ingest.prices.errors import ValidationError
-from market_data_ingest.prices.store import _from_db, _hash, _json_value, _sql_path, safe_name, to_utc_naive
+from market_data_ingest.duckdb_batch import bulk_insert
+from market_data_ingest.prices.store import _from_db, _hash, safe_name, to_utc_naive
 
 from .models import FuturesBar, FuturesContract, validate_bars, validate_contracts
 
@@ -133,36 +131,9 @@ class FuturesStore:
         return self._rows(f"SELECT * FROM {self._check_table(table)}", [])
 
     def _bulk_insert(self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], parquet_path: Path) -> int:
-        """Stage rows as Parquet, check the count, insert in one transaction. Mirrors
-        PriceStore._bulk_insert; kept separate so this phase does not refactor the price store."""
-        if not rows:
-            return 0
-        cols = ", ".join(columns)
-        struct = "{" + ", ".join(f"'{k}': '{v}'" for k, v in columns.items()) + "}"
-        with tempfile.TemporaryDirectory() as tmp:
-            ndjson = Path(tmp) / "batch.ndjson"
-            with ndjson.open("w") as fh:
-                for row in rows:
-                    fh.write(json.dumps({k: _json_value(row[k]) for k in columns}, allow_nan=False) + "\n")
-            parquet_path.parent.mkdir(parents=True, exist_ok=True)
-            src = f"read_json('{_sql_path(ndjson)}', format = 'newline_delimited', columns = {struct})"
-            self.con.execute(f"COPY (SELECT {cols} FROM {src}) TO '{_sql_path(parquet_path)}' (FORMAT parquet)")
-            staged_src = f"read_parquet('{_sql_path(parquet_path)}')"
-            staged = self.con.execute(f"SELECT count(*) FROM {staged_src}").fetchone()
-            if not staged or int(staged[0]) != len(rows):
-                raise ValidationError(f"staged {staged[0] if staged else 0} rows for a {len(rows)}-row batch")
-            self.con.execute("BEGIN TRANSACTION")
-            try:
-                before = self.row_count(table)
-                self.con.execute(
-                    f"INSERT INTO {table} ({cols}) SELECT DISTINCT {cols} FROM {staged_src} ON CONFLICT DO NOTHING"
-                )
-                inserted = self.row_count(table) - before
-                self.con.execute("COMMIT")
-            except BaseException:
-                self.con.execute("ROLLBACK")
-                raise
-        return inserted
+        """Check the table against this store's allowlist, then run the shared batch insert
+        (market_data_ingest.duckdb_batch, the same code PriceStore uses)."""
+        return bulk_insert(self.con, self._check_table(table), columns, rows, parquet_path=parquet_path)
 
     def _provenance(self, values: list[Any], run_id: str, as_of: datetime) -> dict[str, Any]:
         return {
