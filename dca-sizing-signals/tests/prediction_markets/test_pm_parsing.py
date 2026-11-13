@@ -188,6 +188,23 @@ def test_narrative_fields_not_ingested(config, clock):
     assert (kress.bid, kress.ask) == (pytest.approx(0.154), pytest.approx(0.155))
 
 
+def test_intl_orderbook_levels_are_best_first(config, clock):
+    """CLOB lists bids ascending and asks descending (captured); level 0 must be the best price."""
+    raw = response_body("intl_clob_book_kress_yes.json")
+    session = FakeSession([FakeResponse.json_body(raw)])
+
+    book = _intl_source(session, config, clock).fetch_orderbook(raw["asset_id"])
+
+    bids = [lvl for lvl in book.orderbook if lvl.side == "bid"]
+    asks = [lvl for lvl in book.orderbook if lvl.side == "ask"]
+    assert (len(bids), len(asks)) == (len(raw["bids"]), len(raw["asks"]))
+    assert bids[0].level == 0 and bids[0].price == max(float(b["price"]) for b in raw["bids"])
+    assert asks[0].level == 0 and asks[0].price == min(float(a["price"]) for a in raw["asks"])
+    assert {lvl.market_id for lvl in book.orderbook} == {raw["market"]}, "stored under the conditionId"
+    assert session.calls[0].params == {"token_id": raw["asset_id"]}
+    assert int(bids[0].ts_utc.timestamp() * 1000) == int(raw["timestamp"])
+
+
 def test_pmus_public_endpoints_work_without_keys(config, clock):
     """US gateway event, BBO, book and history parse with no credentials and send no auth headers."""
     session = FakeSession(
@@ -208,8 +225,11 @@ def test_pmus_public_endpoints_work_without_keys(config, clock):
     assert {m.market_id for m in event.markets} == {KRESS_US_SLUG, "nphc-nvidiaceo-2028-12-31-ianbuc"}
     (q,) = bbo.quotes
     assert (q.venue, q.market_id, q.outcome) == (US, KRESS_US_SLUG, "Yes")
-    assert (q.bid, q.ask, q.last) == (pytest.approx(0.14), pytest.approx(0.16), pytest.approx(0.14))
-    assert q.mid == pytest.approx(0.15)
+    raw_bbo = response_body("us_gateway_bbo_colkre.json")["marketData"]
+    bid, ask = float(raw_bbo["bestBid"]["value"]), float(raw_bbo["bestAsk"]["value"])
+    assert (q.bid, q.ask) == (pytest.approx(bid), pytest.approx(ask))
+    assert q.last == pytest.approx(float(raw_bbo["lastTradePx"]["value"]))
+    assert q.mid == pytest.approx((bid + ask) / 2)
     raw_book = response_body("us_gateway_book_colkre.json")["marketData"]
     assert len([lvl for lvl in book.orderbook if lvl.side == "bid"]) == len(raw_book["bids"])
     assert history.quotes and all(r.backfilled for r in history.quotes)
