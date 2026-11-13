@@ -27,9 +27,10 @@ Perplexity backup planner, so changing it forces a rebuild and a repaste of ever
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -69,6 +70,79 @@ def read_abort_markers(base: Path, day: date, slot_id: str) -> List[Dict[str, An
         if stamp.tzinfo is None:
             continue
         markers.append({**marker, "fired_at_et": stamp.astimezone(ET)})
+    return markers
+
+
+class MarkerFileInvalid(ValueError):
+    """A marker file exists but at least one line fails :func:`read_markers_strict`'s rules.
+
+    The message is one short reason naming the failing line ("abort marker line 2 is malformed"), with
+    no path, so each caller can prefix its own context.
+    """
+
+
+@dataclass(frozen=True)
+class StrictMarker:
+    """One line of a marker file that passed :func:`read_markers_strict`.
+
+    ``gate`` and ``reason_code`` are passed through exactly as written, unvalidated: which gates a
+    caller accepts is its own policy (the gap proof takes only gate1/GATE1_OFF_WINDOW, the backfill
+    any pre-broker gate1/gate2), so it is checked there, not here.
+    """
+
+    line: int  # 1-based, counting non-blank lines only
+    gate: Any
+    reason_code: Any
+    fired_at_et: datetime
+    record: Mapping[str, Any]
+
+
+def read_markers_strict(base: Path, day: date, slot_id: str) -> Optional[List[StrictMarker]]:
+    """Every marker line for ``slot_id`` on ``day``, or ``None`` when there is no marker file.
+
+    The fail-closed twin of :func:`read_abort_markers` (2026-11-12). That one SKIPS bad lines so the
+    watchdog degrades toward ``slot_did_not_fire``; a caller that turns a marker into a claim -- the
+    kill-switch gap proof excusing a pair as $0, the afternoon backfill writing the gate and fire time
+    into run_state -- cannot skip, because a skipped line could hide a different abort. So here ANY
+    non-blank line that is not well-formed raises :class:`MarkerFileInvalid`, and so does an unreadable
+    file. Each caller used to carry its own copy of these rules; they now share this one so the two
+    cannot drift apart.
+
+    A line passes when it parses as a JSON object with no duplicate keys (the ``dca_config`` rule), has
+    ``kind`` ``evidence_free_abort``, names this slot and trading day, and carries a timezone-aware
+    ``fired_at_utc``. An empty or all-blank file returns ``[]``: the caller decides whether "the file
+    is there but says nothing" blocks (both current callers refuse it). Blank lines are ignored, as
+    the writer's trailing newline makes one.
+    """
+    # Lazy: dca_config imports near_close_dca, and the watchdog's lenient path above must stay light.
+    from dca_config import _reject_duplicate_keys
+
+    path = marker_path(base, day, slot_id)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise MarkerFileInvalid(f"abort marker unreadable ({type(exc).__name__})") from exc
+    markers: List[StrictMarker] = []
+    for number, line in enumerate((line for line in text.splitlines() if line.strip()), start=1):
+        try:
+            marker = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+        except ValueError as exc:
+            raise MarkerFileInvalid(f"abort marker line {number} is malformed") from exc
+        if not isinstance(marker, dict) or marker.get("kind") != MARKER_KIND:
+            raise MarkerFileInvalid(f"abort marker line {number} is not an evidence-free abort marker")
+        if marker.get("slot_id") != slot_id or marker.get("trading_day") != day.isoformat():
+            raise MarkerFileInvalid(f"abort marker line {number} is for another slot or day")
+        raw = marker.get("fired_at_utc")
+        try:
+            fired = datetime.fromisoformat(raw.replace("Z", "+00:00")) if isinstance(raw, str) else None
+        except ValueError:
+            fired = None
+        if fired is None or fired.tzinfo is None:
+            raise MarkerFileInvalid(f"abort marker line {number} has no timezone-aware fire time")
+        markers.append(StrictMarker(line=number, gate=marker.get("gate"), reason_code=marker.get("reason_code"),
+                                    fired_at_et=fired.astimezone(ET), record=marker))
     return markers
 
 
