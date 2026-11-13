@@ -1,0 +1,19 @@
+{
+  "_about": "Real READ-ONLY Robinhood MCP responses (tool: get_crypto_quotes, symbols BTC-USD and ETH-USD, timezone America/New_York) captured twice on 2026-11-13, at 10:13:28 and 10:17:52 ET, for the crypto loss-hedge shadow point-in-time tests (docs/adr-goals-and-loss-hedge-shadow.md, test 11). Values are verbatim; each capture keeps the response's results list unchanged. No rhs_account_number was supplied, so no account data of any kind is present. Pricing is market-maker routed, as the routing field states.",
+  "captures": [
+    {
+      "captured_at": "2026-11-13T15:13:29+00:00",
+      "results": [
+        {"symbol": "BTCUSD", "id": "3d961844-d360-45fc-989b-f6fca761d511", "bid_price": "68073.62", "bid_time": "2026-11-13T10:13:28.787-05:00", "ask_price": "69375.67203298", "ask_time": "2026-11-13T10:13:28.76-05:00", "mark_price": "68724.64601649", "open_price": "68393.595", "routing": "Market Maker Routing", "updated_at": "2026-11-13T10:13:28.804-05:00"},
+        {"symbol": "ETHUSD", "id": "76637d50-c702-4ed1-bcb5-5b0732a81f48", "bid_price": "1920.29272842", "bid_time": "2026-11-13T10:13:28.809-05:00", "ask_price": "1956.91543937", "ask_time": "2026-11-13T10:13:28.792-05:00", "mark_price": "1938.604083895", "open_price": "1923.345", "routing": "Market Maker Routing", "updated_at": "2026-11-13T10:13:28.814-05:00"}
+      ]
+    },
+    {
+      "captured_at": "2026-11-13T15:17:53+00:00",
+      "results": [
+        {"symbol": "BTCUSD", "id": "3d961844-d360-45fc-989b-f6fca761d511", "bid_price": "68191.29", "bid_time": "2026-11-13T10:17:52.2-05:00", "ask_price": "69499.28367606", "ask_time": "2026-11-13T10:17:52.143-05:00", "mark_price": "68845.28683803", "open_price": "68404.11", "routing": "Market Maker Routing", "updated_at": "2026-11-13T10:17:52.2-05:00"},
+        {"symbol": "ETHUSD", "id": "76637d50-c702-4ed1-bcb5-5b0732a81f48", "bid_price": "1921.18560626", "bid_time": "2026-11-13T10:17:52.215-05:00", "ask_price": "1957.82738494", "ask_time": "2026-11-13T10:17:52.147-05:00", "mark_price": "1939.5064956", "open_price": "1923.615", "routing": "Market Maker Routing", "updated_at": "2026-11-13T10:17:52.215-05:00"}
+      ]
+    }
+  ]
+}
