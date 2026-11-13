@@ -100,7 +100,7 @@ Tables follow the research sketch (research 1.7): `futures_contract`, `futures_b
 | Need | Source | Note |
 |---|---|---|
 | Historical ES/NQ/YM per-contract bars | Databento CME Globex MDP 3.0, from June 2010 | Recommended primary (research 1.5); cost and licensing are open questions 2 and 3 |
-| Index levels for anchors | Robinhood MCP `get_index_quotes` / `get_index_historicals` | Futures coverage untested; assume index-only until a read-only probe shows otherwise |
+| Index levels for anchors | Robinhood MCP `get_index_quotes` / `get_index_historicals` | Index-only, confirmed by the 2026-11-12 probe (open question 4). SPX and NDX are listed directly; the Dow is listed only as DJX (1/100 scale, per the symbol's usual definition; not checked against a published spec) |
 | ETF open prints (SPY, QQQ, DIA) | The existing `market_data_ingest/prices` source | Reuses current ingestion |
 | Ex-dividend dates | Existing `corporate_actions` (`cash_dividend`, `ex_date`) | No new source |
 | Macro and earnings timing | BLS/BEA calendars, ALFRED first-release vintages, EDGAR acceptance time | Never current FRED values in a backtest |
@@ -185,12 +185,46 @@ over.
 | 1 | How is "same session, 9:35 slot" expressed through `ForecastResult`? | `horizon_trading_days = 0`; slot in the provider table (D2) |
 | 2 | Vendor for history, and how to load it without a new Python dependency? | Databento batch download in CSV encoding, loaded with DuckDB's CSV reader; the `databento` client only if a later need justifies it |
 | 3 | Licence posture for storing raw futures bars locally? | Store only 1-minute bars and anchor-time trades needed by D4; confirm terms before the first download |
-| 4 | Does the Robinhood MCP return futures quotes? | Probe read-only once; until then assume index levels only |
+| 4 | Does the Robinhood MCP return futures quotes? | **Answered 2026-11-12: no.** See "Robinhood probe" below. Index levels only; every overnight futures price comes from the vendor (question 2) |
 | 5 | Rate for fair value? | 3-month T-bill from ALFRED first-release vintages; SOFR term as a sensitivity check |
 | 6 | Expected dividend points? | Trailing-yield approximation adjusted by known ex-dates from `corporate_actions`; record the method per row |
 | 7 | Single-stock mapping? | Out of phase 1; index-level forecasts only. Later: overnight-only beta on point-in-time constituents |
 | 8 | Weekends and holidays? | `hours_in_window` as a feature; flag and evaluate weekend gaps separately |
 | 9 | Live shadow length? | 6 months minimum (D8) |
+
+### Robinhood probe (open question 4, 2026-11-12)
+
+The operator asked for one read-only check: index and search tools only, no orders. It ran at
+about 22:30 ET on Thursday 2026-11-12, while ES and NQ trade on Globex.
+
+**Facts**
+
+- **No futures asset type.** `search` accepts only `instrument`, `currency_pair` and
+  `market_index`. A request for `futures` is refused as an unsupported asset type, and the
+  tool's own description says futures "will be added".
+- **No ES, NQ or YM** in search results or in the 31-entry `get_indexes` list.
+- **The list has:** SPX, NDX, DJX, XSP, XND, VIX, and FX, metal, commodity and crypto
+  reference rates. It has no DJI.
+- **The values are not live overnight.** `get_index_quotes` returned these exchange
+  timestamps for Thursday 2026-11-12:
+
+  | Index | Value | Exchange timestamp (ET) |
+  |---|---|---|
+  | SPX | 7592.4 | 16:58 |
+  | NDX | 28289.19 | 17:15 |
+
+  Neither value moved with the overnight session.
+
+**Consequences**
+
+- All overnight futures prices come from the vendor (D6 and question 2). Robinhood cannot stand
+  in for the vendor, so the licence step stays the gate for real data.
+- Robinhood can supply the cash-close anchors: SPX and NDX directly, and DJX for the Dow. A YM
+  comparison against DJX needs the scale factor, which must be checked against a published
+  definition before use.
+- VIX is available. It is a possible later volatility feature, outside this ADR's scope.
+- The search tool says futures will be added. Re-probe before relying on this answer if that
+  changes.
 
 ## Implementation plan (one draft PR per phase)
 
