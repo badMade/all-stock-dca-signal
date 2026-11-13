@@ -63,7 +63,15 @@ def _raise(kind: str, problems: Sequence[str]) -> None:
 
 def validate_contracts(contracts: Sequence[FuturesContract]) -> None:
     problems: list[str] = []
+    seen: dict[tuple[str, str], FuturesContract] = {}
     for i, c in enumerate(contracts):
+        # Two different versions of one contract in ONE batch share as_of and ingested_at, so a
+        # later read could only pick between them by hash order (PR #2264 review: multiplier 5
+        # and 500 in one batch both landed and contract() returned 5). Refuse the batch instead.
+        key = (c.source, c.contract_id)
+        if key in seen and seen[key] != c:
+            problems.append(f"#{i} conflicts with an earlier version of the same contract")
+        seen.setdefault(key, c)
         if not (_text(c.contract_id) and _text(c.underlying_index) and _text(c.source)):
             problems.append(f"#{i} missing id, index or source")
         if c.root not in ROOTS:
@@ -76,12 +84,14 @@ def validate_contracts(contracts: Sequence[FuturesContract]) -> None:
         _raise("contracts", problems)
 
 
-def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[str]) -> list[str]:
+def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[tuple[str, str]]) -> list[str]:
     problems: list[str] = []
     if not _text(b.source):
         problems.append(f"#{i} missing source")
-    if b.contract_id not in known_contracts:
-        problems.append(f"#{i} unknown contract")
+    # Keyed by (source, contract_id) (PR #2265 review): a bar from one vendor against a contract
+    # only another vendor stored would have no contract (or multiplier) under its own source.
+    if (b.source, b.contract_id) not in known_contracts:
+        problems.append(f"#{i} unknown contract for its source")
     if not _aware(b.bar_start_utc):
         problems.append(f"#{i} bar start is not timezone-aware")
     elif b.bar_start_utc.second or b.bar_start_utc.microsecond:
@@ -96,14 +106,17 @@ def _bar_problems(i: int, b: FuturesBar, known_contracts: frozenset[str]) -> lis
     return problems
 
 
-def validate_bars(bars: Sequence[FuturesBar], known_contracts: Iterable[str]) -> None:
+def validate_bars(bars: Sequence[FuturesBar], known_contracts: Iterable[tuple[str, str]]) -> None:
+    """Refuse the batch unless every bar is valid and belongs to a known (source, contract_id)."""
     known = frozenset(known_contracts)
     problems: list[str] = []
-    seen: dict[tuple[str, datetime], FuturesBar] = {}
+    seen: dict[tuple[str, str, datetime], FuturesBar] = {}
     for i, b in enumerate(bars):
         problems.extend(_bar_problems(i, b, known))
         if _aware(b.bar_start_utc):
-            key = (b.contract_id, b.bar_start_utc)
+            # Keyed per source: two vendors' bars for one minute are separate series, not a
+            # conflict (reads keep them apart too; see FuturesStore._LATEST_BARS).
+            key = (b.source, b.contract_id, b.bar_start_utc)
             # Two different bars for one minute in ONE batch is ambiguous, not a correction:
             # a correction arrives in a later batch with a later as_of.
             if key in seen and seen[key] != b:

@@ -6,6 +6,15 @@ Write rules (tests/prices/test_store_point_in_time.py):
 * Each primary key includes a ``content_hash`` of the row's values, so re-ingesting identical
   data conflicts and is dropped (``ON CONFLICT DO NOTHING``), while a vendor correction has a
   new hash and lands as a new row with a later ``as_of``.
+* ``daily_bars_raw`` dedupes by version instead (PR #2265 review, the same fix as the futures
+  store): a bar is new unless the newest version known for (source, symbol, session) at the
+  batch's as_of already has its hash (``duckdb_batch.drop_unchanged``), and its key adds as_of
+  and run_id. With content_hash alone, a vendor correcting a close A -> B and then reverting to
+  A had the revert dropped and the store served B. An older file whose key lacks as_of/run_id
+  refuses such a revert loudly (``require_all_new``) instead of dropping it.
+  ``corporate_actions`` and ``yahoo_legacy_bars`` keep the content_hash key: several distinct
+  actions can share (source, symbol, action_type, ex_date), so their version identity needs the
+  vendor id first, and the Yahoo archive is a one-time import.
 * One batch is validated, staged to ``<staging_dir>/<run_id>/<name>.parquet``, counted, and
   inserted from that Parquet file in a single transaction. A failure anywhere writes nothing.
 
@@ -30,7 +39,7 @@ from typing import Any
 
 import duckdb
 
-from ..duckdb_batch import bulk_insert
+from ..duckdb_batch import bulk_insert, drop_unchanged
 from .models import AdjustedBar, CorporateAction, DailyBar, Quote, ReconciliationResult
 from .validate import validate_actions, validate_bars
 
@@ -46,7 +55,7 @@ CREATE TABLE IF NOT EXISTS daily_bars_raw (
     volume DOUBLE NOT NULL, vwap DOUBLE, trades BIGINT,
     content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, symbol, session, content_hash)
+    PRIMARY KEY (source, symbol, session, content_hash, as_of, run_id)
 );
 CREATE TABLE IF NOT EXISTS corporate_actions (
     source VARCHAR NOT NULL, vendor_id VARCHAR,
@@ -297,10 +306,23 @@ class PriceStore:
         return int(row[0]) if row else 0
 
     def _bulk_insert(
-        self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], *, parquet_path: Path | None
+        self,
+        table: str,
+        columns: dict[str, str],
+        rows: list[dict[str, Any]],
+        *,
+        parquet_path: Path | None,
+        require_all_new: bool = False,
     ) -> int:
         """Check the table against this store's allowlist, then run the shared batch insert."""
-        return bulk_insert(self.con, self._check_table(table), columns, rows, parquet_path=parquet_path)
+        return bulk_insert(
+            self.con,
+            self._check_table(table),
+            columns,
+            rows,
+            parquet_path=parquet_path,
+            require_all_new=require_all_new,
+        )
 
     # --- bars and corporate actions ------------------------------------------------------------
 
@@ -331,10 +353,17 @@ class PriceStore:
                     "run_id": run_id,
                 }
             )
-        sessions = sorted({b.session for b in batch})
+        rows = drop_unchanged(self.con, "daily_bars_raw", ["source", "symbol", "session"], rows, as_of=stamp)
+        if not rows:
+            return 0
+        sessions = sorted({r["session"] for r in rows})
         name = f"daily_bars_{sessions[0].isoformat()}_{_hash([r['content_hash'] for r in rows])[:12]}.parquet"
         return self._bulk_insert(
-            "daily_bars_raw", _BAR_COLUMNS, rows, parquet_path=Path(staging_dir) / safe_name(run_id) / name
+            "daily_bars_raw",
+            _BAR_COLUMNS,
+            rows,
+            parquet_path=Path(staging_dir) / safe_name(run_id) / name,
+            require_all_new=True,
         )
 
     def ingest_corporate_actions(
