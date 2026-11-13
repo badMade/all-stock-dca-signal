@@ -1416,6 +1416,14 @@ def _in_date_context(line: str, match: re.Match) -> bool:
     return before.endswith("/") or after.startswith("/")
 
 
+_CVE_ID_PREFIX = re.compile(r"\bCVE-\d{4}-$")
+
+
+def _is_cve_id_suffix(line: str, match: re.Match) -> bool:
+    """True when ``match`` is the 6-7 digit suffix of a CVE id."""
+    return len(match.group(0)) <= 7 and bool(_CVE_ID_PREFIX.search(line[: match.start()]))
+
+
 def _is_real_date(value: str) -> bool:
     """True when a date-shaped literal is an actual YYYYMM or YYYYMMDD date."""
     if not _DATE_LIKE.fullmatch(value):
@@ -1716,6 +1724,11 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
                 # inside a CSS comment, string or selector, it must still be caught
                 # (Copilot review, PR #1597).
                 if rel.endswith(".css") and _is_css_hex_colour_value(css_lines, lineno - 1, match):
+                    continue
+                # CVE numeric suffixes are vulnerability references, not accounts.
+                # Keep the exemption length-bounded so a nine-digit account
+                # following the same prefix is still rejected.
+                if _is_cve_id_suffix(line, match):
                     continue
                 offenders.append(f"{rel}:{lineno}: {match.group(0)}")
 
@@ -5133,3 +5146,15 @@ def test_0935_payload_wait_covers_the_launchers_rebuild():
         f"rebuild can publish ({worst // 3600}:{worst % 3600 // 60:02d}:{worst % 60:02d} ET)"
     )
     assert deadline < window_end.hour * 3600 + window_end.minute * 60, "the wait must end inside the 0935 window"
+
+
+def test_a_cve_id_suffix_is_not_an_account_but_a_nine_digit_one_still_is():
+    # Assemble probes from fragments so this file does not itself contain account-shaped literals.
+    cve_suffix = "CVE-2026-" + "4" + "12345"
+    account_suffix = "CVE-2026-" + "1112" + "22333"
+    ordinary_number = " " + "4" + "12345"
+
+    for text, expected in ((cve_suffix, True), (account_suffix, False), (ordinary_number, False)):
+        match = _ACCOUNT_SHAPED.search(text)
+        assert match is not None
+        assert _is_cve_id_suffix(text, match) is expected
