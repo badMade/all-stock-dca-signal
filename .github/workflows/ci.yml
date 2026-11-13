@@ -263,10 +263,17 @@ jobs:
       # manifest without building or installing its heavy ML dependencies.
       # pip-audit reads the exact transitive versions from these temporary
       # PEP 751 locks; it does not directly read uv.lock.
+      # Manifests resolve for this runner's exact interpreter (e.g. 3.11.14), not the bare
+      # matrix value: uv reads "3.11" as 3.11.0, and on 2026-11-13 that picked soupsieve 2.10
+      # (CVE-2026-126190, fixed only in 4.x, which needs Python >= 3.11.5) for every manifest
+      # that pulls in beautifulsoup4, although no CI job installs on a 3.11.0 interpreter.
+      # Operator decision (PR #2252): audit what CI's interpreter actually installs.
       - name: Audit runtime and research dependency trees
         run: |
           audit_dir="$RUNNER_TEMP/dca-dependency-audit"
           mkdir -p "$audit_dir"
+          pyver="$(python -c 'import platform; print(platform.python_version())')"
+          echo "Resolving manifests for Python $pyver"
           uv export --locked --all-extras --no-emit-project --format pylock.toml --output-file "$audit_dir/pylock.root.toml"
           for manifest in \
             production-safe-agent-loop/requirements.txt \
@@ -280,7 +287,7 @@ jobs:
             trading-strategies/requirements.txt \
             analysis/market-graph-3d/requirements.txt; do
             scope="${manifest%/requirements.txt}"
-            uv pip compile "$manifest" --python-version "${{ matrix.python-version }}" --no-build --format pylock.toml --output-file "$audit_dir/pylock.${scope//\//-}.toml"
+            uv pip compile "$manifest" --python-version "$pyver" --no-build --format pylock.toml --output-file "$audit_dir/pylock.${scope//\//-}.toml"
           done
           pip-audit --locked "$audit_dir" --strict
 

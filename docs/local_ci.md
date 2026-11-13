@@ -42,7 +42,7 @@ scripts/local_ci.sh --all        # everything the scheduled CI run does
 | Lint & test (core DCA) (3.12) | default run (ruff, `pytest --cov=. --cov-fail-under=90`, demo) |
 | Lint & test (core DCA) (3.11) | `--py311` (uv-managed env, Python 3.11) |
 | Dependency & secret audit | `--audit` (`pip-audit --requirement requirements-dev.txt --strict`) |
-| Dependency audit (research) ×2 | `--audit` (the same `uv export` / `uv pip compile` / `pip-audit --locked` sequence, for 3.11 and 3.12) |
+| Dependency audit (research) ×2 | `--research-audit` (the same `uv export` / `uv pip compile` / `pip-audit --locked` sequence; CI runs it for 3.11 and 3.12, locally for your interpreter. Both resolve manifests for the interpreter's exact patch version, since a bare `3.11` reads as 3.11.0) |
 | Lint & test (\<sibling\>) | `--changed`, `--all`, or a project name; each runs in a uv-managed env built from the same requirement files and Python version as its CI job |
 | *(not in CI)* | `scripts/tests` (incl. the workflow-policy tests), always run |
 
