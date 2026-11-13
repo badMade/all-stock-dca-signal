@@ -139,7 +139,7 @@ Lookahead risk: EDGAR acceptance time is a usable point-in-time stamp. Consensus
 | Polygon/Massive | Strong on US equities/ETFs (SPY/QQQ/DIA opens); futures coverage not verified | Subscription | Good for equities | Use for ETF open prints |
 | Stooq | Free daily data | Free | Daily only; no session boundaries | Not suitable for overnight windows |
 | Robinhood MCP `get_index_quotes` / `get_index_historicals` | Index values; coverage of futures **not verified** | Included | Unknown | ADR open question; assume index-only until tested |
-| Yahoo Finance | Excluded by project policy | | | Do not use |
+| Yahoo Finance (yfinance `ES=F`, `NQ=F`, `YM=F`; `SPY`/`QQQ`/`DIA`) | Daily history long; intraday short (roughly 7 days at 1-minute, 60 days below 1 hour, 730 days hourly; unverified) | Free | Continuous front-month only, no contract ID, so roll windows cannot be kept to a single contract | **Allowed for research and backtests only** (non-buying tasks, per `docs/yfinance_replacement_plan.md`). Never a live buying slot. Good for daily history and a cheap first look before paying for Databento; flag and drop roll-window nights |
 
 ### 1.6 Model integration design
 
@@ -451,7 +451,7 @@ CREATE TABLE overnight_gap_forecast (
 | Purpose of the tracker | Volatility and gap-size context, not directional alpha |
 | Overnight move definition | Fair-value-adjusted, single contract, 16:00 to 09:29 ET |
 | Primary data vendor | Databento CME Globex MDP 3.0, 1-minute bars plus trades around anchors |
-| ETF open prints | Existing equity vendor (not Yahoo) for SPY/QQQ/DIA |
+| ETF open prints | Existing equity vendor for SPY/QQQ/DIA; yfinance acceptable for backtests, never for a live slot |
 | Integration point | New `OvernightGapForecastProvider` through the existing `ForecastProvider` interface; no existing object modified |
 | Default weight | Zero (observe-only) in `SizingAdjustmentReader` for at least 6 months of live shadow |
 | Primary metric | Out-of-sample pinball loss and P10 to P90 coverage of 9:35 price vs prior close |
