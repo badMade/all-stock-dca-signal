@@ -1,0 +1,318 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:09:07+00:00",
+    "method": "GET",
+    "url": "https://gateway.polymarket.us/v1/events/slug/nvidiaceo-2028-12-31",
+    "request_body": null,
+    "http_status": 200,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Public gateway, no key. Subset: event.markets trimmed from 23 to 2 (Kress, Buck); kept fields as served."
+  },
+  "response": {
+    "event": {
+      "id": "259467",
+      "chatChannel": {
+        "id": "nvidiaceo-2028-12-31",
+        "type": "CHAT_CHANNEL_TYPE_MESSAGING",
+        "chatMemberCount": 18820
+      },
+      "ticker": "nvidiaceo-2028-12-31",
+      "slug": "nvidiaceo-2028-12-31",
+      "title": "Next CEO of NVIDIA?",
+      "description": "Next CEO of NVIDIA?",
+      "startDate": "2026-11-11T22:00:00Z",
+      "endDate": "2029-01-01T04:59:00Z",
+      "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/what-will-nvidia-say-during-their-next-earnings-call-k6nfBYU1idBr.jpg",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "category": "finance",
+      "createdAt": "2026-11-11T23:53:10Z",
+      "updatedAt": "2026-11-13T02:55:18Z",
+      "startTime": "2026-11-11T22:00:00Z",
+      "seriesSlug": "nvidiaceo",
+      "period": "NS",
+      "markets": [
+        {
+          "id": "2444112",
+          "question": "Next CEO of NVIDIA?",
+          "slug": "nphc-nvidiaceo-2028-12-31-ianbuc",
+          "endDate": "2029-01-15T04:00:00Z",
+          "category": "finance",
+          "startDate": "2026-11-11T23:53:10Z",
+          "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-ian-buck-be-the-next-ceo-of-nvidia-9yxgF7H011Sr.jpg",
+          "description": "This market will settle to Yes if Ian Buck is the next person to assume the position of Chief Executive Officer (CEO) of NVIDIA Corporation, after Jensen Huang, by December 31, 2028, 11:59 PM ET. Outcome sourced from NVIDIA.\n\nA person will be considered to assume the position of CEO of NVIDIA when they are appointed as CEO by NVIDIA's Board of Directors, or otherwise formally appointed to the role, and begin serving in the role. The announcement of a successor alone will not qualify.\n\nService by acting or interim CEOs of NVIDIA does not constitute holding the position of CEO of NVIDIA.\n\nIf no new CEO of NVIDIA assumes the position by December 31, 2028, 11:59 PM ET, this market will settle to No.\n\nFor full rules, see: https://polymarketexchange.com/files/product-terms/NPHC.pdf.",
+          "active": true,
+          "marketType": "futures",
+          "closed": false,
+          "createdAt": "2026-11-11T23:53:10Z",
+          "updatedAt": "2026-11-13T02:55:18Z",
+          "archived": false,
+          "orderPriceMinTickSize": 0.01,
+          "gameStartTime": "2026-11-11T22:00:00Z",
+          "manualActivation": false,
+          "sportsMarketType": "futures",
+          "marketSides": [
+            {
+              "id": "4887610",
+              "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+              "identifier": "nphc-nvidiaceo-2028-12-31-ianbuc",
+              "createdAt": "2026-11-11T23:53:10Z",
+              "updatedAt": "2026-11-11T23:53:10Z",
+              "description": "Yes",
+              "price": "0.3100",
+              "marketId": 2444112,
+              "long": true,
+              "quote": {
+                "value": "0.3200",
+                "currency": "USD"
+              },
+              "tradable": true
+            },
+            {
+              "id": "4887611",
+              "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+              "identifier": "nphc-nvidiaceo-2028-12-31-ianbuc",
+              "createdAt": "2026-11-11T23:53:10Z",
+              "updatedAt": "2026-11-11T23:53:10Z",
+              "description": "No",
+              "price": "0.3200",
+              "marketId": 2444112,
+              "long": false,
+              "quote": {
+                "value": "0.69",
+                "currency": "USD"
+              },
+              "tradable": true
+            }
+          ],
+          "outcomes": "[\"Yes\",\"No\"]",
+          "outcomePrices": "[\"0.3100\",\"0.3200\"]",
+          "ep3Status": "OPEN",
+          "status": "MARKET_STATUS_OPEN",
+          "assetPriceTerms": null,
+          "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+          "hidden": false,
+          "tags": [],
+          "title": "Ian Buck",
+          "feeCoefficient": 0.095,
+          "bestBidQuote": {
+            "value": "0.3100",
+            "currency": "USD"
+          },
+          "bestAskQuote": {
+            "value": "0.3200",
+            "currency": "USD"
+          },
+          "titleShort": "Ian Buck",
+          "ep3SyncedAt": "2026-11-11T23:53:10Z",
+          "minimumTradeQty": 0.01,
+          "comboEnabled": false,
+          "politics": null,
+          "eventSubcategory": "EXECUTIVE",
+          "singlesRfqConfig": {
+            "enabled": true,
+            "midpointDeviation": 0.2,
+            "minOrderValueUsd": 2500,
+            "maxQuoteAgeSeconds": 30,
+            "quoteWindows": [
+              {
+                "windowMs": "400"
+              }
+            ],
+            "ruleName": "default",
+            "version": "singles-market-default-v1.1"
+          }
+        },
+        {
+          "id": "2444110",
+          "question": "Next CEO of NVIDIA?",
+          "slug": "nphc-nvidiaceo-2028-12-31-colkre",
+          "endDate": "2029-01-15T04:00:00Z",
+          "category": "finance",
+          "startDate": "2026-11-11T23:53:10Z",
+          "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/nvidia-ceo-colette-kress-55d0cd3dfb.jpg",
+          "description": "This market will settle to Yes if Colette Kress is the next person to assume the position of Chief Executive Officer (CEO) of NVIDIA Corporation, after Jensen Huang, by December 31, 2028, 11:59 PM ET. Outcome sourced from NVIDIA.\n\nA person will be considered to assume the position of CEO of NVIDIA when they are appointed as CEO by NVIDIA's Board of Directors, or otherwise formally appointed to the role, and begin serving in the role. The announcement of a successor alone will not qualify.\n\nService by acting or interim CEOs of NVIDIA does not constitute holding the position of CEO of NVIDIA.\n\nIf no new CEO of NVIDIA assumes the position by December 31, 2028, 11:59 PM ET, this market will settle to No.\n\nFor full rules, see: https://polymarketexchange.com/files/product-terms/NPHC.pdf.",
+          "active": true,
+          "marketType": "futures",
+          "closed": false,
+          "createdAt": "2026-11-11T23:53:10Z",
+          "updatedAt": "2026-11-13T02:55:18Z",
+          "archived": false,
+          "orderPriceMinTickSize": 0.01,
+          "gameStartTime": "2026-11-11T22:00:00Z",
+          "manualActivation": false,
+          "sportsMarketType": "futures",
+          "marketSides": [
+            {
+              "id": "4887606",
+              "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+              "identifier": "nphc-nvidiaceo-2028-12-31-colkre",
+              "createdAt": "2026-11-11T23:53:10Z",
+              "updatedAt": "2026-11-11T23:53:10Z",
+              "description": "Yes",
+              "price": "0.1400",
+              "marketId": 2444110,
+              "long": true,
+              "quote": {
+                "value": "0.1500",
+                "currency": "USD"
+              },
+              "tradable": true
+            },
+            {
+              "id": "4887607",
+              "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+              "identifier": "nphc-nvidiaceo-2028-12-31-colkre",
+              "createdAt": "2026-11-11T23:53:10Z",
+              "updatedAt": "2026-11-11T23:53:10Z",
+              "description": "No",
+              "price": "0.1500",
+              "marketId": 2444110,
+              "long": false,
+              "quote": {
+                "value": "0.86",
+                "currency": "USD"
+              },
+              "tradable": true
+            }
+          ],
+          "outcomes": "[\"Yes\",\"No\"]",
+          "outcomePrices": "[\"0.1400\",\"0.1500\"]",
+          "ep3Status": "OPEN",
+          "status": "MARKET_STATUS_OPEN",
+          "assetPriceTerms": null,
+          "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+          "hidden": false,
+          "tags": [],
+          "title": "Colette Kress",
+          "feeCoefficient": 0.095,
+          "bestBidQuote": {
+            "value": "0.1400",
+            "currency": "USD"
+          },
+          "bestAskQuote": {
+            "value": "0.1500",
+            "currency": "USD"
+          },
+          "titleShort": "Colette Kress",
+          "ep3SyncedAt": "2026-11-11T23:53:10Z",
+          "minimumTradeQty": 0.01,
+          "comboEnabled": false,
+          "politics": null,
+          "eventSubcategory": "EXECUTIVE",
+          "singlesRfqConfig": {
+            "enabled": true,
+            "midpointDeviation": 0.2,
+            "minOrderValueUsd": 2500,
+            "maxQuoteAgeSeconds": 30,
+            "quoteWindows": [
+              {
+                "windowMs": "400"
+              }
+            ],
+            "ruleName": "default",
+            "version": "singles-market-default-v1.1"
+          }
+        }
+      ],
+      "participants": [],
+      "hidden": false,
+      "tags": [
+        {
+          "id": "32",
+          "label": "Econ",
+          "slug": "economics",
+          "updatedAt": "2026-11-13T02:55:48Z",
+          "image": "https://static.polymarket.us/images/new-category-icons/Icon-Economy.png",
+          "tradable": false,
+          "subtags": [
+            {
+              "id": "33",
+              "label": "Fed Decision",
+              "slug": "fed-decision",
+              "updatedAt": "2026-09-04T23:53:19Z",
+              "tradable": false,
+              "parentId": 32,
+              "subtags": [],
+              "hub": null,
+              "featuredEventIds": []
+            },
+            {
+              "id": "34",
+              "label": "CPI",
+              "slug": "cpi",
+              "updatedAt": "2026-11-13T02:55:48Z",
+              "tradable": false,
+              "parentId": 32,
+              "subtags": [],
+              "hub": null,
+              "featuredEventIds": []
+            }
+          ],
+          "hub": null,
+          "featuredEventIds": []
+        },
+        {
+          "id": "414",
+          "label": "Tech",
+          "slug": "tech",
+          "updatedAt": "2026-11-13T02:55:48Z",
+          "image": "https://static.polymarket.us/images/new-category-icons/Icon-Technology.png",
+          "tradable": false,
+          "subtags": [],
+          "hub": null,
+          "featuredEventIds": []
+        },
+        {
+          "id": "930",
+          "label": "Business",
+          "slug": "business",
+          "updatedAt": "2026-11-13T02:55:48Z",
+          "tradable": false,
+          "subtags": [],
+          "hub": null,
+          "featuredEventIds": []
+        },
+        {
+          "id": "1709",
+          "label": "CEOs",
+          "slug": "ceos",
+          "updatedAt": "2026-11-13T02:55:48Z",
+          "subtags": [],
+          "hub": null,
+          "featuredEventIds": []
+        },
+        {
+          "id": "2160",
+          "label": "NVIDIA",
+          "slug": "nvidia",
+          "updatedAt": "2026-11-13T02:55:48Z",
+          "image": "",
+          "tradable": false,
+          "subtags": [],
+          "hub": null,
+          "featuredEventIds": []
+        }
+      ],
+      "teams": [],
+      "sortType": "price",
+      "marketGroups": [],
+      "streamProvider": "",
+      "streamRequiresAuth": false,
+      "combos": {
+        "enabled": false,
+        "numMarkets": 0,
+        "numSpreadsAndTotalsMarkets": 0
+      },
+      "marketCounts": {
+        "numMarkets": 23,
+        "numSpreadsAndTotalsMarkets": 0
+      },
+      "fixtureId": "",
+      "insiderTradingRules": null,
+      "payoutEstimateMessage": "",
+      "payoutEstimateTime": ""
+    }
+  }
+}

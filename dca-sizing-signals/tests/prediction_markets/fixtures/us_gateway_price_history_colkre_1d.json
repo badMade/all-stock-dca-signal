@@ -1,0 +1,140 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:10:07+00:00",
+    "method": "GET",
+    "url": "https://gateway.polymarket.us/v1/price-history?symbol=nphc-nvidiaceo-2028-12-31-colkre&fixedInterval=INTERVAL_1D&fidelity=60",
+    "request_body": null,
+    "http_status": 200,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Public gateway history, no key."
+  },
+  "response": {
+    "history": [
+      {
+        "timestamp": 1794452400,
+        "longPrice": 0.34,
+        "shortPrice": 0.67
+      },
+      {
+        "timestamp": 1794456000,
+        "longPrice": 0.32,
+        "shortPrice": 0.69
+      },
+      {
+        "timestamp": 1794459600,
+        "longPrice": 0.24,
+        "shortPrice": 0.77
+      },
+      {
+        "timestamp": 1794463200,
+        "longPrice": 0.13,
+        "shortPrice": 0.88
+      },
+      {
+        "timestamp": 1794466800,
+        "longPrice": 0.25,
+        "shortPrice": 0.76
+      },
+      {
+        "timestamp": 1794470400,
+        "longPrice": 0.26,
+        "shortPrice": 0.75
+      },
+      {
+        "timestamp": 1794474000,
+        "longPrice": 0.11,
+        "shortPrice": 0.9
+      },
+      {
+        "timestamp": 1794477600,
+        "longPrice": 0.11,
+        "shortPrice": 0.9
+      },
+      {
+        "timestamp": 1794481200,
+        "longPrice": 0.29,
+        "shortPrice": 0.72
+      },
+      {
+        "timestamp": 1794484800,
+        "longPrice": 0.31,
+        "shortPrice": 0.7
+      },
+      {
+        "timestamp": 1794488400,
+        "longPrice": 0.53,
+        "shortPrice": 0.48
+      },
+      {
+        "timestamp": 1794492000,
+        "longPrice": 0.28,
+        "shortPrice": 0.81
+      },
+      {
+        "timestamp": 1794495600,
+        "longPrice": 0.24,
+        "shortPrice": 0.77
+      },
+      {
+        "timestamp": 1794499200,
+        "longPrice": 0.23,
+        "shortPrice": 0.78
+      },
+      {
+        "timestamp": 1794502800,
+        "longPrice": 0.27,
+        "shortPrice": 0.79
+      },
+      {
+        "timestamp": 1794506400,
+        "longPrice": 0.21,
+        "shortPrice": 0.8
+      },
+      {
+        "timestamp": 1794510000,
+        "longPrice": 0.19,
+        "shortPrice": 0.87
+      },
+      {
+        "timestamp": 1794513600,
+        "longPrice": 0.16,
+        "shortPrice": 0.85
+      },
+      {
+        "timestamp": 1794517200,
+        "longPrice": 0.15,
+        "shortPrice": 0.87
+      },
+      {
+        "timestamp": 1794520800,
+        "longPrice": 0.13,
+        "shortPrice": 0.88
+      },
+      {
+        "timestamp": 1794524400,
+        "longPrice": 0.15,
+        "shortPrice": 0.86
+      },
+      {
+        "timestamp": 1794528000,
+        "longPrice": 0.16,
+        "shortPrice": 0.85
+      },
+      {
+        "timestamp": 1794531600,
+        "longPrice": 0.18,
+        "shortPrice": 0.83
+      },
+      {
+        "timestamp": 1794535200,
+        "longPrice": 0.16,
+        "shortPrice": 0.86
+      },
+      {
+        "timestamp": 1794538800,
+        "longPrice": 0.15,
+        "shortPrice": 0.86
+      }
+    ]
+  }
+}

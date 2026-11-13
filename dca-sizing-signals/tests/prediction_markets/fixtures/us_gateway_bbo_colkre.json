@@ -1,0 +1,59 @@
+{
+  "_provenance": {
+    "captured_at_utc": "2026-11-13T03:09:07+00:00",
+    "method": "GET",
+    "url": "https://gateway.polymarket.us/v1/markets/nphc-nvidiaceo-2028-12-31-colkre/bbo",
+    "request_body": null,
+    "http_status": 200,
+    "recorded": "live response, captured by Claude Code on the operator's Mac; no credentials sent",
+    "note": "Public gateway BBO, no key."
+  },
+  "response": {
+    "marketData": {
+      "marketSlug": "nphc-nvidiaceo-2028-12-31-colkre",
+      "currentPx": {
+        "value": "0.1450",
+        "currency": "USD"
+      },
+      "lastTradePx": {
+        "value": "0.1800",
+        "currency": "USD"
+      },
+      "settlementPx": null,
+      "sharesTraded": "91135.6500",
+      "openInterest": "36015.5700",
+      "bestAsk": {
+        "value": "0.1500",
+        "currency": "USD"
+      },
+      "bestBid": {
+        "value": "0.1400",
+        "currency": "USD"
+      },
+      "askDepth": 46,
+      "bidDepth": 9,
+      "lastPriceSample": {
+        "longPx": {
+          "value": "0.1800",
+          "currency": "USD"
+        },
+        "shortPx": {
+          "value": "0.82",
+          "currency": "USD"
+        },
+        "ts": "2026-11-13T03:08:57.050319421Z"
+      },
+      "longQuote": {
+        "value": "0.1500",
+        "currency": "USD"
+      },
+      "shortQuote": {
+        "value": "0.86",
+        "currency": "USD"
+      },
+      "state": "MARKET_STATE_OPEN",
+      "bidShares": "14000",
+      "askShares": "49000"
+    }
+  }
+}
