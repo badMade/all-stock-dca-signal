@@ -162,7 +162,7 @@ jobs:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
       # directory keeps these current in the meantime.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -201,7 +201,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -244,7 +244,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -305,7 +305,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -341,7 +341,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -385,7 +385,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -431,7 +431,7 @@ jobs:
     # download plus the transformer tests' training time.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -481,7 +481,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -512,7 +512,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -543,7 +543,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -578,7 +578,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

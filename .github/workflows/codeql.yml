@@ -1,0 +1,57 @@
+name: CodeQL
+
+# Static analysis (SAST) for the Python tree, REPORT-ONLY: it uploads findings to the repository's code-scanning
+# view and is not a required check, so it can never block a merge or a live-path fix.
+#
+# Deliberately NOT on push / pull_request: the 2026-10-31 Actions billing block (docs/local_ci.md) cut push CI
+# to the minimum, and CodeQL on a ~500k-line tree is the most expensive job here. Weekly on main plus a manual
+# trigger gives a weekly readiness review a fresh SAST signal at a bounded cost.
+#
+# Needs code scanning to be available for the repository (public repo, or GitHub Advanced Security on a private
+# one). If it is not, the analyze step fails visibly here and nothing else is affected.
+#
+# TRUST BOUNDARY: `schedule` runs this file against main only; `workflow_dispatch` is allowed because the job holds
+# only `security-events: write` and reads no secrets.
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Monday 06:17 UTC, before the US market opens
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The research trees carry their own dependencies and are outside the live path (CLAUDE.md "Conventions");
+      # scanning them would bury live-path findings, so they are excluded the same way the core ruff gate does.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: python
+          build-mode: none
+          config: |
+            paths-ignore:
+              - trading-strategies
+              - analysis
+              - viz/vendor
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:python"
