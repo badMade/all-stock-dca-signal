@@ -65,7 +65,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from dca_paths import cron_tracking_root
 from scripts import finalize_run_evidence
-from scripts.abort_markers import MARKER_KIND, marker_path
+from scripts.abort_markers import MarkerFileInvalid, marker_path, read_markers_strict
 from scripts.finalize_run_evidence import (
     ET,
     SLOT_EVIDENCE_LAYOUT,
@@ -134,42 +134,30 @@ def read_abort_marker(root: Path, day: date, slot: str) -> Optional[AbortMarker]
     Deliberately stricter than ``scripts.abort_markers.read_abort_markers``, which SKIPS bad lines so
     the watchdog degrades toward ``slot_did_not_fire``. Here the marker names the gate and time the
     evidence will claim, so a skipped line could hide a different abort: the file must hold exactly one
-    line, and that line must be a well-formed pre-broker marker for this day and slot (the same rules
-    the kill-switch gap proof applies). Two markers, even identical ones, are two fires and need a human.
+    line, and that line must be a well-formed pre-broker marker for this day and slot. The per-line rules
+    are ``scripts.abort_markers.read_markers_strict``, shared with the kill-switch gap proof. Two markers,
+    even identical ones, are two fires and need a human.
     """
     path = marker_path(root, day, slot)
+    # Parse, kind, slot/day and tz-aware fire time are the shared strict reader's rules (2026-11-12
+    # consolidation, so this and the kill-switch gap proof cannot drift); the exactly-one-line, gate
+    # and same-ET-day rules below are this script's own.
     try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+        markers = read_markers_strict(root, day, slot)
+    except MarkerFileInvalid as exc:
+        raise BackfillRefused(f"{day} {slot}: {exc} ({path})") from exc
+    if markers is None:
         return None
-    except (OSError, UnicodeError) as exc:
-        raise BackfillRefused(f"{day} {slot}: abort marker {path} unreadable ({type(exc).__name__})") from exc
-    lines = [line for line in text.splitlines() if line.strip()]
-    if len(lines) != 1:
+    if len(markers) != 1:
         raise BackfillRefused(
-            f"{day} {slot}: abort marker file {path} holds {len(lines)} marker lines; exactly one is needed"
+            f"{day} {slot}: abort marker file {path} holds {len(markers)} marker lines; exactly one is needed"
         )
-    try:
-        marker = json.loads(lines[0], object_pairs_hook=_reject_duplicate_keys)
-    except ValueError as exc:
-        raise BackfillRefused(f"{day} {slot}: abort marker {path} is malformed") from exc
-    if not isinstance(marker, dict) or marker.get("kind") != MARKER_KIND:
-        raise BackfillRefused(f"{day} {slot}: {path} is not an evidence-free abort marker")
-    if marker.get("slot_id") != slot or marker.get("trading_day") != day.isoformat():
-        raise BackfillRefused(f"{day} {slot}: abort marker {path} is for another slot or day")
-    gate, reason = marker.get("gate"), marker.get("reason_code")
+    gate, reason = markers[0].gate, markers[0].reason_code
     if not isinstance(gate, str) or not _GATE_TOKEN.match(gate) or gate not in MARKER_GATES:
         raise BackfillRefused(f"{day} {slot}: abort marker gate {gate!r} is not a pre-broker {MARKER_GATES} abort")
     if not isinstance(reason, str) or not _REASON_CODE.match(reason) or not reason.startswith(f"{gate.upper()}_"):
         raise BackfillRefused(f"{day} {slot}: abort marker reason_code {reason!r} does not belong to {gate}")
-    raw = marker.get("fired_at_utc")
-    try:
-        fired = datetime.fromisoformat(raw.replace("Z", "+00:00")) if isinstance(raw, str) else None
-    except ValueError:
-        fired = None
-    if fired is None or fired.tzinfo is None:
-        raise BackfillRefused(f"{day} {slot}: abort marker has no timezone-aware fired_at_utc")
-    fired = fired.astimezone(ET)
+    fired = markers[0].fired_at_et
     if fired.date() != day:
         raise BackfillRefused(f"{day} {slot}: abort marker fired_at {fired.isoformat()} is not on {day} ET")
     return AbortMarker(gate=gate, reason_code=reason, fired_at=fired, path=path)
