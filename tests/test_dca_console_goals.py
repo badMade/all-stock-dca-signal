@@ -1,6 +1,6 @@
 """Tests written FIRST for the console Goals page (docs/adr-goals-and-loss-hedge-shadow.md, D5).
 
-They fail until ``POST /api/goals/propose`` and ``dca_console_goals.py`` land:
+They are skipped until ``dca_console_goals.py`` lands (with ``POST /api/goals/propose``):
 
 * Test 1 (HTTP half): the route rejects bad proposals before writing anything.
 * Test 2: the route keeps ``/api/jobs``' guard order (untrusted 403, Basic 401, token 403).
@@ -27,6 +27,13 @@ from test_dca_console import AUTH_CREDENTIAL, auth_headers, request
 
 import dca_console
 from dca_console import AuthFailureLog, ConsoleAccess, ConsoleApp, Settings, make_server
+
+# Gated like tests/test_dca_goals.py (#2287) and the hedge-shadow tests (1a561bf): until
+# dca_console_goals.py lands, this file skips instead of failing 17 tests on main.
+pytest.importorskip(
+    "dca_console_goals",
+    reason="console Goals page is deferred pending ADR approval",
+)
 
 REPO = Path(__file__).resolve().parents[1]
 ROUTE = "/api/goals/propose"
