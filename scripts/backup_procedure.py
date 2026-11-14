@@ -32,7 +32,7 @@ from near_close_dca import BUDGET_TIERS
 from scripts import backup_planner
 
 # The latest placement time per slot is dca_order_plan.LATEST_PLACEMENT_ET (the NEXT canonical slot's
-# start, and the 16:00 close for the final slot), so the prompts and the planner cannot disagree.
+# window open, and the 16:00 close for the final slot), so the prompts and the planner cannot disagree.
 _NEXT_SLOT_START = dca_order_plan.LATEST_PLACEMENT_ET
 _SLOT_LABEL = {"0935": "market-open", "1030": "morning", "1130": "intraday", "1230": "midday",
                "1330": "intraday", "1430": "intraday", "1530": "final"}
@@ -239,8 +239,8 @@ def _slot_resolution(backup: Backup) -> str:
                 f"latest placement time {_NEXT_SLOT_START[slot]}.")
     # The two-fire task (13:50 and 14:50): the clock decides which slot this run backs up.
     return ("This task fires twice a day, so the clock decides the slot. ET time from 13:40 to 14:20 means slot 1330 "
-            "(intraday), latest placement 14:30. ET time from 14:40 to 15:20 means slot 1430 (intraday), latest "
-            "placement 15:30. Any other time is outside the range.")
+            f"(intraday), latest placement {_NEXT_SLOT_START['1330']}. ET time from 14:40 to 15:20 means slot 1430 "
+            f"(intraday), latest placement {_NEXT_SLOT_START['1430']}. Any other time is outside the range.")
 
 
 def _latest(backup: Backup) -> str:

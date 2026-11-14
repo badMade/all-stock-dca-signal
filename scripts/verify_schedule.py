@@ -30,7 +30,7 @@ Statuses, most to least settled:
   * ``awaiting_evidence``  -- the slot's time has passed but its grace deadline
     (acceptance-window end + ``GRACE_MINUTES``) has not; a run may still be
     finalizing.
-  * ``not_due``            -- before the slot's nominal time.
+  * ``not_due``            -- before the slot's window opens (its earliest accepted start).
   * ``market_closed``      -- Gate 0 says the slot ends silently today (closed
     exchange, or a >= 13:00 slot on an early close) and nothing was written.
 
@@ -98,6 +98,14 @@ SLOT_EVIDENCE_LAYOUT: Dict[str, tuple[str, str]] = {
     "1530": ("afternoon", "ce16ba6b/scheduled_runs"),
 }
 
+
+
+def _acceptance_start(slot_id: str, day: date) -> datetime:
+    """Earliest accepted start for ``slot_id`` on ``day`` (the finalizer's acceptance window)."""
+    # Imported here because finalize_run_evidence imports this module.
+    from scripts.finalize_run_evidence import acceptance_window
+
+    return acceptance_window(slot_id, day)[0]
 
 def slot_run_dir_relative(slot_id: str, day: date) -> Path:
     """The slot's dated run directory, relative to the cron-tracking root."""
@@ -173,7 +181,6 @@ def classify_slot_evidence(
     spec = SLOTS[slot_id]
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot_id]
     now_et = now.astimezone(ET) if now.tzinfo else now.replace(tzinfo=ET)
-    nominal = datetime.combine(day, time(*spec.nominal_et), tzinfo=ET)
     deadline = datetime.combine(day, time(*spec.window_end_et), tzinfo=ET) + timedelta(minutes=GRACE_MINUTES)
     reasons: List[str] = []
     verified = False
@@ -206,7 +213,10 @@ def classify_slot_evidence(
 
     if verified:
         status = STATUS_VERIFIED
-    elif now_et < nominal:
+    elif now_et < _acceptance_start(slot_id, day):
+        # Not due until the slot's window OPENS, not its nominal time: since 2026-11-14 a slot
+        # may legitimately start at :25 (15:20 for the final slot), so an early run in flight
+        # before nominal reads as awaiting evidence, not as not-due.
         status = STATUS_NOT_DUE
     elif market_closed and not run_dir_present:
         status = STATUS_MARKET_CLOSED

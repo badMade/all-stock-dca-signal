@@ -223,7 +223,7 @@ def test_roster_identity_names_every_runner_slot():
     assert list(rows) == ["0935", "1030", "1130", "1230", "1330", "1430", "1530"]
     morning = rows["1030"]
     assert morning["executor_class"] == "MorningDCAExecutor" and morning["cron_id"] == "42173154"
-    assert morning["run_dca_entry"] == "run_slot" and morning["window"] == {"start": "10:30", "end": "11:00"}
+    assert morning["run_dca_entry"] == "run_slot" and morning["window"] == {"start": "10:25", "end": "11:00"}
     assert morning["executor_window"] == {"start": "10:25", "end": "10:35"} and morning["trades"] is True
     assert morning["artifact_dir"] == "morning_dca" and morning["pointer_name"] == "latest_morning_run.json"
     assert morning["config_file"] == "morning_dca.json"

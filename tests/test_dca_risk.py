@@ -845,6 +845,15 @@ def test_manual_flag_wins_over_scheduled_origin():
     assert deployed_by_day([state], stream=STREAM_SCHEDULED) == {}
 
 
+def test_afternoon_evidence_floor_is_the_230_slots_early_open():
+    """2026-11-14: the 2:30 slot opens at 2:25 PM ET, so an unfinalized 2:30 run that fired
+    early (generated_at 14:27) is still afternoon evidence; 14:24 is before the window."""
+    early_fire = _scheduled_state("2026-07-08", 900.0, et_time="14:27:00")
+    before_open = _scheduled_state("2026-07-08", 900.0, et_time="14:24:00")
+    assert is_afternoon_scheduled_evidence(early_fire) is True
+    assert is_afternoon_scheduled_evidence(before_open) is False
+
+
 def test_afternoon_evidence_before_230pm_rejected():
     """Scheduled evidence timestamped before 2:30 PM ET is not counted as afternoon."""
     early = _scheduled_state("2026-07-07", 900.0, et_time="09:45:00")  # morning

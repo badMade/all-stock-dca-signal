@@ -8172,11 +8172,13 @@ def test_run_slot_accepts_the_edges_of_the_five_minute_window(offset_minutes, tm
     assert result["run_state_path"]
 
 
-@pytest.mark.parametrize("offset_minutes", [0, 2])
-def test_run_slot_accepts_1530ets_own_narrower_start_window(offset_minutes, tmp_path):
-    """1530ET's approved trigger_window is 15:30-15:32 ET, not the shared
-    +/-5-minute tolerance: the 15:35 post-trade sync neither waits nor retries
-    for an in-progress run (config/scheduled_tasks.json's "10ce362c" entry)."""
+@pytest.mark.parametrize("offset_minutes", [-10, -5, 0, 2])
+def test_run_slot_accepts_1530ets_own_start_window(offset_minutes, tmp_path):
+    """1530ET starts from 15:20 to 15:32 ET, not the shared +/-5-minute tolerance.
+    The late cutoff is 15:32 because the 15:35 post-trade sync neither waits nor
+    retries for an in-progress run (config/scheduled_tasks.json's "10ce362c"
+    entry); the early side opens 10 minutes before nominal (operator decision
+    2026-11-14) so an early scheduler fire is not aborted as off-schedule."""
     from datetime import timedelta as _timedelta
 
     from run_dca import run_slot
@@ -8196,8 +8198,8 @@ def test_run_slot_accepts_1530ets_own_narrower_start_window(offset_minutes, tmp_
     assert result["run_state_path"]
 
 
-@pytest.mark.parametrize("offset_minutes", [-1, 3, 5])
-def test_run_slot_rejects_1530et_outside_its_narrower_start_window(offset_minutes, tmp_path):
+@pytest.mark.parametrize("offset_minutes", [-11, 3, 5])
+def test_run_slot_rejects_1530et_outside_its_start_window(offset_minutes, tmp_path):
     """A 15:34 firing must abort even though it is inside the shared
     +/-5-minute tolerance every other slot uses -- it would otherwise race the
     15:35 post-trade sync and risk a missing or partial final-run report
@@ -8280,17 +8282,17 @@ def test_run_drift_check(mock_detect_drift, mock_send_slack_alert, mock_atomic_w
         # Pre-retime: Keep legacy 15:15 window
         (datetime(2026, 7, 26, 12, 0, tzinfo=EASTERN), time(15, 15)),
         # Exact retime date: Canonical 15:25 window
-        (datetime(2026, 7, 27, 12, 0, tzinfo=EASTERN), time(15, 25)),
+        (datetime(2026, 7, 27, 12, 0, tzinfo=EASTERN), time(15, 20)),
         # Post-retime date: Canonical 15:25 window
-        (datetime(2026, 7, 28, 12, 0, tzinfo=EASTERN), time(15, 25)),
+        (datetime(2026, 7, 28, 12, 0, tzinfo=EASTERN), time(15, 20)),
         # Pre-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
         (datetime(2026, 7, 26, 16, 0, tzinfo=timezone.utc), time(15, 15)),
         # UTC retime-date timestamp that is still pre-retime in ET (00:30 UTC -> 20:30 EDT previous day)
         (datetime(2026, 7, 27, 0, 30, tzinfo=timezone.utc), time(15, 15)),
         # Post-retime but provided in UTC (16:00 UTC -> 12:00 EDT)
-        (datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc), time(15, 25)),
+        (datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc), time(15, 20)),
         # UTC post-retime timestamp that is still on retime date in ET (00:30 UTC -> 20:30 EDT)
-        (datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc), time(15, 25))
+        (datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc), time(15, 20))
     ]
 )
 def test_final_buy_trend_override_window_start(dt, expected_time):

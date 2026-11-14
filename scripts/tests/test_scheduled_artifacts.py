@@ -121,7 +121,7 @@ def test_afternoon_live_classification_is_non_null_object_with_required_fields()
     assert rc["manual_run"] is False
     assert rc["stream"] == "afternoon"
     assert rc["scheduled_for_et"] == "15:30"
-    assert rc["scheduled_window_start_et"] == "15:25"
+    assert rc["scheduled_window_start_et"] == "15:20"  # 15:25 until the 2026-11-14 early-fire tolerance
     assert rc["scheduled_window_end_et"] == "15:35"
     assert rc["cron_id"] == AFTERNOON_LIVE_CRON_ID == "10ce362c"
     assert rc["supersedes_cron_id"] == AFTERNOON_LIVE_SUPERSEDES_CRON_ID == "ce16ba6b"

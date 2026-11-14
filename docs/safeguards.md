@@ -374,7 +374,9 @@ of the sizing decision. Tier selection never keys on planned spend.
   weekdays **2026-07-02 → 2026-08-28**, **3:30–3:35 PM ET** (retimed from
   3:20 PM to align with the canonical 3:30 PM ET final live task); confirm/extend
   it independently, since extending `config/trading_window.json` alone does not
-  change that external script.
+  change that external script. Since 2026-11-14 the in-repo 3:30 window opens at
+  **3:20 PM ET** (early-fire tolerance), so that script must also be widened to
+  3:20 PM or it will still block an early fire the repo now accepts.
 - The one-time reminder that fired 2026-08-15 to decide on continuation past
   2026-08-28 (`f7411889`) was never rescheduled after the window extended to
   Oct 30 and was retired 2026-09-13. It is superseded by a new one-time

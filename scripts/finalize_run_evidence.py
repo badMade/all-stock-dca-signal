@@ -181,11 +181,11 @@ def parse_started_at(value: str) -> datetime:
 
 
 # The live prompts' own Gate 1 opens EARLY_START_MINUTES before the nominal
-# time (e.g. 2:25-2:55 PM for the 2:30 slot, 12:25 PM-1:00 PM for 12:30),
-# while dca_runner.SLOTS opens AT nominal for every slot except 09:35 (which
-# opens at 9:31 and gets no early allowance here). A fire
-# that passed the prompt's Gate 1 at 14:26 is a real scheduled fire, so this
-# accepts the union of the two: never refuse evidence Gate 1 already accepted.
+# time (e.g. 2:25-2:55 PM for the 2:30 slot, 12:25 PM-1:00 PM for 12:30).
+# Since 2026-11-14 dca_runner.SLOTS opens there too (:25 for the half-hour
+# slots, 15:20 for the final slot, 9:31 for 09:35, which gets no early allowance
+# here), so the union below equals SLOTS today; it is kept so a fire that passed
+# the prompt's Gate 1 is never refused even if the two drift apart again.
 EARLY_START_MINUTES = 5
 
 

@@ -61,7 +61,8 @@ artifact root stays under `.../ce16ba6b` for continuity across the repair.
 
 **Retimed to 3:30 PM ET on 2026-07-27** (from 3:20 PM ET). Writers emit only the
 canonical identity: `scheduled_for_et='15:30'`,
-`scheduled_window_start_et='15:25'`, and
+`scheduled_window_start_et='15:20'` (15:25 until the 2026-11-14 early-fire
+tolerance; validators accept both), and
 `run_id='scheduled_YYYYMMDD_1530ET'` under
 `scheduled_runs/YYYYMMDD_1530ET/`. Validators and schemas also **accept** the
 legacy identity (`'15:20'`, `'15:15'`, `scheduled_YYYYMMDD_1520ET`) so run_states
@@ -110,7 +111,7 @@ artifacts written before/after the repair both remain valid.
   "cron_id": "10ce362c",
   "supersedes_cron_id": "ce16ba6b",
   "scheduled_for_et": "15:30",
-  "scheduled_window_start_et": "15:25",
+  "scheduled_window_start_et": "15:20",
   "scheduled_window_end_et": "15:35",
   "manual_run": false,
   "run_id": "scheduled_YYYYMMDD_1530ET",
@@ -246,7 +247,7 @@ The Fri Jul 17 2026 3:20 PM ET scheduled `run_state` was repaired to include a
    For the scheduled 3:30 PM run it carries `run_origin='scheduled'`,
    `manual_run=false`, `run_type='scheduled_live_test'`, `cron_id='10ce362c'`,
    `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:30'`,
-   `scheduled_window_start_et='15:25'`, `scheduled_window_end_et='15:35'`,
+   `scheduled_window_start_et='15:20'` (or the prior `'15:25'`), `scheduled_window_end_et='15:35'`,
    `run_id='scheduled_YYYYMMDD_1530ET'`, `triggered_at_utc`, and
    `state_schema_version`.
 2. **Nested object is authoritative.** In this repo, scheduled/manual identity fields live

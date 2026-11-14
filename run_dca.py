@@ -227,7 +227,10 @@ _SLOT_SCHEDULE_TOLERANCE = timedelta(minutes=5)
 # missing or partial final-run (Codex review: "Enforce the final slot's 15:32
 # start cutoff"). Every other slot keeps the shared symmetric tolerance.
 _SLOT_SCHEDULE_BOUNDS: Dict[str, tuple[timedelta, timedelta]] = {
-    "1530ET": (timedelta(0), timedelta(minutes=2)),
+    # Opens 10 minutes early (15:20) from 2026-11-14, matching dca_runner.SLOTS["1530"]:
+    # an early scheduler fire is accepted instead of aborting as off-schedule. The
+    # 15:32 late cutoff above is unchanged.
+    "1530ET": (timedelta(minutes=10), timedelta(minutes=2)),
 }
 
 
@@ -2491,10 +2494,10 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     Pre-retime dates (before ``CANONICAL_RETIME_DATE_YYYYMMDD``) keep the
     legacy 15:15 ET bound so a legacy 3:20 PM run stays covered. On/after the
     retime, the bound narrows to the canonical classification window start
-    (15:25 ET) so a delayed/replayed or misfired scheduled invocation between
-    15:15 and 15:24 ET does not skip the downtrend check outside the window
-    the manifest actually permits (15:30-15:32 ET starts) -- codex review
-    discussion_r3657271692.
+    (15:25 ET, 15:20 ET since the 2026-11-14 early-fire tolerance) so a
+    delayed/replayed or misfired scheduled invocation before it does not skip
+    the downtrend check outside the window the manifest actually permits
+    (15:20-15:32 ET starts) -- codex review discussion_r3657271692.
     """
     now_et = now.astimezone(EASTERN)
     window_start_et = (
@@ -3772,9 +3775,9 @@ def _run_pipeline_impl(
     # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
     # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
     # attributable to the scheduled window; on/after the retime it narrows to the
-    # canonical 15:25 ET classification window start, so a delayed/replayed or
-    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
-    # check outside the window the manifest actually permits (15:30-15:32 ET
+    # canonical classification window start (15:20 ET since 2026-11-14), so a
+    # delayed/replayed or misfired invocation before it does not skip the downtrend
+    # check outside the window the manifest actually permits (15:20-15:32 ET
     # starts) -- codex review discussion_r3657271692.
     # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
     # are unaffected — they run outside this window and/or with scheduled=False.

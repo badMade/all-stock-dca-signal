@@ -54,8 +54,12 @@ EASTERN = ZoneInfo("America/New_York")
 
 # Afternoon scheduled evidence must not be accepted with a timestamp before this
 # ET wall-clock time. Mirrors the "afternoon scheduled evidence must not accept
-# timestamps before 2:30 PM ET" execution constraint.
-AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
+# timestamps before 2:30 PM ET" execution constraint, lowered to the 2:30 slot's
+# own window open (dca_runner.SLOTS["1430"], 14:25 since 2026-11-14): an unfinalized
+# 2:30 run that fired early carries a 14:25-14:29 generated_at and is still that
+# slot's afternoon evidence. The 1:30 slot closes at 14:00, so nothing earlier
+# can slip in.
+AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 25)
 
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30

@@ -286,7 +286,7 @@ def test_scheduled_classification_fields():
     assert rc["cron_id"] == "10ce362c"
     assert rc["supersedes_cron_id"] == "ce16ba6b"
     assert rc["scheduled_for_et"] == "15:30"
-    assert rc["scheduled_window_start_et"] == "15:25"
+    assert rc["scheduled_window_start_et"] == "15:20"  # 15:25 until the 2026-11-14 early-fire tolerance
     assert rc["scheduled_window_end_et"] == "15:35"
     assert rc["manual_run"] is False
     assert rc["run_id"] == "scheduled_20260706_1530ET"
@@ -749,9 +749,9 @@ def test_select_requires_valid_scheduled_state():
 
 def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
     # _scheduled_state() carries the canonical 1530ET identity, so the
-    # attribution window starts at 15:25 (Codex review r3654117272: "Select
-    # the fallback attribution window from the run identity") -- 15:20 is
-    # now correctly excluded even though it was accepted before that fix.
+    # attribution window starts at 15:20 (15:25 until the 2026-11-14 early-fire
+    # tolerance; Codex review r3654117272: "Select the fallback attribution
+    # window from the run identity") -- 15:19 is excluded.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         # Scheduled state exists but has no order IDs (simulated write failure).
@@ -760,7 +760,7 @@ def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
             broker_window_orders=[
-                {"order_id": "BRK-1", "submitted_at_et": "15:20"},
+                {"order_id": "BRK-1", "submitted_at_et": "15:19"},
                 {"order_id": "MAN-9", "submitted_at_et": "15:26"},
                 {"order_id": "BRK-2", "submitted_at_et": "15:34"},
             ],
@@ -768,7 +768,7 @@ def test_broker_fallback_only_with_scheduled_state_and_excludes_manual():
         )
         assert sel.ok
         assert sel.used_broker_fallback
-        assert sel.order_ids == ["BRK-2"]  # BRK-1 before 15:25, MAN-9 still excluded
+        assert sel.order_ids == ["BRK-2"]  # BRK-1 before 15:20, MAN-9 still excluded
 
 
 def test_broker_fallback_excludes_recovery_context_orders():
@@ -1065,16 +1065,17 @@ def test_non_fallback_paths_do_not_collect_recovery_ids():
 
 
 def test_broker_fallback_excludes_out_of_window_orders():
-    # Canonical 1530ET identity -> window is 15:25-15:35 inclusive.
+    # Canonical 1530ET identity -> window is 15:20-15:35 inclusive (15:25 until the
+    # 2026-11-14 early-fire tolerance).
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         write_run_artifacts(_scheduled_state(order_ids=()), base=base)
         sel = select_scheduled_state_for_reporting(
             TRADING_DAY, base=base,
             broker_window_orders=[
-                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:25
-                {"order_id": "PRE-RETIME", "submitted_at_et": "15:20"},  # before 15:25 (legacy-only window)
-                {"order_id": "IN-1", "submitted_at_et": "15:25"},    # inclusive start
+                {"order_id": "EARLY", "submitted_at_et": "15:10"},   # before 15:20
+                {"order_id": "PRE-RETIME", "submitted_at_et": "15:19"},  # before 15:20 (legacy-only window)
+                {"order_id": "IN-1", "submitted_at_et": "15:20"},    # inclusive start (an early fire)
                 {"order_id": "IN-2", "submitted_at_et": "2026-07-06T15:35:00-04:00"},  # inclusive end, ISO
                 {"order_id": "LATE", "submitted_at_et": "15:50"},    # after 15:35
                 {"order_id": "NOTIME"},                              # no timestamp -> dropped
@@ -1232,6 +1233,17 @@ def test_legacy_1520et_scheduled_classification_still_validates():
     assert validate_classification(rc).ok
 
 
+def test_validation_accepts_the_prior_canonical_15_25_window_start():
+    # Writers emit 15:20 since the 2026-11-14 early-fire tolerance, but every
+    # canonical 1530ET artifact written between the 2026-07-27 retime and then
+    # carries 15:25 and must stay valid scheduled evidence.
+    rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
+    rc["scheduled_window_start_et"] = "15:25"
+    assert validate_classification(rc).ok
+    rc["scheduled_window_start_et"] = "15:24"  # neither identity's start
+    assert not validate_classification(rc).ok
+
+
 def test_validation_rejects_hybrid_canonical_legacy_identity():
     # Codex review discussion_r3653976747 ("Validate canonical and legacy
     # identity fields as a unit"): scheduled_for_et, scheduled_window_start_et,
@@ -1243,7 +1255,7 @@ def test_validation_rejects_hybrid_canonical_legacy_identity():
     # real scheduled slot ever produces that combination.
     rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
     assert rc["scheduled_for_et"] == "15:30"
-    assert rc["scheduled_window_start_et"] == "15:25"
+    assert rc["scheduled_window_start_et"] == "15:20"
     rc["run_id"] = "scheduled_20260706_1520ET"  # legacy run_id, canonical times
     res = validate_classification(rc)
     assert not res.ok
