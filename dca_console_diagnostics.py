@@ -81,7 +81,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
         "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "sizing_suggestion_history",
         "sizing_suggestion_compare", "market_open_quote_shadow",
-        "scripts.backup_strategy",
+        "scripts.backup_strategy", "scripts.backup_state_root",
     )),
     ("reporting_ops", "Reporting & monitoring", (
         "dca_alerts", "dca_average_cost_snapshot", "dca_notion_sync", "dca_reporting", "dca_weekly_dashboard",
@@ -92,6 +92,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.sync_live_prompts", "scripts.triage_log_summary", "scripts.triage_reconcile_batch", "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
         "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.planner_repaste_notice", "scripts.slot_attribution",
         "scripts.abort_markers", "scripts.kill_switch_gap_proof", "scripts.local_ci_sweep",
+        "scripts.index_run_states_sqlite",
     )),
     ("broker_market", "Broker, orders & market data", (
         "dca_live_adapters", "dca_slot_guard", "build_raw_data", "run_market_open_signals",
@@ -99,7 +100,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.prior_reference_bindings", "scripts.assemble_order_pages", "scripts.adhoc_orders",
         "scripts.emit_order_plan", "scripts.refresh_market_open_candidates", "scripts.backup_gates",
         "scripts.backup_procedure", "scripts.merge_order_pages", "scripts.check_per_order_record",
-        "scripts.reshape_order_pages", "scripts.find_order_baseline",
+        "scripts.reshape_order_pages", "scripts.find_order_baseline", "dca_retry",
     )),
     ("research", "Research & analysis", (
         "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",
