@@ -131,6 +131,13 @@ CREATE TABLE IF NOT EXISTS universe_membership (
     {_PROV},
     PRIMARY KEY (ticker, effective_from, content_hash)
 );
+CREATE TABLE IF NOT EXISTS goal_versions (
+    goal_id VARCHAR NOT NULL, goal_version INTEGER NOT NULL, kind VARCHAR NOT NULL,
+    metric VARCHAR, horizon_years INTEGER, target DOUBLE,
+    effective_from TIMESTAMP NOT NULL, goal_json VARCHAR NOT NULL,
+    {_PROV},
+    PRIMARY KEY (goal_id, goal_version, content_hash)
+);
 """
 
 
@@ -877,3 +884,76 @@ class LedgerStore:
             [as_of_date, self._known(known_at)],
         ).fetchall()
         return [r[0] for r in rows]
+
+    # --- goal versions (docs/adr-goals-and-loss-hedge-shadow.md, Phase 2) ---------------------
+    # Bitemporal on purpose: ``as_of`` is when the goal version took effect in the config, and
+    # ``ingested_at`` is when this ledger learned it. A read at ``known_at`` only sees rows that
+    # were both asserted and ingested by then, so a later correction never rewrites history.
+
+    _GOAL_KEYS = {"goal_id", "goal_version", "effective_from"}
+    _GOAL_OPTIONAL = frozenset({
+        "kind", "metric", "horizon_years", "target", "benchmark",
+        "mode", "max_drawdown", "hedge_budget_pct", "instruments",
+    })
+    _GOAL_KINDS = ("aspirational", "loss_hedge")
+
+    def ingest_goal_versions(self, rows: Iterable[dict[str, Any]], *, source: str, run_id: str, as_of: datetime) -> int:
+        """One row per goal version. ``kind`` defaults to ``aspirational``; the full entry is kept
+        as canonical JSON so a hedge goal's fields survive even though only the key columns are typed."""
+        to_utc_naive(as_of)
+        problems: list[str] = []
+        prepared = []
+        for i, raw in enumerate(rows):
+            r = _Row(raw, kind="goal_versions", index=i, required=self._GOAL_KEYS, optional=self._GOAL_OPTIONAL)
+            version = raw.get("goal_version")
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                r.problems.append(f"{r.where}: goal_version must be a positive int")
+            kind = raw.get("kind", "aspirational")
+            if kind not in self._GOAL_KINDS:
+                r.problems.append(f"{r.where}: kind must be one of {list(self._GOAL_KINDS)}")
+            target = raw.get("target")
+            if target is not None and not _finite(target):
+                r.problems.append(f"{r.where}: target must be a finite number or absent")
+            effective = r.moment("effective_from")
+            out: dict[str, Any] = {
+                "goal_id": r.text("goal_id"),
+                "goal_version": version,
+                "kind": kind,
+                "metric": raw.get("metric"),
+                "horizon_years": raw.get("horizon_years"),
+                "target": target,
+                "effective_from": effective,  # r.moment() already returns naive UTC
+            }
+            if not r.problems:
+                entry = {**raw, "effective_from": effective.isoformat()}
+                out["goal_json"] = _canonical_json(entry, where=r.where, field="goal")
+                out["content_hash"] = _hash([out[k] for k in sorted(out)])
+            problems += r.problems
+            prepared.append(out)
+        _raise_if(problems, "goal_versions")
+        return self._insert("goal_versions", prepared, source=source, run_id=run_id, as_of=as_of)
+
+    def goal_versions(self, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
+        """Latest version of each (goal_id, goal_version) asserted AND ingested by ``known_at``."""
+        known = self._known(known_at)
+        return self._rows(
+            "SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER (PARTITION BY goal_id, goal_version "
+            "ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn FROM goal_versions "
+            "WHERE as_of <= ? AND ingested_at <= ?) WHERE rn = 1 ORDER BY goal_id, goal_version",
+            [known, known],
+        )
+
+    def goal_version_on(self, day: date, *, kind: str = "aspirational", known_at: datetime | None = None) -> dict[str, Any] | None:
+        """The version of ``kind`` in effect on ``day`` (ET calendar day), as known at ``known_at``.
+        Latest ``effective_from`` wins; None when nothing has taken effect yet."""
+        from zoneinfo import ZoneInfo
+
+        eastern = ZoneInfo("America/New_York")
+        in_effect = []
+        for row in self.goal_versions(known_at=known_at):
+            if row["kind"] != kind:
+                continue
+            effective_day = row["effective_from"].replace(tzinfo=timezone.utc).astimezone(eastern).date()
+            if effective_day <= day:
+                in_effect.append(row)
+        return max(in_effect, key=lambda row: row["effective_from"], default=None)
