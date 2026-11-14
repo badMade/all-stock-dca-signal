@@ -14,7 +14,7 @@ account number.
 
 Usage::
 
-    python3 -m scripts.primary_gates clock --slot 1130 [--now <offset-aware ISO-8601>]
+    python3 -m scripts.primary_gates clock --slot 1130 [--now <offset-aware ISO-8601>] [--latest-start HH:MM]
     python3 -m scripts.primary_gates budget --orders-pages <week baseline json> --account <number> \\
         --trading-day YYYY-MM-DD --buying-power <usd>
 
@@ -29,7 +29,7 @@ import math
 import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -39,18 +39,23 @@ from dca_runner import BrokerOrder
 
 ET = ZoneInfo("America/New_York")
 _ACCOUNT_SHAPE = re.compile(r"[0-9]+")
+_HHMM_SHAPE = re.compile(r"[0-9]{2}:[0-9]{2}")
 
 
 def _verdict(status: str, gate: Optional[int], reason: str, now_et: datetime) -> dict:
     return {"status": status, "gate": gate, "reason": reason, "now_et": now_et.isoformat()}
 
 
-def evaluate_clock(slot_id: str, now: datetime) -> dict:
+def evaluate_clock(slot_id: str, now: datetime, latest_start: Optional[time] = None) -> dict:
     """Run Gate 0 (market day), Gate 1 (time sanity) and Gate 3 (trading window), in that order.
 
     ``now`` must be offset-aware; it is converted to America/New_York here, so a UTC instant is judged by its
     ET hour and the host's wall clock is never consulted. A date the calendar does not cover is an ABORT, never
     a PROCEED.
+
+    ``latest_start`` (ET wall-clock time) can only TIGHTEN Gate 1: a start at or after it is an ABORT even when
+    ``dca_runner.SLOTS`` would accept it. It exists for the 3:30 prompt, whose text closes at 3:55 PM while
+    ``SLOTS['1530']`` runs to 4:00 PM. It never widens the slot window and never outranks Gate 0.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("evaluate_clock requires an offset-aware datetime")
@@ -66,6 +71,8 @@ def evaluate_clock(slot_id: str, now: datetime) -> dict:
         return _verdict("END_SILENTLY", 0, "market closed or early-close afternoon", now_et)
     if not dca_runner.gate_time_sanity(now_et, slot):
         return _verdict("ABORT", 1, f"outside the {slot_id} acceptance window", now_et)
+    if latest_start is not None and now_et.time().replace(tzinfo=None) >= latest_start:
+        return _verdict("ABORT", 1, f"at or after the latest start {latest_start.strftime('%H:%M')} ET", now_et)
     if not dca_runner.gate_trading_window(now_et.date()):
         return _verdict("ABORT", 3, "outside the approved live-trading window", now_et)
     return _verdict("PROCEED", None, "gates 0, 1 and 3 passed", now_et)
@@ -145,6 +152,20 @@ def _exit_code(document: dict) -> int:
     return 1 if document.get("status") == "ABORT" else 0
 
 
+def _hhmm(text: str) -> time:
+    """argparse type: a strict 24-hour HH:MM; anything else is a usage error (exit 2).
+
+    strptime alone accepts single-digit fields, so ``15:5`` would parse as 15:05 -- before the 3:30 window,
+    aborting every start -- instead of failing as a typo (PR #2290 review). The shape is checked first.
+    """
+    if not _HHMM_SHAPE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not HH:MM (24-hour)")
+    try:
+        return datetime.strptime(text, "%H:%M").time()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r} is not HH:MM (24-hour)") from exc
+
+
 def _cmd_clock(args: argparse.Namespace) -> int:
     if args.slot not in dca_runner.SLOTS:
         print(f"unknown slot {args.slot!r}", file=sys.stderr)
@@ -161,7 +182,7 @@ def _cmd_clock(args: argparse.Namespace) -> int:
             print("--now must carry a UTC offset", file=sys.stderr)
             return 2
     try:
-        document = evaluate_clock(args.slot, now)
+        document = evaluate_clock(args.slot, now, latest_start=args.latest_start)
     except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only, never connector text
         document = {"status": "ABORT", "gate": None, "reason": f"unexpected {type(exc).__name__}"}
     pin = account_pin(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"))
@@ -198,6 +219,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     clock = sub.add_parser("clock", help="Gates 0, 1 and 3 plus the account-pin check.")
     clock.add_argument("--slot", required=True)
     clock.add_argument("--now", default=None, help="Offset-aware ISO-8601 instant; defaults to the real clock.")
+    clock.add_argument(
+        "--latest-start",
+        type=_hhmm,
+        default=None,
+        help="HH:MM ET; a start at or after it aborts at Gate 1. Can only tighten the slot window.",
+    )
     budget = sub.add_parser("budget", help="Gate 6 cap arithmetic from a saved week-baseline orders_pages file.")
     budget.add_argument("--orders-pages", type=Path, required=True)
     budget.add_argument("--account", required=True)
