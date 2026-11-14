@@ -329,3 +329,10 @@ def test_format_status_reports_percent_rate_and_slowest_shard_eta():
 
 def test_format_status_before_any_step_line_says_so():
     assert "no step lines yet" in run_sharded.format_status({1: None, 2: None}, 120.0, {})
+
+
+def test_eval_horizons_is_forwarded_only_when_given(tmp_path: Path):
+    given, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s1", _fresh_args(max_horizon=90, eval_horizons="2,3,90"))
+    assert given[given.index("--eval-horizons") + 1] == "2,3,90"
+    omitted, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s2", _fresh_args(max_horizon=90))
+    assert "--eval-horizons" not in omitted

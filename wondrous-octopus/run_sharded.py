@@ -401,6 +401,8 @@ def build_shard_cmd(
             cmd.extend(["--diagnostic-sample", str(args.diagnostic_sample)])
     if getattr(args, "max_horizon", 1) > 1:
         cmd.extend(["--max-horizon", str(args.max_horizon)])
+    if getattr(args, "eval_horizons", None):
+        cmd.extend(["--eval-horizons", args.eval_horizons])
     if getattr(args, "history_dir", None):
         # Frozen snapshot: a resume refuses when archive rows change, and the live archive refreshes daily.
         cmd.extend(["--history-dir", str(args.history_dir)])
@@ -489,6 +491,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         default=1,
         help="Forecast every trading day t+1..t+N (default 1 = next-day only); frozen per shard",
+    )
+    parser.add_argument(
+        "--eval-horizons",
+        default=None,
+        metavar="H,H,...",
+        help="Horizons matured, scored and calibrated per shard (each in 2..max-horizon; default 5,10,15,20); "
+        "frozen per shard, e.g. 2,3,...,90 to calibrate every horizon",
     )
     parser.add_argument(
         "--history-dir",
