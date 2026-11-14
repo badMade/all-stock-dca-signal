@@ -145,8 +145,9 @@ jobs:
   # follow-up fix landed: a docs page missing from docs/README.md (#2244, #2266), an
   # account-shaped test literal (#2259, #2266), a test file importing a module that did not
   # exist yet, which stops collection of the whole suite (#2266), and a module with no
-  # plain-English note or OTHER_GROUPS entry (#2268, #2269). Target: well under 2 minutes;
-  # the 10-minute timeout is only a hang ceiling (raise config/self_heal.json's
+  # plain-English note or OTHER_GROUPS entry (#2268, #2269). Measured on PR 2294's hosted
+  # runner: 47 s passing, 72 s on a deliberate unindexed-docs break (collection ~22-30 s,
+  # tests ~10 s). The 10-minute timeout is only a hang ceiling (raise config/self_heal.json's
   # ci_worst_case_minutes with it, as for the others). Run the same set locally with
   # scripts/local_ci.sh --registration; tests/test_local_ci.py and
   # scripts/tests/test_workflow_policy.py keep the two file lists identical.
