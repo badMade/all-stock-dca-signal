@@ -215,3 +215,96 @@ def test_a_clean_daily_run_still_merges_and_exits_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(run_sharded.subprocess, "run", fake_run)
     assert run_sharded.main(["--daily", "--run-dir-base", str(base)]) == 0
     assert (base / "all_shards_tomorrow.csv").is_file()
+
+
+# --- 90-day horizons, a frozen snapshot and run_walkforward presets pass through a sharded replay ---------------------
+
+
+def test_horizon_history_dir_and_preset_are_forwarded_to_a_fresh_shard(tmp_path: Path):
+    args = _fresh_args(preset="full", max_horizon=90, history_dir=tmp_path / "snap", diagnostic_sample=100)
+    cmd, mode = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "shard_1", args)
+    assert mode == "fresh"
+    assert cmd[cmd.index("--preset") + 1] == "full"
+    assert cmd[cmd.index("--max-horizon") + 1] == "90"
+    assert cmd[cmd.index("--history-dir") + 1] == str(tmp_path / "snap")
+
+
+def test_a_preset_owns_the_cadence_flags_so_they_are_not_sent(tmp_path: Path):
+    """An explicit --update-every etc. would silently override the preset's value."""
+    args = _fresh_args(preset="full", diagnostic_sample=100)
+    cmd, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "shard_1", args)
+    for flag in ("--window-len", "--update-every", "--refit-every", "--diagnostic-sample"):
+        assert flag not in cmd
+
+
+def test_without_a_preset_the_legacy_cadence_flags_and_next_day_horizon_are_kept(tmp_path: Path):
+    cmd, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "shard_1", _fresh_args(diagnostic_sample=100))
+    assert cmd[cmd.index("--window-len") + 1] == "60"
+    assert cmd[cmd.index("--update-every") + 1] == "5"
+    assert cmd[cmd.index("--diagnostic-sample") + 1] == "100"
+    assert "--preset" not in cmd and "--max-horizon" not in cmd and "--history-dir" not in cmd
+
+
+def test_dry_run_discovers_tickers_from_the_given_history_dir(tmp_path: Path, capsys):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for t in ("AAA", "BBB", "CCC", "DDD"):
+        (snap / f"{t}.csv").write_text("Date,Open,High,Low,Close,Volume\n2026-01-02,1,1,1,1,1\n", encoding="utf-8")
+    code = run_sharded.main(
+        ["--dry-run", "--shards", "2", "--history-dir", str(snap), "--run-dir-base", str(tmp_path / "out")]
+    )
+    assert code == 0
+    assert f"Archive: {snap}" in capsys.readouterr().out
+
+
+# --- --shards auto ----------------------------------------------------------------------------------------------------
+
+
+def test_auto_shard_count_is_the_smallest_resource_ceiling():
+    count, why = run_sharded.auto_shard_count(6140, cpu_count=16, ram_gb=128)
+    assert count == 8 and "limited by cores" in why  # cores 8, size 8, ram 9
+    count, why = run_sharded.auto_shard_count(6140, cpu_count=64, ram_gb=32)
+    assert count == 2 and "limited by ram" in why  # 32*0.6/8 = 2
+    count, why = run_sharded.auto_shard_count(1000, cpu_count=64, ram_gb=512)
+    assert count == 1 and "min-shard-size" in why  # a small universe is not split into tiny shards
+
+
+def test_auto_shard_count_never_returns_zero():
+    assert run_sharded.auto_shard_count(10, cpu_count=1, ram_gb=1)[0] == 1
+    assert run_sharded.auto_shard_count(10, cpu_count=None, ram_gb=None)[0] >= 1
+
+
+def test_an_explicit_shard_count_is_used_as_given(tmp_path: Path):
+    assert run_sharded.resolve_shard_count(6, 6140, tmp_path)[0] == 6
+
+
+def test_auto_reuses_an_existing_partition_instead_of_redealing_tickers(tmp_path: Path):
+    for n in (1, 2, 3):
+        (tmp_path / f"shard_{n}").mkdir()
+    assert run_sharded.resolve_shard_count("auto", 6140, tmp_path)[0] == 3
+
+
+def test_auto_prefers_the_recorded_shard_plan(tmp_path: Path):
+    (tmp_path / run_sharded.SHARD_PLAN).write_text('{"shards": 5}', encoding="utf-8")
+    (tmp_path / "shard_1").mkdir()
+    assert run_sharded.resolve_shard_count("auto", 6140, tmp_path)[0] == 5
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "many"])
+def test_shards_argument_rejects_nonsense(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        run_sharded._shards_arg(bad)
+
+
+def test_shards_argument_accepts_auto_and_positive_integers():
+    assert run_sharded._shards_arg("auto") == "auto" and run_sharded._shards_arg("8") == 8
+
+
+def test_a_dry_run_does_not_write_a_shard_plan(tmp_path: Path):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for t in ("AAA", "BBB"):
+        (snap / f"{t}.csv").write_text("Date,Open,High,Low,Close,Volume\n2026-01-02,1,1,1,1,1\n", encoding="utf-8")
+    out = tmp_path / "out"
+    run_sharded.main(["--shard", "1", "--dry-run", "--history-dir", str(snap), "--run-dir-base", str(out)])
+    assert not (out / run_sharded.SHARD_PLAN).exists()  # a dry run writes nothing
