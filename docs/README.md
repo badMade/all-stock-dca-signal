@@ -61,6 +61,7 @@ environment (see the repository README).
 | [credit_usage_proxy_report.md](credit_usage_proxy_report.md) | One-time 2026-07-27 4:30 PM ET credit-usage proxy report contract, including the separate recovery-run section |
 | [restore_runbook.md](restore_runbook.md) | Restore procedure + audit checklist |
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
+| [weekly_readiness_check_prompt.md](weekly_readiness_check_prompt.md) | A fixed-rubric, read-only prompt for a scheduled agent that scores the repo weekly against ten external standards (SEC 15c3-5 benchmark, SRE PRR, ASVS L1, NIST SSDF, OpenSSF Scorecard, SLSA, Well-Architected, ISO 25010, FINRA-style records, SOC 2) and reports week-over-week change; a self-assessment, not an audit |
 | [workflow_policy.md](workflow_policy.md) | The CI-enforced workflow policy checks (job timeouts, concurrency, checkout credentials) and how to declare a reasoned exception |
 | [scheduled_session_repo_access.md](scheduled_session_repo_access.md) | Dated probe log for whether a Routine-fired scheduled session actually has working repo (clone/fetch/push) and environment (account number) access |
 | [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): the 10:30 live mode (the 9:45 watchlist mode was retired; `mode` is required), task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
