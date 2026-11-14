@@ -10,7 +10,7 @@ import math
 from collections.abc import Iterable, Sequence
 
 from .errors import ValidationError
-from .models import CorporateAction, DailyBar
+from .models import CorporateAction, DailyBar, action_version_key
 
 BAR_SOURCES = frozenset({"massive", "alpaca"})
 ACTION_TYPES = frozenset({"forward_split", "reverse_split", "stock_dividend", "cash_dividend"})
@@ -87,6 +87,21 @@ def action_problems(action: CorporateAction) -> list[str]:
 
 
 def validate_actions(actions: Iterable[CorporateAction]) -> None:
-    problems = [p for a in actions for p in action_problems(a)]
+    """Refuse the batch if any action is malformed or two share one version identity.
+
+    Two actions with the same (source, action_version_key) in one batch are two versions of one
+    action delivered at the same as_of: the read macro would keep one by hash order and the
+    versioned dedupe would re-insert the other on every run (PR #2265 follow-up). A vendor that
+    sends no id and two distinct same-day actions of one type lands here too, loudly, instead of
+    one of them vanishing from the adjusted series.
+    """
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for a in actions:
+        problems.extend(action_problems(a))
+        key = (a.source, action_version_key(a))
+        if key in seen:
+            problems.append(f"{a.symbol} {a.action_type} {a.ex_date}: two versions of one action in one batch")
+        seen.add(key)
     if problems:
         _raise("corporate actions", problems)

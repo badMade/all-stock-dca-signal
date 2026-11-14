@@ -46,6 +46,20 @@ class CorporateAction:
     vendor_id: str | None = None
 
 
+# The version identity of one corporate action within its source: the vendor's own id when it
+# sends one, else symbol|action_type|ex_date. The read macro (``actions_known_at``) partitions by
+# ACTION_VERSION_SQL and the write-side dedupe compares action_version_key against it, so the two
+# must stay the same expression (tests/prices/test_store_point_in_time.py checks they agree).
+ACTION_VERSION_SQL = "coalesce(vendor_id, symbol || '|' || action_type || '|' || CAST(ex_date AS VARCHAR))"
+
+
+def action_version_key(action: CorporateAction) -> str:
+    """The Python twin of ACTION_VERSION_SQL (DuckDB casts a DATE to its ISO form)."""
+    if action.vendor_id is not None:
+        return action.vendor_id
+    return f"{action.symbol}|{action.action_type}|{action.ex_date.isoformat()}"
+
+
 @dataclass(frozen=True, slots=True)
 class Quote:
     """A last trade. ``ts`` is when it traded; ``as_of`` is when we fetched it."""

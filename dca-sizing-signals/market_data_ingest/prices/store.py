@@ -12,9 +12,12 @@ Write rules (tests/prices/test_store_point_in_time.py):
   and run_id. With content_hash alone, a vendor correcting a close A -> B and then reverting to
   A had the revert dropped and the store served B. An older file whose key lacks as_of/run_id
   refuses such a revert loudly (``require_all_new``) instead of dropping it.
-  ``corporate_actions`` and ``yahoo_legacy_bars`` keep the content_hash key: several distinct
-  actions can share (source, symbol, action_type, ex_date), so their version identity needs the
-  vendor id first, and the Yahoo archive is a one-time import.
+* ``corporate_actions`` dedupes by version the same way (PR #2265 follow-up). Its version
+  identity is ``ACTION_VERSION_SQL``: (source, vendor_id), or (source, symbol|action_type|ex_date)
+  when the vendor sends no id -- the same partition ``actions_known_at`` reads by, so the write
+  and read sides agree on what "the newest version" is. Its key adds as_of and run_id, and
+  ``validate_actions`` refuses two versions of one action in one batch.
+  ``yahoo_legacy_bars`` keeps the content_hash key: the Yahoo archive is a one-time import.
 * One batch is validated, staged to ``<staging_dir>/<run_id>/<name>.parquet``, counted, and
   inserted from that Parquet file in a single transaction. A failure anywhere writes nothing.
 
@@ -40,7 +43,15 @@ from typing import Any
 import duckdb
 
 from ..duckdb_batch import bulk_insert, drop_unchanged
-from .models import AdjustedBar, CorporateAction, DailyBar, Quote, ReconciliationResult
+from .models import (
+    ACTION_VERSION_SQL,
+    AdjustedBar,
+    CorporateAction,
+    DailyBar,
+    Quote,
+    ReconciliationResult,
+    action_version_key,
+)
 from .validate import validate_actions, validate_bars
 
 FAR_FUTURE = datetime(9999, 12, 31)
@@ -67,7 +78,7 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
     historical_adjustment_factor DOUBLE,
     content_hash VARCHAR NOT NULL,
     as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
-    PRIMARY KEY (source, symbol, action_type, ex_date, content_hash)
+    PRIMARY KEY (source, symbol, action_type, ex_date, content_hash, as_of, run_id)
 );
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     run_id VARCHAR NOT NULL, job VARCHAR NOT NULL, session DATE,
@@ -121,7 +132,7 @@ CREATE OR REPLACE MACRO bars_known_at(known_at) AS TABLE
 CREATE OR REPLACE MACRO actions_known_at(known_at) AS TABLE
     WITH versions AS (
         SELECT *, row_number() OVER (
-            PARTITION BY source, coalesce(vendor_id, symbol || '|' || action_type || '|' || CAST(ex_date AS VARCHAR))
+            PARTITION BY source, {ACTION_VERSION_SQL}
             ORDER BY as_of DESC, ingested_at DESC, content_hash) AS vrn
         FROM corporate_actions WHERE as_of <= known_at),
     latest AS (SELECT *, {_PRIORITY} AS prio FROM versions WHERE vrn = 1),
@@ -406,15 +417,31 @@ class PriceStore:
                     "record_date": a.record_date,
                     "pay_date": a.pay_date,
                     "historical_adjustment_factor": a.historical_adjustment_factor,
+                    # Not a stored column: the dedupe key drop_unchanged compares (see models).
+                    "version_key": action_version_key(a),
                     "content_hash": _hash(values),
                     "as_of": stamp,
                     "ingested_at": ingested_at,
                     "run_id": run_id,
                 }
             )
+        rows = drop_unchanged(
+            self.con,
+            "corporate_actions",
+            ["source", "version_key"],
+            rows,
+            as_of=stamp,
+            key_sql={"version_key": ACTION_VERSION_SQL},
+        )
+        if not rows:
+            return 0
         name = f"corporate_actions_{_hash([r['content_hash'] for r in rows])[:12]}.parquet"
         return self._bulk_insert(
-            "corporate_actions", _ACTION_COLUMNS, rows, parquet_path=Path(staging_dir) / safe_name(run_id) / name
+            "corporate_actions",
+            _ACTION_COLUMNS,
+            rows,
+            parquet_path=Path(staging_dir) / safe_name(run_id) / name,
+            require_all_new=True,
         )
 
     def raw_bars(self, symbol: str) -> list[dict[str, Any]]:
