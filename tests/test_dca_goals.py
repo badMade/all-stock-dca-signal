@@ -335,7 +335,7 @@ def _random_hedge_entry(rng: random.Random) -> dict:
 
 def test_7_no_goal_document_can_unlock_execution(tmp_path):
     # Seeded, deterministic property test (stdlib random; no new test dependency).
-    rng = random.Random(20261113)
+    rng = random.Random(20_261_113)
     for i in range(2000):
         doc = document(growth_entry(), _random_hedge_entry(rng))
         if rng.random() < 0.2:
