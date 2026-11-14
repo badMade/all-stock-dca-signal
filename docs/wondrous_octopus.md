@@ -244,6 +244,24 @@ Runs 18:30 Mon-Fri local time (after the close and the archive refresh); log at
 job must read the archive that keeps getting new days. After rewriting a plist, run `xattr -c` on it
 before `launchctl bootstrap`.
 
+### Sharded replays (`run_sharded.py`)
+
+```bash
+python run_sharded.py --parallel --history-dir <frozen snapshot> --preset full --max-horizon 90 \
+  --gbm-row-cap 500000 --online-steps 4 --diagnostic-sample 500 --run-dir-base ~/octopus/sharded
+```
+
+One replay process per ticker shard, run concurrently. `--shards` defaults to `auto`: the smallest of one
+shard per 2 cores, what fits in 60% of RAM (about 8 GB per shard) and a 750-ticker floor per shard. On the
+16-core, 128 GB Mac with the 6,140-ticker archive that is 8. An existing run directory's partition is always
+reused (recorded in `shard_plan.json`), because changing the count would re-deal the tickers and strand every
+checkpoint. `--preset`, `--max-horizon` and `--history-dir` pass through to `run_walkforward.py`; a preset owns
+the window/update/refit/diagnostic cadence, so those flags are not sent with it.
+
+The auto constants are resource ceilings, not a measured optimum: each shard trains its own model on only its
+own tickers, so more shards is faster but may be less accurate. Compare shard counts on the same window before
+treating the default as the most accurate setting.
+
 ### Recovery retrains
 
 After major discrepancies or errors (a `DEGRADED` health flag, a runtime failure that leaves
