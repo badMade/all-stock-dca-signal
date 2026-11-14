@@ -118,7 +118,13 @@ def bulk_insert(
 
 
 def drop_unchanged(
-    con: duckdb.DuckDBPyConnection, table: str, keys: list[str], rows: list[dict[str, Any]], *, as_of: datetime
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    keys: list[str],
+    rows: list[dict[str, Any]],
+    *,
+    as_of: datetime,
+    key_sql: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """The rows whose content_hash differs from the newest version known for their key at ``as_of``.
 
@@ -130,6 +136,9 @@ def drop_unchanged(
             datetimes, dates, strings), because stored and batch keys are compared directly.
         rows: the prepared batch, each with a ``content_hash``.
         as_of: the batch's naive-UTC as_of; versions known only after it are ignored.
+        key_sql: for a key that is not a stored column, the SQL expression that computes it
+            (an internal constant, never caller text). Each row must carry that key's value
+            under the same name; bulk_insert ignores keys outside its column list.
 
     A re-ingest of the newest value is dropped; a revert to an older value is kept, because the
     newest version no longer matches it. The lookup is bounded to the batch's own key values
@@ -137,8 +146,9 @@ def drop_unchanged(
     """
     if not rows:
         return []
-    partition = ", ".join(keys)
-    bounds = " AND ".join(f"list_contains(?, {k})" for k in keys)
+    exprs = [(key_sql or {}).get(k, k) for k in keys]
+    partition = ", ".join(exprs)
+    bounds = " AND ".join(f"list_contains(?, {e})" for e in exprs)
     found = con.execute(
         f"SELECT {partition}, content_hash FROM (SELECT *, row_number() OVER ("
         f"PARTITION BY {partition} ORDER BY as_of DESC, ingested_at DESC, content_hash) AS rn "

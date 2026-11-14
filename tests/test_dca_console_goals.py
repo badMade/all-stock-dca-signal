@@ -1,6 +1,6 @@
 """Tests written FIRST for the console Goals page (docs/adr-goals-and-loss-hedge-shadow.md, D5).
 
-They fail until ``POST /api/goals/propose`` and ``dca_console_goals.py`` land:
+They are skipped until ``dca_console_goals.py`` lands (with ``POST /api/goals/propose``):
 
 * Test 1 (HTTP half): the route rejects bad proposals before writing anything.
 * Test 2: the route keeps ``/api/jobs``' guard order (untrusted 403, Basic 401, token 403).

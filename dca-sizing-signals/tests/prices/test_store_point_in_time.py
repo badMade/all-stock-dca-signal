@@ -346,3 +346,141 @@ def test_an_older_price_file_key_refuses_a_revert(tmp_path, staging_dir):
         with pytest.raises(ValidationError, match="collided with the primary key"):
             ingest(old, staging_dir, [bar("AAPL", session, 250.00)], run_id="run-c", as_of=utc(2026, 10, 18, 2))
         assert old.row_count("daily_bars_raw") == 2
+
+
+# --- PR #2265 follow-up: versioned dedupe for corporate actions --------------------------------
+
+
+def _with_id(action, vendor_id):
+    from dataclasses import replace
+
+    return replace(action, vendor_id=vendor_id)
+
+
+@pytest.mark.parametrize("vendor_id", [None, "split-123"])
+def test_a_corporate_action_revert_is_kept(store, staging_dir, vendor_id):
+    """A -> B -> A on a split ratio: the revert is the newest version, so it must be stored."""
+    ex = date(2024, 6, 10)
+    first = _with_id(split("NVDA", ex, 1, 10), vendor_id)
+    wrong = _with_id(split("NVDA", ex, 1, 20), vendor_id)
+    assert ingest_actions(store, staging_dir, [first], run_id="ca-a", as_of=utc(2026, 10, 17, 1)) == 1
+    assert ingest_actions(store, staging_dir, [wrong], run_id="ca-b", as_of=utc(2026, 10, 18, 1)) == 1
+    assert ingest_actions(store, staging_dir, [first], run_id="ca-c", as_of=utc(2026, 10, 18, 2)) == 1
+
+    assert store.split_price_factor("NVDA", after=date(2024, 6, 7), through=TODAY) == pytest.approx(0.1)
+    # The correction is still visible to a query made while it was the newest version.
+    known = utc(2026, 10, 18, 1, 30)
+    assert store.split_price_factor("NVDA", after=date(2024, 6, 7), through=TODAY, known_at=known) == pytest.approx(
+        0.05
+    )
+
+
+def test_re_sending_the_newest_corporate_action_is_still_a_no_op(store, staging_dir):
+    ex = date(2024, 6, 10)
+    ingest_actions(store, staging_dir, [split("NVDA", ex, 1, 10)], run_id="ca-a", as_of=utc(2026, 10, 17, 1))
+    ingest_actions(store, staging_dir, [split("NVDA", ex, 1, 20)], run_id="ca-b", as_of=utc(2026, 10, 18, 1))
+    assert ingest_actions(store, staging_dir, [split("NVDA", ex, 1, 20)], run_id="ca-c", as_of=utc(2026, 10, 19)) == 0
+    assert store.row_count("corporate_actions") == 2
+
+
+def test_two_versions_of_one_action_in_one_batch_are_held_back_and_the_rest_written(store, staging_dir):
+    """PR #2282 review: an ambiguous identity fails the run without blocking other symbols."""
+    from market_data_ingest.prices.errors import AmbiguousActionsError
+
+    ex = date(2024, 6, 10)
+    batch = [split("NVDA", ex, 1, 10), split("NVDA", ex, 1, 20), split("AAPL", ex, 1, 4)]
+    with pytest.raises(AmbiguousActionsError, match="NVDA forward_split 2024-06-10: 2 different versions") as err:
+        ingest_actions(store, staging_dir, batch)
+    assert err.value.inserted == 1
+    assert store.con.execute("SELECT symbol FROM corporate_actions").fetchall() == [("AAPL",)]
+
+    ids = [
+        _with_id(cash_dividend("AAPL", ex, 0.25), "d-1"),
+        _with_id(cash_dividend("AAPL", date(2024, 6, 11), 0.5), "d-1"),
+    ]
+    with pytest.raises(AmbiguousActionsError):
+        ingest_actions(store, staging_dir, ids, run_id="run-ca2")
+    assert store.row_count("corporate_actions") == 1
+
+
+def test_an_exact_repeat_inside_one_batch_is_stored_once(store, staging_dir):
+    """Overlapping vendor pages repeat a row; that must not fail the run (PR #2282 review)."""
+    action = _with_id(split("NVDA", date(2024, 6, 10), 1, 10), "s-1")
+    assert ingest_actions(store, staging_dir, [action, action]) == 1
+    assert store.row_count("corporate_actions") == 1
+
+
+def test_an_id_less_and_an_id_bearing_copy_apply_once(store, staging_dir):
+    """A vendor that starts sending ids must not make one split apply twice (PR #2282 review)."""
+    ex = date(2024, 6, 10)
+    ingest_actions(store, staging_dir, [split("NVDA", ex, 1, 10)], run_id="ca-a", as_of=utc(2026, 10, 17, 1))
+    ingest_actions(
+        store, staging_dir, [_with_id(split("NVDA", ex, 1, 10), "s-1")], run_id="ca-b", as_of=utc(2026, 10, 18, 1)
+    )
+    assert store.split_price_factor("NVDA", after=date(2024, 6, 7), through=TODAY) == pytest.approx(0.1)
+    # Before the id-bearing copy was known, the id-less one still applies.
+    early = utc(2026, 10, 17, 2)
+    assert store.split_price_factor("NVDA", after=date(2024, 6, 7), through=TODAY, known_at=early) == pytest.approx(0.1)
+
+
+def test_a_split_and_a_dividend_sharing_a_vendor_id_are_two_actions(store, staging_dir):
+    """Massive's splits and dividends come from two id spaces (PR #2282 review)."""
+    ex = date(2024, 6, 10)
+    batch = [_with_id(split("NVDA", ex, 1, 10), "X1"), _with_id(cash_dividend("NVDA", ex, 0.01), "X1")]
+    assert ingest_actions(store, staging_dir, batch) == 2
+    assert store.split_price_factor("NVDA", after=date(2024, 6, 7), through=TODAY) == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("bad", [None, "2024-06-10", datetime(2024, 6, 10)])
+def test_a_non_date_ex_date_is_a_validation_error(store, staging_dir, bad):
+    from dataclasses import replace
+
+    with pytest.raises(ValidationError, match="ex_date is not a date"):
+        ingest_actions(store, staging_dir, [replace(split("NVDA", date(2024, 6, 10), 1, 10), ex_date=bad)])
+
+
+def test_distinct_vendor_ids_on_one_day_are_two_actions(store, staging_dir):
+    """A regular and a special dividend on the same ex_date are both kept when the vendor ids differ."""
+    ex = date(2024, 6, 10)
+    batch = [_with_id(cash_dividend("AAPL", ex, 0.25), "d-1"), _with_id(cash_dividend("AAPL", ex, 1.00), "d-2")]
+    assert ingest_actions(store, staging_dir, batch) == 2
+    assert ingest_actions(store, staging_dir, batch, run_id="run-ca2", as_of=utc(2026, 10, 19)) == 0
+
+
+def test_python_and_sql_action_version_keys_agree(store, staging_dir):
+    from market_data_ingest.prices.models import ACTION_VERSION_SQL, action_version_key
+
+    actions = [
+        split("NVDA", date(2024, 6, 10), 1, 10),
+        _with_id(cash_dividend("AAPL", date(2024, 6, 10), 0.25), "d-9"),
+        _with_id(split("MSFT", date(2024, 6, 10), 1, 2), "s-9"),
+    ]
+    ingest_actions(store, staging_dir, actions)
+    stored = {row[0] for row in store.con.execute(f"SELECT {ACTION_VERSION_SQL} FROM corporate_actions").fetchall()}
+    assert stored == {action_version_key(a) for a in actions}
+
+
+def test_an_older_action_file_key_refuses_a_revert(tmp_path, staging_dir):
+    """A file whose corporate_actions key lacks as_of/run_id must fail loudly, not drop the revert."""
+    import duckdb
+
+    from market_data_ingest.prices.store import PriceStore
+
+    path = tmp_path / "old.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute(
+        "CREATE TABLE corporate_actions (source VARCHAR NOT NULL, vendor_id VARCHAR, "
+        "action_type VARCHAR NOT NULL, symbol VARCHAR NOT NULL, ex_date DATE NOT NULL, "
+        "split_from DOUBLE, split_to DOUBLE, cash_amount DOUBLE, currency VARCHAR, "
+        "declaration_date DATE, record_date DATE, pay_date DATE, historical_adjustment_factor DOUBLE, "
+        "content_hash VARCHAR NOT NULL, as_of TIMESTAMP NOT NULL, ingested_at TIMESTAMP NOT NULL, "
+        "run_id VARCHAR NOT NULL, PRIMARY KEY (source, symbol, action_type, ex_date, content_hash))"
+    )
+    con.close()
+    ex = date(2024, 6, 10)
+    with PriceStore(path, clock=lambda: utc(2026, 10, 18, 3)) as old:
+        ingest_actions(old, staging_dir, [split("NVDA", ex, 1, 10)], run_id="ca-a", as_of=utc(2026, 10, 17, 1))
+        ingest_actions(old, staging_dir, [split("NVDA", ex, 1, 20)], run_id="ca-b", as_of=utc(2026, 10, 18, 1))
+        with pytest.raises(ValidationError, match="collided with the primary key"):
+            ingest_actions(old, staging_dir, [split("NVDA", ex, 1, 10)], run_id="ca-c", as_of=utc(2026, 10, 18, 2))
+        assert old.row_count("corporate_actions") == 2
