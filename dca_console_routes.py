@@ -408,6 +408,14 @@ def _route_config_effective(app, request: RouteRequest) -> Response:
     return Response.json(200, effective_config(app.settings.config_dir, _now(app)))
 
 
+def _route_goals(app, request: RouteRequest) -> Response:
+    # Read-only Goals panel data (docs/adr-goals-and-loss-hedge-shadow.md, D5).
+    from dca_console_goals import goals_view
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, goals_view(app.settings.config_dir, app.settings.output, now=_now(app)))
+
+
 def _route_config_ladder(app, request: RouteRequest) -> Response:
     from dca_console_config import ladder_preview
 
@@ -643,6 +651,7 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/config/file": _route_config_file,
     "/api/config/effective": _route_config_effective,
     "/api/config/ladder": _route_config_ladder,
+    "/api/goals": _route_goals,
     "/api/config/ladder/point": _route_config_ladder_point,
     "/api/alerts": _route_alerts,
     "/api/alerts/inbox": _route_alerts_inbox,

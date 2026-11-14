@@ -15,19 +15,12 @@ import ast
 import re
 from pathlib import Path
 
-import pytest
-
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PACKAGE_ROOT.parent
 
 HEDGE_MODULE = PACKAGE_ROOT / "market_data_ingest" / "ledger" / "hedge_shadow.py"
 GOAL_MODULES = [REPO_ROOT / "dca_goals.py", REPO_ROOT / "dca_console_goals.py"]
 ALL_MODULES = [HEDGE_MODULE, *GOAL_MODULES]
-
-pytestmark = pytest.mark.skipif(
-    not all(path.is_file() for path in ALL_MODULES),
-    reason="goal and loss-hedge implementation is deferred pending ADR approval",
-)
 
 # Word-bounded at the start so "replace_" or "workplace" never match "place_" (same rule as the CSP test).
 _BROKER_TOOL = re.compile(r"\b(place|preview|review|cancel|submit)_\w*order\w*|\b(place|preview|review|cancel)_\w*",

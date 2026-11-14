@@ -24,10 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-hedge_shadow = pytest.importorskip(
-    "market_data_ingest.ledger.hedge_shadow",
-    reason="loss-hedge shadow implementation is deferred pending ADR approval",
-)
+from market_data_ingest.ledger import hedge_shadow
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 ET = ZoneInfo("America/New_York")
@@ -82,8 +79,8 @@ def test_8_a_nanosecond_stamp_rounds_up_never_down():
     # The stamp is 21:14:59.920988052Z. Python datetimes stop at microseconds, so the parser must
     # round UP to .920989: truncating to .920988 would let a .920988 decision see a quote that
     # was published 52 ns later -- a tiny lookahead, but a lookahead. Inclusive at .920989.
-    truncated = datetime(2026, 11, 2, 21, 14, 59, 920988, tzinfo=timezone.utc)
-    rounded_up = datetime(2026, 11, 2, 21, 14, 59, 920989, tzinfo=timezone.utc)
+    truncated = datetime(2026, 11, 2, 21, 14, 59, 920_988, tzinfo=timezone.utc)
+    rounded_up = datetime(2026, 11, 2, 21, 14, 59, 920_989, tzinfo=timezone.utc)
     assert hedge_shadow.option_quote_at(OPTIONS["option_quotes"], QQQ_640_PUT, truncated) is None
     assert hedge_shadow.option_quote_at(OPTIONS["option_quotes"], QQQ_640_PUT, rounded_up) is not None
 

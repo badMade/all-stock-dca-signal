@@ -170,5 +170,9 @@
   "scripts.workspace_probe": "Tests whether the cloud workspace keeps its files between runs.",
   "sizing_adjustment_reader": "Reads the optional sizing-adjustment files from the forecasting tools and combines them into one answer for the strategy.",
   "snap": "A scratch file holding a few sample price lists. Not part of normal operation.",
-  "dca_console_rank": "Feeds the Composite rank page: reads the daily composite-rank job's output (the ranked S&P 500 list, who entered or left the above-80 list, and how ranks move) and only displays it."
+  "dca_console_rank": "Feeds the Composite rank page: reads the daily composite-rank job's output (the ranked S&P 500 list, who entered or left the above-80 list, and how ranks move) and only displays it.",
+  "dca_goals": "Holds the operator's goals, like the yearly growth target and the loss hedge. It checks them, falls back to no goal if anything is wrong, and keeps hedge trading switched off.",
+  "dca_console_goals": "Feeds the Goals panel on the Config page. It checks a proposed goal change and saves it as a proposal file; it never edits the settings files.",
+  "scripts.propose_goal_pr": "Turns the newest saved goal proposal into a draft pull request against the goals settings file, so a goal only changes when the operator merges it.",
+  "scripts.backup_state_root": "Backs up the live run-state folder, checks every file in the archive against a manifest, and can test a restore. It never changes the source folder."
 }

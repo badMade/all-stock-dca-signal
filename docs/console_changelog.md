@@ -5,6 +5,14 @@ Covers `console/` and `dca_console*.py`. Newest first. Every change to a file un
 `ASSET_DIGEST` in `dca_console_release.py` (`tests/test_console_release.py` enforces it).
 Process: `docs/local_console.md#release-process-stable-vs-sandbox`.
 
+## 1.3.0
+
+- Goals panel on the Config page (docs/adr-goals-and-loss-hedge-shadow.md): shows the goals in effect and saves a
+  growth-goal or loss-hedge change as a proposal file under `<output>/goal-proposals/` (`POST /api/goals/propose`,
+  same guard order and 1 KB limit as `/api/jobs`; read side `GET /api/goals`). The new allowlisted job
+  "Open goal-change PR" (`propose-goal`, `scripts/propose_goal_pr.py`) turns the newest proposal into a draft PR
+  against `config/goals.json`. The console still never writes `config/`. Hedge mode is off or shadow only.
+
 ## 1.2.0
 
 - Composite rank page: adds the daily trade list (with how it changed day to day), the review-first ticker proposal,

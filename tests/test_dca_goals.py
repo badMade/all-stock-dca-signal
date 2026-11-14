@@ -24,8 +24,9 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import dca_goals
 import pytest
+
+import dca_goals
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = REPO / "schemas" / "goals.schema.json"
@@ -335,7 +336,7 @@ def _random_hedge_entry(rng: random.Random) -> dict:
 
 def test_7_no_goal_document_can_unlock_execution(tmp_path):
     # Seeded, deterministic property test (stdlib random; no new test dependency).
-    rng = random.Random(20261113)
+    rng = random.Random(2026_11_13)
     for i in range(2000):
         doc = document(growth_entry(), _random_hedge_entry(rng))
         if rng.random() < 0.2:
