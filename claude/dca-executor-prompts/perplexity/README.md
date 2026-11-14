@@ -80,6 +80,18 @@ that bought:
 `sources.live_prompt_placements` plus `sources.plan_first_placements` should equal the number of orders placed. Zero
 for a slot that bought means the recognition chain is broken, and the backup will stand down (fail closed).
 
+## Order history: full seven-day fetch, no baseline reuse (2026-11-14)
+
+The Claude live-mirror prompts reuse a saved week envelope (WEEK BASELINE REUSE, and since 67d9d617 an
+earlier-day envelope via `scripts.find_order_baseline --kind week`) so a missed 9:35 does not force an
+unsaveable full-week fetch (the 2026-11-13 10:30 `output_cap_exceeded` abort). The backups deliberately do
+NOT, yet: step 2 fetches from 00:00 ET seven days back (the kill-switch figure is a trailing seven-day sum a
+Monday-start envelope cannot supply), the planner refuses any envelope not dated today
+(`orders_pages_trading_day_mismatch`), and the saved envelopes exist only on the Mac. A very large week can
+therefore still stop a backup run fail-closed with nothing placed. The operator's chosen follow-up is a hybrid:
+when the Mac is online, look up and merge the baseline and run the planner there; otherwise keep this full
+fetch. `scripts/tests/test_backup_week_history.py` pins the current behavior and must change with that work.
+
 ## Which slots take the safety-gate path
 
 All seven, read from `scripts.backup_planner.GATED_SLOTS` when the prompts are generated. Each prompt asks the planner
