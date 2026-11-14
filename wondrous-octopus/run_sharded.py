@@ -19,9 +19,11 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -117,6 +119,53 @@ def _shards_arg(value: str) -> str | int:
     if n < 1:
         raise argparse.ArgumentTypeError("--shards must be at least 1")
     return n
+
+
+_PROGRESS_RE = re.compile(r"\] (\d+)/(\d+) \(")
+
+
+def parse_shard_progress(log_file: Path, tail_bytes: int = 16384) -> tuple[int, int] | None:
+    """(steps_done, steps_total) from the last replay progress line in a shard log, else None.
+
+    Reads only the file's tail so polling stays cheap on multi-GB logs; None while a shard is still
+    loading data or in its first fit (no step line yet)."""
+    try:
+        with log_file.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - tail_bytes))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    found = _PROGRESS_RE.findall(text)
+    return (int(found[-1][0]), int(found[-1][1])) if found else None
+
+
+def format_status(progress: dict[int, tuple[int, int] | None], elapsed_s: float, baseline: dict[int, int]) -> str:
+    """One aggregate line: overall percent, steps/h since launch and an ETA set by the slowest shard.
+
+    ``baseline`` holds each shard's step count at launch so a resumed run measures only this
+    invocation's speed. The ETA is the slowest shard's remaining steps at its own rate, because the
+    run is only finished when every shard is."""
+    seen = {i: p for i, p in progress.items() if p}
+    if not seen:
+        return f"status: {len(progress)} shards started, no step lines yet (loading / first fit), elapsed {elapsed_s / 60:.0f}m"
+    done = sum(p[0] for p in seen.values())
+    total = sum(p[1] for p in seen.values())
+    worst_eta = 0.0
+    rate_total = 0.0
+    for i, (cur, tot) in seen.items():
+        rate = (cur - baseline.get(i, 0)) / elapsed_s if elapsed_s > 0 else 0.0
+        rate_total += rate
+        if rate > 0:
+            worst_eta = max(worst_eta, (tot - cur) / rate)
+    pct = 100.0 * done / total if total else 0.0
+    line = f"status: {len(seen)}/{len(progress)} shards reporting | {pct:.1f}% ({done}/{total} steps)"
+    if rate_total > 0 and worst_eta > 0:
+        eta_at = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + worst_eta))
+        line += f" | {rate_total * 3600:.0f} steps/h combined | ETA {eta_at} ({worst_eta / 3600:.1f}h left)"
+    else:
+        line += " | rate not measurable yet"
+    return line + f" | elapsed {elapsed_s / 3600:.1f}h"
 
 
 def split_into_shards(tickers: Sequence[str], n_shards: int) -> list[list[str]]:
@@ -395,6 +444,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Run all shards sequentially (default if neither --shard nor --parallel is passed)",
     )
     parser.add_argument(
+        "--status-every",
+        type=float,
+        default=10.0,
+        help="Parallel mode: print one aggregate progress/ETA line to the launcher log every N minutes (0 disables)",
+    )
+    parser.add_argument(
         "--parallel",
         action="store_true",
         help="Run all shards concurrently in background processes",
@@ -666,13 +721,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\nAll active shards launched. Waiting for completion...")
         exit_code = 0
         try:
-            for i, proc, log_file in processes:
-                code = proc.wait()
-                if code == 0:
-                    print(f"  [Shard {i}] Completed successfully.")
-                else:
-                    print(f"  [Shard {i}] Stopped with exit code {code}. Check {log_file}")
-                    exit_code = code
+            pending = list(processes)
+            started = time.monotonic()
+            baseline = {i: (parse_shard_progress(lf) or (0, 0))[0] for i, _, lf in processes}
+            next_status = started + args.status_every * 60
+            while pending:
+                for item in list(pending):
+                    i, proc, log_file = item
+                    code = proc.poll()
+                    if code is None:
+                        continue
+                    pending.remove(item)
+                    if code == 0:
+                        print(f"  [Shard {i}] Completed successfully.")
+                    else:
+                        print(f"  [Shard {i}] Stopped with exit code {code}. Check {log_file}")
+                        exit_code = code
+                if pending and args.status_every > 0 and time.monotonic() >= next_status:
+                    next_status = time.monotonic() + args.status_every * 60
+                    snap = {i: parse_shard_progress(lf) for i, _, lf in processes}
+                    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] " + format_status(snap, time.monotonic() - started, baseline), flush=True)
+                if pending:
+                    time.sleep(2)
         except KeyboardInterrupt:
             print("\nInterrupt received! Terminating parallel shard processes (checkpoints retained)...")
             for _, proc, _ in processes:

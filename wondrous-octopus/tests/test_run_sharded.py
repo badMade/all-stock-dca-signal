@@ -308,3 +308,24 @@ def test_a_dry_run_does_not_write_a_shard_plan(tmp_path: Path):
     out = tmp_path / "out"
     run_sharded.main(["--shard", "1", "--dry-run", "--history-dir", str(snap), "--run-dir-base", str(out)])
     assert not (out / run_sharded.SHARD_PLAN).exists()  # a dry run writes nothing
+
+
+# --- periodic aggregate status (parallel launcher) ---------------------------------------------------------------------
+
+
+def test_parse_shard_progress_reads_the_last_step_line(tmp_path: Path):
+    log = tmp_path / "stdout.log"
+    log.write_text("loading\n[>   ] 10/100 (10%) | x\n[>   ] 11/100 (11%) | y\n", encoding="utf-8")
+    assert run_sharded.parse_shard_progress(log) == (11, 100)
+    assert run_sharded.parse_shard_progress(tmp_path / "missing.log") is None
+    log.write_text("still loading\n", encoding="utf-8")
+    assert run_sharded.parse_shard_progress(log) is None
+
+
+def test_format_status_reports_percent_rate_and_slowest_shard_eta():
+    line = run_sharded.format_status({1: (50, 100), 2: (25, 100)}, 3600.0, {1: 0, 2: 0})
+    assert "37.5%" in line and "75 steps/h" in line and "ETA" in line and "elapsed 1.0h" in line
+
+
+def test_format_status_before_any_step_line_says_so():
+    assert "no step lines yet" in run_sharded.format_status({1: None, 2: None}, 120.0, {})
