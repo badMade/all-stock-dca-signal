@@ -5,7 +5,7 @@
 # turn main red without a deliberate commit here: a new ruff minor can add a rule
 # to the selected E/F/I/B sets, and a new pytest major can change collection
 # behavior. Bump these intentionally (dependabot opens the PR).
-pytest==9.1.1
+pytest==9.2.0
 ruff==0.17.4
 # schemas/*.json are a load-bearing contract (run_state, run_classification,
 # pointers, cost tracker). Every schema test used to guard its import with
