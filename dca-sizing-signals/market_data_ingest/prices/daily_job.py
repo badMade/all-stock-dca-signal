@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .errors import ProviderError, ValidationError
+from .errors import AmbiguousActionsError, ProviderError, ValidationError
 from .models import JobResult
 from .provider import SessionCalendar
 from .store import PriceStore
@@ -114,6 +114,9 @@ def run_daily_job(
             inserted += store.ingest_daily_bars(bars, run_id=run_id, as_of=clock(), staging_dir=staging_dir)
         actions = router.corporate_actions(session - timedelta(days=ACTION_LOOKBACK_DAYS))
         inserted += store.ingest_corporate_actions(actions, run_id=run_id, as_of=clock(), staging_dir=staging_dir)
+    except AmbiguousActionsError as exc:
+        # The unambiguous actions were written; count them in the failed run's record.
+        return finish("failed", 1, exc, inserted + exc.inserted)
     except (ProviderError, ValidationError) as exc:
         return finish("failed", 1, exc, inserted)
     except BaseException as exc:
