@@ -457,4 +457,9 @@ executionEnvironments = [
 # requires-python, and the MIN_PYTHON = (3, 11) runtime guards that mirror it
 # (scripts/assemble_market_data.py, backup_planner.py, local_heartbeat.py,
 # build_backup_planner.py), stay at 3.11, so the stdlib-only core still runs on any 3.11.
-environments = ["python_full_version >= '3.11.5'"]
+# `sys_platform != 'emscripten'` (2026-11-14): httpx2's Pyodide-only httpx2-jsfetch marker forked
+# the lock for emscripten, and torch (the `strategies` extra) ships no emscripten wheels and no
+# sdist, so any re-resolve failed outright ("No solution ... sys_platform == 'emscripten'") and
+# took CI's research audit down with it. None of this code runs under Pyodide.
+# tests/test_uv_lock_sync.py pins both this and the lock matching pyproject's pins.
+environments = ["python_full_version >= '3.11.5' and sys_platform != 'emscripten'"]
