@@ -197,6 +197,44 @@ def test_ci_python_setup_works_on_self_hosted_runners():
     assert dispatch["inputs"]["runner"]["default"] == ""
 
 
+
+def test_registration_job_runs_on_every_pr_including_drafts():
+    """2026-11-14: the fast registration gate must run where the core job does not.
+
+    Draft PRs skip every other ci.yml job (the 2026-10-31 Actions-spend cut), and PRs were merged
+    before the 25-35 minute core job finished, so registration breaks (an unindexed docs page, an
+    account-shaped test literal, an unimportable test file, an unnoted module) reached main four
+    times on 2026-11-13/14. This job is the cheap check that closes that gap, so it must stay
+    unconditional (no draft `if`, no `needs` on the path-filtered `changes` job) and stay small.
+    """
+    root = Path(__file__).resolve().parents[2]
+    ci = REAL_DOCS[".github/workflows/ci.yml"]
+    on = _normalize_on_key(ci)["on"]
+    assert "paths" not in on["pull_request"] and "paths-ignore" not in on["pull_request"]
+    job = ci["jobs"]["registration"]
+    assert job["name"] == "Registration checks"
+    assert "if" not in job, "the registration job must run on draft PRs too"
+    assert "needs" not in job, "the registration job must not wait on (or be filtered by) another job"
+    assert job["timeout-minutes"] <= 10
+    runs = [step.get("run", "") for step in job["steps"]]
+    collect = [r for r in runs if "--collect-only" in r]
+    assert len(collect) == 1 and "pytest" in collect[0]
+    tests = [r for r in runs if "pytest" in r and "--collect-only" not in r]
+    assert len(tests) == 1
+    # The same set scripts/local_ci.sh --registration runs (tests/test_local_ci.py pins that side).
+    script = (root / "scripts" / "local_ci.sh").read_text(encoding="utf-8")
+    match = re.search(r'^REGISTRATION_TESTS="([^"]+)"', script, re.MULTILINE)
+    assert match, "local_ci.sh lost its REGISTRATION_TESTS list"
+    assert match.group(1).split() == [
+        "tests/test_dca_console_docs.py",
+        "tests/test_dca_console_diagnostics.py",
+        "tests/test_config_invariants.py",
+    ]
+    for path in match.group(1).split():
+        assert path in tests[0], f"ci.yml's registration job does not run {path}"
+        assert (root / path).is_file(), path
+
+
 # --- Synthetic fixtures: the violation and exception mechanisms themselves ---
 
 def test_ci_gives_every_main_push_its_own_concurrency_group():

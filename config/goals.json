@@ -1,0 +1,18 @@
+{
+  "$schema": "../schemas/goals.schema.json",
+  "version": 1,
+  "status": "active",
+  "goals": [
+    {"goal_id": "growth-twr-5y", "goal_version": 1, "kind": "aspirational", "metric": "twr_cagr",
+     "horizon_years": 5, "target": 0.20, "benchmark": "SP500_TR",
+     "effective_from": "2026-12-01T00:00:00-05:00"},
+    {"goal_id": "loss-hedge", "goal_version": 1, "kind": "loss_hedge", "mode": "shadow",
+     "max_drawdown": 0.25, "hedge_budget_pct": 0.02,
+     "instruments": [
+       {"instrument": "protective_put", "mode": "shadow", "underlying": "QQQ", "horizon_days": 45},
+       {"instrument": "crypto_allocation", "mode": "shadow", "assets": ["BTC"], "max_alloc_pct": 0.05,
+        "hold_days": 10}
+     ],
+     "effective_from": "2026-12-01T00:00:00-05:00"}
+  ]
+}

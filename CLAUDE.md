@@ -82,9 +82,10 @@ ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals
 ```
 
-**Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`; see
+**Run `scripts/local_ci.sh` before pushing** (`--quick`, `--changed`, `--all`, or `--registration`
+for the ~16-second registration checks the `Registration checks` job runs on every PR, drafts included; see
 `docs/local_ci.md`). It mirrors every CI job locally; since the 2026-10-31 Actions billing block,
-draft PRs skip CI, push CI runs only Python 3.12 and path-filtered siblings, and the 3.11 leg runs
+draft PRs skip every CI job but `Registration checks`, push CI runs only Python 3.12 and path-filtered siblings, and the 3.11 leg runs
 on a weekday schedule. `scripts/local_ci_status.sh <flags>` posts the result to
 the tested commit as a `local-ci` status. Set the `CI_RUNS_ON` repo variable to move CI onto a self-hosted runner.
 

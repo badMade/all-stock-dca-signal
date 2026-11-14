@@ -80,3 +80,22 @@ def test_pr_number_must_be_numeric():
     done = subprocess.run(["bash", str(SCRIPT), "--dry-run", "--pr", "abc"], cwd=ROOT, capture_output=True,
                           text=True, check=False)
     assert done.returncode == 2
+
+
+def test_registration_dry_run_runs_only_the_fast_registration_set():
+    # The same set as ci.yml's "Registration checks" job (scripts/tests/test_workflow_policy.py
+    # pins the two together): collection first, then the three registration test files.
+    out = _dry_run("--registration")
+    assert "--collect-only -q" in out
+    for path in ("tests/test_dca_console_docs.py", "tests/test_dca_console_diagnostics.py",
+                 "tests/test_config_invariants.py"):
+        assert path in out, path
+    assert "ruff check ." not in out and "--cov-fail-under" not in out
+    assert "dry-run demo smoke test" not in out and "==> scripts/tests" not in out
+    assert "Dry run: nothing was executed." in out
+
+
+def test_registration_mode_refuses_options_that_would_widen_it():
+    done = subprocess.run(["bash", str(SCRIPT), "--dry-run", "--registration", "--all"], cwd=ROOT,
+                          capture_output=True, text=True, check=False)
+    assert done.returncode == 2 and "--registration" in done.stderr

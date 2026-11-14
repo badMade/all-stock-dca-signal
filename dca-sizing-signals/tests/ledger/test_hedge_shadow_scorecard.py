@@ -20,10 +20,7 @@ from datetime import date
 
 import pytest
 
-hedge_shadow = pytest.importorskip(
-    "market_data_ingest.ledger.hedge_shadow",
-    reason="loss-hedge shadow implementation is deferred pending ADR approval",
-)
+from market_data_ingest.ledger import hedge_shadow
 
 DAYS = [date(2026, 3, d) for d in (2, 3, 4, 5, 6, 9)]  # six weekdays (synthetic calendar)
 EQUITY = dict(zip(DAYS, [-0.02, -0.01, 0.01, 0.02, -0.03, 0.01], strict=True))

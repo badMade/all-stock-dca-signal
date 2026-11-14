@@ -156,7 +156,10 @@ def test_every_scanned_module_has_a_plain_english_note_and_no_stale_ones():
     notes = _plain_notes(repo)
     scanned = {m["id"]: m for m in build_architecture(repo)["modules"]}
     assert (repo / PLAIN_NOTES_FILE).is_file()
-    assert sorted(set(scanned) - set(notes)) == [], "add a plain-English note to docs/architecture_plain_english.json"
+    assert sorted(set(scanned) - set(notes)) == [], (
+        "add a plain-English note to docs/architecture_plain_english.json (and, for a module in the "
+        "'other' layer, an entry in dca_console_diagnostics.OTHER_GROUPS)"
+    )
     assert sorted(set(notes) - set(scanned)) == [], "remove notes for modules that are no longer scanned"
     assert all(len(note.split()) >= 6 for note in notes.values())
     assert scanned["dca_fileio"]["plain"] == notes["dca_fileio"]
@@ -190,7 +193,10 @@ def test_other_layer_is_split_into_subcategories_and_nothing_is_left_unsorted():
     other = [m for m in data["modules"] if m["layer"] == "other"]
     assert other and all(m["group"] for m in other)
     assert all(m["group"] == "" for m in data["modules"] if m["layer"] != "other")
-    assert [m["id"] for m in other if m["group"] == UNSORTED_GROUP[0]] == [], "give new modules a home in OTHER_GROUPS"
+    assert [m["id"] for m in other if m["group"] == UNSORTED_GROUP[0]] == [], (
+        "give new modules a home in dca_console_diagnostics.OTHER_GROUPS (and a plain-English note in "
+        "docs/architecture_plain_english.json)"
+    )
     assert [g["id"] for g in data["groups"]] == [gid for gid, _, _ in OTHER_GROUPS]
     members = [name for _, _, names in OTHER_GROUPS for name in names]
     assert len(members) == len(set(members)), "a module is listed in two subcategories"

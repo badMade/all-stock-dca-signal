@@ -8,7 +8,7 @@
   "max_tick_seconds": 600,
   "max_wall_clock_seconds": 1800,
   "monthly_actions_minutes": 300,
-  "ci_worst_case_minutes": 150,
+  "ci_worst_case_minutes": 160,
   "max_forward_skew_minutes": 2880,
   "max_cumulative_skew_minutes": 10080,
   "max_archive_kib_per_incident": 1024,

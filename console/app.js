@@ -818,6 +818,8 @@ async function startJob(action) {
   }
 }
 window.startJob = startJob;
+// The Goals panel (pages.js) posts proposals with the same token handling as jobs.
+window.postWithToken = (path, body) => postWithToken(path, body);
 
 async function postWithToken(path, body) {
   if (!state.token) {

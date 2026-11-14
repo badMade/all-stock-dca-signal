@@ -85,10 +85,11 @@ def test_real_repository_catalog_covers_the_docs_corpus_and_every_catalog_ref():
     catalog = allowed_docs(REPO)
     # The registration triangle is closed for the real corpus: every docs/
     # page is linked from the docs index (GUI expansion Phase 5).
-    assert docs_index(REPO, set())["unregistered"] == []
+    unregistered = docs_index(REPO, set())["unregistered"]
+    assert unregistered == [], f"add a row for each of these to the table in docs/README.md: {unregistered}"
     assert {name for name in catalog if name.startswith("docs/")} == {
         f"docs/{path.name}" for path in (REPO / "docs").glob("*.md")
-    }
+    }, "every docs/*.md page needs a row in docs/README.md's table (add the missing page's row there)"
     refs = {row["docs"] for row in module_catalog("python3") if isinstance(row.get("docs"), str)}
     missing = sorted(ref for ref in refs if ref.endswith((".md", ".txt")) and ref not in catalog)
     assert missing == [], f"program directory doc_refs outside the docs catalog: {missing}"

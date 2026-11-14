@@ -1,4 +1,4 @@
-## CapEx Scan Report (2026-11-07)
+## CapEx Scan Report (2026-11-14)
 
 | Ticker | Company | Period End | Tier | Current ($M) | Prior ($M) | Delta ($M) | Delta (%) | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -32,7 +32,7 @@
 | JPM | JPMorgan Chase & Co. | N/A | supplier | $0.0M | N/A | N/A | N/A | NOT_FOUND | Filer reports no capex XBRL tag (e.g. bank or pre-revenue biotech); needs a manual source |
 | LITE | Lumentum Holdings, Inc. | 2026-09-26 | supplier | $229.8M | $166.8M | +$63.0M | +37.8% | PASS | Breached 15.0% QoQ delta (+37.8%), but under $250M supplier addition |
 | LLY | Eli Lilly and Company | 2022-09-30 | supplier | $617.2M | $371.0M | N/A | N/A | STALE | Latest XBRL period 2022-09-30 is stale (> 200 days); not trusted |
-| LUNR | Intuitive Machines, Inc. | 2026-06-30 | supplier | $24.1M | $9.9M | +$14.2M | +143.6% | PASS | Breached 15.0% QoQ delta (+143.6%), but under $250M supplier addition |
+| LUNR | Intuitive Machines, Inc. | 2026-09-30 | supplier | $32.7M | $24.1M | +$8.6M | +35.9% | PASS | Breached 15.0% QoQ delta (+35.9%), but under $250M supplier addition |
 | MA | Mastercard Incorporated | 2026-09-30 | supplier | $222.0M | $291.0M | -$69.0M | -23.7% | PASS | Within normal thresholds |
 | MRVL | Marvell Technology, Inc. | 2026-08-01 | supplier | $126.7M | $155.7M | -$29.0M | -18.6% | PASS | Within normal thresholds |
 | MSFT | Microsoft Corporation | 2026-09-30 | hyperscaler | $39,367.0M | $35,802.0M | +$3,565.0M | +10.0% | PASS | Breached $2,000M hyperscaler addition (+$3,565.0M), but under 15.0% QoQ delta |
@@ -41,14 +41,14 @@
 | NVDA | NVIDIA Corporation | 2026-07-26 | supplier | $2,677.0M | $1,757.0M | +$920.0M | +52.4% | FLAGGED | Breached both gates: +52.4% QoQ delta and $+920.0M supplier addition |
 | QBTS | D-Wave Quantum Inc. | 2026-06-30 | supplier | $4.4M | $1.1M | +$3.4M | +311.1% | PASS | Breached 15.0% QoQ delta (+311.1%), but under $250M supplier addition |
 | QCOM | Qualcomm Incorporated | 2026-09-27 | supplier | $916.0M | $496.0M | +$420.0M | +84.7% | FLAGGED | Breached both gates: +84.7% QoQ delta and $+420.0M supplier addition |
-| QUBT | Quantum Computing Inc. | 2026-06-30 | supplier | $2.7M | $1.8M | +$0.8M | +46.7% | PASS | Breached 15.0% QoQ delta (+46.7%), but under $250M supplier addition |
-| RGTI | Rigetti Computing, Inc. | 2026-06-30 | supplier | $12.0M | $4.4M | +$7.6M | +171.9% | PASS | Breached 15.0% QoQ delta (+171.9%), but under $250M supplier addition |
-| RKLB | Rocket Lab USA, Inc. | 2026-06-30 | supplier | $26.1M | $27.1M | -$1.0M | -3.8% | PASS | Within normal thresholds |
+| QUBT | Quantum Computing Inc. | 2026-09-30 | supplier | $9.4M | $2.7M | +$6.8M | +253.2% | PASS | Breached 15.0% QoQ delta (+253.2%), but under $250M supplier addition |
+| RGTI | Rigetti Computing, Inc. | 2026-09-30 | supplier | $26.2M | $12.0M | +$14.2M | +118.4% | PASS | Breached 15.0% QoQ delta (+118.4%), but under $250M supplier addition |
+| RKLB | Rocket Lab USA, Inc. | 2026-09-30 | supplier | $31.1M | $26.1M | +$5.0M | +19.3% | PASS | Breached 15.0% QoQ delta (+19.3%), but under $250M supplier addition |
 | SNDK | Sandisk Corporation | 2026-10-02 | supplier | $54.0M | $43.0M | +$11.0M | +25.6% | PASS | Breached 15.0% QoQ delta (+25.6%), but under $250M supplier addition |
 | SPCX | Space Exploration Technologies Corp. | N/A | supplier | N/A | N/A | N/A | N/A | NOT_SCANNABLE | Private equity holding |
 | STM | STMicroelectronics N.V. | N/A | supplier | N/A | N/A | N/A | N/A | NOT_SCANNABLE | Form 20-F annual filer (EUR reporting) |
 | STX | Seagate Technology Holdings plc | 2026-10-02 | supplier | $211.0M | $187.0M | +$24.0M | +12.8% | PASS | Within normal thresholds |
-| TEL | TE Connectivity plc | 2026-06-26 | supplier | $304.0M | $270.0M | +$34.0M | +12.6% | PASS | Within normal thresholds |
+| TEL | TE Connectivity plc | 2026-09-25 | supplier | $290.0M | $304.0M | -$14.0M | -4.6% | PASS | Within normal thresholds |
 | TRLV | Trulieve Cannabis Corp. | 2025-12-31 | supplier | $44.2M | $44.2M | N/A | N/A | NOT_FOUND | Latest reported period could not be converted to a standalone quarter |
 | TSLA | Tesla, Inc. | 2026-09-30 | hyperscaler | $4,732.0M | $5,789.0M | -$1,057.0M | -18.3% | PASS | Within normal thresholds |
 | TSM | Taiwan Semiconductor Manufacturing Co. | 2025-12-31 | hyperscaler | N/A | N/A | N/A | N/A | NOT_SCANNABLE | Form 20-F annual filer (NT$ reporting) |

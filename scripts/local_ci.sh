@@ -7,6 +7,8 @@
 #
 #   core (default)      Lint & test (core DCA): ruff -> coverage-gated pytest -> dry-run demo,
 #                       plus scripts/tests (no CI job of its own runs that suite; CLAUDE.md lists it)
+#   --registration      Registration checks: pytest --collect-only, then the three registration
+#                       test files. ONLY that, in well under a minute; the one job drafts also run
 #   --audit             Dependency & secret audit: pip-audit on the pinned dev tooling
 #   --research-audit    Dependency audit (research): uv export of uv.lock + every research
 #                       manifest resolved without building, then pip-audit --locked
@@ -17,6 +19,7 @@
 # Usage:
 #   scripts/local_ci.sh                       # core checks
 #   scripts/local_ci.sh --quick               # skip the full coverage run; lint + demo + scripts/tests
+#   scripts/local_ci.sh --registration        # only the fast registration checks (alone; no other option)
 #   scripts/local_ci.sh ticker-advisor ...    # also lint+test the named sibling projects
 #   scripts/local_ci.sh --changed             # also the siblings CI would run for this branch vs origin/main
 #   scripts/local_ci.sh --changed=REF         # ...diffed against REF instead
@@ -54,6 +57,9 @@ fi
 
 # Every sibling job in ci.yml, in its order there. tests/test_local_ci.py fails if this list
 # and ci.yml's `changes` job drift apart, so a new sibling job cannot silently go unrun here.
+# ci.yml's "Registration checks" job runs exactly these after `pytest --collect-only`.
+# scripts/tests/test_workflow_policy.py fails if the two lists drift apart.
+REGISTRATION_TESTS="tests/test_dca_console_docs.py tests/test_dca_console_diagnostics.py tests/test_config_invariants.py"
 SIBLINGS="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch dca-sizing-signals"
 # Sibling venvs live OUTSIDE the checkout: pytest's testpaths is "." (it would collect every
 # test_*.py in their site-packages), ruff would lint them, and Google Drive mirrors ~/Documents,
@@ -61,6 +67,8 @@ SIBLINGS="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octop
 VENVS="${DCA_LOCAL_CI_VENVS:-$HOME/.cache/all-stock-dca/ci-venvs}"
 
 quick=0
+registration=0
+widened=""
 audit=0
 py311=0
 research_audit=0
@@ -73,17 +81,19 @@ expect_pr=0
 for arg in "$@"; do
   if [ "$expect_pr" -eq 1 ]; then pr="$arg"; expect_pr=0; continue; fi
   case "$arg" in
-    --quick) quick=1 ;;
-    --audit) audit=1 ;;
-    --py311) py311=1 ;;
-    --research-audit) research_audit=1 ;;
+    --quick) quick=1; widened="$arg" ;;
+    --registration) registration=1 ;;
+    --audit) audit=1; widened="$arg" ;;
+    --py311) py311=1; widened="$arg" ;;
+    --research-audit) research_audit=1; widened="$arg" ;;
     --keep-going) keep_going=1 ;;
     --dry-run) dry_run=1 ;;
-    --changed) changed_ref="origin/main" ;;
-    --changed=*) changed_ref="${arg#--changed=}" ;;
+    --changed) changed_ref="origin/main"; widened="$arg" ;;
+    --changed=*) changed_ref="${arg#--changed=}"; widened="$arg" ;;
     --pr) expect_pr=1 ;;
     --pr=*) pr="${arg#--pr=}" ;;
     --all)
+      widened="$arg"
       audit=1
       py311=1
       research_audit=1
@@ -91,17 +101,23 @@ for arg in "$@"; do
       # shellcheck disable=SC2206
       siblings+=($SIBLINGS)
       ;;
-    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "local_ci: unknown option $arg" >&2; exit 2 ;;
     *)
       case " $SIBLINGS " in
-        *" $arg "*) siblings+=("$arg") ;;
+        *" $arg "*) siblings+=("$arg"); widened="$arg" ;;
         *) echo "local_ci: $arg is not a CI sibling project ($SIBLINGS)" >&2; exit 2 ;;
       esac
       ;;
   esac
 done
 [ "$expect_pr" -eq 0 ] || { echo "local_ci: --pr needs a PR number" >&2; exit 2; }
+# --registration is the fast gate on its own; mixing it with a mode that adds checks would make
+# "registration passed" mean something else. (--keep-going, --dry-run and --pr still combine.)
+if [ "$registration" -eq 1 ] && [ -n "$widened" ]; then
+  echo "local_ci: --registration runs alone; drop $widened (or drop --registration for the full run)" >&2
+  exit 2
+fi
 if [ -n "$pr" ] && ! [[ "$pr" =~ ^[0-9]+$ ]]; then echo "local_ci: --pr must be a number" >&2; exit 2; fi
 
 # --changed: the same rule as ci.yml's `changes` job -- a sibling runs when a file under it
@@ -265,6 +281,16 @@ research_audit_step() {
   rm -rf "$audit_dir"
   return $status
 }
+
+# ci.yml's "Registration checks" job: the fast gate drafts also run, and nothing else.
+if [ "$registration" -eq 1 ]; then
+  run_step "pytest --collect-only (an unimportable test file stops the whole suite)" \
+    "$PY" -m pytest --collect-only -q
+  # word-splitting REGISTRATION_TESTS is the point here
+  # shellcheck disable=SC2086
+  run_step "registration tests: $REGISTRATION_TESTS" "$PY" -m pytest $REGISTRATION_TESTS
+  finish
+fi
 
 run_step "ruff check ." "$PY" -m ruff check .
 

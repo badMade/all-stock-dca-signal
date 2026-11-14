@@ -33,6 +33,7 @@ so both can report on the same commit without overwriting each other.
 ```bash
 scripts/local_ci.sh              # ruff, coverage-gated pytest, scripts/tests, dry-run demo
 scripts/local_ci.sh --quick      # same minus the full coverage run (~1 min)
+scripts/local_ci.sh --registration  # only the fast registration checks (~16 s warm); runs alone
 scripts/local_ci.sh --changed    # + sibling projects changed vs origin/main (ci.yml's rule)
 scripts/local_ci.sh --all        # everything the scheduled CI run does
 ```
@@ -40,6 +41,7 @@ scripts/local_ci.sh --all        # everything the scheduled CI run does
 | CI job | Local equivalent |
 | --- | --- |
 | Lint & test (core DCA) (3.12) | default run (ruff, `pytest --cov=. --cov-fail-under=90`, demo) |
+| Registration checks | `--registration` (`pytest --collect-only -q`, then the three registration test files; see below) |
 | Lint & test (core DCA) (3.11) | `--py311` (uv-managed env, Python 3.11) |
 | Dependency & secret audit | `--audit` (`pip-audit --requirement requirements-dev.txt --strict`) |
 | Dependency audit (research) ×2 | `--research-audit` (the same `uv export` / `uv pip compile` / `pip-audit --locked` sequence; CI runs it for 3.11 and 3.12, locally for your interpreter. Both resolve manifests for the interpreter's exact patch version, since a bare `3.11` reads as 3.11.0) |
@@ -49,6 +51,27 @@ scripts/local_ci.sh --all        # everything the scheduled CI run does
 The core interpreter is `$PYTHON`, else `./.venv`, else the main checkout's `.venv` (worktrees
 under `.claude/worktrees/` have none of their own). `--py311`, `--audit` and the siblings need
 `uv` and network on first use. The main difference from CI is the OS: macOS rather than Ubuntu.
+
+### Registration checks (`--registration`)
+
+Added 2026-11-14. A few small tests guard repo-wide registration invariants, and until then they
+ran only inside the 25-35 minute core job, which drafts skip and which PRs were merged before it
+finished. On 2026-11-13 and 2026-11-14 that let four kinds of break reach `main`, each turning every
+PR's core CI red until a follow-up fix landed. The `Registration checks` job in `ci.yml` runs them
+on every PR, **drafts included**, with no path filter, and `--registration` runs the same set:
+
+| Step | Catches | Fix the failure message names |
+| --- | --- | --- |
+| `pytest --collect-only -q` | a test file that cannot import its module (one collection error stops the whole core suite) | gate a test-first file with `pytest.importorskip("<module>")` (the `HINT:` line comes from `conftest.py`) |
+| `tests/test_dca_console_docs.py` | a `docs/*.md` page with no row in `docs/README.md` | add the page's row to `docs/README.md` |
+| `tests/test_dca_console_diagnostics.py` | a new module with no plain-English note or subcategory | add it to `docs/architecture_plain_english.json` and, for an `other`-layer module, `dca_console_diagnostics.OTHER_GROUPS` |
+| `tests/test_config_invariants.py` | a 6-to-12-digit literal that looks like an account number | use `conftest.FIXTURE_ACCOUNT_NUMBER` in tests, or 5 digits or fewer; the guard takes no exceptions |
+
+`--registration` runs alone: combined with `--quick`, `--all`, `--changed`, an audit or a sibling
+it exits 2, so a pass always means exactly this set (`--keep-going`, `--dry-run` and `--pr` still
+combine). `scripts/tests/test_workflow_policy.py` keeps the job unconditional and its file list
+identical to `REGISTRATION_TESTS` in the script. Its 10-minute timeout is counted in
+`config/self_heal.json`'s `ci_worst_case_minutes` (150 to 160).
 
 ### Reporting the result to GitHub
 
