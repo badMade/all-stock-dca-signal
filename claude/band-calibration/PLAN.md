@@ -73,9 +73,12 @@ existing MAE skill.
 
 **Non-goals.** No Model Confidence Set (deferred).
 
-**Proof.** Tests on a seeded synthetic ledger with a known breach rate recover it inside the
-interval at the stated rate, and a ledger with clustered breaches gets a wider interval than
-an independent one. Existing suite passes.
+**Proof.** `cd wondrous-octopus && python -m pytest tests/test_band_uncertainty.py -q`, then
+the full suite. A seeded series with a known 80% rate is recovered inside the interval, and
+the same daily values arranged in runs get a wider interval than when interleaved.
+
+**Status.** Implemented as `band_uncertainty.py` on the PR stacked on #2300. Functions only;
+wiring into reports is Rock 3.
 
 ### Rock 3: Trust scorecard over time
 
