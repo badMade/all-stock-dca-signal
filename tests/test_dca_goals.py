@@ -1,6 +1,6 @@
 """Tests written FIRST for the goals layer (docs/adr-goals-and-loss-hedge-shadow.md).
 
-Every test here fails until ``dca_goals.py``, ``schemas/goals.schema.json`` and the console
+Every test here is skipped until ``dca_goals.py``, ``schemas/goals.schema.json`` and the console
 Goals page land. They pin the behaviour the operator approved, not an implementation:
 
 * Test 1 (unit half): a goal proposal from the console is validated before anything is written.
@@ -24,8 +24,14 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import dca_goals
 import pytest
+
+# Gated like the hedge-shadow tests (1a561bf): until dca_goals.py lands, this file skips
+# instead of failing collection, which would stop the whole core pytest run.
+dca_goals = pytest.importorskip(
+    "dca_goals",
+    reason="goals implementation is deferred pending ADR approval",
+)
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = REPO / "schemas" / "goals.schema.json"
@@ -335,7 +341,7 @@ def _random_hedge_entry(rng: random.Random) -> dict:
 
 def test_7_no_goal_document_can_unlock_execution(tmp_path):
     # Seeded, deterministic property test (stdlib random; no new test dependency).
-    rng = random.Random(20261113)
+    rng = random.Random(20_261_113)
     for i in range(2000):
         doc = document(growth_entry(), _random_hedge_entry(rng))
         if rng.random() < 0.2:
