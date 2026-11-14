@@ -943,7 +943,9 @@ class LedgerStore:
             [known, known],
         )
 
-    def goal_version_on(self, day: date, *, kind: str = "aspirational", known_at: datetime | None = None) -> dict[str, Any] | None:
+    def goal_version_on(
+        self, day: date, *, kind: str = "aspirational", known_at: datetime | None = None
+    ) -> dict[str, Any] | None:
         """The version of ``kind`` in effect on ``day`` (ET calendar day), as known at ``known_at``.
         Latest ``effective_from`` wins; None when nothing has taken effect yet."""
         from zoneinfo import ZoneInfo
