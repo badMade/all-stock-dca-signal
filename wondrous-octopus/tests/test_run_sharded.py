@@ -310,7 +310,7 @@ def test_a_dry_run_does_not_write_a_shard_plan(tmp_path: Path):
     assert not (out / run_sharded.SHARD_PLAN).exists()  # a dry run writes nothing
 
 
-# --- periodic aggregate status (parallel launcher) ---------------------------------------------------------------------
+# --- periodic aggregate status (parallel launcher) -------------------------------------------------------------------
 
 
 def test_parse_shard_progress_reads_the_last_step_line(tmp_path: Path):
@@ -332,7 +332,8 @@ def test_format_status_before_any_step_line_says_so():
 
 
 def test_eval_horizons_is_forwarded_only_when_given(tmp_path: Path):
-    given, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s1", _fresh_args(max_horizon=90, eval_horizons="2,3,90"))
+    args = _fresh_args(max_horizon=90, eval_horizons="2,3,90")
+    given, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s1", args)
     assert given[given.index("--eval-horizons") + 1] == "2,3,90"
     omitted, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s2", _fresh_args(max_horizon=90))
     assert "--eval-horizons" not in omitted

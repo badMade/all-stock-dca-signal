@@ -148,7 +148,10 @@ def format_status(progress: dict[int, tuple[int, int] | None], elapsed_s: float,
     run is only finished when every shard is."""
     seen = {i: p for i, p in progress.items() if p}
     if not seen:
-        return f"status: {len(progress)} shards started, no step lines yet (loading / first fit), elapsed {elapsed_s / 60:.0f}m"
+        return (
+            f"status: {len(progress)} shards started, no step lines yet (loading / first fit), "
+            f"elapsed {elapsed_s / 60:.0f}m"
+        )
     done = sum(p[0] for p in seen.values())
     total = sum(p[1] for p in seen.values())
     worst_eta = 0.0
@@ -749,7 +752,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pending and args.status_every > 0 and time.monotonic() >= next_status:
                     next_status = time.monotonic() + args.status_every * 60
                     snap = {i: parse_shard_progress(lf) for i, _, lf in processes}
-                    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] " + format_status(snap, time.monotonic() - started, baseline), flush=True)
+                    stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    print(f"[{stamp}] " + format_status(snap, time.monotonic() - started, baseline), flush=True)
                 if pending:
                     time.sleep(2)
         except KeyboardInterrupt:
