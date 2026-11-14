@@ -39,6 +39,7 @@ from dca_runner import BrokerOrder
 
 ET = ZoneInfo("America/New_York")
 _ACCOUNT_SHAPE = re.compile(r"[0-9]+")
+_HHMM_SHAPE = re.compile(r"[0-9]{2}:[0-9]{2}")
 
 
 def _verdict(status: str, gate: Optional[int], reason: str, now_et: datetime) -> dict:
@@ -152,7 +153,13 @@ def _exit_code(document: dict) -> int:
 
 
 def _hhmm(text: str) -> time:
-    """argparse type: a strict 24-hour HH:MM; anything else is a usage error (exit 2)."""
+    """argparse type: a strict 24-hour HH:MM; anything else is a usage error (exit 2).
+
+    strptime alone accepts single-digit fields, so ``15:5`` would parse as 15:05 -- before the 3:30 window,
+    aborting every start -- instead of failing as a typo (PR #2290 review). The shape is checked first.
+    """
+    if not _HHMM_SHAPE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not HH:MM (24-hour)")
     try:
         return datetime.strptime(text, "%H:%M").time()
     except ValueError as exc:

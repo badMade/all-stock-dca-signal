@@ -314,7 +314,8 @@ def test_cli_latest_start_flag_tightens_the_window():
     assert late.returncode == 1 and json.loads(late.stdout)["status"] == "ABORT"
 
 
-@pytest.mark.parametrize("bad", ["3:55pm", "25:00", "15:61", "", "15"])
+# "15:5" and "9:55": strptime alone accepts single-digit fields (PR #2290 review), so "15:5" read as 15:05.
+@pytest.mark.parametrize("bad", ["3:55pm", "25:00", "15:61", "", "15", "15:5", "9:55", " 15:55", "15:55 "])
 def test_cli_rejects_a_malformed_latest_start_with_exit_2(bad):
     done = _run("clock", "--slot", "1530", "--now", f"{MONDAY}T15:30:00-04:00", "--latest-start", bad)
     assert done.returncode == 2 and "PROCEED" not in done.stdout

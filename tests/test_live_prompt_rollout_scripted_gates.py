@@ -148,3 +148,47 @@ def test_per_order_revalidation_and_incremental_history_are_unchanged(slot):
     assert "REVALIDATE BEFORE EVERY ORDER, not once per batch" in text
     assert "PER-ORDER INCREMENTAL HISTORY" in text
     assert "BATCHED TRADABILITY" in text
+
+
+# ---- PR #2290 review: the per-order turn plan ------------------------------------------------------------------
+# Every prompt carrying the rule, 11:30 (#2267) included, since they share one paragraph.
+
+WITH_PARALLEL = ALL_ROLLED + ("1130",)
+
+
+def _paragraph(slot: str) -> str:
+    text = _text(slot)
+    start = text.index(PARALLEL)
+    return text[start : text.index("\n", start)]
+
+
+@pytest.mark.parametrize("slot", WITH_PARALLEL)
+def test_the_read_turn_includes_the_buying_power_refresh(slot):
+    rule = _paragraph(slot)
+    assert "(4) the account's current buying power" in rule
+
+
+@pytest.mark.parametrize("slot", WITH_PARALLEL)
+def test_the_second_turn_ends_with_the_final_clock_recheck_that_dates_the_order(slot):
+    rule = _paragraph(slot)
+    final = rule.index("FINAL clock recheck")
+    assert rule.index("in a second turn") < final < rule.index("call `place_equity_order` in a turn of its own")
+    # The opening check no longer stands in for the order's clock_checked_at; the final recheck does.
+    assert rule.count("clock_checked_at") == 1 and final < rule.index("clock_checked_at")
+    assert "OPENING check" in rule
+
+
+@pytest.mark.parametrize("slot", FULL + CLOCK_ONLY + ("1130",))
+def test_the_final_recheck_runs_the_slot_clock_command(slot):
+    rule = _paragraph(slot)
+    tail = rule[rule.index("FINAL clock recheck") :]
+    assert f"scripts.primary_gates clock --slot {slot} --now" in tail
+
+
+def test_3_30_per_order_checks_do_not_apply_the_start_only_latest_start():
+    """--latest-start 15:55 closes the START; the old per-order recheck used SLOTS['1530'] to 4:00 PM."""
+    assert "--latest-start" not in _paragraph("1530")
+    text = _text("1530")
+    scripted = text[text.index("SCRIPTED GATES 0, 1 AND 3") :]
+    assert "clock --slot 1530 --latest-start 15:55" in scripted[: scripted.index("\n")]
+
