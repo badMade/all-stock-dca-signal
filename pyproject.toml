@@ -109,6 +109,9 @@ py-modules = [
     # present for packaged entry points to import outside a source checkout.
     "dca_net_utils",
     "dca_config",
+    # Operator goals + shadow-only loss hedge (docs/adr-goals-and-loss-hedge-shadow.md); read by
+    # the console Goals page and suggester scoring, so it must ship with the wheel.
+    "dca_goals",
     "dca_fileio",
     # Provenance sidecars (SHA-256, source, fetch time) for fetched market-data
     # files; imported by ticker-market-breadth, yfinance-prefetch and ml-forecaster,
@@ -261,6 +264,8 @@ scripts = ["*.sh"]
     # to defaults (both modes fully off) for a checkout that intended them active.
     "config/inverse_martingale.json",
     "config/ml_sizing_adjustment.json",
+    # Read by dca_goals.load_goals; missing means neutral goals (no target, hedge off).
+    "config/goals.json",
     # Read by dca_config.load_near_close_overrides for the afternoon task; a
     # missing file yields {} silently, so an installed wheel ignored every
     # override a checkout honoured. tests/test_config_invariants.py now derives

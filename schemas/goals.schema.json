@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "goals.schema.json",
+  "title": "Operator goals and the shadow-only loss hedge",
+  "description": "docs/adr-goals-and-loss-hedge-shadow.md. Goals are evaluation inputs; none of these fields reaches a live dollar amount. Hedge mode is off or shadow only: there is deliberately no value that turns hedge execution on, and no field that names a hard limit (spend caps, position caps, kill switch, ladder ceiling). dca_goals.py re-checks every rule below at load time and fails closed to neutral goals.",
+  "type": "object",
+  "required": ["version", "status", "goals"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "type": "integer", "minimum": 0 },
+    "status": { "type": "string", "enum": ["active", "inactive"] },
+    "goals": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/definitions/growth_goal" },
+          { "$ref": "#/definitions/loss_hedge_goal" }
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "finite": {
+      "description": "Rejects NaN: every JSON Schema bound comparison against NaN is false, so NaN passes minimum/maximum on its own. This inner schema matches NaN only (no real number is both >= 1e308 and <= -1e308), and 'not' turns that into a rejection.",
+      "not": { "minimum": 1e308, "maximum": -1e308 }
+    },
+    "goal_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "goal_version": { "type": "integer", "minimum": 1 },
+    "effective_from": {
+      "type": "string",
+      "description": "Timezone-aware ISO 8601 date-time. A naive value is rejected so a goal never changes at an ambiguous instant.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2}(\\.\\d{1,9})?)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "growth_goal": {
+      "type": "object",
+      "required": ["goal_id", "goal_version", "kind", "metric", "horizon_years", "target", "effective_from"],
+      "additionalProperties": false,
+      "properties": {
+        "goal_id": { "$ref": "#/definitions/goal_id" },
+        "goal_version": { "$ref": "#/definitions/goal_version" },
+        "kind": { "const": "aspirational" },
+        "metric": { "type": "string", "enum": ["twr_cagr", "mwr_irr"] },
+        "horizon_years": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "target": { "allOf": [{ "$ref": "#/definitions/finite" }, { "type": "number", "exclusiveMinimum": 0, "maximum": 0.5 }] },
+        "benchmark": { "type": "string", "pattern": "^[A-Z0-9_]{1,32}$" },
+        "effective_from": { "$ref": "#/definitions/effective_from" }
+      }
+    },
+    "loss_hedge_goal": {
+      "type": "object",
+      "required": ["goal_id", "goal_version", "kind", "mode", "max_drawdown", "hedge_budget_pct", "instruments", "effective_from"],
+      "additionalProperties": false,
+      "properties": {
+        "goal_id": { "$ref": "#/definitions/goal_id" },
+        "goal_version": { "$ref": "#/definitions/goal_version" },
+        "kind": { "const": "loss_hedge" },
+        "mode": { "type": "string", "enum": ["off", "shadow"] },
+        "max_drawdown": { "allOf": [{ "$ref": "#/definitions/finite" }, { "type": "number", "exclusiveMinimum": 0, "maximum": 0.9 }] },
+        "hedge_budget_pct": { "allOf": [{ "$ref": "#/definitions/finite" }, { "type": "number", "minimum": 0, "maximum": 0.05 }] },
+        "instruments": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/definitions/option_instrument" },
+              { "$ref": "#/definitions/crypto_instrument" }
+            ]
+          }
+        },
+        "effective_from": { "$ref": "#/definitions/effective_from" }
+      }
+    },
+    "option_instrument": {
+      "type": "object",
+      "required": ["instrument", "mode", "underlying", "horizon_days"],
+      "additionalProperties": false,
+      "properties": {
+        "instrument": { "type": "string", "enum": ["protective_put", "collar"] },
+        "mode": { "type": "string", "enum": ["off", "shadow"] },
+        "underlying": { "type": "string", "pattern": "^[A-Z]{1,5}$" },
+        "horizon_days": { "type": "integer", "minimum": 7, "maximum": 365 }
+      }
+    },
+    "crypto_instrument": {
+      "type": "object",
+      "required": ["instrument", "mode", "assets", "max_alloc_pct", "hold_days"],
+      "additionalProperties": false,
+      "properties": {
+        "instrument": { "const": "crypto_allocation" },
+        "mode": { "type": "string", "enum": ["off", "shadow"] },
+        "assets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["BTC", "ETH"] }
+        },
+        "max_alloc_pct": { "allOf": [{ "$ref": "#/definitions/finite" }, { "type": "number", "exclusiveMinimum": 0, "maximum": 0.05 }] },
+        "hold_days": { "type": "integer", "minimum": 1, "maximum": 60 }
+      }
+    }
+  }
+}

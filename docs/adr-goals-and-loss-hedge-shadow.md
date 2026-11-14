@@ -1,8 +1,10 @@
 # ADR: Operator goals, a console goal editor, and a shadow-only loss hedge
 
-- **Status:** Proposed (2026-11-13). Tests first: the tests under "Tests (written first)" are
-  committed ahead of implementation and skip while their required modules are absent. No
-  implementation lands until the operator approves the tests and answers the open questions below.
+- **Status:** Accepted (2026-11-13). The operator approved the 12 tests as written (including
+  test 12's synthetic returns) and accepted every proposed default under "Open questions".
+  Phases 0 and 1, the console Goals panel and the hedge shadow pricing/scorecard functions are
+  implemented; the daily hedge capture task and its DuckDB tables, Phase 2 progress tables and
+  Phase 4 stay open.
 - **Scope:** goals as versioned data, a console page that proposes goal changes as pull
   requests, and a shadow-only loss hedge (options and crypto). **Nothing here changes a live
   dollar amount, places, previews or reviews an order, or edits a file under `config/` at
@@ -125,7 +127,7 @@ sizing suggesters, no broker or network import, append-only ledger rows.
 
 ### D5. Console Goals page proposes changes as pull requests
 
-- New page and reader `dca_console_goals.py`. It shows the active goals, version history, hedge
+- A Goals panel on the console Config page, backed by `dca_console_goals.py` and `GET /api/goals`. It shows the active goals, version history, hedge
   shadow results, and a form whose `mode` picker offers only `off` and `shadow`, under a fixed
   "Hedge execution disabled" banner.
 - New route `POST /api/goals/propose` with the **same guard order** as `/api/jobs` (untrusted
@@ -136,7 +138,8 @@ sizing suggesters, no broker or network import, append-only ledger rows.
 - A new allowlisted job action `propose-goal` (posted as `{"action": "propose-goal"}` to the
   existing `/api/jobs`) takes the newest proposal file and builds the new `config/goals.json` (only the edited
   entry changes, its `goal_version` and the file `version` bump), commits it on branch
-  `goals/v<N>` and opens a PR titled `[AI-Assisted] Goal v<N>`. The operator merges. The next
+  `goals/<goal_id>-v<N>` in a throwaway worktree of `origin/main` and opens a DRAFT PR titled
+  `Goal <goal_id> v<N>` (`scripts/propose_goal_pr.py`). The operator merges. The next
   scheduled slot reads the merged file. No file watcher, no ad hoc run.
 - This is the console's first write path. It is confined to the console output tree and is
   stated as a deliberate amendment of the "never writes state or config" rule: the console

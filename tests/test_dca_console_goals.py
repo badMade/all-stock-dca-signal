@@ -28,13 +28,6 @@ from test_dca_console import AUTH_CREDENTIAL, auth_headers, request
 import dca_console
 from dca_console import AuthFailureLog, ConsoleAccess, ConsoleApp, Settings, make_server
 
-# Gated like tests/test_dca_goals.py (#2287) and the hedge-shadow tests (1a561bf): until
-# dca_console_goals.py lands, this file skips instead of failing 17 tests on main.
-pytest.importorskip(
-    "dca_console_goals",
-    reason="console Goals page is deferred pending ADR approval",
-)
-
 REPO = Path(__file__).resolve().parents[1]
 ROUTE = "/api/goals/propose"
 PROPOSALS = "goal-proposals"

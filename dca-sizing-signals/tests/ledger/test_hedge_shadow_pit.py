@@ -24,10 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-hedge_shadow = pytest.importorskip(
-    "market_data_ingest.ledger.hedge_shadow",
-    reason="loss-hedge shadow implementation is deferred pending ADR approval",
-)
+from market_data_ingest.ledger import hedge_shadow
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 ET = ZoneInfo("America/New_York")

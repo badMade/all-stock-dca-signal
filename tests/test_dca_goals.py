@@ -26,12 +26,7 @@ from pathlib import Path
 
 import pytest
 
-# Gated like the hedge-shadow tests (1a561bf): until dca_goals.py lands, this file skips
-# instead of failing collection, which would stop the whole core pytest run.
-dca_goals = pytest.importorskip(
-    "dca_goals",
-    reason="goals implementation is deferred pending ADR approval",
-)
+import dca_goals
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = REPO / "schemas" / "goals.schema.json"

@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -751,6 +752,19 @@ class ConsoleApp:
              "Run Stage 1 curriculum pre-training smoke run on PyTorch with the neural Octopus model.",
              not neural_reason, neural_reason),
         ]
+        # Goals page: turn the newest saved proposal into a draft PR (scripts/propose_goal_pr.py).
+        # It needs git and gh on PATH and at least one proposal; it never edits this checkout's
+        # config/ (it works in a throwaway worktree of origin/main under the console output).
+        from dca_console_goals import newest_proposal
+
+        goal_reason = " ".join(part for part in (
+            "" if shutil.which("git") else "git is not on PATH.",
+            "" if shutil.which("gh") else "Install and sign in to the GitHub CLI (gh).",
+            "" if newest_proposal(self.settings.output) else "Save a goal proposal on the Goals panel first.",
+        ) if part)
+        definitions.append(("propose-goal", "Open goal-change PR",
+                            "Open a draft pull request that applies the newest goal proposal to config/goals.json.",
+                            not goal_reason, goal_reason))
         # Demo actions always write under output/demo, never into the observed local root.
         from dca_console_launch import launch_actions
 
@@ -886,6 +900,17 @@ class ConsoleApp:
         if action in LAUNCH_SPECS:
             today = self.settings.day or datetime.now(ET).date()
             return run_launch(self, action, job_id, log, repo=REPO, run_command=self._command, today=today)
+        if action == "propose-goal":
+            from dca_console_goals import newest_proposal, proposals_dir
+
+            proposal = newest_proposal(self.settings.output)
+            if proposal is None:
+                log("No goal proposal to apply.\n")
+                return 1
+            return self._command([
+                "scripts/propose_goal_pr.py", "--proposal", str(proposal),
+                "--work-dir", str(proposals_dir(self.settings.output) / ".worktrees"),
+            ], log, timeout=300)
         results = []
         if action in {"demo-all", "demo-dca"}:
             day = self.settings.day if self.settings.mode == "demo" else default_demo_day()
@@ -1256,7 +1281,7 @@ def make_server(
             if not secrets.compare_digest(self.headers.get("X-Console-Token", ""), app.token):
                 self._forbidden("Missing or invalid console token.")
                 return
-            if self.path not in {"/api/jobs", "/api/jobs/cancel"}:
+            if self.path not in {"/api/jobs", "/api/jobs/cancel", "/api/goals/propose"}:
                 self._json(404, {"error": "Not found"})
                 return
             try:
@@ -1273,6 +1298,17 @@ def make_server(
                         result[k] = v
                     return result
                 payload = json.loads(self.rfile.read(length), object_pairs_hook=_reject_duplicate_keys)
+                if self.path == "/api/goals/propose":
+                    # Goals page (docs/adr-goals-and-loss-hedge-shadow.md, D5). Same guard order and
+                    # 1 KB body limit as /api/jobs; the only write is one proposal file under
+                    # <output>/goal-proposals/. config/goals.json changes only through the PR the
+                    # allowlisted propose-goal job opens and the operator merges.
+                    from dca_console_goals import save_proposal
+
+                    name = save_proposal(app.settings.output, app.settings.config_dir, payload,
+                                         now=datetime.now(timezone.utc))
+                    self._json(202, {"proposal": name})
+                    return
                 if self.path == "/api/jobs/cancel":
                     # The cancel body is as closed as the start body: one string
                     # naming the job the page is looking at (GUI expansion Phase 5).

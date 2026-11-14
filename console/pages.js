@@ -780,6 +780,158 @@ window.ConsolePages = (() => {
   }
 
   /* Config. */
+  /* Goals (docs/adr-goals-and-loss-hedge-shadow.md, D5). Saving writes a proposal file only;
+     the allowlisted propose-goal job turns the newest proposal into a draft PR against
+     config/goals.json, which the operator merges. Hedge mode offers only off and shadow:
+     hedge execution is disabled in code and nothing on this panel can enable it. */
+  function goalInput(type, value, attrs = {}) {
+    const element = document.createElement("input");
+    element.type = type;
+    element.value = value === null || value === undefined ? "" : String(value);
+    for (const [key, attr] of Object.entries(attrs)) element.setAttribute(key, attr);
+    return element;
+  }
+
+  function goalSelect(options, value) {
+    const element = document.createElement("select");
+    for (const option of options) {
+      const item = document.createElement("option");
+      item.value = option;
+      item.textContent = option;
+      if (option === value) item.selected = true;
+      element.append(item);
+    }
+    return element;
+  }
+
+  function goalField(label, control) {
+    const wrap = document.createElement("label");
+    wrap.className = "goal-field";
+    wrap.append(text("span", "goal-field-label", label), control);
+    return wrap;
+  }
+
+  function goalStartOfDay(dateValue) {
+    // Midnight on the chosen day in this browser's timezone, sent as an aware UTC instant.
+    return new Date(`${dateValue}T00:00`).toISOString();
+  }
+
+  function goalTomorrow() {
+    const day = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+  }
+
+  function goalPercent(value) {
+    return value === null || value === undefined ? "" : Math.round(value * 10000) / 100;
+  }
+
+  function goalForm(title, fields, build, status, reload) {
+    const form = document.createElement("form");
+    form.className = "goal-form";
+    const button = text("button", "button", "Save proposal");
+    button.type = "submit";
+    form.append(text("h4", "", title), ...fields, button);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      button.disabled = true;
+      status.textContent = "Saving proposal…";
+      try {
+        const saved = await window.postWithToken("/api/goals/propose", { goal: build() });
+        status.textContent = `Saved ${saved.proposal}. Use "Open goal-change PR" to open a draft PR.`;
+        await reload();
+      } catch (error) {
+        status.textContent = `Not saved: ${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    return form;
+  }
+
+  function renderGoals(data, status, reload) {
+    const doc = data.document || { goals: [] };
+    const growth = arr(doc.goals).find((goal) => goal.kind === "aspirational") || {};
+    const hedge = arr(doc.goals).find((goal) => goal.kind === "loss_hedge") || {};
+    const put = arr(hedge.instruments).find((item) => item.instrument === "protective_put") || {};
+    const crypto = arr(hedge.instruments).find((item) => item.instrument === "crypto_allocation") || {};
+    const modes = arr(data.hedge_modes);
+
+    const target = goalInput("number", goalPercent(growth.target ?? 0.2), { min: "0.01", max: "50", step: "0.01" });
+    const horizon = goalInput("number", growth.horizon_years ?? 5, { min: "1", max: "30", step: "1" });
+    const metric = goalSelect(arr(data.growth_metrics), growth.metric || "twr_cagr");
+    const benchmark = goalInput("text", growth.benchmark || "SP500_TR", { pattern: "[A-Z0-9_]{1,32}" });
+    const growthDate = goalInput("date", goalTomorrow());
+    const growthForm = goalForm("Growth goal", [
+      goalField("Target per year (%)", target), goalField("Horizon (years)", horizon),
+      goalField("Metric", metric), goalField("Benchmark", benchmark), goalField("Effective from", growthDate),
+    ], () => ({
+      goal_id: growth.goal_id || "growth-twr-5y", kind: "aspirational", metric: metric.value,
+      horizon_years: Number(horizon.value), target: Number(target.value) / 100, benchmark: benchmark.value,
+      effective_from: goalStartOfDay(growthDate.value),
+    }), status, reload);
+
+    const hedgeMode = goalSelect(modes, hedge.mode || "shadow");
+    const drawdown = goalInput("number", goalPercent(hedge.max_drawdown ?? 0.25), { min: "1", max: "90", step: "0.5" });
+    const budget = goalInput("number", goalPercent(hedge.hedge_budget_pct ?? 0.02), { min: "0", max: "5", step: "0.1" });
+    const putMode = goalSelect(modes, put.mode || "shadow");
+    const putUnderlying = goalInput("text", put.underlying || "QQQ", { pattern: "[A-Z]{1,5}" });
+    const putHorizon = goalInput("number", put.horizon_days ?? 45, { min: "7", max: "365", step: "1" });
+    const cryptoMode = goalSelect(modes, crypto.mode || "shadow");
+    const assetBoxes = arr(data.crypto_assets).map((asset) => {
+      const box = goalInput("checkbox", asset);
+      box.checked = arr(crypto.assets).length ? arr(crypto.assets).includes(asset) : asset === "BTC";
+      return goalField(asset, box);
+    });
+    const cryptoAlloc = goalInput("number", goalPercent(crypto.max_alloc_pct ?? 0.05), { min: "0.1", max: "5", step: "0.1" });
+    const cryptoHold = goalInput("number", crypto.hold_days ?? 10, { min: "1", max: "60", step: "1" });
+    const hedgeDate = goalInput("date", goalTomorrow());
+    const hedgeForm = goalForm("Loss hedge (shadow only)", [
+      text("div", "error-banner", "Hedge execution is disabled. Shadow mode records what a hedge would have done; it never trades."),
+      goalField("Hedge mode", hedgeMode), goalField("Max drawdown (%)", drawdown), goalField("Hedge budget per year (%)", budget),
+      goalField("Protective put mode", putMode), goalField("Put underlying", putUnderlying), goalField("Put horizon (days)", putHorizon),
+      goalField("Crypto mode", cryptoMode), ...assetBoxes, goalField("Crypto max allocation (%)", cryptoAlloc),
+      goalField("Crypto hold (days)", cryptoHold), goalField("Effective from", hedgeDate),
+    ], () => ({
+      goal_id: hedge.goal_id || "loss-hedge", kind: "loss_hedge", mode: hedgeMode.value,
+      max_drawdown: Number(drawdown.value) / 100, hedge_budget_pct: Number(budget.value) / 100,
+      instruments: [
+        { instrument: "protective_put", mode: putMode.value, underlying: putUnderlying.value, horizon_days: Number(putHorizon.value) },
+        { instrument: "crypto_allocation", mode: cryptoMode.value,
+          assets: assetBoxes.map((field) => field.querySelector("input")).filter((box) => box.checked).map((box) => box.value),
+          max_alloc_pct: Number(cryptoAlloc.value) / 100, hold_days: Number(cryptoHold.value) },
+      ],
+      effective_from: goalStartOfDay(hedgeDate.value),
+    }), status, reload);
+
+    const active = data.active || {};
+    const summary = keyValues([
+      ["Growth goal in effect", active.growth ? `${goalPercent(active.growth.target)}% ${active.growth.metric} over ${active.growth.horizon_years}y (v${active.growth.goal_version})` : "none"],
+      ["Loss hedge", `${active.hedge?.mode || "off"} (execution ${data.hedge_execution || "disabled"})`],
+      ["Saved proposals", arr(data.proposals).join(", ") || "none"],
+    ]);
+    const openPr = text("button", "button", "Open goal-change PR");
+    openPr.type = "button";
+    openPr.addEventListener("click", () => window.startJob("propose-goal"));
+    return [warnings(data.warnings), summary, growthForm, hedgeForm, openPr].filter(Boolean);
+  }
+
+  function goalsPanel() {
+    const host = text("div", "goals-host", "Loading goals…");
+    const status = text("div", "subtle", "");
+    const load = async () => {
+      try {
+        const data = await fetchJson("/api/goals", { ttl: 0 });
+        host.replaceChildren(...renderGoals(data, status, load));
+      } catch (error) {
+        host.replaceChildren(text("div", "error-banner", error.message));
+      }
+    };
+    load();
+    return panel(panelTitle("Goals", "Operator goals",
+      "Saving writes a proposal file only. 'Open goal-change PR' turns the newest proposal into a draft PR against config/goals.json; the goal changes when you merge it. Hedge mode is off or shadow only."),
+    [host, status], "proposals become draft PRs");
+  }
+
   const configSection = document.querySelector('section.page[data-page="config"]');
   if (configSection && configSection.querySelector("[data-page-body]")) {
     let lastConfig = "";
@@ -918,7 +1070,7 @@ if (Array.isArray(view.warnings) && view.warnings.length) container.append(warni
         effectiveButton.type = "button";
         effectiveButton.addEventListener("click", async () => { effectiveHost.replaceChildren(text("div", "panel empty-state", "Loading…")); try { const view = await fetchJson("/api/config/effective", { ttl: 60000 }); effectiveHost.replaceChildren(auto(view, "effective")); } catch (error) { effectiveHost.replaceChildren(text("div", "error-banner", error.message)); } });
         const deep = panel("Ladder and effective configuration", [ladderButton, ladderHost, effectiveButton, effectiveHost], "loaded on demand");
-        mount(configSection, warnings(data.warnings), catalog, parity, streams, sizing, gates, windowPanel, deep);
+        mount(configSection, warnings(data.warnings), goalsPanel(), catalog, parity, streams, sizing, gates, windowPanel, deep);
       } catch (error) {
         failure(configSection, error);
       }
