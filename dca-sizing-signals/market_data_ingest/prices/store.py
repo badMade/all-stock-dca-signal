@@ -15,8 +15,12 @@ Write rules (tests/prices/test_store_point_in_time.py):
 * ``corporate_actions`` dedupes by version the same way (PR #2265 follow-up). Its version
   identity is ``ACTION_VERSION_SQL``: (source, vendor_id), or (source, symbol|action_type|ex_date)
   when the vendor sends no id -- the same partition ``actions_known_at`` reads by, so the write
-  and read sides agree on what "the newest version" is. Its key adds as_of and run_id, and
-  ``validate_actions`` refuses two versions of one action in one batch.
+  and read sides agree on what "the newest version" is. Its key adds as_of and run_id. An exact
+  repeat inside one batch is stored once; two different actions with one identity are held back
+  (``split_ambiguous_actions``), the rest of the batch is written, and ``AmbiguousActionsError``
+  then fails the run. ``actions_known_at`` hides an id-less version whenever the same source has
+  an id-bearing version of that symbol/type/ex_date, so a vendor that starts (or stops) sending
+  ids cannot make one split apply twice (PR #2282 review).
   ``yahoo_legacy_bars`` keeps the content_hash key: the Yahoo archive is a one-time import.
 * One batch is validated, staged to ``<staging_dir>/<run_id>/<name>.parquet``, counted, and
   inserted from that Parquet file in a single transaction. A failure anywhere writes nothing.
@@ -52,7 +56,8 @@ from .models import (
     ReconciliationResult,
     action_version_key,
 )
-from .validate import validate_actions, validate_bars
+from .errors import AmbiguousActionsError
+from .validate import split_ambiguous_actions, validate_actions, validate_bars
 
 FAR_FUTURE = datetime(9999, 12, 31)
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
@@ -135,7 +140,12 @@ CREATE OR REPLACE MACRO actions_known_at(known_at) AS TABLE
             PARTITION BY source, {ACTION_VERSION_SQL}
             ORDER BY as_of DESC, ingested_at DESC, content_hash) AS vrn
         FROM corporate_actions WHERE as_of <= known_at),
-    latest AS (SELECT *, {_PRIORITY} AS prio FROM versions WHERE vrn = 1),
+    latest AS (
+        SELECT *, {_PRIORITY} AS prio FROM versions AS v
+        WHERE vrn = 1 AND NOT (v.vendor_id IS NULL AND EXISTS (
+            SELECT 1 FROM versions AS w
+            WHERE w.vendor_id IS NOT NULL AND w.source = v.source AND w.symbol = v.symbol
+                AND w.action_type = v.action_type AND w.ex_date = v.ex_date))),
     ranked AS (
         SELECT *, min(prio) OVER (PARTITION BY symbol, action_type, ex_date) AS best FROM latest)
     SELECT source, vendor_id, action_type, symbol, ex_date, split_from, split_to, cash_amount, as_of
@@ -382,6 +392,20 @@ class PriceStore:
     ) -> int:
         batch = list(actions)
         validate_actions(batch)
+        batch, held = split_ambiguous_actions(batch)
+        inserted = self._insert_actions(batch, run_id=run_id, as_of=as_of, staging_dir=staging_dir)
+        if held:
+            shown = "; ".join(held[:20]) + (f" (+{len(held) - 20} more)" if len(held) > 20 else "")
+            raise AmbiguousActionsError(
+                f"{len(held)} ambiguous corporate action identities held back ({inserted} other rows written): "
+                f"{shown}",
+                inserted=inserted,
+            )
+        return inserted
+
+    def _insert_actions(
+        self, batch: list[CorporateAction], *, run_id: str, as_of: datetime, staging_dir: Path
+    ) -> int:
         if not batch:
             return 0
         stamp, ingested_at = to_utc_naive(as_of), to_utc_naive(self._clock())

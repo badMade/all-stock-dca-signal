@@ -226,3 +226,21 @@ def test_cli_exits_non_zero_without_credentials(tmp_path, capsys):
     assert code != 0
     err = capsys.readouterr().err
     assert "MASSIVE_API_KEY" in err
+
+
+def test_an_ambiguous_action_fails_the_run_but_other_actions_are_stored(store, staging_dir, run_ids):
+    """PR #2282 review: one ambiguous identity must not block every symbol for the 30-day window."""
+    ex = date(2024, 6, 10)
+
+    def split(symbol, split_to):
+        return CorporateAction(
+            source="massive", action_type="forward_split", symbol=symbol, ex_date=ex, split_from=1, split_to=split_to
+        )
+
+    router = FakeRouter(actions=[split("NVDA", 10), split("NVDA", 20), split("AAPL", 4), split("AAPL", 4)])
+
+    result = run(store, staging_dir, router, run_ids)
+
+    assert (result.status, result.exit_code, result.error_class) == ("failed", 1, "AmbiguousActionsError")
+    assert store.con.execute("SELECT symbol FROM corporate_actions").fetchall() == [("AAPL",)]
+    assert store.run_events(result.run_id)[-1]["row_count"] == 12 + 1
