@@ -27,9 +27,8 @@ updates:
     labels:
       - dependencies
 
-  # Workflow actions are currently pinned by tag, which is mutable. These PRs
-  # keep them current; converting the pins to commit SHAs is the stronger
-  # posture and dependabot maintains those too.
+  # Workflow actions are pinned to full commit SHAs (a tag is mutable), each with its
+  # version in a trailing comment. These PRs move the SHA and the comment together.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

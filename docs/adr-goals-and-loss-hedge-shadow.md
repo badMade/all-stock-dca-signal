@@ -1,8 +1,8 @@
 # ADR: Operator goals, a console goal editor, and a shadow-only loss hedge
 
-- **Status:** Proposed (2026-11-13). Tests first: the 12 tests under "Tests (written first)" are
-  committed on this branch and fail by design. No implementation lands until the operator
-  approves the tests and answers the open questions below.
+- **Status:** Proposed (2026-11-13). Tests first: the tests under "Tests (written first)" are
+  committed ahead of implementation and skip while their required modules are absent. No
+  implementation lands until the operator approves the tests and answers the open questions below.
 - **Scope:** goals as versioned data, a console page that proposes goal changes as pull
   requests, and a shadow-only loss hedge (options and crypto). **Nothing here changes a live
   dollar amount, places, previews or reviews an order, or edits a file under `config/` at
