@@ -12,3 +12,5 @@
 | Labeling the 90-day experiment report with the model it ran | Small fix to `scripts/run_90day_prediction_experiment.py`; separate PR |
 | Scheduling the trust scorecard after the daily update | An operator action on the Mac (launchd), or a later `daily_update.py` hook; kept out of Rock 3 so the daily cycle is not touched |
 | Multi-horizon end-to-end check of the trust scorecard on a real run | The demo run is horizon 1 only; needs the full-archive run directory on the operator's Mac |
+| Synthetic-truth replay of the Octopus model itself | Rock 4 replays the GBM quantile model, which is enough to test the harness and scoring. Octopus has its own training path, so its replay is a separate, longer run on the operator's Mac |
+| A subtler planted signal | Lag-1 correlation 0.5 shows the harness has power. How weak a signal it can detect, and at what archive size, is a power study of its own |

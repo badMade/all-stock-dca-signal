@@ -27,6 +27,7 @@ construction.
 
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -300,20 +301,28 @@ class TestVerdict:
 
 
 class TestThroughTheHarness:
-    def test_random_walk_reports_no_skill(self, tmp_path):
-        # The smallest run that still supports an interval. The full-size
-        # three-scenario check is the command line (see PLAN.md, Rock 4);
-        # this keeps the wiring honest in the suite.
-        result = st.run_scenario("random_walk", work_dir=tmp_path, n_tickers=4, n_rows=260, seed=0)
+    def test_random_walk_reports_no_skill_from_the_command_line(self, tmp_path, capsys):
+        # ONE small replay, driven the way an operator drives it, and read
+        # back from the result file: the harness run is by far the slowest
+        # thing in this file, so it is not repeated for a second assertion
+        # style. The full-size three-scenario check is the command line
+        # itself (see PLAN.md, Rock 4); this keeps the wiring honest in the
+        # suite -- archive naming, harness arguments, ledger read, verdict.
+        code = st.main(
+            ["--scenario", "random_walk", "--work-dir", str(tmp_path), "--tickers", "4", "--rows", "260"]
+        )
+        assert code == 0
+        assert "random_walk" in capsys.readouterr().out
+        (result,) = json.loads((tmp_path / "synthetic_truth.json").read_text(encoding="utf-8"))
         assert result["expect"] == "no_skill"
         assert result["n_forecasts"] > 0
         assert result["verdict"] == {"passed": True, "reasons": []}
         assert result["hit_rate"]["low"] <= 0.5
 
-    def test_command_line_writes_a_result_and_exits_zero_when_all_pass(self, tmp_path, capsys):
-        code = st.main(
-            ["--scenario", "random_walk", "--work-dir", str(tmp_path), "--tickers", "4", "--rows", "260"]
-        )
-        assert code == 0
-        assert (tmp_path / "synthetic_truth.json").is_file()
-        assert "random_walk" in capsys.readouterr().out
+    def test_a_harness_that_refuses_is_a_failed_check_not_a_pass(self, tmp_path, monkeypatch):
+        # No evidence must never read as "no skill found".
+        import run_walkforward
+
+        monkeypatch.setattr(run_walkforward, "main", lambda argv: 1)
+        result = st.run_scenario("random_walk", work_dir=tmp_path, n_tickers=2, n_rows=80, seed=0)
+        assert result["verdict"] == {"passed": False, "reasons": ["harness_exit_1"]}

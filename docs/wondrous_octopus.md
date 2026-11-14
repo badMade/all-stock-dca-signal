@@ -395,6 +395,42 @@ horizon. Until that much history exists the status is `unknown`, never `ok`.
 `flagged` is a label on research output. It reaches no order and no sizing; the tool exits 0
 when a band is flagged and 1 only when it refuses to read or write.
 
+### Synthetic-truth recovery (`synthetic_truth.py`)
+
+A check on the measuring instrument, not on the model. It writes small price archives whose
+answer is fixed by construction, replays them through the unmodified harness
+(`run_walkforward.main`), and checks the result.
+
+```bash
+python wondrous-octopus/synthetic_truth.py --scenario all --work-dir /tmp/octopus-truth
+```
+
+| Scenario | Must show | Why |
+|---|---|---|
+| `random_walk` | no skill | Nothing is predictable, so reported skill would be a lookahead leak or a scoring bug |
+| `garch_leverage` | no skill | The size of tomorrow's move is predictable, its direction is not |
+| `planted_drift` | skill | Returns follow yesterday's with lag-1 correlation 0.5; a harness that misses this has no power |
+
+Skill is `1 - sum|predicted - actual| / sum|actual|` on close log-returns, which is skill
+against a no-change forecast. The no-skill check is one-sided: a fitted model on noise comes
+out slightly worse than doing nothing, and that is honest. The command exits 0 only when
+every scenario matches, and writes `synthetic_truth.json` in the work directory. A harness
+run that refuses counts as a failed check.
+
+Measured on 2026-11-14 at the default size (8 tickers, 500 rows, GBM quantile model, seed 0):
+
+| Scenario | Forecasts | Skill (95% interval) | Hit rate | Verdict |
+|---|---|---|---|---|
+| `random_walk` | 3,120 | -2.9% (-4.0% to -1.9%) | 50.0% | pass |
+| `garch_leverage` | 3,120 | -2.7% (-3.8% to -1.6%) | 50.4% | pass |
+| `planted_drift` | 3,120 | +9.3% (+7.5% to +11.3%) | 62.9% | pass |
+
+The planted drift's ceiling for a sign-following forecaster is 66.7%. The run takes about
+six minutes on CPU. One thing it surfaced, outside its pass criteria: calibrated coverage
+was 76.6% to 77.1% in all three runs, with intervals that exclude 80%. On a run this short
+(390 scored dates) the adaptive calibrator has not finished closing the gap. That is input
+to the calibrator work in `claude/band-calibration/PLAN.md`, not a harness fault.
+
 ## Production-safety safeguards
 
 The five production-safe-loop primitives (spec → circuit breaker → ledger → bounded loop →
