@@ -50,6 +50,13 @@ REGIME_WINDOWS: tuple[tuple[str, str, str], ...] = (
 NOMINAL_COVERAGE = 0.8
 
 
+#: Miss penalty of the interval score for the central p10-p90 interval:
+#: 2 / alpha with alpha = 1 - NOMINAL_COVERAGE (Gneiting & Raftery 2007,
+#: JASA 102:359-378, eq. 43). A realized value outside the band costs this
+#: many times its distance from the nearer edge, on top of the band's width.
+INTERVAL_PENALTY = 2.0 / (1.0 - NOMINAL_COVERAGE)
+
+
 def bucket_regime(target_date: str) -> str:
     for name, start, end in REGIME_WINDOWS:
         if start <= target_date <= end:
@@ -60,6 +67,72 @@ def bucket_regime(target_date: str) -> str:
 def _pinball(quantile: float, predicted: float, actual: float) -> float:
     error = actual - predicted
     return max(quantile * error, (quantile - 1.0) * error)
+
+
+def _interval_score(low: float, high: float, actual: float) -> float:
+    """Interval score of the band [low, high]: width plus the miss penalty.
+
+    The one number that prices coverage and width together -- coverage alone
+    rewards a wider band, width alone a narrower one. Bounds are closed, the
+    same convention ``in_band`` uses, so a value exactly on an edge is a hit
+    under both and the breach rates stay consistent with coverage.
+    """
+    score = high - low
+    if actual < low:
+        score += INTERVAL_PENALTY * (low - actual)
+    elif actual > high:
+        score += INTERVAL_PENALTY * (actual - high)
+    return score
+
+
+def _fold_scorecard(sums: dict[str, float], score: Mapping[str, Any], component: str) -> None:
+    """Fold one record's band-scorecard fields into running sums.
+
+    Ledgers written before the scorecard existed carry none of its keys, and
+    a resumed run appends new-format records to such a ledger, so both shapes
+    arrive in one stream. The calibrated interval score is exactly
+    recoverable from what an old record does hold: it equals
+    INTERVAL_PENALTY * (pinball_p10 + pinball_p90), which follows from the
+    two definitions case by case. Breach side and the raw-band score are not
+    recoverable, so they are counted only over records that carry them
+    (``n_scorecard``) rather than diluted by, or guessed for, the rest.
+    """
+    interval = score.get("interval_score")
+    if interval is None:
+        pinball = score["pinball"][component]
+        sums["interval_score"] += INTERVAL_PENALTY * (pinball["p10"] + pinball["p90"])
+        return
+    sums["interval_score"] += interval[component]
+    sums["n_scorecard"] += 1
+    sums["interval_score_raw"] += score["interval_score_raw"][component]
+    sums["below_band"] += 1.0 if score["below_band"][component] else 0.0
+    sums["above_band"] += 1.0 if score["above_band"][component] else 0.0
+
+
+def _scorecard_summary(sums: Mapping[str, float]) -> dict[str, Any]:
+    """Report fields for the band scorecard; None, never 0.0, when unknowable.
+
+    A 0.0 breach rate would read as "this band never missed on that side";
+    for a ledger that predates the fields the honest answer is "not recorded".
+    """
+    n = sums["n"]
+    sided = sums["n_scorecard"]
+    return {
+        "interval_score": sums["interval_score"] / n,
+        "interval_score_raw": (sums["interval_score_raw"] / sided) if sided else None,
+        "below_rate": (sums["below_band"] / sided) if sided else None,
+        "above_rate": (sums["above_band"] / sided) if sided else None,
+    }
+
+
+#: Zeroed scorecard sums, merged into each accumulator's per-bucket dict.
+_SCORECARD_ZERO = {
+    "interval_score": 0.0,
+    "interval_score_raw": 0.0,
+    "below_band": 0.0,
+    "above_band": 0.0,
+    "n_scorecard": 0.0,
+}
 
 
 def _bounded_log_return(value: float) -> float:
@@ -146,6 +219,10 @@ def score_forecast(
     in_band: dict[str, bool] = {}
     in_band_raw: dict[str, bool] = {}
     band_width: dict[str, float] = {}
+    interval_score: dict[str, float] = {}
+    interval_score_raw: dict[str, float] = {}
+    below_band: dict[str, bool] = {}
+    above_band: dict[str, bool] = {}
     for component in COMPONENTS:
         predicted = point[component]
         realized = actual[component]
@@ -160,6 +237,17 @@ def score_forecast(
         in_band[component] = quantiles[component]["p10"] <= realized <= quantiles[component]["p90"]
         in_band_raw[component] = quantiles_raw[component]["p10"] <= realized <= quantiles_raw[component]["p90"]
         band_width[component] = quantiles[component]["p90"] - quantiles[component]["p10"]
+        interval_score[component] = _interval_score(
+            quantiles[component]["p10"], quantiles[component]["p90"], realized
+        )
+        interval_score_raw[component] = _interval_score(
+            quantiles_raw[component]["p10"], quantiles_raw[component]["p90"], realized
+        )
+        # Which side a miss fell on: the calibrator scales the band
+        # symmetrically around p50, so a band can sit at 80% overall while
+        # failing mostly on one side, and pooled coverage cannot show that.
+        below_band[component] = realized < quantiles[component]["p10"]
+        above_band[component] = realized > quantiles[component]["p90"]
     return {
         "abs_err": abs_err,
         "sq_err": sq_err,
@@ -168,6 +256,10 @@ def score_forecast(
         "in_band": in_band,
         "in_band_raw": in_band_raw,
         "band_width": band_width,
+        "interval_score": interval_score,
+        "interval_score_raw": interval_score_raw,
+        "below_band": below_band,
+        "above_band": above_band,
         "non_finite": has_non_finite,
         # "Inside the realized values": did the point land within the day's
         # actual traded range? Scored for close and open, the two components
@@ -216,6 +308,7 @@ class MetricsAccumulator:
                 "in_band": 0.0,
                 "in_band_raw": 0.0,
                 "band_width": 0.0,
+                **_SCORECARD_ZERO,
             }
         )
         self._range_hits: dict[tuple[str, str], dict[str, float]] = defaultdict(
@@ -243,6 +336,7 @@ class MetricsAccumulator:
                 sums["in_band"] += 1.0 if score["in_band"][component] else 0.0
                 sums["in_band_raw"] += 1.0 if score["in_band_raw"][component] else 0.0
                 sums["band_width"] += score["band_width"][component]
+                _fold_scorecard(sums, score, component)
             hits = self._range_hits[(model, bucket)]
             hits["n"] += 1
             hits["close_in_range"] += 1.0 if score["close_in_range"] else 0.0
@@ -277,6 +371,7 @@ class MetricsAccumulator:
                         "coverage": sums["in_band"] / n,
                         "coverage_raw": sums["in_band_raw"] / n,
                         "band_width": sums["band_width"] / n,
+                        **_scorecard_summary(sums),
                     }
                 if model_block:
                     regime_block[model] = model_block
@@ -449,6 +544,7 @@ class HorizonMetricsAccumulator:
             "in_band": 0.0,
             "in_band_raw": 0.0,
             "band_width": 0.0,
+            **_SCORECARD_ZERO,
         }
         self._sums: dict[tuple[str, int, str], dict[str, float]] = defaultdict(zero)
         # Over-time view is close-only: the headline component, and 90
@@ -474,6 +570,7 @@ class HorizonMetricsAccumulator:
         sums["in_band"] += 1.0 if score["in_band"][component] else 0.0
         sums["in_band_raw"] += 1.0 if score["in_band_raw"][component] else 0.0
         sums["band_width"] += score["band_width"][component]
+        _fold_scorecard(sums, score, component)
 
     @staticmethod
     def _summary(sums: Mapping[str, float]) -> dict[str, Any]:
@@ -486,6 +583,7 @@ class HorizonMetricsAccumulator:
             "coverage": sums["in_band"] / n,
             "coverage_raw": sums["in_band_raw"] / n,
             "band_width": sums["band_width"] / n,
+            **_scorecard_summary(sums),
         }
 
     def report(self) -> dict[str, Any]:
