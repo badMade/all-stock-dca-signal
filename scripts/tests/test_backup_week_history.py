@@ -46,6 +46,7 @@ TASKS = [backup.task_id for backup in backup_procedure.BACKUPS]
 
 ACCOUNT = "999000111"  # synthetic; conftest assigns the same value to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 LAST4 = ACCOUNT[-4:]
+OTHER_ACCOUNT = "12345"  # a different account; five digits so the account-number guard never flags it
 DAY = "2026-11-12"  # a Thursday
 TODAY = date.fromisoformat(DAY)
 MONDAY = "2026-11-09"
@@ -384,12 +385,12 @@ def test_the_flag_pins_account_week_writer_hash_and_snapshot(tmp_path, monkeypat
     _claude_week_envelope(root)
     out = Path(_merged_poll1(root, tmp_path)["out"])
     assert _week_refusal(out, "0000") == "week_envelope_last4_mismatch"
-    assert _week_refusal(_rewrite(out, lambda e: e.update(account_number="999000222"))) == "orders_pages_account_mismatch"
+    assert _week_refusal(_rewrite(out, lambda e: e.update(account_number=OTHER_ACCOUNT))) == "orders_pages_account_mismatch"
     assert _week_refusal(_rewrite(out, lambda e: e.update(trading_day=DAY))) == "week_envelope_not_this_week"
     assert _week_refusal(_rewrite(out, lambda e: e["ingest"].update(base_ingest_tool=None))) == "week_envelope_untrusted_base"
     assert _week_refusal(_rewrite(out, lambda e: e["pages"][0]["orders"].pop())) == "week_envelope_payload_mismatch"
     assert _week_refusal(_rewrite(out, lambda e: e.update(snapshot_at="2026-11-11T20:40:00+00:00"))) == "week_envelope_snapshot_not_today"
-    monkeypatch.setenv(backup_planner.ACCOUNT_ENV, "999000222")
+    monkeypatch.setenv(backup_planner.ACCOUNT_ENV, OTHER_ACCOUNT)
     assert _week_refusal(out) == "orders_pages_account_mismatch"
     monkeypatch.delenv(backup_planner.ACCOUNT_ENV)
     assert _week_refusal(out) == "week_envelope_account_unset"
