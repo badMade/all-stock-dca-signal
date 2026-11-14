@@ -44,6 +44,28 @@ os.environ["DCA_DISABLE_DOTENV"] = "1"
 os.environ["DCA_DISABLE_SLOT_STATUS_PUBLISH"] = "1"
 
 
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Print the fix for a test file that cannot import its module at collection.
+
+    A test written before its module (test-first) fails collection with ModuleNotFoundError,
+    and one collection error stops the WHOLE core run, not just that file (2026-11-13: #2266's
+    tests/test_dca_goals.py and tests/test_dca_console_goals.py turned every PR red until
+    #2287/#2288 gated them). pytest's own output names the import but not the repo's fix, so
+    this adds it once per offending file. Read-only: it never changes the exit status.
+    """
+    for report in terminalreporter.stats.get("error", []):
+        if getattr(report, "when", None) != "collect" or not getattr(report, "failed", False):
+            continue
+        text = getattr(report, "longreprtext", "")
+        if "ModuleNotFoundError" in text or "ImportError" in text:
+            terminalreporter.write_line(
+                f"HINT: {report.nodeid} cannot import a module at collection. If it is test-first, gate it with "
+                '`pytest.importorskip("<module>")` (see tests/test_dca_goals.py) so the rest of the suite still runs.',
+                yellow=True,
+                bold=True,
+            )
+
 @pytest.fixture(autouse=True)
 def _isolate_ticker_history_and_intraday_archive(monkeypatch, tmp_path):
     """Keep signal inputs and publication out of the operator's managed archive.

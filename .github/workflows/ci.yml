@@ -13,8 +13,9 @@ on:
       - "**/*.md"
   # Draft PRs do not run CI (2026-10-31): every agent PR opens as a draft and
   # pushes several times, which was 285 PR runs (~12k runner-minutes) in one week.
-  # The jobs below skip while the PR is a draft; ready_for_review starts the
-  # first real run. Check a draft locally with scripts/local_ci.sh --changed.
+  # The jobs below skip while the PR is a draft, except the short `registration`
+  # job (2026-11-14); ready_for_review starts the first full run. Check a draft
+  # locally with scripts/local_ci.sh --changed.
   # Skipped jobs report success, and main has no required status checks.
   pull_request:
     branches: ["main"]
@@ -136,6 +137,51 @@ jobs:
             fi
           done
 
+  # The fast registration gate (2026-11-14). The only job that also runs on DRAFT PRs, and it
+  # is not path-filtered: no `if`, no `needs` on `changes`. These small tests guard repo-wide
+  # registration invariants, and before this job existed they ran only inside the 25-35 minute
+  # core job, which drafts skip and which PRs were merged before it finished. On 2026-11-13/14
+  # that let four kinds of break reach main, each turning every PR's core CI red until a
+  # follow-up fix landed: a docs page missing from docs/README.md (#2244, #2266), an
+  # account-shaped test literal (#2259, #2266), a test file importing a module that did not
+  # exist yet, which stops collection of the whole suite (#2266), and a module with no
+  # plain-English note or OTHER_GROUPS entry (#2268, #2269). Measured on PR 2294's hosted
+  # runner: 47 s passing, 72 s on a deliberate unindexed-docs break (collection ~22-30 s,
+  # tests ~10 s). The 10-minute timeout is only a hang ceiling (raise config/self_heal.json's
+  # ci_worst_case_minutes with it, as for the others). Run the same set locally with
+  # scripts/local_ci.sh --registration; tests/test_local_ci.py and
+  # scripts/tests/test_workflow_policy.py keep the two file lists identical.
+  registration:
+    name: Registration checks
+    runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # One unimportable test file fails collection of the WHOLE core suite, not just itself.
+      - name: Collect every test (fails on an unimportable test file)
+        run: pytest --collect-only -q
+
+      - name: Registration tests (docs index, diagnostics notes, account-number guard)
+        run: >-
+          pytest
+          tests/test_dca_console_docs.py
+          tests/test_dca_console_diagnostics.py
+          tests/test_config_invariants.py
+
   test:
     name: Lint & test (core DCA)
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -147,8 +193,9 @@ jobs:
     # 2026-11-04: raised 30 -> 45. After PR 2152 restored ~19k reverted lines the
     # 3.12 leg took 29m19s on main (ec07c5c) and 25m on PR 2151's rerun, and
     # PR 2151's first attempt was cancelled at 30m at 95% with no failures.
-    # Still a hang ceiling. PR-reachable timeouts now sum to 150, which is
-    # config/self_heal.json's ci_worst_case_minutes; raise that with this.
+    # Still a hang ceiling. PR-reachable timeouts now sum to 160 (150 plus the
+    # registration job's 10, 2026-11-14), which is config/self_heal.json's
+    # ci_worst_case_minutes; raise that with this.
     timeout-minutes: 45
     strategy:
       fail-fast: false

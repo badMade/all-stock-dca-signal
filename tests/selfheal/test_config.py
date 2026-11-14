@@ -47,7 +47,7 @@ def test_shipped_config_loads_with_required_defaults_and_canonical_units() -> No
     assert loaded.max_tick_seconds == 600
     assert loaded.max_wall_clock_seconds == 1_800
     assert loaded.monthly_actions_minutes == 300
-    assert loaded.ci_worst_case_minutes == 150
+    assert loaded.ci_worst_case_minutes == 160
     assert loaded.max_forward_skew_seconds == 172_800
     assert loaded.max_cumulative_skew_seconds == 604_800
     assert loaded.max_archive_bytes_per_incident == 1_048_576

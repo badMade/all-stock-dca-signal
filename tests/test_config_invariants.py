@@ -1739,7 +1739,8 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
         "account-shaped literal(s) found in tracked files; use "
         '"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" in config and the environment '
         "variable at runtime (only the synthetic values in "
-        "_SYNTHETIC_ACCOUNT_VALUES are permitted):\n  " + "\n  ".join(offenders)
+        "_SYNTHETIC_ACCOUNT_VALUES are permitted). Fix: in a test, use conftest.FIXTURE_ACCOUNT_NUMBER "
+        "or keep the number to 5 digits or fewer; this guard takes no exceptions:\n  " + "\n  ".join(offenders)
     )
 
 
