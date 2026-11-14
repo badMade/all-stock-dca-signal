@@ -248,7 +248,7 @@ before `launchctl bootstrap`.
 
 ```bash
 python run_sharded.py --parallel --history-dir <frozen snapshot> --preset full --max-horizon 90 \
-  --gbm-row-cap 500000 --online-steps 4 --diagnostic-sample 500 --run-dir-base ~/octopus/sharded
+  --run-dir-base ~/octopus/sharded
 ```
 
 One replay process per ticker shard, run concurrently. `--shards` defaults to `auto`: the smallest of one
