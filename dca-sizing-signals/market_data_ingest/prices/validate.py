@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
+from datetime import date, datetime
 
 from .errors import ValidationError
-from .models import CorporateAction, DailyBar
+from .models import CorporateAction, DailyBar, action_version_key
 
 BAR_SOURCES = frozenset({"massive", "alpaca"})
 ACTION_TYPES = frozenset({"forward_split", "reverse_split", "stock_dividend", "cash_dividend"})
@@ -75,6 +76,9 @@ def action_problems(action: CorporateAction) -> list[str]:
         out.append(f"{where}: unknown action type")
     if not isinstance(action.symbol, str) or not action.symbol.strip():
         out.append(f"{where}: empty symbol")
+    # A datetime is a date subclass but would hash and key differently from the stored DATE.
+    if not isinstance(action.ex_date, date) or isinstance(action.ex_date, datetime):
+        out.append(f"{where}: ex_date is not a date")
     if action.action_type in SPLIT_TYPES:
         ratio = (action.split_from, action.split_to)
         if not all(_finite(v) and v is not None and v > 0 for v in ratio):
@@ -87,6 +91,33 @@ def action_problems(action: CorporateAction) -> list[str]:
 
 
 def validate_actions(actions: Iterable[CorporateAction]) -> None:
+    """Refuse the whole batch if any action is malformed."""
     problems = [p for a in actions for p in action_problems(a)]
     if problems:
         _raise("corporate actions", problems)
+
+
+def split_ambiguous_actions(
+    actions: Sequence[CorporateAction],
+) -> tuple[list[CorporateAction], list[str]]:
+    """The batch without ambiguous identities, and a description of each one held back.
+
+    Call after ``validate_actions``. An exact repeat of an action (overlapping vendor pages) is
+    kept once: before the versioned dedupe the insert's SELECT DISTINCT absorbed it, and it must
+    not fail a run (PR #2282 review). Two DIFFERENT actions with one (source, action_version_key)
+    are ambiguous -- two versions of one action at one as_of, or two id-less same-day actions of
+    one type -- so the read macro would keep one by hash order and the dedupe would re-insert the
+    other every run. Those identities are held back whole; everything else is returned in order.
+    """
+    by_key: dict[tuple[str, str], list[CorporateAction]] = {}
+    for a in actions:
+        group = by_key.setdefault((a.source, action_version_key(a)), [])
+        if a not in group:
+            group.append(a)
+    kept = [group[0] for group in by_key.values() if len(group) == 1]
+    held = [
+        f"{group[0].symbol} {group[0].action_type} {group[0].ex_date}: {len(group)} different versions in one batch"
+        for group in by_key.values()
+        if len(group) > 1
+    ]
+    return kept, held

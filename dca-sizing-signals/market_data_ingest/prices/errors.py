@@ -51,5 +51,18 @@ class ValidationError(ValueError):
     """A batch (or a legacy file) failed schema or sanity checks; none of it is written."""
 
 
+class AmbiguousActionsError(ValidationError):
+    """Some corporate actions shared one version identity with different values and were held back.
+
+    Unlike its parent, the rest of the batch WAS written (``inserted`` rows) before this was
+    raised: one ambiguous symbol must not stop every other symbol's splits and dividends for the
+    whole re-pull window (PR #2282 review). The run still fails loudly, naming what was held back.
+    """
+
+    def __init__(self, message: str, *, inserted: int) -> None:
+        super().__init__(message)
+        self.inserted = inserted
+
+
 class SpliceNotValidatedError(Exception):
     """Refused to join yahoo_legacy and vendor history without a passing reconciliation."""
