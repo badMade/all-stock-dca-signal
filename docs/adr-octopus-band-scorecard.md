@@ -1,6 +1,6 @@
 # Octopus band scorecard and calibrator evaluation
 
-Status: proposed. Rock 1 tests are written; no implementation is merged.
+Status: proposed. Rock 1 is implemented on PR #2300 and not merged.
 
 ## Context
 
@@ -49,11 +49,19 @@ model against itself.
 - Reports can rank calibrators on one proper score.
 - Nothing here reaches live sizing. Octopus stays a research artifact.
 
+## Operator decisions (2026-11-14)
+
+- The evaluation target is live forward trust, judged over time. Forward-only results stay
+  the headline; cross-validated results are context.
+- A standing, append-only trust scorecard is a permanent requirement.
+
 ## Open questions
 
 1. Promotion rule: `claude/band-calibration/PLAN.md` proposes one. It needs operator sign-off
-   before Rock 4 results are read.
+   before Rock 5 results are read.
 2. Replay source: which run directory, and does it hold raw quantiles for every horizon?
-3. Horizons in scope for Rocks 2 to 4: all 1 to 90, or the evaluated subset?
-4. Volatility bucket definition for Rock 4: trailing realized-volatility terciles, or the
+3. Horizons tracked in the trust scorecard: proposed 1, 5, 21, 63 and 90.
+4. Volatility bucket definition for Rock 5: trailing realized-volatility terciles, or the
    existing ticker clusters?
+5. Rolling window length for the trust scorecard: proposed 63 trading days.
+6. Online components inside CPCV folds (Rock 7): frozen or replayed.
