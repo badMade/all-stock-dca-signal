@@ -3,9 +3,9 @@
 Build plan for the `band-calibration` cycle. Vision in `VTO.md`. Decision record in
 `docs/adr-octopus-band-scorecard.md`.
 
-**Same Page Meeting: not held.** The Codex CLI was not reachable from the session that
-wrote this plan, so no adversarial review has run. Treat this plan as unreviewed until the
-operator either runs that review or waives it.
+**Same Page Meeting: waived.** The Codex CLI was not reachable from the session that wrote
+this plan, so no adversarial review ran. The operator waived it for this cycle on
+2026-11-14. Review happens on each draft PR instead.
 
 ## Starting point (facts, read 2026-11-14 at `158955be`)
 
@@ -29,6 +29,8 @@ operator either runs that review or waives it.
   cost order, and each is kept or dropped on evidence from the standing scorecard.
 - A standing way to judge how well things are working is a permanent requirement, not a
   one-off report.
+- Signed off: the promotion rule below, the trust scorecard horizons (1, 5, 21, 63, 90)
+  and its 63-trading-day rolling window.
 
 ## Rocks
 
@@ -149,12 +151,11 @@ Every Rock writes its result into the Rock 3 history using the same metrics, and
 `DEFERRED.md` records the cost of each. A design is kept if it changed a decision or caught
 a fault; otherwise it is retired after one cycle.
 
-## Promotion rule (pre-registered, not applied in this cycle)
+## Promotion rule (pre-registered, signed off 2026-11-14, not applied in this cycle)
 
 A candidate calibrator is eligible for a promotion decision only if its interval score beats
 the current calibrator with a 95% block-bootstrap interval that excludes zero, and its
 coverage in every named stress regime is no further from 80% than the current calibrator's.
-Awaiting operator sign-off.
 
 ## Deferred
 

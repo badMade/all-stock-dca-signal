@@ -57,11 +57,11 @@ model against itself.
 
 ## Open questions
 
-1. Promotion rule: `claude/band-calibration/PLAN.md` proposes one. It needs operator sign-off
-   before Rock 5 results are read.
-2. Replay source: which run directory, and does it hold raw quantiles for every horizon?
-3. Horizons tracked in the trust scorecard: proposed 1, 5, 21, 63 and 90.
-4. Volatility bucket definition for Rock 5: trailing realized-volatility terciles, or the
+1. Replay source for Rock 5: which run directory, and does it hold raw quantiles for every
+   horizon?
+2. Volatility bucket definition for Rock 5: trailing realized-volatility terciles, or the
    existing ticker clusters?
-5. Rolling window length for the trust scorecard: proposed 63 trading days.
-6. Online components inside CPCV folds (Rock 7): frozen or replayed.
+3. Online components inside CPCV folds (Rock 7): frozen or replayed.
+
+Settled on 2026-11-14: the promotion rule in `claude/band-calibration/PLAN.md`; trust
+scorecard horizons 1, 5, 21, 63 and 90; a 63-trading-day rolling window.
