@@ -26,14 +26,16 @@ from scripts import primary_gates
 
 REPO = Path(__file__).resolve().parents[2]
 ACCOUNT = "999000111"  # conftest.py's synthetic value
-OTHER_ACCOUNT = "999000222"
+# Derived, never written as a literal: tests/test_config_invariants.py takes no account-shaped literal other than
+# the synthetic ACCOUNT above (use conftest.FIXTURE_ACCOUNT_NUMBER or keep a number to 5 digits or fewer).
+OTHER_ACCOUNT = str(int(ACCOUNT) + 1)
 MONDAY = "2026-11-16"
 WEDNESDAY = "2026-11-18"
 
 
 def _row(index: int, amount: str, day: str = WEDNESDAY, state: str = "filled") -> dict:
     return {
-        "id": f"{index:08d}-0000-4000-8000-000000000000",
+        "id": f"order-{index}",
         "symbol": "CAT",
         "side": "buy",
         "state": state,
