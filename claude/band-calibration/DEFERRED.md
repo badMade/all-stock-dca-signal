@@ -10,3 +10,5 @@
 | Pre-listing backcast of ticker history | Rejected, not deferred: it invents data and breaks the eligibility rule in `horizons.py` |
 | Delisted tickers in the archive | Real gap (survivorship). Needs a data-source decision of its own |
 | Labeling the 90-day experiment report with the model it ran | Small fix to `scripts/run_90day_prediction_experiment.py`; separate PR |
+| Scheduling the trust scorecard after the daily update | An operator action on the Mac (launchd), or a later `daily_update.py` hook; kept out of Rock 3 so the daily cycle is not touched |
+| Multi-horizon end-to-end check of the trust scorecard on a real run | The demo run is horizon 1 only; needs the full-archive run directory on the operator's Mac |
