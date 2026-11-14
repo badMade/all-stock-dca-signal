@@ -246,9 +246,19 @@ jobs:
       # --cov-fail-under guards the live decision path against silent erosion.
       # The threshold is set just under the current figure so a genuine drop
       # fails the build without flapping on a one-line change.
+      # 2026-11-14: `-n auto` (pytest-xdist) spreads the suite over every runner core;
+      # serially it used one core for 25-29 min (see timeout-minutes above).
+      # COVERAGE_CORE=sysmon (Python 3.12+ sys.monitoring, line coverage only; the
+      # suite measures no branches) cuts tracing overhead on the 3.12 leg. 3.11 has
+      # no sys.monitoring, so it gets '' and coverage.py ignores an empty value.
+      # Measured in a 4-core container: 32m06s serial -> 6m45s, 90.97% -> 90.96%.
+      # tests/test_ci_parallel_coverage.py pins this step and local_ci.sh together.
       - name: Run tests with coverage
+        env:
+          COVERAGE_CORE: ${{ matrix.python-version == '3.12' && 'sysmon' || '' }}
         run: |
           pytest \
+            -n auto \
             --cov=. \
             --cov-report=term-missing:skip-covered \
             --cov-fail-under=90

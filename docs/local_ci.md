@@ -40,7 +40,7 @@ scripts/local_ci.sh --all        # everything the scheduled CI run does
 
 | CI job | Local equivalent |
 | --- | --- |
-| Lint & test (core DCA) (3.12) | default run (ruff, `pytest --cov=. --cov-fail-under=90`, demo) |
+| Lint & test (core DCA) (3.12) | default run (ruff, `pytest -n auto --cov=. --cov-fail-under=90`, demo; CI also sets `COVERAGE_CORE=sysmon` on 3.12) |
 | Registration checks | `--registration` (`pytest --collect-only -q`, then the three registration test files; see below) |
 | Lint & test (core DCA) (3.11) | `--py311` (uv-managed env, Python 3.11) |
 | Dependency & secret audit | `--audit` (`pip-audit --requirement requirements-dev.txt --strict`) |

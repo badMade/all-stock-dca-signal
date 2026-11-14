@@ -40,6 +40,9 @@ dev = [
     "jsonschema==4.26.0",
     "referencing==0.37.0",
     "pytest-cov==7.1.0",
+    # Same pin as requirements-dev.txt: without it, CI's documented `pytest -n auto`
+    # coverage command is an "unrecognized arguments" error on this install path.
+    "pytest-xdist==3.8.0",
     # scripts/workflow_policy.py imports yaml; without it here, `pip install
     # -e '.[dev]'` collects fine on an environment where jsonschema/referencing
     # happen to pull PyYAML in transitively and fails collection everywhere
