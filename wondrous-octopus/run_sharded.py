@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import subprocess
@@ -48,6 +49,74 @@ ensure_venv(
 from data import discover_available_tickers  # noqa: E402
 
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+
+
+#: Tentative sizing constants for ``--shards auto``. They bound the choice by resources and by a minimum shard
+#: size; they are NOT yet backed by a measured accuracy comparison across shard counts (a shard trains its own
+#: model on only its own tickers, so smaller shards may be less accurate). Re-tune from a measured 4-vs-8
+#: comparison before trusting "auto" as the most accurate setting.
+MIN_TICKERS_PER_SHARD = 750
+GB_PER_SHARD = 8.0  # measured ~7.5 GB per ~1,500-ticker shard on 2026-11-11, rounded up
+RAM_BUDGET_FRACTION = 0.6  # leave the rest for the OS, the GPU driver and the operator's other work
+SHARD_PLAN = "shard_plan.json"
+
+
+def _physical_ram_gb() -> float | None:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def auto_shard_count(
+    n_tickers: int, cpu_count: int | None = None, ram_gb: float | None = None
+) -> tuple[int, str]:
+    """Pick a shard count from the machine and the universe; returns (count, human-readable reason).
+
+    The count is the smallest of three ceilings, never below 1: one shard per 2 cores (each shard is mostly a
+    single busy thread plus GPU waits), what fits in RAM, and a floor on shard size so a shard keeps enough
+    tickers to learn from.
+    """
+    cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+    ram = ram_gb if ram_gb is not None else _physical_ram_gb()
+    by_cpu = max(1, cpus // 2)
+    by_size = max(1, n_tickers // MIN_TICKERS_PER_SHARD)
+    ceilings = {"cores": by_cpu, "min-shard-size": by_size}
+    if ram is not None:
+        ceilings["ram"] = max(1, int(ram * RAM_BUDGET_FRACTION // GB_PER_SHARD))
+    limiting = min(ceilings, key=lambda k: ceilings[k])
+    count = ceilings[limiting]
+    detail = ", ".join(f"{k}<={v}" for k, v in ceilings.items())
+    return count, f"auto -> {count} shards ({detail}; limited by {limiting})"
+
+
+def resolve_shard_count(requested: str | int, n_tickers: int, run_dir_base: Path) -> tuple[int, str]:
+    """An explicit number is used as given. ``auto`` first reuses the partition already on disk: changing the count
+    mid-run would re-deal the tickers and make every existing shard checkpoint unresumable."""
+    if str(requested) != "auto":
+        return int(requested), f"--shards {requested}"
+    plan = run_dir_base / SHARD_PLAN
+    if plan.is_file():
+        try:
+            return int(json.loads(plan.read_text(encoding="utf-8"))["shards"]), f"auto -> reusing {SHARD_PLAN}"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    existing = [d for d in run_dir_base.glob("shard_*") if d.is_dir() and d.name.removeprefix("shard_").isdigit()]
+    if existing:
+        return len(existing), f"auto -> reusing the {len(existing)} shard directories already under {run_dir_base}"
+    return auto_shard_count(n_tickers)
+
+
+def _shards_arg(value: str) -> str | int:
+    if value == "auto":
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--shards must be a positive integer or 'auto', got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError("--shards must be at least 1")
+    return n
 
 
 def split_into_shards(tickers: Sequence[str], n_shards: int) -> list[list[str]]:
@@ -258,23 +327,38 @@ def build_shard_cmd(
         str(shard_dir),
         "--start",
         args.start,
-        "--window-len",
-        str(args.window_len),
-        "--update-every",
-        str(args.update_every),
-        "--refit-every",
-        str(args.refit_every),
         "--checkpoint-every",
         str(args.checkpoint_every),
         "--model",
         args.model,
     ]
+    preset = getattr(args, "preset", None)
+    if preset:
+        # A run_walkforward preset owns window/update/refit/diagnostic cadence, so those flags are NOT sent
+        # (an explicit flag would silently override the preset's value).
+        cmd.extend(["--preset", preset])
+    else:
+        cmd.extend(
+            [
+                "--window-len",
+                str(args.window_len),
+                "--update-every",
+                str(args.update_every),
+                "--refit-every",
+                str(args.refit_every),
+            ]
+        )
+        if args.diagnostic_sample:
+            cmd.extend(["--diagnostic-sample", str(args.diagnostic_sample)])
+    if getattr(args, "max_horizon", 1) > 1:
+        cmd.extend(["--max-horizon", str(args.max_horizon)])
+    if getattr(args, "history_dir", None):
+        # Frozen snapshot: a resume refuses when archive rows change, and the live archive refreshes daily.
+        cmd.extend(["--history-dir", str(args.history_dir)])
     if args.gbm_row_cap:
         cmd.extend(["--gbm-row-cap", str(args.gbm_row_cap)])
     if args.online_steps:
         cmd.extend(["--online-steps", str(args.online_steps)])
-    if args.diagnostic_sample:
-        cmd.extend(["--diagnostic-sample", str(args.diagnostic_sample)])
     if args.end:
         cmd.extend(["--end", args.end])
     if getattr(args, "now", None):
@@ -294,9 +378,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--shards",
-        type=int,
-        default=4,
-        help="Total number of shards to partition the archive into (default: 4)",
+        type=_shards_arg,
+        default="auto",
+        help="Number of shards, or 'auto' (default): sized from cores, RAM and a minimum shard size, and an "
+        "existing run directory's partition is always reused",
     )
     parser.add_argument(
         "--shard",
@@ -336,6 +421,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         default=100,
         help="Tickers sampled for encoder health diagnostic (default: 100 = faster check)",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=("quick", "overnight", "full"),
+        default=None,
+        help="run_walkforward preset; owns window/update/refit/diagnostic cadence, so --window-len, "
+        "--update-every, --refit-every and --diagnostic-sample are then NOT passed (default: none)",
+    )
+    parser.add_argument(
+        "--max-horizon",
+        type=int,
+        default=1,
+        help="Forecast every trading day t+1..t+N (default 1 = next-day only); frozen per shard",
+    )
+    parser.add_argument(
+        "--history-dir",
+        type=Path,
+        default=None,
+        help="Ticker CSV archive (default: configured). Use a frozen snapshot for long replays",
     )
     parser.add_argument(
         "--end",
@@ -438,13 +542,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             last_p = get_shard_last_processed_date(s_dir)
             print(f"  Shard {i}/{len(shard_dirs)} ({s_dir.name}): last processed {last_p or 'unknown'}")
     else:
-        history_dir = configured_ticker_history_dir()
+        history_dir = args.history_dir or configured_ticker_history_dir()
         all_tickers = discover_available_tickers(history_dir)
         if not all_tickers:
             print(f"REFUSED: no valid tickers found in {history_dir}", file=sys.stderr)
             return 1
 
-        shards = split_into_shards(all_tickers, args.shards)
+        n_shards, shard_reason = resolve_shard_count(args.shards, len(all_tickers), args.run_dir_base)
+        print(f"Shard count: {shard_reason}")
+        shards = split_into_shards(all_tickers, n_shards)
+        if not args.dry_run:
+            args.run_dir_base.mkdir(parents=True, exist_ok=True)
+            plan = {"shards": len(shards), "tickers": len(all_tickers), "reason": shard_reason}
+            (args.run_dir_base / SHARD_PLAN).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
         shard_dirs = [args.run_dir_base / f"shard_{i}" for i in range(1, len(shards) + 1)]
         total_tickers = sum(len(s) for s in shards)
         archive_latest = get_archive_latest_date(history_dir)
