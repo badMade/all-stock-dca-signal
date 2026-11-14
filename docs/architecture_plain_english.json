@@ -116,6 +116,7 @@
   "scripts.generate_perplexity_backup_prompts": "Writes the six backup prompts with every rule and number spelled out inside, because the cloud agent cannot read this repo.",
   "scripts.github_mcp_login": "Opens a browser login for the GitHub tool connection.",
   "scripts.index_run_states_sqlite": "Builds a small database that indexes past run results so history questions answer fast. The run files stay the only source of truth, and the database can be deleted and rebuilt.",
+  "scripts.primary_gates": "Runs the main executor's early safety checks in one command: market day, clock, buying window, account and weekly caps. It reads only the clock, config and order history it is given, and never places orders.",
   "scripts.healthcheck": "A pass/fail health check: lint, tests, smoke test and a dependency audit. It says nothing unless something is wrong.",
   "scripts.idempotency": "Gives every order a unique key, so a run and its re-run asking for the same buy produce the same key and the broker never takes it twice.",
   "scripts.ingest_market_data": "Checks raw broker prices and quotes and saves them, unchanged, as the data file the signal step reads.",
