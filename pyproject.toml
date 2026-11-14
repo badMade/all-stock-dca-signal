@@ -16,7 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 selfheal = [
     "pytest==9.1.1",
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "pyright==1.1.414",
     "pytest-cov==7.1.0",
     "pip-audit==2.10.1",
@@ -36,7 +36,7 @@ selfheal = [
 # at all (Codex review, PR #219).
 dev = [
     "pytest==9.1.1",
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "jsonschema==4.26.0",
     "referencing==0.37.0",
     "pytest-cov==7.1.0",
