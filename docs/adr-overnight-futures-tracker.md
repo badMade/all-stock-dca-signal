@@ -99,7 +99,7 @@ Tables follow the research sketch (research 1.7): `futures_contract`, `futures_b
 
 | Need | Source | Note |
 |---|---|---|
-| Historical ES/NQ/YM per-contract bars | Databento CME Globex MDP 3.0, from June 2010 | Recommended primary (research 1.5); cost and licensing are open questions 2 and 3 |
+| Historical ES/NQ/YM per-contract bars | **None chosen.** Databento was the recommended primary (research 1.5) but is deferred: see "Deferred: Databento loader" below | The store takes any source, so a vendor can be added later without changing it |
 | Index levels for anchors | Robinhood MCP `get_index_quotes` / `get_index_historicals` | Index-only, confirmed by the 2026-11-12 probe (open question 4). SPX and NDX are listed directly; the Dow is listed only as DJX (1/100 scale, per the symbol's usual definition; not checked against a published spec) |
 | ETF open prints (SPY, QQQ, DIA) | The existing `market_data_ingest/prices` source | Reuses current ingestion |
 | Ex-dividend dates | Existing `corporate_actions` (`cash_dividend`, `ex_date`) | No new source |
@@ -183,8 +183,8 @@ over.
 | # | Question | Decision (accepted proposed default) |
 |---|---|---|
 | 1 | How is "same session, 9:35 slot" expressed through `ForecastResult`? | `horizon_trading_days = 0`; slot in the provider table (D2) |
-| 2 | Vendor for history, and how to load it without a new Python dependency? | Databento batch download in CSV encoding, loaded with DuckDB's CSV reader; the `databento` client only if a later need justifies it |
-| 3 | Licence posture for storing raw futures bars locally? | Store only 1-minute bars and anchor-time trades needed by D4; confirm terms before the first download |
+| 2 | Vendor for history, and how to load it without a new Python dependency? | **Deferred (operator, 2026-11-14).** Databento is not used for now; its slot is kept and specified below. No other vendor chosen yet |
+| 3 | Licence posture for storing raw futures bars locally? | **Open.** For Databento, two points could not be confirmed in writing (see the deferred section). Any future vendor must answer the same two questions before a download |
 | 4 | Does the Robinhood MCP return futures quotes? | **Answered 2026-11-12: no.** See "Robinhood probe" below. Index levels only; every overnight futures price comes from the vendor (question 2) |
 | 5 | Rate for fair value? | 3-month T-bill from ALFRED first-release vintages; SOFR term as a sensitivity check |
 | 6 | Expected dividend points? | Trailing-yield approximation adjusted by known ex-dates from `corporate_actions`; record the method per row |
@@ -246,12 +246,62 @@ about 22:30 ET on Thursday 2026-11-12, while ES and NQ trade on Globex.
 | 1. Boundaries | Done | #2241 | `overnight_futures` registered both ways in `tests/test_architecture_boundaries.py`, which since 2026-11-12 runs in CI (`Lint & test (dca-sizing-signals)`) |
 | 2. Pure computation | Done | #2263 | `overnight_futures/fair_value.py` and `tracker.py`, 49 test cases, written test first |
 | 3. Ingestion: store | Done | #2264, #2265 | `market_data_ingest/futures/` append-only store. #2265 fixed four review findings after #2264: vendor reverts kept, reads split by source, ambiguous batches refused, versioned dedupe. Uses the shared `market_data_ingest/duckdb_batch.py` from #2254 |
-| 3. Ingestion: Databento loader | **Blocked** | None | Waits on the operator confirming Databento's licence terms for storing raw 1-minute bars locally, and the cost of a sample download (open questions 2 and 3). No loader or real data until then |
-| 4. Offline evaluation | Not started | None | Needs real data from step 3 |
+| 3. Ingestion: Databento loader | **Deferred** | None | Operator decision 2026-11-14: "more trouble than it's worth" for now. The slot is kept and the build is specified in "Deferred: Databento loader" below. No loader, account or data |
+| 4. Offline evaluation | Not started | None | Needs real futures data, so it waits until some vendor is chosen |
 | 5. Live shadow | Not started | None | Needs step 4 to pass D8; the 6-month shadow period starts here |
 
 Related: open question 4 was answered by the Robinhood probe above (#2251). Nothing in steps 1 to 3
 is imported by the core, the three entry points or `sizing_adjustment_reader.py`.
+
+## Deferred: Databento loader (operator decision, 2026-11-14)
+
+**Decision.** Databento is not used for now. The operator judged it more trouble than it is worth at
+this stage. Its place in the design is kept, so it can be built later without reworking anything
+else. Nothing below is implemented, and no account, credit or download exists.
+
+**Why it was deferred (research of 2026-11-14).**
+
+| Point | Finding | Status |
+|---|---|---|
+| Licence for historical data | Databento says users "don't need a license to access historical data, which we define as 24 hours into the past", except to redistribute it ([licensing guide](https://databento.com/blog/introduction-market-data-licensing)) | Fact, Databento's own page |
+| Cost | Pay-as-you-go per GB, no subscription for historical data, $125 sign-up credit valid 6 months; `metadata.get_cost` quotes an exact price free ([pricing](https://databento.com/pricing), [usage FAQ](https://databento.com/docs/faqs/usage-pricing-and-data-credits)) | Fact. Estimated cost for 16 years of ES/NQ/YM 1-minute bars: a few dollars (inference) |
+| Keeping data after an account closes | Databento's terms page could not be read (404). A third-party report says the terms require deleting all downloaded data, including backups, when the subscription ends ([GitHub issue](https://github.com/emanuel894/trading_agent/issues/42)) | **Unconfirmed.** Conflicts with D5's append-only store kept indefinitely |
+| CME licence for analysing historical data | Search summaries of CME's guidelines quote "Non-Display Use of Historical Information must be licensed, but is not reportable" ([CME non-display guidelines](https://www.cmegroup.com/market-data/distributor/files/cme-group-data-licensing-policy-guidelines-and-non-display-licensing-faq.pdf)); CME's site blocked automated reading of the document itself | **Unconfirmed.** Unclear whether personal backtesting needs a CME licence or fee |
+
+**The slot that is kept.**
+
+- `market_data_ingest/futures/store.py` is already source-agnostic: every contract and bar row
+  carries `source`, a bar must belong to a contract stored by the same source, and every read takes
+  `source=` (#2264, #2265). A Databento loader writes rows with `source="databento"`; nothing in the
+  store, the tracker or the tests changes.
+- The loader would be one new module, `market_data_ingest/futures/databento_loader.py`. It does not
+  exist, and no placeholder file is added, because an empty module would be dead code.
+
+**Preconditions before anyone builds it.**
+
+1. Written answers from Databento support to both unconfirmed points: may downloaded GLBX.MDP3
+   OHLCV-1m data be kept after an account closes, and does individual non-professional backtesting
+   need a CME non-display licence or fee?
+2. A `metadata.get_cost` quote for the exact request (dataset `GLBX.MDP3`, schema `ohlcv-1m`, roots
+   ES, NQ and YM, the chosen date range), and the operator's approval of that spend.
+3. A new operator decision to un-defer, recorded here with its date.
+
+**Build-out spec (for later, tests first as in phases 1 to 3).**
+
+| Item | Specification |
+|---|---|
+| Download | Batch download in CSV encoding, so no new Python dependency (open question 2's original default). Store the raw files outside the repo; record each file's SHA-256 with the ingest run |
+| Contracts | From the `definition` schema: contract id, root, expiry (UTC) and multiplier, mapped to `FuturesContract` with `source="databento"`. Ingest contracts before bars, because the store refuses orphan bars |
+| Bars | From `ohlcv-1m`: bar start (UTC), open, high, low, close and volume, mapped to `FuturesBar`. Price scaling and timestamp format must be confirmed against a real sample file (Databento can emit fixed-point or decimal prices); the first test pins that mapping |
+| Fixture | A small licensed sample, a few hours of one ES contract, committed only if the licence allows it; otherwise a synthetic file built to the confirmed format |
+| Tests first | Column mapping and price scaling; one bad row rejects the batch; re-ingest adds nothing; a vendor correction lands as a new version; contracts load before bars; the raw file's checksum is recorded |
+| Boundaries | Lives in `market_data_ingest`, never imports `overnight_futures`, and nothing on the live side imports it (`tests/test_architecture_boundaries.py`) |
+
+**Effect on the plan.** Steps 4 (offline evaluation) and 5 (live shadow) need real futures data, so
+they wait until a vendor is chosen. Possible sources were not evaluated here and none is chosen:
+yfinance is permitted for research (`docs/yfinance_replacement_plan.md`) but gives a continuous
+front-month series with short intraday history, which D4's single-contract rule cannot use as is;
+CME DataMine and other vendors were not priced.
 
 ## Verification
 

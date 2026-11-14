@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime
+from datetime import time as clock_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -272,3 +273,49 @@ def test_cli_never_prints_the_account_number(monkeypatch):
         env={**__import__("os").environ, "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER": "999000111"},
     )
     assert "999000111" not in done.stdout + done.stderr
+
+
+# --------------------------------------------------------------------------------------------------------------
+# --latest-start (rollout, 2026-11-14): the 3:30 prompt text closes at 3:55 PM while dca_runner.SLOTS['1530']
+# runs to 4:00 PM. The script must not loosen that, so a caller may state a LATEST start that can only tighten the
+# window; it can never widen it past dca_runner's own gate.
+# --------------------------------------------------------------------------------------------------------------
+
+LATEST = clock_time(15, 55)
+
+
+def test_latest_start_aborts_at_and_after_the_limit_and_proceeds_before_it():
+    before = primary_gates.evaluate_clock("1530", at(MONDAY, "15:54"), latest_start=LATEST)
+    at_limit = primary_gates.evaluate_clock("1530", at(MONDAY, "15:55"), latest_start=LATEST)
+    assert before["status"] == "PROCEED"
+    assert (at_limit["status"], at_limit["gate"]) == ("ABORT", 1)
+    assert "latest" in at_limit["reason"].lower()
+
+
+def test_latest_start_cannot_widen_the_slot_window():
+    # 16:00 is outside SLOTS['1530'] (exclusive end); a generous latest_start must not rescue it.
+    out = primary_gates.evaluate_clock("1530", at(MONDAY, "16:00"), latest_start=clock_time(16, 30))
+    assert (out["status"], out["gate"]) == ("ABORT", 1)
+
+
+def test_without_latest_start_the_slot_window_alone_decides():
+    assert primary_gates.evaluate_clock("1530", at(MONDAY, "15:57"))["status"] == "PROCEED"
+
+
+def test_latest_start_does_not_override_a_closed_market():
+    out = primary_gates.evaluate_clock("1530", at("2026-10-17", "15:56"), latest_start=LATEST)
+    assert (out["status"], out["gate"]) == ("END_SILENTLY", 0)
+
+
+def test_cli_latest_start_flag_tightens_the_window():
+    ok = _run("clock", "--slot", "1530", "--now", f"{MONDAY}T15:54:00-04:00", "--latest-start", "15:55")
+    late = _run("clock", "--slot", "1530", "--now", f"{MONDAY}T15:56:00-04:00", "--latest-start", "15:55")
+    assert ok.returncode == 0 and json.loads(ok.stdout)["status"] == "PROCEED"
+    assert late.returncode == 1 and json.loads(late.stdout)["status"] == "ABORT"
+
+
+# "15:5" and "9:55": strptime alone accepts single-digit fields (PR #2290 review), so "15:5" read as 15:05.
+@pytest.mark.parametrize("bad", ["3:55pm", "25:00", "15:61", "", "15", "15:5", "9:55", " 15:55", "15:55 "])
+def test_cli_rejects_a_malformed_latest_start_with_exit_2(bad):
+    done = _run("clock", "--slot", "1530", "--now", f"{MONDAY}T15:30:00-04:00", "--latest-start", bad)
+    assert done.returncode == 2 and "PROCEED" not in done.stdout
