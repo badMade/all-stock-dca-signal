@@ -88,7 +88,7 @@ DEFAULT_MIN_COVERAGE = 0.95
 #: A quiet name is reported under ``ticker_errors.quiet`` (Gate 5 scores it NO_DATA, never a BUY) and leaves the
 #: coverage denominator. A feed outage also returns empty series, so more than this share still refuses.
 MAX_QUIET_SHARE = 0.25
-#: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
+#: A payload is built one minute after the decision time and read by a session inside the slot's ~30-40-minute
 #: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
 #: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
 DEFAULT_MAX_AGE_MINUTES = 45

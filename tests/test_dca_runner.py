@@ -2932,6 +2932,33 @@ def test_gate1_0935_window_closes_at_1020_to_absorb_scheduler_lateness():
     assert not dca_runner.gate_time_sanity(datetime(2026, 10, 27, 10, 20, 0, tzinfo=ET), spec)  # exclusive end
 
 
+@pytest.mark.parametrize(
+    "slot_id, early_open",
+    [("1030", (10, 25)), ("1130", (11, 25)), ("1230", (12, 25)), ("1330", (13, 25)), ("1430", (14, 25)), ("1530", (15, 20))],
+)
+def test_gate1_half_hour_slots_accept_an_early_fire(slot_id, early_open):
+    """Operator decision 2026-11-14: the half-hour slots open 5 minutes before their
+    nominal :30 and the 3:30 slot 10 minutes before, so an early scheduler fire is
+    accepted instead of aborting as off-schedule. A minute earlier still fails, and
+    the nominal time and the close are unchanged."""
+    spec = dca_runner.SLOTS[slot_id]
+    hh, mm = early_open
+    assert spec.window_start_et == early_open
+    assert spec.nominal_et == (int(slot_id[:2]), 30)
+    assert spec.window_end_et == (int(slot_id[:2]) + 1, 0)
+    assert dca_runner.gate_time_sanity(datetime(2026, 11, 16, hh, mm, 0, tzinfo=ET), spec)
+    assert not dca_runner.gate_time_sanity(datetime(2026, 11, 16, hh, mm - 1, 59, tzinfo=ET), spec)
+
+
+def test_slot_windows_never_overlap():
+    """Widening the opens must not let one instant belong to two slots: each window
+    opens at or after the previous slot's (exclusive) close, so Gate 1 and Gate 4's
+    interlock still resolve every instant to at most one slot."""
+    specs = sorted(dca_runner.SLOTS.values(), key=lambda s: s.window_start_et)
+    for earlier, later in zip(specs, specs[1:], strict=False):
+        assert later.window_start_et >= earlier.window_end_et, (earlier.slot_id, later.slot_id)
+
+
 def test_gate1_0935_window_closes_before_the_1030_slot_opens():
     """Widening must never let the 9:35 slot overlap the next slot's own window."""
     closes = dca_runner.SLOTS["0935"].window_end_et

@@ -39,10 +39,10 @@ MONDAY = "2026-10-19"
 @pytest.mark.parametrize(
     ("task", "hhmm", "slot", "latest"),
     [
-        (T_0935, "09:55", "0935", "10:30"),
-        (T_1030, "10:50", "1030", "11:30"),
-        (T_1130, "11:50", "1130", "12:30"),
-        (T_1230, "12:50", "1230", "13:30"),
+        (T_0935, "09:55", "0935", "10:25"),  # 2026-11-14: latest placement is the next slot's window OPEN (:25 / 15:20), not its nominal :30
+        (T_1030, "10:50", "1030", "11:25"),
+        (T_1130, "11:50", "1130", "12:25"),
+        (T_1230, "12:50", "1230", "13:25"),
         (T_1530, "15:40", "1530", "16:00"),  # 2026-11-09: moved from 15:45 after a 16:03 start skipped the whole run
     ],
 )
@@ -58,8 +58,8 @@ def test_a_single_fire_task_proceeds_at_its_fire_time(task, hhmm, slot, latest):
         (T_0935, "09:46", "skipped_outside_window"),  # 2026-10-26: a manual 09:46 run placed 25 buys before its fire
         (T_0935, "09:54", "skipped_outside_window"),  # the fire time is the earliest start, so Claude's slot goes first
         (T_0935, "09:55", "PROCEED"),
-        (T_0935, "10:29", "PROCEED"),
-        (T_0935, "10:30", "skipped_outside_window"),  # never at or after the latest placement time
+        (T_0935, "10:24", "PROCEED"),
+        (T_0935, "10:25", "skipped_outside_window"),  # never at or after the latest placement time (the 10:30 slot's 10:25 open)
         (T_1530, "15:39", "skipped_outside_window"),
         (T_1530, "15:40", "PROCEED"),
         (T_1530, "15:45", "PROCEED"),  # a start five minutes late is still inside the window
@@ -75,14 +75,14 @@ def test_single_fire_window_edges(task, hhmm, expected):
     ("hhmm", "expected", "slot", "latest"),
     [
         ("13:39", "skipped_outside_window", None, None),
-        ("13:40", "PROCEED", "1330", "14:30"),
-        ("13:50", "PROCEED", "1330", "14:30"),
-        ("14:20", "PROCEED", "1330", "14:30"),
+        ("13:40", "PROCEED", "1330", "14:25"),  # 2026-11-14: latest placement is the next slot's window OPEN (:25 / 15:20), not its nominal :30
+        ("13:50", "PROCEED", "1330", "14:25"),
+        ("14:20", "PROCEED", "1330", "14:25"),
         ("14:21", "skipped_outside_window", None, None),
         ("14:39", "skipped_outside_window", None, None),
-        ("14:40", "PROCEED", "1430", "15:30"),
-        ("14:50", "PROCEED", "1430", "15:30"),
-        ("15:20", "PROCEED", "1430", "15:30"),
+        ("14:40", "PROCEED", "1430", "15:20"),
+        ("14:50", "PROCEED", "1430", "15:20"),
+        ("15:20", "PROCEED", "1430", "15:20"),
         ("15:21", "skipped_outside_window", None, None),
     ],
 )

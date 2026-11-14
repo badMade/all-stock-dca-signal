@@ -861,10 +861,12 @@ def test_garbage_survivor_input_returns_a_structured_error_never_raises(config, 
 # Review gaps found 2026-10-07 (ADR "Open design gaps"): cross-slot top-ups, buying power, spread
 # ---------------------------------------------------------------------------
 
+# Each window runs from the slot's own window open to the next slot's window open (2026-11-14: the
+# half-hour slots open at :25 and the final slot at 15:20), so the windows tile the day without overlap.
 _WINDOWS = {
-    "0935": ("09:35", "10:30"), "1030": ("10:30", "11:30"), "1130": ("11:30", "12:30"),
-    "1230": ("12:30", "13:30"), "1330": ("13:30", "14:30"), "1430": ("14:30", "15:30"),
-    "1530": ("15:30", "16:00"),
+    "0935": ("09:31", "10:25"), "1030": ("10:25", "11:25"), "1130": ("11:25", "12:25"),
+    "1230": ("12:25", "13:25"), "1330": ("13:25", "14:25"), "1430": ("14:25", "15:20"),
+    "1530": ("15:20", "16:00"),
 }
 
 

@@ -721,12 +721,19 @@ SLOTS: dict[str, SlotSpec] = {
     # time with 32 candidates unplaced. The close stays before the 10:30 slot's open,
     # and Gate 4's interlock reads the same bounds, so it widens with the window.
     "0935": SlotSpec("0935", (9, 35), (9, 31), (10, 20), "market-open"),
-    "1030": SlotSpec("1030", (10, 30), (10, 30), (11, 0), "morning"),
-    "1130": SlotSpec("1130", (11, 30), (11, 30), (12, 0), "intraday"),
-    "1230": SlotSpec("1230", (12, 30), (12, 30), (13, 0), "midday"),
-    "1330": SlotSpec("1330", (13, 30), (13, 30), (14, 0), "intraday"),
-    "1430": SlotSpec("1430", (14, 30), (14, 30), (15, 0), "intraday"),
-    "1530": SlotSpec("1530", (15, 30), (15, 30), (16, 0), "final"),
+    # The half-hour slots open 5 minutes before nominal and the 3:30 slot 10 minutes
+    # before (operator decision 2026-11-14). The only jitter on record is lateness
+    # (594s), but a strict :30 start turned any early scheduler fire into an
+    # off-schedule abort, and the live prompts' fallback text already accepted :25
+    # starts. 1530 opens at 15:20, still after 1430's 15:00 close; every other early
+    # open stays after the previous slot's close too, so no instant belongs to two
+    # slots. Gate 4's interlock reads these bounds, so its scan widens with them.
+    "1030": SlotSpec("1030", (10, 30), (10, 25), (11, 0), "morning"),
+    "1130": SlotSpec("1130", (11, 30), (11, 25), (12, 0), "intraday"),
+    "1230": SlotSpec("1230", (12, 30), (12, 25), (13, 0), "midday"),
+    "1330": SlotSpec("1330", (13, 30), (13, 25), (14, 0), "intraday"),
+    "1430": SlotSpec("1430", (14, 30), (14, 25), (15, 0), "intraday"),
+    "1530": SlotSpec("1530", (15, 30), (15, 20), (16, 0), "final"),
 }
 
 

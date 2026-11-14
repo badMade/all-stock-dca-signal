@@ -99,15 +99,18 @@ _ORDER_KEYS = frozenset(
 
 
 def _latest_placement_table() -> dict[str, str]:
-    """Latest ET placement time per slot: the NEXT slot's nominal start, and the 16:00 close for the last.
+    """Latest ET placement time per slot: the NEXT slot's window open, and the 16:00 close for the last.
 
-    A backup that fires inside a slot's window may still finish before the next canonical slot's own
-    gates run, so that slot sees the backup's buys. Derived from ``dca_runner.SLOTS``, never retyped.
+    A backup that fires inside a slot's window must finish before the next canonical slot can start,
+    so that slot sees the backup's buys. The bound is the next slot's ``window_start_et``, not its
+    nominal time: since 2026-11-14 the half-hour slots open at :25 and the final slot at 15:20, so a
+    nominal bound let a backup still place while the next primary's Gate 4 was already running, and
+    its orders read as a second live executor there. Derived from ``dca_runner.SLOTS``, never retyped.
     """
     slot_ids = sorted(SLOTS, key=lambda sid: SLOTS[sid].nominal_et)
     table: dict[str, str] = {}
     for index, slot_id in enumerate(slot_ids):
-        hour, minute = SLOTS[slot_ids[index + 1]].nominal_et if index + 1 < len(slot_ids) else (16, 0)
+        hour, minute = SLOTS[slot_ids[index + 1]].window_start_et if index + 1 < len(slot_ids) else (16, 0)
         table[slot_id] = f"{hour:02d}:{minute:02d}"
     return table
 
@@ -118,12 +121,15 @@ LATEST_PLACEMENT_ET = _latest_placement_table()
 def placement_window(slot: str, trading_day: date) -> tuple[datetime, datetime]:
     """The slot's ``[start, end)`` ET placement window on ``trading_day``.
 
-    Start is the slot's nominal time and end is :data:`LATEST_PLACEMENT_ET`. Raises ``ValueError``
-    for a slot that is not on the roster.
+    Start is the slot's window open (``SLOTS[slot].window_start_et``) and end is
+    :data:`LATEST_PLACEMENT_ET`, the next slot's window open, so the windows tile the day without
+    overlap and an order placed by an early-firing primary (10:27 for the 10:30 slot, 15:22 for the
+    final slot) belongs to its own slot rather than the previous one. Raises ``ValueError`` for a slot
+    that is not on the roster.
     """
     if slot not in SLOTS:
         raise ValueError(f"unknown slot {slot!r}")
-    start_h, start_m = SLOTS[slot].nominal_et
+    start_h, start_m = SLOTS[slot].window_start_et
     end_h, end_m = (int(part) for part in LATEST_PLACEMENT_ET[slot].split(":"))
     return (
         datetime.combine(trading_day, time(start_h, start_m), tzinfo=ET),

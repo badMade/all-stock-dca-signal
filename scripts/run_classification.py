@@ -381,7 +381,12 @@ CRON_ID = "10ce362c"
 SUPERSEDES_CRON_ID = "ce16ba6b"
 SCHEDULED_RUN_TYPE = "scheduled_live_test"
 SCHEDULED_FOR_ET = "15:30"
-SCHEDULED_WINDOW_START_ET = "15:25"
+# The final slot's window opens at 15:20 from 2026-11-14 (operator decision: accept an
+# early scheduler fire; dca_runner.SLOTS["1530"] opens there too). Artifacts written
+# before then carry 15:25, so both stay valid or historical runs would reclassify as
+# invalid -- the same approach as MARKET_OPEN_LEGACY_SCHEDULED_WINDOW_START_ET below.
+SCHEDULED_WINDOW_START_ET = "15:20"
+PRIOR_SCHEDULED_WINDOW_START_ET = "15:25"
 SCHEDULED_WINDOW_END_ET = "15:35"
 # 10ce362c was retimed from 3:20 PM to the canonical 3:30 PM ET on 2026-07-27. Runs
 # that fired before then carry the old identity, so validation accepts it as legacy
@@ -704,9 +709,9 @@ def _attribution_window_start_min(rc: Any) -> int:
     Codex review r3654117272 ("Select the fallback attribution window from
     the run identity"): the window previously always started at the wider
     legacy 15:15 boundary, even for a canonical 1530ET run whose canonical
-    classification window starts at 15:25. That let an unrelated broker order
-    submitted at 15:15-15:24 be wrongly attributed to a canonical run. Use
-    15:25 whenever the validated state carries the canonical scheduled_for_et
+    classification window starts at 15:25 (15:20 since the 2026-11-14 early-fire
+    tolerance). That let an unrelated broker order submitted before it be wrongly
+    attributed to a canonical run. Use SCHEDULED_WINDOW_START_ET whenever the validated state carries the canonical scheduled_for_et
     ('15:30'); fall back to the wider legacy 15:15 boundary only for a
     validated legacy ('15:20') identity (or anything unexpected, to stay at
     least as permissive as prior behavior for data this function has already
@@ -1782,7 +1787,7 @@ def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult
             run_id_ok_legacy = bool(legacy_match) and legacy_match.group(1) < CANONICAL_RETIME_DATE_YYYYMMDD
             is_canonical_identity = (
                 scheduled_for_et == SCHEDULED_FOR_ET
-                and window_start_et == SCHEDULED_WINDOW_START_ET
+                and window_start_et in (SCHEDULED_WINDOW_START_ET, PRIOR_SCHEDULED_WINDOW_START_ET)
                 and run_id_ok_canonical
             )
             is_legacy_identity = (
@@ -4233,7 +4238,7 @@ def select_scheduled_state_for_reporting(
       * Broker time-window fallback is allowed ONLY when a valid scheduled
         state exists but lacks order IDs due to a known write failure; even
         then manual order IDs are excluded AND only broker orders whose ET
-        timestamp lands inside the attribution window are attributed -- 15:25-15:35
+        timestamp lands inside the attribution window are attributed -- 15:20-15:35
         for a canonical 1530ET state, 15:15-15:35 only for a legacy 1520ET state
         (see _attribution_window_start_min).
 

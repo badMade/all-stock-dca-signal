@@ -2057,12 +2057,13 @@ _SLOT_FILES = [
 # caught even though nothing at runtime ever reads these files as config.
 _SLOT_TIME_WINDOWS = {
     "1-executor-0935-cron_35_13.txt": "9:31-10:20 AM ET",
-    "2-executor-1030-cron_30_14.txt": "10:30-11:00 AM ET",
-    "3-executor-1130-cron_30_15.txt": "11:30 AM-12:00 PM ET",
-    "4-executor-1230-cron_30_16.txt": "12:30-1:00 PM ET",
-    "5-executor-1330-cron_30_17.txt": "1:30-2:00 PM ET",
-    "6-executor-1430-cron_30_18.txt": "2:30-3:00 PM ET",
-    "7-executor-1530-cron_30_19.txt": "3:30-4:00 PM ET",
+    # 2026-11-14: the half-hour slots open at :25 and the final slot at 3:20 (dca_runner.SLOTS).
+    "2-executor-1030-cron_30_14.txt": "10:25-11:00 AM ET",
+    "3-executor-1130-cron_30_15.txt": "11:25 AM-12:00 PM ET",
+    "4-executor-1230-cron_30_16.txt": "12:25-1:00 PM ET",
+    "5-executor-1330-cron_30_17.txt": "1:25-2:00 PM ET",
+    "6-executor-1430-cron_30_18.txt": "2:25-3:00 PM ET",
+    "7-executor-1530-cron_30_19.txt": "3:20-4:00 PM ET",
 }
 
 # Slots whose legacy counterpart has a committed, verifiable ref_id convention

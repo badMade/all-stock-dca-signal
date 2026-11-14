@@ -109,7 +109,9 @@ AFTERNOON_LIVE_CRON_ID = "10ce362c"
 AFTERNOON_LIVE_SUPERSEDES_CRON_ID = "ce16ba6b"
 AFTERNOON_LIVE_RUN_TYPE = "scheduled_live_test"
 AFTERNOON_LIVE_SCHEDULED_FOR_ET = "15:30"
-AFTERNOON_LIVE_WINDOW_START_ET = "15:25"
+# 15:20 from 2026-11-14 (early-fire tolerance); earlier artifacts carry 15:25 and stay
+# valid via scripts.run_classification.PRIOR_SCHEDULED_WINDOW_START_ET.
+AFTERNOON_LIVE_WINDOW_START_ET = "15:20"
 # Retimed from 3:20 PM ET on 2026-07-27. Legacy runs written before then carry
 # these values; validators accept them so existing artifacts stay valid.
 AFTERNOON_LIVE_LEGACY_SCHEDULED_FOR_ET = "15:20"

@@ -32,7 +32,7 @@
       "Collect every order_id in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",
       "Exclude any run_state with run_origin='manual' or manual_run=true, regardless of file path.",
       "Never infer scheduled status from same-day broker orders alone; a valid scheduled run_state must exist.",
-      "Broker time-window fallback (15:15-15:35 ET) is allowed only when a valid scheduled state exists but lacks order IDs due to a known write failure; manual order IDs stay excluded.",
+      "Broker time-window fallback (15:20-15:35 ET for a canonical 1530ET run since 2026-11-14, 15:15-15:35 ET for a legacy 1520ET run) is allowed only when a valid scheduled state exists but lacks order IDs due to a known write failure; manual order IDs stay excluded.",
       "Scheduled-live cost basis, slippage, reliability, and order-count metrics come only from validated scheduled runs."
     ],
     "manual_reporting": {

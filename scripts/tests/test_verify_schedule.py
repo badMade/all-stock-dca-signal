@@ -109,9 +109,12 @@ def test_nothing_at_all_after_the_deadline_is_no_evidence():
 
 
 def test_time_based_statuses():
-    before = datetime(2026, 9, 22, 10, 29, tzinfo=ET)
+    before = datetime(2026, 9, 22, 10, 24, tzinfo=ET)  # before the 10:25 window open
     inside_grace = datetime(2026, 9, 22, 11, 29, tzinfo=ET)  # window end 11:00 + 30 min
     assert classify(now=before, run_dir=False)["status"] == "not_due"
+    # 2026-11-14: the slot opens at 10:25, so an early run in flight at 10:27 is awaiting
+    # evidence, not "not due" (it would otherwise read as if the slot had not started).
+    assert classify(now=datetime(2026, 9, 22, 10, 27, tzinfo=ET), run_dir=True)["status"] == "awaiting_evidence"
     assert classify(now=inside_grace, run_dir=True)["status"] == "awaiting_evidence"
     assert classify(now=datetime(2026, 9, 22, 11, 31, tzinfo=ET), run_dir=True)["status"] == "evidence_incomplete"
     # Evidence written before the nominal time (clock skew) is still evidence.

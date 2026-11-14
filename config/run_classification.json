@@ -18,11 +18,11 @@
     "schedule_et": "15:30",
     "schedule_human": "3:30 PM ET weekdays",
     "cron_utc": "30 19 * * 1-5",
-    "window_start_et": "15:25",
+    "window_start_et": "15:20",
     "window_end_et": "15:35",
     "retimed_on_et": "2026-07-27",
     "retimed_from_et": "15:20",
-    "retimed_note": "10ce362c was retimed from 3:20 PM ET to the canonical 3:30 PM ET on 2026-07-27. Newly written scheduled evidence uses scheduled_for_et='15:30', scheduled_window_start_et='15:25', and run ids of the form scheduled_YYYYMMDD_1530ET. The artifact root stays under .../ce16ba6b for continuity.",
+    "retimed_note": "10ce362c was retimed from 3:20 PM ET to the canonical 3:30 PM ET on 2026-07-27. Newly written scheduled evidence uses scheduled_for_et='15:30', scheduled_window_start_et='15:20' (15:25 until the 2026-11-14 early-fire tolerance; validators accept both), and run ids of the form scheduled_YYYYMMDD_1530ET. The artifact root stays under .../ce16ba6b for continuity.",
     "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
   },
   "artifact_paths": {
@@ -38,7 +38,8 @@
     "cron_id": "10ce362c",
     "supersedes_cron_id": "ce16ba6b",
     "scheduled_for_et": "15:30",
-    "scheduled_window_start_et": "15:25",
+    "scheduled_window_start_et": "15:20",
+    "prior_scheduled_window_start_et": "15:25",
     "scheduled_window_end_et": "15:35",
     "manual_run": false,
     "run_id_pattern": "scheduled_YYYYMMDD_1530ET",
@@ -738,7 +739,7 @@
       "requirement": "Final-run reconciliation MUST use the true final-run scheduled window. 3:30 PM ET is 19:30Z during EDT, so the lower bound is 19:30Z.",
       "forbidden": "18:30Z MUST NOT be used as the final-run lower bound. 18:30Z is 2:30 PM ET, a different scheduled slot, and using it sweeps the entire afternoon intraday window into the final run.",
       "dst_note": "3:30 PM ET is 19:30Z during EDT and 20:30Z during EST. Derive the instant from the ET slot; do NOT hardcode 19:30Z year-round.",
-      "consistency_with_existing_fallback": "broker_time_window_fallback scopes attribution to a CLOSED window whose start depends on the run identity: 15:25-15:35 ET (19:25Z-19:35Z during EDT) for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET (19:15Z-19:35Z during EDT) ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state -- see scripts.run_classification._attribution_window_start_min. This field previously reported 15:15-15:35 for all runs, which would let a consumer attribute an otherwise-unclaimed 15:15-15:24 order to a current 3:30 run that the code correctly refuses (codex review: 'Report the canonical broker fallback window accurately'). Both variants remain narrower than, and consistent with, the rule above; all of them exclude 18:30Z."
+      "consistency_with_existing_fallback": "broker_time_window_fallback scopes attribution to a CLOSED window whose start depends on the run identity: 15:20-15:35 ET (19:20Z-19:35Z during EDT) for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET (19:15Z-19:35Z during EDT) ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state -- see scripts.run_classification._attribution_window_start_min. This field previously reported 15:15-15:35 for all runs, which would let a consumer attribute an otherwise-unclaimed 15:15-15:24 order to a current 3:30 run that the code correctly refuses (codex review: 'Report the canonical broker fallback window accurately'). Both variants remain narrower than, and consistent with, the rule above; all of them exclude 18:30Z."
     },
     "final_run_evidence_definition": [
       "an order_id present in the final run's own submitted_orders.csv",
@@ -753,7 +754,7 @@
       "upper_utc_edt": "19:35Z",
       "dst_note": "Both bounds are DERIVED from the ET slot and must be recomputed under EST (20:30Z-20:35Z). Do NOT hardcode the Z values year-round; the same rule already stated for the lower bound applies to the upper.",
       "why_bounded": "The rule previously stated only a lower bound, so ANY later same-day order not already claimed qualified indefinitely -- a manual or unrelated order placed at 16:00 ET would be attributed to the 3:30 scheduled run and swept into scheduled watchdog and slippage results. An unbounded 'final-run evidence' test is not a window (codex review: 'Cap the final-run time fallback at the window end').",
-      "consistency_with_code": "scripts.run_classification._in_scheduled_window_et enforces a CLOSED window for the same fallback -- 15:25-15:35 for a canonical 1530ET run, 15:15-15:35 for a legacy 1520ET one. This rule's upper bound is that same 15:35 end; its lower bound is deliberately the slot time itself, which is the stricter of the two.",
+      "consistency_with_code": "scripts.run_classification._in_scheduled_window_et enforces a CLOSED window for the same fallback -- 15:20-15:35 for a canonical 1530ET run, 15:15-15:35 for a legacy 1520ET one. This rule's upper bound is that same 15:35 end; its lower bound is deliberately the slot time itself, which is the stricter of the two.",
       "precedence": "Unchanged: this is still the LAST resort. Artifact-linked evidence (order_id, ref_id, final-run ref_id prefix) is checked first, and the earlier-stream-claim exclusion still applies before the window test runs."
     },
     "evidence_ordering": "Check artifact-linked evidence FIRST (order_id, then ref_id, then final-run ref_id prefix). The time-window test is the LAST resort and is valid only after the earlier-stream-claim exclusion has been applied.",
@@ -909,7 +910,7 @@
     "conditions": [
       "A valid scheduled run_state exists (run_origin='scheduled', passes schema validation).",
       "The scheduled run_state lacks order IDs due to a known/recorded write failure.",
-      "Only broker orders inside the scheduled window on the scheduled trading day may be attributed. The window START depends on the run identity: 15:25-15:35 ET for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state. This condition previously read 15:15-15:35 for every run, which permitted attributing an otherwise-unclaimed 15:15-15:24 order to a canonical 3:30 run that scripts.run_classification._attribution_window_start_min() correctly refuses -- the authoritative block has to state the rule the code enforces, not a superset of it (codex review: 'Correct the actual broker fallback contract')."
+      "Only broker orders inside the scheduled window on the scheduled trading day may be attributed. The window START depends on the run identity: 15:20-15:35 ET for a CANONICAL scheduled_YYYYMMDD_1530ET state, and 15:15-15:35 ET ONLY for a LEGACY scheduled_YYYYMMDD_1520ET state. This condition previously read 15:15-15:35 for every run, which permitted attributing an otherwise-unclaimed 15:15-15:24 order to a canonical 3:30 run that scripts.run_classification._attribution_window_start_min() correctly refuses -- the authoritative block has to state the rule the code enforces, not a superset of it (codex review: 'Correct the actual broker fallback contract')."
     ],
     "constraints": [
       "Manual order IDs (from manual_runs/**/run_state*.json) must still be excluded even under fallback.",

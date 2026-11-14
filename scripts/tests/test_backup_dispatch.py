@@ -65,7 +65,7 @@ def test_every_slot_maps_to_its_backup_task(slot, task_id):
 
 
 @pytest.mark.parametrize("slot, start, end", [
-    ("0935", "09:50", "10:30"), ("1230", "12:45", "13:30"),
+    ("0935", "09:50", "10:25"), ("1230", "12:45", "13:25"),  # 2026-11-14: latest placement is the next slot's window OPEN (:25 / 15:20), not its nominal :30
     # 2026-11-09: the final slot's window opens at 15:40 (10 minutes after the slot), not 15:45, because its backup
     # fires at 15:40 and only has until 16:00; every other slot keeps 15 minutes.
     ("1530", "15:40", "16:00"),

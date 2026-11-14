@@ -302,8 +302,9 @@ def test_slot_for_window_boundaries_and_after_last(tmp_path):
 def test_slots_for_active_and_next_window_opening():
     start, _end = dca_order_plan.placement_window("0935", FIXTURE_DATE)
     assert slots_for(start - time_delta(35), time_delta(35)) == ["0935"]
-    assert slots_for(start, time_delta(54)) == ["0935"]
-    assert slots_for(start, time_delta(55)) == ["0935", "1030"]
+    # 0935 opens 09:31 and 1030 opens 10:25 (2026-11-14), 54 minutes later.
+    assert slots_for(start, time_delta(53)) == ["0935"]
+    assert slots_for(start, time_delta(54)) == ["0935", "1030"]
     assert slots_for(datetime.combine(FIXTURE_DATE, time(16, 0), ET), time_delta(10)) == []
     with pytest.raises(ValueError, match="timezone-aware"):
         slots_for(datetime.combine(FIXTURE_DATE, time(9, 0)), time_delta(5))
