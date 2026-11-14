@@ -120,6 +120,8 @@ py-modules = [
     # Imported by dca_paths (loads the operator's .env), so it must ship with the
     # wheel or `import dca_paths` fails outside a source checkout.
     "dca_env",
+    # Opt-in retry/backoff helpers (PRODUCTION_READINESS gap 6); not imported by any live path yet.
+    "dca_retry",
     "dca_risk",
     "dca_live_adapters",
     "dca_reporting",
