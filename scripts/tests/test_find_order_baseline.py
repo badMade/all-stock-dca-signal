@@ -58,18 +58,18 @@ def _order(label, utc_hhmmss, *, day=DAY, symbol="KDP", usd="2.000000", state="f
     }
 
 
-def _run_dir(root: Path, slot: str) -> Path:
-    path = root / fob.slot_run_dir_relative(slot, datetime.fromisoformat(DAY).date())
+def _run_dir(root: Path, slot: str, slot_day=DAY) -> Path:
+    path = root / fob.slot_run_dir_relative(slot, datetime.fromisoformat(slot_day).date())
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _assembled(root, slot, orders, *, kind="day", snapshot_at, account=ACCOUNT, tamper=None):
+def _assembled(root, slot, orders, *, kind="day", snapshot_at, account=ACCOUNT, tamper=None, slot_day=DAY, envelope_day=None):
     """Write a REAL assemble_order_pages envelope where slot ``slot`` would have saved it."""
-    run_dir = _run_dir(root, slot)
+    run_dir = _run_dir(root, slot, slot_day)
     page = run_dir / f"raw_{kind}.json"
     page.write_text(json.dumps({"orders": orders}), encoding="utf-8")
-    env_day = DAY if kind == "day" else MONDAY
+    env_day = envelope_day or (DAY if kind == "day" else MONDAY)
     envelope, _ = asm.assemble([str(page)], account_number=account, trading_day=env_day, snapshot_at=snapshot_at)
     if tamper:
         tamper(envelope)
@@ -188,10 +188,53 @@ def test_week_kind_reads_the_week_file_keyed_by_monday(tmp_path):
     assert result["envelope_trading_day"] == MONDAY
 
 
+def test_prior_day_week_base_is_found_and_today_base_wins(tmp_path):
+    older = _assembled(tmp_path, "1530", [_order("m", "15:00:00", day=MONDAY)], kind="week",
+                       snapshot_at="2026-11-11T15:40:00-05:00", slot_day="2026-11-11")
+    found = _find(tmp_path, kind="week")
+    assert found["ok"] and found["base"] == str(older) and found["base_day"] == "2026-11-11"
+    today = _assembled(tmp_path, "1330", [_order("m", "15:00:00", day=MONDAY)], kind="week",
+                       snapshot_at=f"{DAY}T13:52:41-05:00")
+    found = _find(tmp_path, kind="week")
+    assert found["base"] == str(today) and found["base_day"] == DAY
+
+
+def test_prior_day_week_base_merges_with_the_printed_120_second_boundary(tmp_path):
+    base_path = _assembled(tmp_path, "1530", [_order("m", "15:00:00", day=MONDAY)], kind="week",
+                           snapshot_at="2026-11-11T15:40:00-05:00", slot_day="2026-11-11")
+    found = _find(tmp_path, kind="week")
+    increment = tmp_path / "prior_week_increment.json"
+    increment.write_text(json.dumps({"orders": [_order("m", "15:00:00", day=MONDAY),
+                                                  _order("new", "19:00:00")]}), encoding="utf-8")
+    out = tmp_path / "today_week.json"
+    code = merge.main(["--base", found["base"], "--account", ACCOUNT, "--trading-day", MONDAY,
+                       "--created-at-gte", found["created_at_gte"], "--snapshot-at", f"{DAY}T10:00:00-05:00",
+                       "--overlap-seconds", "120", "--out", str(out), str(increment)])
+    assert code == 0
+    assert out.exists() and base_path.exists()
+
+
+def test_prior_iso_week_and_pre_monday_snapshots_are_rejected(tmp_path):
+    _assembled(tmp_path, "1530", [_order("m", "15:00:00", day="2026-11-02")], kind="week",
+               snapshot_at="2026-11-06T15:40:00-05:00", slot_day="2026-11-06", envelope_day="2026-11-02")
+    found = _find(tmp_path, kind="week")
+    assert not found["ok"]
+    # A correctly keyed current-week envelope with a snapshot before Monday is also rejected.
+    _assembled(tmp_path, "1530", [_order("m", "15:00:00", day=MONDAY)], kind="week",
+               snapshot_at="2026-11-08T15:40:00-05:00", slot_day="2026-11-11")
+    found = _find(tmp_path, kind="week")
+    assert not found["ok"] and any(r["reason"] == "snapshot_outside_window" for r in found["rejected"])
+
+
+def test_day_lookup_never_searches_prior_days(tmp_path):
+    _assembled(tmp_path, "1530", [_order("m", "15:00:00")], snapshot_at="2026-11-11T15:40:00-05:00", slot_day="2026-11-11")
+    assert not _find(tmp_path, kind="day")["ok"]
+
+
 def test_a_week_envelope_last_written_on_an_earlier_day_is_rejected(tmp_path):
     _assembled(tmp_path, "1330", [_order("m", "15:00:00", day=MONDAY)], kind="week", snapshot_at="2026-11-11T13:52:41-05:00")
     result = _find(tmp_path, kind="week")
-    assert result["ok"] is False and result["rejected"][0]["reason"] == "snapshot_not_today"
+    assert result["ok"] is True and result["base_day"] == "2026-11-12"
 
 
 def test_nothing_saved_yet_is_a_clean_no_valid_baseline(tmp_path):
@@ -327,10 +370,11 @@ def test_mixed_offsets_are_compared_as_instants_not_text(tmp_path):
     assert sorted(_plan(tmp_path)["merge"]) == ["day", "week"]
 
 
-def test_plan_without_a_day_base_takes_the_week_boundary_and_day_falls_back(tmp_path):
-    _assembled(tmp_path, "1330", [_order("a", "18:44:00")], kind="week", snapshot_at=f"{DAY}T13:52:41-05:00")
+def test_plan_without_a_day_base_takes_the_prior_day_week_boundary_and_day_falls_back(tmp_path):
+    _assembled(tmp_path, "1530", [_order("a", "18:44:00", day=MONDAY)], kind="week", snapshot_at="2026-11-11T13:52:41-05:00", slot_day="2026-11-11")
     plan = _plan(tmp_path)
     assert plan["boundary_kind"] == "week" and list(plan["merge"]) == ["week"]
+    assert plan["merge"]["week"]["base"] and plan["lookups"]["week"]["base_day"] == "2026-11-11"
     assert plan["fallback_full"] == ["day"]
 
 

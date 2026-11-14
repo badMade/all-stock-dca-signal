@@ -128,3 +128,14 @@ week base older than that boundary is not merged, and only the week falls back t
 2:30 run would have merged onto the 1:30 envelopes (37 day orders, 168 week orders, snapshot
 13:52 ET), and the increment would have held about one order. The 10:30 and 11:30 prompts keep
 the plain rule, because their day pages are still small.
+
+## 2026-11-14 — Reuse earlier-day ISO-week envelopes after a missed slot
+
+The 2026-11-13 09:35 slot did not fire, leaving no same-day week envelope for 10:30. The
+full ISO-week fetch was 135,748 characters and could not be persisted. `find_order_baseline
+--kind week` now searches week envelopes from all slots on earlier trading days in the same ISO
+week after checking earlier slots today. It accepts snapshots from Monday through today (ET),
+retains all existing envelope and row integrity checks, and chooses the newest snapshot. The
+result reports `base_day`. Day lookups are unchanged. Prompts first try this lookup when the
+9:35 baseline is unusable, then merge the bounded increment into this run's own output; full-week
+fetch remains the fail-closed fallback.
