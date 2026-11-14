@@ -5,6 +5,15 @@ updates:
   # upstream release add a rule to the selected E/F/I/B sets and turn main red
   # with no commit here). Pinning only works if something keeps the pins moving,
   # which is this.
+  #
+  # 2026-11-14: this job also bumps the same pins in pyproject.toml but never relocks uv.lock
+  # (#2279 ruff, #2275 types-pyyaml), which left `uv export --locked` re-resolving and the research
+  # audit red until #2296. The uv job below bumps pyproject.toml, requirements-dev.txt AND uv.lock
+  # together (#2145, #2211), so it alone owns the packages pyproject.toml declares. This job keeps
+  # the sibling manifests (llm-providers, production-safe-agent-loop, ...). Packages a sibling also
+  # lists (pytest, msgpack, yfinance, ...) stay here, because `ignore` cannot be scoped to a path;
+  # if one of those bumps drifts the lock, tests/test_uv_lock_sync.py fails on the PR ("run uv lock").
+  # tests/test_dependabot_config.py keeps this list in step with pyproject.toml.
   - package-ecosystem: pip
     directory: "/"
     schedule:
@@ -14,6 +23,22 @@ updates:
       prefix: "deps"
     labels:
       - dependencies
+    ignore:
+      - dependency-name: "jsonschema"
+      - dependency-name: "pip-audit"
+      - dependency-name: "pip-tools"
+      - dependency-name: "pyright"
+      - dependency-name: "pytest-cov"
+      - dependency-name: "pyyaml"
+      - dependency-name: "referencing"
+      - dependency-name: "ruamel-yaml"
+      - dependency-name: "ruff"
+      - dependency-name: "scipy-stubs"
+      - dependency-name: "types-beautifulsoup4"
+      - dependency-name: "types-pillow"
+      - dependency-name: "types-pyyaml"
+      - dependency-name: "types-requests"
+      - dependency-name: "uv"
 
   # uv.lock also records the optional research graph. Keep those exact
   # transitive versions current independently of the pinned pip dev tools.

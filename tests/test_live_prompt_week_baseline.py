@@ -1,4 +1,4 @@
-"""Every post-9:35 live prompt must build its ISO-week history from the 9:35 week baseline.
+"""Post-9:35 prompts must reuse a safe ISO-week baseline across missed slots.
 
 2026-11-05 15:30 ET: the run reached Gate 6 with 81 BUY candidates and aborted
 ``ABORT_GATE6_HISTORY_INCOMPLETE`` / ``output_cap_exceeded`` with 0 orders, because the
@@ -13,10 +13,14 @@ envelope, failing closed on any gap. Replaying the real 2026-11-05 data through 
 baseline of 149 orders + the 25-order same-day page) gives 157 orders -- the same count the
 14:30 run reported from a full fetch. So the 3:30 slot only has to save TODAY's orders.
 
-These tests pin the WEEK BASELINE REUSE rule in the 10:30, 11:30, 1:30, 2:30 and 3:30 prompts so it
-cannot silently drift out of one of them. The 12:30 prompt is deliberately absent: it reshapes the
-week's rows into ``orders_week.json`` by hand, so it needs a scripted reshape before it can use the
-merged envelope (tracked separately).
+2026-11-13: the 9:35 slot did not fire, so the 10:30 session had no same-day week envelope and
+fell back to a 135,748-character full-week fetch that could not be saved. The week finder now
+checks envelopes from earlier trading days of the same ISO week; merge_order_pages revalidates
+the base rows and overlap, so these are safe incremental bases.
+
+These tests pin the WEEK BASELINE REUSE rule in the 10:30, 11:30, 12:30, 1:30, 2:30 and 3:30 prompts so it
+cannot silently drift out of one of them. The 12:30 prompt reshapes the week's rows into
+``orders_week.json`` through the scripted ``reshape_order_pages`` tool.
 """
 
 from pathlib import Path
@@ -92,8 +96,16 @@ def test_rule_only_narrows_by_created_at_gte(slot):
 
 def test_rule_falls_back_to_the_full_fetch_when_no_baseline_or_merge_refuses(slot):
     rule = _rule(slot)
-    assert "exit 2" in rule
+    assert "exit 2" in rule or "exits 2" in rule
     assert "full" in rule and "OVERSIZED ORDER PAGES" in rule
+
+
+def test_missed_935_uses_prior_week_baseline_before_full_fetch(slot):
+    rule = _rule(slot)
+    if slot in {"1030", "1130", "1230"}:
+        assert "scripts.find_order_baseline --kind week" in rule
+        assert "prior_baseline_merge" in rule
+        assert "full ISO" in rule and "OVERSIZED ORDER PAGES" in rule
 
 
 def test_rule_covers_the_gate_7_per_order_week_refetch(slot):
@@ -118,7 +130,7 @@ def test_1230_builds_orders_week_with_the_reshape_script_never_by_hand(slot):
     assert "NEVER reshape a row by hand" in rule
     # The merged envelope replaces the re-emitted raw copies, and a reshape refusal falls back too.
     assert "orders_week_raw.json" in rule and "orders_week_raw_final.json" in rule
-    assert "reshape_order_pages ends with exit 2" in rule
+    assert "reshape" in rule and "refuses" in rule
 
 
 def test_1230_gate_4_and_gate_6_5_point_back_at_the_rule(slot):

@@ -1,0 +1,3243 @@
+{
+ "_about": {
+  "what": "Filled market buys from the scheduled DCA runs, sanitized for tests. Account number, order IDs and ref IDs removed; kept only date, ticker, side, quantity, price (first execution) and dollar amount.",
+  "source_runs": [
+   "2026-10-26_1530ET",
+   "2026-10-27_1530ET",
+   "20261106_1530ET",
+   "20261110_1530ET",
+   "20261111_1530ET"
+  ],
+  "source_root": "cron_tracking/ce16ba6b/scheduled_runs/<run>/orders_pages_*.json",
+  "extracted_on": "2026-11-14",
+  "order_count": 403,
+  "sanitization": "no account number, no UUID, no 9-12 digit literal (checked by tests/test_goal_progress_golden.py)",
+  "closes_source": "ticker_data/<TICKER>.csv (Yahoo daily archive), Close column, for the golden tickers only"
+ },
+ "fills": [
+  {
+   "date": "2026-10-26",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.043911",
+   "price": "39.3974",
+   "amount_usd": "1.73"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "AAPL",
+   "side": "buy",
+   "quantity": "0.013489",
+   "price": "341.7399",
+   "amount_usd": "4.61"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CAT",
+   "side": "buy",
+   "quantity": "0.002142",
+   "price": "685.9623",
+   "amount_usd": "1.47"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CBRS",
+   "side": "buy",
+   "quantity": "0.014658",
+   "price": "108.4724",
+   "amount_usd": "1.59"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CHD",
+   "side": "buy",
+   "quantity": "0.012749",
+   "price": "105.0999",
+   "amount_usd": "1.34"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CHE",
+   "side": "buy",
+   "quantity": "0.001952",
+   "price": "512.1599",
+   "amount_usd": "1.00"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CL",
+   "side": "buy",
+   "quantity": "0.015895",
+   "price": "93.7399",
+   "amount_usd": "1.49"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "CVS",
+   "side": "buy",
+   "quantity": "0.019498",
+   "price": "92.8299",
+   "amount_usd": "1.81"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "DFTX",
+   "side": "buy",
+   "quantity": "0.048009",
+   "price": "35.41",
+   "amount_usd": "1.70"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.004501",
+   "price": "242.1599",
+   "amount_usd": "1.09"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "FLKR",
+   "side": "buy",
+   "quantity": "0.039454",
+   "price": "49.9305",
+   "amount_usd": "1.97"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "GFUZ",
+   "side": "buy",
+   "quantity": "0.456714",
+   "price": "5.8899",
+   "amount_usd": "2.69"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "GOOG",
+   "side": "buy",
+   "quantity": "0.005925",
+   "price": "315.5982",
+   "amount_usd": "1.87"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "GOOGL",
+   "side": "buy",
+   "quantity": "0.00574",
+   "price": "318.7599",
+   "amount_usd": "1.83"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.002809",
+   "price": "466.3289",
+   "amount_usd": "1.31"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.088305",
+   "price": "20.9499",
+   "amount_usd": "1.85"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "HSY",
+   "side": "buy",
+   "quantity": "0.012625",
+   "price": "168.7068",
+   "amount_usd": "2.13"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.008515",
+   "price": "251.3089",
+   "amount_usd": "2.14"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "KR",
+   "side": "buy",
+   "quantity": "0.022955",
+   "price": "66.6499",
+   "amount_usd": "1.53"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "KVUE",
+   "side": "buy",
+   "quantity": "0.100585",
+   "price": "19.4859",
+   "amount_usd": "1.96"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "LUNR",
+   "side": "buy",
+   "quantity": "0.146991",
+   "price": "10.4088",
+   "amount_usd": "1.53"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "MA",
+   "side": "buy",
+   "quantity": "0.006504",
+   "price": "616.4699",
+   "amount_usd": "4.01"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "MCK",
+   "side": "buy",
+   "quantity": "0.001481",
+   "price": "999.1999",
+   "amount_usd": "1.48"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.05339",
+   "price": "63.1199",
+   "amount_usd": "3.37"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.010841",
+   "price": "144.8199",
+   "amount_usd": "1.57"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "MSFT",
+   "side": "buy",
+   "quantity": "0.002942",
+   "price": "523.4472",
+   "amount_usd": "1.54"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "NFLX",
+   "side": "buy",
+   "quantity": "0.034705",
+   "price": "65.1199",
+   "amount_usd": "2.26"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "QBTS",
+   "side": "buy",
+   "quantity": "0.173648",
+   "price": "11.4599",
+   "amount_usd": "1.99"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "QUBT",
+   "side": "buy",
+   "quantity": "0.363359",
+   "price": "6.4399",
+   "amount_usd": "2.34"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.245335",
+   "price": "11.2499",
+   "amount_usd": "2.76"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.006106",
+   "price": "252.1899",
+   "amount_usd": "1.54"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "SATA",
+   "side": "buy",
+   "quantity": "0.032751",
+   "price": "98.0099",
+   "amount_usd": "3.21"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.012658",
+   "price": "129.554",
+   "amount_usd": "1.64"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "SPCX",
+   "side": "buy",
+   "quantity": "0.010145",
+   "price": "145.8799",
+   "amount_usd": "1.48"
+  },
+  {
+   "date": "2026-10-26",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.020839",
+   "price": "56.6244",
+   "amount_usd": "1.18"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "ABBV",
+   "side": "buy",
+   "quantity": "0.004224",
+   "price": "286.439900",
+   "amount_usd": "1.210000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.034989",
+   "price": "103.458800",
+   "amount_usd": "3.620000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CAH",
+   "side": "buy",
+   "quantity": "0.014793",
+   "price": "248.080000",
+   "amount_usd": "3.670000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CCI",
+   "side": "buy",
+   "quantity": "0.017321",
+   "price": "86.599900",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CHD",
+   "side": "buy",
+   "quantity": "0.019338",
+   "price": "104.970000",
+   "amount_usd": "2.030000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CHE",
+   "side": "buy",
+   "quantity": "0.002501",
+   "price": "511.690000",
+   "amount_usd": "1.280000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CL",
+   "side": "buy",
+   "quantity": "0.022513",
+   "price": "92.389900",
+   "amount_usd": "2.080000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "CVS",
+   "side": "buy",
+   "quantity": "0.015626",
+   "price": "92.150000",
+   "amount_usd": "1.440000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.009907",
+   "price": "240.219900",
+   "amount_usd": "2.380000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "FFIV",
+   "side": "buy",
+   "quantity": "0.002978",
+   "price": "459.959900",
+   "amount_usd": "1.370000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "GLW",
+   "side": "buy",
+   "quantity": "0.013591",
+   "price": "127.289900",
+   "amount_usd": "1.730000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.022051",
+   "price": "444.415000",
+   "amount_usd": "9.800000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.102608",
+   "price": "20.758500",
+   "amount_usd": "2.130000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "HSY",
+   "side": "buy",
+   "quantity": "0.033203",
+   "price": "165.043000",
+   "amount_usd": "5.480000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.007072",
+   "price": "251.666900",
+   "amount_usd": "1.780000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "KR",
+   "side": "buy",
+   "quantity": "0.053947",
+   "price": "65.619900",
+   "amount_usd": "3.540000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "KVUE",
+   "side": "buy",
+   "quantity": "0.121840",
+   "price": "19.369600",
+   "amount_usd": "2.360000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "LLY",
+   "side": "buy",
+   "quantity": "0.001127",
+   "price": "1277.153000",
+   "amount_usd": "1.440000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "MA",
+   "side": "buy",
+   "quantity": "0.002685",
+   "price": "610.689900",
+   "amount_usd": "1.640000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "MCK",
+   "side": "buy",
+   "quantity": "0.001794",
+   "price": "991.717800",
+   "amount_usd": "1.780000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.041507",
+   "price": "62.397900",
+   "amount_usd": "2.590000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "MSFT",
+   "side": "buy",
+   "quantity": "0.002889",
+   "price": "529.479900",
+   "amount_usd": "1.530000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "NFLX",
+   "side": "buy",
+   "quantity": "0.024592",
+   "price": "63.028000",
+   "amount_usd": "1.550000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.014769",
+   "price": "95.470000",
+   "amount_usd": "1.410000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.009721",
+   "price": "249.949900",
+   "amount_usd": "2.430000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "RVI",
+   "side": "buy",
+   "quantity": "0.051869",
+   "price": "24.869900",
+   "amount_usd": "1.290000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.016652",
+   "price": "127.909900",
+   "amount_usd": "2.130000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "SYY",
+   "side": "buy",
+   "quantity": "0.030160",
+   "price": "81.563700",
+   "amount_usd": "2.460000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "TRLV",
+   "side": "buy",
+   "quantity": "0.093809",
+   "price": "10.659900",
+   "amount_usd": "1.000000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.062264",
+   "price": "55.729900",
+   "amount_usd": "3.470000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "USFD",
+   "side": "buy",
+   "quantity": "0.014830",
+   "price": "101.141300",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-10-27",
+   "ticker": "VCX",
+   "side": "buy",
+   "quantity": "0.047295",
+   "price": "24.949600",
+   "amount_usd": "1.180000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.052144",
+   "price": "38.738700",
+   "amount_usd": "2.020000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.088528",
+   "price": "39.987300",
+   "amount_usd": "3.540000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AAPL",
+   "side": "buy",
+   "quantity": "0.010366",
+   "price": "340.515700",
+   "amount_usd": "3.530000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AAPL",
+   "side": "buy",
+   "quantity": "0.017531",
+   "price": "331.407700",
+   "amount_usd": "5.810000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ABBV",
+   "side": "buy",
+   "quantity": "0.011810",
+   "price": "285.329900",
+   "amount_usd": "3.370000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ABBV",
+   "side": "buy",
+   "quantity": "0.025059",
+   "price": "287.719900",
+   "amount_usd": "7.210000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.013933",
+   "price": "109.809900",
+   "amount_usd": "1.530000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.031043",
+   "price": "110.167500",
+   "amount_usd": "3.420000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.033052",
+   "price": "111.639900",
+   "amount_usd": "3.690000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ACGL",
+   "side": "buy",
+   "quantity": "0.080537",
+   "price": "107.899900",
+   "amount_usd": "8.690000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AMAT",
+   "side": "buy",
+   "quantity": "0.003832",
+   "price": "386.206100",
+   "amount_usd": "1.480000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AMAT",
+   "side": "buy",
+   "quantity": "0.004060",
+   "price": "379.231200",
+   "amount_usd": "1.540000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AMD",
+   "side": "buy",
+   "quantity": "0.007319",
+   "price": "482.289900",
+   "amount_usd": "3.530000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AMD",
+   "side": "buy",
+   "quantity": "0.021542",
+   "price": "440.979900",
+   "amount_usd": "9.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ANET",
+   "side": "buy",
+   "quantity": "0.012092",
+   "price": "167.050000",
+   "amount_usd": "2.020000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "APH",
+   "side": "buy",
+   "quantity": "0.100939",
+   "price": "79.850000",
+   "amount_usd": "8.060000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ASML",
+   "side": "buy",
+   "quantity": "0.002085",
+   "price": "1515.129900",
+   "amount_usd": "3.160000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ASML",
+   "side": "buy",
+   "quantity": "0.002101",
+   "price": "1523.068900",
+   "amount_usd": "3.200000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ASML",
+   "side": "buy",
+   "quantity": "0.005151",
+   "price": "1422.979900",
+   "amount_usd": "7.330000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AVGO",
+   "side": "buy",
+   "quantity": "0.005103",
+   "price": "323.335000",
+   "amount_usd": "1.650000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AVGO",
+   "side": "buy",
+   "quantity": "0.010042",
+   "price": "324.629900",
+   "amount_usd": "3.260000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AVGO",
+   "side": "buy",
+   "quantity": "0.021257",
+   "price": "309.060800",
+   "amount_usd": "6.570000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "AWK",
+   "side": "buy",
+   "quantity": "0.067844",
+   "price": "147.395600",
+   "amount_usd": "10.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "BDX",
+   "side": "buy",
+   "quantity": "0.007155",
+   "price": "212.419900",
+   "amount_usd": "1.520000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "BTX",
+   "side": "buy",
+   "quantity": "1.331575",
+   "price": "7.509900",
+   "amount_usd": "10.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "BTX",
+   "side": "buy",
+   "quantity": "0.243094",
+   "price": "8.268400",
+   "amount_usd": "2.010000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "BTX",
+   "side": "buy",
+   "quantity": "0.251559",
+   "price": "8.029900",
+   "amount_usd": "2.020000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "BTX",
+   "side": "buy",
+   "quantity": "0.289319",
+   "price": "8.329900",
+   "amount_usd": "2.410000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CAH",
+   "side": "buy",
+   "quantity": "0.005173",
+   "price": "253.229900",
+   "amount_usd": "1.310000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CAT",
+   "side": "buy",
+   "quantity": "0.002318",
+   "price": "621.116700",
+   "amount_usd": "1.440000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CAT",
+   "side": "buy",
+   "quantity": "0.010010",
+   "price": "592.379900",
+   "amount_usd": "5.930000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CB",
+   "side": "buy",
+   "quantity": "0.003388",
+   "price": "365.970900",
+   "amount_usd": "1.240000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CB",
+   "side": "buy",
+   "quantity": "0.015866",
+   "price": "366.809900",
+   "amount_usd": "5.820000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CBRS",
+   "side": "buy",
+   "quantity": "0.011207",
+   "price": "95.473500",
+   "amount_usd": "1.070000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CBRS",
+   "side": "buy",
+   "quantity": "0.051585",
+   "price": "99.640000",
+   "amount_usd": "5.140000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CCI",
+   "side": "buy",
+   "quantity": "0.016643",
+   "price": "90.127000",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CCI",
+   "side": "buy",
+   "quantity": "0.017359",
+   "price": "86.409900",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CCI",
+   "side": "buy",
+   "quantity": "0.034646",
+   "price": "86.589900",
+   "amount_usd": "3.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CHD",
+   "side": "buy",
+   "quantity": "0.014950",
+   "price": "109.695400",
+   "amount_usd": "1.640000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CHD",
+   "side": "buy",
+   "quantity": "0.074104",
+   "price": "108.359900",
+   "amount_usd": "8.030000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CHE",
+   "side": "buy",
+   "quantity": "0.006452",
+   "price": "539.309900",
+   "amount_usd": "3.480000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CIEN",
+   "side": "buy",
+   "quantity": "0.009916",
+   "price": "290.419900",
+   "amount_usd": "2.880000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CIEN",
+   "side": "buy",
+   "quantity": "0.009867",
+   "price": "308.069900",
+   "amount_usd": "3.040000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CINF",
+   "side": "buy",
+   "quantity": "0.015096",
+   "price": "186.139900",
+   "amount_usd": "2.810000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CL",
+   "side": "buy",
+   "quantity": "0.027991",
+   "price": "96.101300",
+   "amount_usd": "2.690000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CL",
+   "side": "buy",
+   "quantity": "0.059155",
+   "price": "96.863800",
+   "amount_usd": "5.730000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "COHR",
+   "side": "buy",
+   "quantity": "0.009198",
+   "price": "205.459900",
+   "amount_usd": "1.890000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "COHR",
+   "side": "buy",
+   "quantity": "0.012693",
+   "price": "198.529900",
+   "amount_usd": "2.520000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CSCO",
+   "side": "buy",
+   "quantity": "0.017325",
+   "price": "102.740000",
+   "amount_usd": "1.780000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CSCO",
+   "side": "buy",
+   "quantity": "0.026670",
+   "price": "94.109900",
+   "amount_usd": "2.510000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CSCO",
+   "side": "buy",
+   "quantity": "0.030150",
+   "price": "103.148800",
+   "amount_usd": "3.110000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CTAS",
+   "side": "buy",
+   "quantity": "0.016284",
+   "price": "223.519900",
+   "amount_usd": "3.640000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CVS",
+   "side": "buy",
+   "quantity": "0.059769",
+   "price": "88.339900",
+   "amount_usd": "5.280000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "CVS",
+   "side": "buy",
+   "quantity": "0.120440",
+   "price": "81.201600",
+   "amount_usd": "9.780000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DFTX",
+   "side": "buy",
+   "quantity": "0.034002",
+   "price": "35.879900",
+   "amount_usd": "1.220000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DFTX",
+   "side": "buy",
+   "quantity": "0.042984",
+   "price": "32.569900",
+   "amount_usd": "1.400000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.005371",
+   "price": "249.449900",
+   "amount_usd": "1.340000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.010686",
+   "price": "249.850000",
+   "amount_usd": "2.670000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DRAM",
+   "side": "buy",
+   "quantity": "0.032651",
+   "price": "47.776800",
+   "amount_usd": "1.560000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DRAM",
+   "side": "buy",
+   "quantity": "0.035936",
+   "price": "47.027500",
+   "amount_usd": "1.690000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DRAM",
+   "side": "buy",
+   "quantity": "0.153075",
+   "price": "40.568200",
+   "amount_usd": "6.210000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "DRI",
+   "side": "buy",
+   "quantity": "0.011538",
+   "price": "227.059900",
+   "amount_usd": "2.620000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "EBAY",
+   "side": "buy",
+   "quantity": "0.021241",
+   "price": "122.400000",
+   "amount_usd": "2.600000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ED",
+   "side": "buy",
+   "quantity": "0.027761",
+   "price": "119.229800",
+   "amount_usd": "3.310000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "ED",
+   "side": "buy",
+   "quantity": "0.033391",
+   "price": "120.089900",
+   "amount_usd": "4.010000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "EG",
+   "side": "buy",
+   "quantity": "0.009651",
+   "price": "412.359900",
+   "amount_usd": "3.980000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "EVR",
+   "side": "buy",
+   "quantity": "0.003990",
+   "price": "300.709900",
+   "amount_usd": "1.200000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "EVR",
+   "side": "buy",
+   "quantity": "0.008330",
+   "price": "285.685000",
+   "amount_usd": "2.380000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "EXR",
+   "side": "buy",
+   "quantity": "0.009129",
+   "price": "159.929900",
+   "amount_usd": "1.460000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "FFIV",
+   "side": "buy",
+   "quantity": "0.005605",
+   "price": "330.059900",
+   "amount_usd": "1.850000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "FFIV",
+   "side": "buy",
+   "quantity": "0.019610",
+   "price": "326.349900",
+   "amount_usd": "6.400000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "FLKR",
+   "side": "buy",
+   "quantity": "0.056495",
+   "price": "50.269900",
+   "amount_usd": "2.840000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "FLKR",
+   "side": "buy",
+   "quantity": "0.084233",
+   "price": "46.299900",
+   "amount_usd": "3.900000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "FLKR",
+   "side": "buy",
+   "quantity": "0.129273",
+   "price": "47.186900",
+   "amount_usd": "6.100000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GE",
+   "side": "buy",
+   "quantity": "0.017849",
+   "price": "319.329900",
+   "amount_usd": "5.700000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GFS",
+   "side": "buy",
+   "quantity": "0.084371",
+   "price": "41.483100",
+   "amount_usd": "3.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GFUZ",
+   "side": "buy",
+   "quantity": "0.373948",
+   "price": "5.909900",
+   "amount_usd": "2.210000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GLW",
+   "side": "buy",
+   "quantity": "0.012657",
+   "price": "123.247900",
+   "amount_usd": "1.560000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GLW",
+   "side": "buy",
+   "quantity": "0.028025",
+   "price": "121.316400",
+   "amount_usd": "3.400000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GOOG",
+   "side": "buy",
+   "quantity": "0.005960",
+   "price": "276.821000",
+   "amount_usd": "1.650000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GOOGL",
+   "side": "buy",
+   "quantity": "0.006155",
+   "price": "277.822200",
+   "amount_usd": "1.710000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GS",
+   "side": "buy",
+   "quantity": "0.001732",
+   "price": "894.670000",
+   "amount_usd": "1.550000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GS",
+   "side": "buy",
+   "quantity": "0.011469",
+   "price": "871.856100",
+   "amount_usd": "10.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "GWW",
+   "side": "buy",
+   "quantity": "0.000999",
+   "price": "1450.335000",
+   "amount_usd": "1.450000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.003029",
+   "price": "462.119900",
+   "amount_usd": "1.400000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.009933",
+   "price": "464.069900",
+   "amount_usd": "4.610000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.010414",
+   "price": "495.469900",
+   "amount_usd": "5.160000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.169046",
+   "price": "21.118400",
+   "amount_usd": "3.570000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.378664",
+   "price": "21.839900",
+   "amount_usd": "8.270000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "HSY",
+   "side": "buy",
+   "quantity": "0.027704",
+   "price": "166.400000",
+   "amount_usd": "4.610000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.008449",
+   "price": "256.831000",
+   "amount_usd": "2.170000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.009426",
+   "price": "243.990000",
+   "amount_usd": "2.300000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.009734",
+   "price": "249.619900",
+   "amount_usd": "2.430000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "INTC",
+   "side": "buy",
+   "quantity": "0.026959",
+   "price": "58.976700",
+   "amount_usd": "1.590000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "INTC",
+   "side": "buy",
+   "quantity": "0.030826",
+   "price": "64.229900",
+   "amount_usd": "1.980000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "IRDM",
+   "side": "buy",
+   "quantity": "0.029441",
+   "price": "44.834200",
+   "amount_usd": "1.320000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "IRDM",
+   "side": "buy",
+   "quantity": "0.038137",
+   "price": "43.788400",
+   "amount_usd": "1.670000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "JPM",
+   "side": "buy",
+   "quantity": "0.007057",
+   "price": "337.249900",
+   "amount_usd": "2.380000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "KDP",
+   "side": "buy",
+   "quantity": "0.069524",
+   "price": "36.677500",
+   "amount_usd": "2.550000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "KR",
+   "side": "buy",
+   "quantity": "0.050306",
+   "price": "66.989900",
+   "amount_usd": "3.370000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "KR",
+   "side": "buy",
+   "quantity": "0.101008",
+   "price": "67.419900",
+   "amount_usd": "6.810000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LITE",
+   "side": "buy",
+   "quantity": "0.002948",
+   "price": "671.500000",
+   "amount_usd": "1.980000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LITE",
+   "side": "buy",
+   "quantity": "0.006999",
+   "price": "634.289900",
+   "amount_usd": "4.440000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LITE",
+   "side": "buy",
+   "quantity": "0.009973",
+   "price": "749.000000",
+   "amount_usd": "7.470000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LLY",
+   "side": "buy",
+   "quantity": "0.001009",
+   "price": "1406.773600",
+   "amount_usd": "1.420000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LLY",
+   "side": "buy",
+   "quantity": "0.001799",
+   "price": "1400.139900",
+   "amount_usd": "2.520000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LULU",
+   "side": "buy",
+   "quantity": "0.015782",
+   "price": "110.880000",
+   "amount_usd": "1.750000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LUNR",
+   "side": "buy",
+   "quantity": "0.110707",
+   "price": "10.658700",
+   "amount_usd": "1.180000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "LUNR",
+   "side": "buy",
+   "quantity": "0.141471",
+   "price": "10.178700",
+   "amount_usd": "1.440000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MA",
+   "side": "buy",
+   "quantity": "0.006345",
+   "price": "649.305900",
+   "amount_usd": "4.120000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MAR",
+   "side": "buy",
+   "quantity": "0.003577",
+   "price": "416.449900",
+   "amount_usd": "1.490000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MCK",
+   "side": "buy",
+   "quantity": "0.002278",
+   "price": "1062.099900",
+   "amount_usd": "2.420000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.082246",
+   "price": "65.169900",
+   "amount_usd": "5.360000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.105045",
+   "price": "65.209900",
+   "amount_usd": "6.850000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MO",
+   "side": "buy",
+   "quantity": "0.017974",
+   "price": "76.220000",
+   "amount_usd": "1.370000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MO",
+   "side": "buy",
+   "quantity": "0.044313",
+   "price": "76.499900",
+   "amount_usd": "3.390000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.013854",
+   "price": "147.969900",
+   "amount_usd": "2.050000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.018215",
+   "price": "146.029900",
+   "amount_usd": "2.660000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.030656",
+   "price": "145.155800",
+   "amount_usd": "4.450000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRSH",
+   "side": "buy",
+   "quantity": "0.012158",
+   "price": "205.620000",
+   "amount_usd": "2.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRVL",
+   "side": "buy",
+   "quantity": "0.008857",
+   "price": "169.349900",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRVL",
+   "side": "buy",
+   "quantity": "0.023543",
+   "price": "163.099900",
+   "amount_usd": "3.840000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MRVL",
+   "side": "buy",
+   "quantity": "0.024099",
+   "price": "182.989900",
+   "amount_usd": "4.410000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MSFT",
+   "side": "buy",
+   "quantity": "0.003358",
+   "price": "532.952100",
+   "amount_usd": "1.790000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MSFT",
+   "side": "buy",
+   "quantity": "0.003810",
+   "price": "519.558300",
+   "amount_usd": "1.980000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MSI",
+   "side": "buy",
+   "quantity": "0.002810",
+   "price": "515.880000",
+   "amount_usd": "1.450000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MU",
+   "side": "buy",
+   "quantity": "0.001738",
+   "price": "874.505600",
+   "amount_usd": "1.520000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "MU",
+   "side": "buy",
+   "quantity": "0.002295",
+   "price": "836.420800",
+   "amount_usd": "1.920000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "NFLX",
+   "side": "buy",
+   "quantity": "0.094316",
+   "price": "63.509900",
+   "amount_usd": "5.990000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.010670",
+   "price": "202.419900",
+   "amount_usd": "2.160000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.011869",
+   "price": "205.569900",
+   "amount_usd": "2.440000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.015812",
+   "price": "186.556200",
+   "amount_usd": "2.950000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.036801",
+   "price": "191.570000",
+   "amount_usd": "7.050000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.015674",
+   "price": "96.969900",
+   "amount_usd": "1.520000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.033698",
+   "price": "107.719900",
+   "amount_usd": "3.630000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.062781",
+   "price": "98.117600",
+   "amount_usd": "6.160000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "PSA",
+   "side": "buy",
+   "quantity": "0.005379",
+   "price": "338.314200",
+   "amount_usd": "1.820000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QBTS",
+   "side": "buy",
+   "quantity": "0.142763",
+   "price": "10.506900",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QCOM",
+   "side": "buy",
+   "quantity": "0.009958",
+   "price": "162.682300",
+   "amount_usd": "1.620000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QQQ",
+   "side": "buy",
+   "quantity": "0.004904",
+   "price": "681.070000",
+   "amount_usd": "3.340000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QQQ",
+   "side": "buy",
+   "quantity": "0.012576",
+   "price": "671.910000",
+   "amount_usd": "8.450000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QTOP",
+   "side": "buy",
+   "quantity": "0.051468",
+   "price": "35.749900",
+   "amount_usd": "1.840000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QTOP",
+   "side": "buy",
+   "quantity": "0.214335",
+   "price": "34.478700",
+   "amount_usd": "7.390000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QUBT",
+   "side": "buy",
+   "quantity": "0.337447",
+   "price": "6.489900",
+   "amount_usd": "2.190000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "QUBT",
+   "side": "buy",
+   "quantity": "1.029127",
+   "price": "5.839900",
+   "amount_usd": "6.010000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.107843",
+   "price": "11.127200",
+   "amount_usd": "1.200000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.600166",
+   "price": "10.097200",
+   "amount_usd": "6.060000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RKLB",
+   "side": "buy",
+   "quantity": "0.025860",
+   "price": "52.977000",
+   "amount_usd": "1.370000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RKLB",
+   "side": "buy",
+   "quantity": "0.030228",
+   "price": "53.922500",
+   "amount_usd": "1.630000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RKLB",
+   "side": "buy",
+   "quantity": "0.136153",
+   "price": "47.152700",
+   "amount_usd": "6.420000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.006786",
+   "price": "229.872100",
+   "amount_usd": "1.560000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.026926",
+   "price": "233.229900",
+   "amount_usd": "6.280000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.033941",
+   "price": "224.799900",
+   "amount_usd": "7.630000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RPRX",
+   "side": "buy",
+   "quantity": "0.019791",
+   "price": "66.189900",
+   "amount_usd": "1.310000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RPRX",
+   "side": "buy",
+   "quantity": "0.024422",
+   "price": "66.741300",
+   "amount_usd": "1.630000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RPRX",
+   "side": "buy",
+   "quantity": "0.024427",
+   "price": "67.137500",
+   "amount_usd": "1.640000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RSG",
+   "side": "buy",
+   "quantity": "0.018130",
+   "price": "247.099500",
+   "amount_usd": "4.480000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "RVI",
+   "side": "buy",
+   "quantity": "0.095020",
+   "price": "21.890100",
+   "amount_usd": "2.080000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.025364",
+   "price": "131.286400",
+   "amount_usd": "3.330000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.052445",
+   "price": "127.179900",
+   "amount_usd": "6.670000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SNDK",
+   "side": "buy",
+   "quantity": "0.001413",
+   "price": "1124.499900",
+   "amount_usd": "1.590000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SNDK",
+   "side": "buy",
+   "quantity": "0.001846",
+   "price": "1093.711600",
+   "amount_usd": "2.020000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SNDK",
+   "side": "buy",
+   "quantity": "0.007353",
+   "price": "904.373100",
+   "amount_usd": "6.650000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SPCX",
+   "side": "buy",
+   "quantity": "0.018650",
+   "price": "136.724200",
+   "amount_usd": "2.550000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STM",
+   "side": "buy",
+   "quantity": "0.050136",
+   "price": "47.669900",
+   "amount_usd": "2.390000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STM",
+   "side": "buy",
+   "quantity": "0.143599",
+   "price": "42.339900",
+   "amount_usd": "6.080000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STX",
+   "side": "buy",
+   "quantity": "0.004134",
+   "price": "452.260000",
+   "amount_usd": "1.870000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STX",
+   "side": "buy",
+   "quantity": "0.005393",
+   "price": "576.597600",
+   "amount_usd": "3.110000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STX",
+   "side": "buy",
+   "quantity": "0.005570",
+   "price": "613.901800",
+   "amount_usd": "3.420000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "STX",
+   "side": "buy",
+   "quantity": "0.014213",
+   "price": "495.308700",
+   "amount_usd": "7.040000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SYY",
+   "side": "buy",
+   "quantity": "0.130958",
+   "price": "76.360000",
+   "amount_usd": "10.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "SYY",
+   "side": "buy",
+   "quantity": "0.030517",
+   "price": "81.919900",
+   "amount_usd": "2.500000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TEL",
+   "side": "buy",
+   "quantity": "0.010094",
+   "price": "216.958600",
+   "amount_usd": "2.190000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TOPT",
+   "side": "buy",
+   "quantity": "0.048867",
+   "price": "33.969400",
+   "amount_usd": "1.660000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TRIN",
+   "side": "buy",
+   "quantity": "0.146312",
+   "price": "17.018400",
+   "amount_usd": "2.490000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TRLV",
+   "side": "buy",
+   "quantity": "0.153780",
+   "price": "11.509900",
+   "amount_usd": "1.770000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TRV",
+   "side": "buy",
+   "quantity": "0.012463",
+   "price": "396.359900",
+   "amount_usd": "4.940000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSLA",
+   "side": "buy",
+   "quantity": "0.003858",
+   "price": "401.660000",
+   "amount_usd": "1.550000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSLA",
+   "side": "buy",
+   "quantity": "0.004554",
+   "price": "399.608800",
+   "amount_usd": "1.820000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSLA",
+   "side": "buy",
+   "quantity": "0.019433",
+   "price": "384.899900",
+   "amount_usd": "7.480000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSLA",
+   "side": "buy",
+   "quantity": "0.024305",
+   "price": "354.645800",
+   "amount_usd": "8.620000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSM",
+   "side": "buy",
+   "quantity": "0.003673",
+   "price": "405.629500",
+   "amount_usd": "1.490000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSM",
+   "side": "buy",
+   "quantity": "0.006056",
+   "price": "363.239900",
+   "amount_usd": "2.200000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSM",
+   "side": "buy",
+   "quantity": "0.012365",
+   "price": "394.650000",
+   "amount_usd": "4.880000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSM",
+   "side": "buy",
+   "quantity": "0.020863",
+   "price": "373.849900",
+   "amount_usd": "7.800000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.020295",
+   "price": "59.619900",
+   "amount_usd": "1.210000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.022301",
+   "price": "56.945800",
+   "amount_usd": "1.270000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.034411",
+   "price": "56.667500",
+   "amount_usd": "1.950000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TXN",
+   "side": "buy",
+   "quantity": "0.004952",
+   "price": "310.929900",
+   "amount_usd": "1.540000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "TXN",
+   "side": "buy",
+   "quantity": "0.007193",
+   "price": "272.451400",
+   "amount_usd": "1.960000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "USFD",
+   "side": "buy",
+   "quantity": "0.037585",
+   "price": "101.899900",
+   "amount_usd": "3.830000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "USFD",
+   "side": "buy",
+   "quantity": "0.044200",
+   "price": "102.940000",
+   "amount_usd": "4.550000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VCX",
+   "side": "buy",
+   "quantity": "0.053734",
+   "price": "21.959900",
+   "amount_usd": "1.180000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VCX",
+   "side": "buy",
+   "quantity": "0.074255",
+   "price": "21.682000",
+   "amount_usd": "1.610000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VCX",
+   "side": "buy",
+   "quantity": "0.390553",
+   "price": "19.049900",
+   "amount_usd": "7.440000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VIAV",
+   "side": "buy",
+   "quantity": "0.074703",
+   "price": "29.449900",
+   "amount_usd": "2.200000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VIAV",
+   "side": "buy",
+   "quantity": "0.161370",
+   "price": "28.320000",
+   "amount_usd": "4.570000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VRT",
+   "side": "buy",
+   "quantity": "0.009529",
+   "price": "228.760000",
+   "amount_usd": "2.180000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VRT",
+   "side": "buy",
+   "quantity": "0.038117",
+   "price": "184.689900",
+   "amount_usd": "7.040000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VRT",
+   "side": "buy",
+   "quantity": "0.036395",
+   "price": "212.939900",
+   "amount_usd": "7.750000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "VT",
+   "side": "buy",
+   "quantity": "0.065018",
+   "price": "153.802100",
+   "amount_usd": "10.000000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "WDC",
+   "side": "buy",
+   "quantity": "0.003558",
+   "price": "340.020000",
+   "amount_usd": "1.210000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "WDC",
+   "side": "buy",
+   "quantity": "0.006068",
+   "price": "260.339900",
+   "amount_usd": "1.580000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "WDC",
+   "side": "buy",
+   "quantity": "0.006537",
+   "price": "357.950000",
+   "amount_usd": "2.340000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "WDC",
+   "side": "buy",
+   "quantity": "0.022553",
+   "price": "285.982300",
+   "amount_usd": "6.450000"
+  },
+  {
+   "date": "2026-11-06",
+   "ticker": "XLG",
+   "side": "buy",
+   "quantity": "0.048119",
+   "price": "60.889900",
+   "amount_usd": "2.930000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.203959",
+   "price": "39.909900",
+   "amount_usd": "8.140000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "AAPL",
+   "side": "buy",
+   "quantity": "0.006383",
+   "price": "349.359900",
+   "amount_usd": "2.230000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ABBV",
+   "side": "buy",
+   "quantity": "0.004397",
+   "price": "291.060300",
+   "amount_usd": "1.280000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.013435",
+   "price": "109.409900",
+   "amount_usd": "1.470000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ABT",
+   "side": "buy",
+   "quantity": "0.021504",
+   "price": "109.279900",
+   "amount_usd": "2.350000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ACGL",
+   "side": "buy",
+   "quantity": "0.016971",
+   "price": "107.239900",
+   "amount_usd": "1.820000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "AMAT",
+   "side": "buy",
+   "quantity": "0.013474",
+   "price": "371.059900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ANET",
+   "side": "buy",
+   "quantity": "0.026883",
+   "price": "185.989900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "APH",
+   "side": "buy",
+   "quantity": "0.024247",
+   "price": "81.245000",
+   "amount_usd": "1.970000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "ASML",
+   "side": "buy",
+   "quantity": "0.003314",
+   "price": "1508.709900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "BDX",
+   "side": "buy",
+   "quantity": "0.010341",
+   "price": "212.729900",
+   "amount_usd": "2.200000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "BTX",
+   "side": "buy",
+   "quantity": "0.573272",
+   "price": "7.779900",
+   "amount_usd": "4.460000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "CAT",
+   "side": "buy",
+   "quantity": "0.009226",
+   "price": "585.249900",
+   "amount_usd": "5.400000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "CBRS",
+   "side": "buy",
+   "quantity": "0.019521",
+   "price": "92.720000",
+   "amount_usd": "1.810000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "CIEN",
+   "side": "buy",
+   "quantity": "0.018231",
+   "price": "274.249900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "COHR",
+   "side": "buy",
+   "quantity": "0.009683",
+   "price": "223.058300",
+   "amount_usd": "2.160000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "CSCO",
+   "side": "buy",
+   "quantity": "0.031696",
+   "price": "98.750000",
+   "amount_usd": "3.130000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "CTAS",
+   "side": "buy",
+   "quantity": "0.009967",
+   "price": "221.729900",
+   "amount_usd": "2.210000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "DFTX",
+   "side": "buy",
+   "quantity": "0.088081",
+   "price": "34.399900",
+   "amount_usd": "3.030000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.013620",
+   "price": "256.227900",
+   "amount_usd": "3.490000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "DRAM",
+   "side": "buy",
+   "quantity": "0.064063",
+   "price": "41.677700",
+   "amount_usd": "2.670000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "DRI",
+   "side": "buy",
+   "quantity": "0.010554",
+   "price": "226.447600",
+   "amount_usd": "2.390000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "EVR",
+   "side": "buy",
+   "quantity": "0.003912",
+   "price": "293.922600",
+   "amount_usd": "1.150000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "EW",
+   "side": "buy",
+   "quantity": "0.023532",
+   "price": "103.259900",
+   "amount_usd": "2.430000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "EXR",
+   "side": "buy",
+   "quantity": "0.016605",
+   "price": "157.779900",
+   "amount_usd": "2.620000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "FFIV",
+   "side": "buy",
+   "quantity": "0.015693",
+   "price": "318.600000",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "FLKR",
+   "side": "buy",
+   "quantity": "0.057934",
+   "price": "47.121800",
+   "amount_usd": "2.730000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GE",
+   "side": "buy",
+   "quantity": "0.006193",
+   "price": "334.197700",
+   "amount_usd": "2.070000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GFS",
+   "side": "buy",
+   "quantity": "0.123434",
+   "price": "40.507400",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GLW",
+   "side": "buy",
+   "quantity": "0.021640",
+   "price": "114.137200",
+   "amount_usd": "2.470000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GOOG",
+   "side": "buy",
+   "quantity": "0.005688",
+   "price": "284.809900",
+   "amount_usd": "1.620000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GOOGL",
+   "side": "buy",
+   "quantity": "0.017400",
+   "price": "287.344700",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "GS",
+   "side": "buy",
+   "quantity": "0.001276",
+   "price": "900.610000",
+   "amount_usd": "1.150000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.072085",
+   "price": "21.918400",
+   "amount_usd": "1.580000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.090578",
+   "price": "21.969900",
+   "amount_usd": "1.990000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "HSY",
+   "side": "buy",
+   "quantity": "0.012103",
+   "price": "171.029900",
+   "amount_usd": "2.070000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "HSY",
+   "side": "buy",
+   "quantity": "0.048282",
+   "price": "170.870000",
+   "amount_usd": "8.250000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "IBM",
+   "side": "buy",
+   "quantity": "0.008249",
+   "price": "243.663800",
+   "amount_usd": "2.010000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "INTC",
+   "side": "buy",
+   "quantity": "0.035820",
+   "price": "57.508300",
+   "amount_usd": "2.060000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "KIM",
+   "side": "buy",
+   "quantity": "0.074656",
+   "price": "25.449900",
+   "amount_usd": "1.900000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "KR",
+   "side": "buy",
+   "quantity": "0.023016",
+   "price": "66.909900",
+   "amount_usd": "1.540000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "LH",
+   "side": "buy",
+   "quantity": "0.009959",
+   "price": "366.496500",
+   "amount_usd": "3.650000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "LITE",
+   "side": "buy",
+   "quantity": "0.003171",
+   "price": "602.229400",
+   "amount_usd": "1.910000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "LULU",
+   "side": "buy",
+   "quantity": "0.030114",
+   "price": "109.913100",
+   "amount_usd": "3.310000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "LUNR",
+   "side": "buy",
+   "quantity": "0.184802",
+   "price": "11.579900",
+   "amount_usd": "2.140000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MCK",
+   "side": "buy",
+   "quantity": "0.001459",
+   "price": "1061.979900",
+   "amount_usd": "1.550000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.030879",
+   "price": "65.740000",
+   "amount_usd": "2.030000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MDLZ",
+   "side": "buy",
+   "quantity": "0.031816",
+   "price": "65.689900",
+   "amount_usd": "2.090000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.017973",
+   "price": "146.879900",
+   "amount_usd": "2.640000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MRVL",
+   "side": "buy",
+   "quantity": "0.009901",
+   "price": "151.489400",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MSFT",
+   "side": "buy",
+   "quantity": "0.004605",
+   "price": "542.826300",
+   "amount_usd": "2.500000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MSI",
+   "side": "buy",
+   "quantity": "0.006352",
+   "price": "522.629900",
+   "amount_usd": "3.320000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "MU",
+   "side": "buy",
+   "quantity": "0.003367",
+   "price": "739.459900",
+   "amount_usd": "2.490000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "NFLX",
+   "side": "buy",
+   "quantity": "0.062440",
+   "price": "62.939900",
+   "amount_usd": "3.930000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.047808",
+   "price": "173.399900",
+   "amount_usd": "8.290000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "NVDA",
+   "side": "buy",
+   "quantity": "0.049725",
+   "price": "178.179900",
+   "amount_usd": "8.860000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.018037",
+   "price": "110.326700",
+   "amount_usd": "1.990000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "PSA",
+   "side": "buy",
+   "quantity": "0.012008",
+   "price": "332.259700",
+   "amount_usd": "3.990000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "QBTS",
+   "side": "buy",
+   "quantity": "0.574653",
+   "price": "10.649900",
+   "amount_usd": "6.120000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "QCOM",
+   "side": "buy",
+   "quantity": "0.011086",
+   "price": "168.671100",
+   "amount_usd": "1.870000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "QQQ",
+   "side": "buy",
+   "quantity": "0.004402",
+   "price": "679.159900",
+   "amount_usd": "2.990000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "QTOP",
+   "side": "buy",
+   "quantity": "0.083027",
+   "price": "35.048700",
+   "amount_usd": "2.910000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "QUBT",
+   "side": "buy",
+   "quantity": "1.224260",
+   "price": "6.599900",
+   "amount_usd": "8.080000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "REGN",
+   "side": "buy",
+   "quantity": "0.002376",
+   "price": "913.094600",
+   "amount_usd": "2.170000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.306179",
+   "price": "12.607000",
+   "amount_usd": "3.860000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.009122",
+   "price": "233.489900",
+   "amount_usd": "2.130000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "RMD",
+   "side": "buy",
+   "quantity": "0.010579",
+   "price": "233.463400",
+   "amount_usd": "2.470000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "RVI",
+   "side": "buy",
+   "quantity": "0.212221",
+   "price": "21.439900",
+   "amount_usd": "4.550000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SATA",
+   "side": "buy",
+   "quantity": "0.032548",
+   "price": "96.470700",
+   "amount_usd": "3.140000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SATA",
+   "side": "buy",
+   "quantity": "0.068899",
+   "price": "96.952600",
+   "amount_usd": "6.680000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.014402",
+   "price": "131.925200",
+   "amount_usd": "1.900000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SNDK",
+   "side": "buy",
+   "quantity": "0.002592",
+   "price": "894.760000",
+   "amount_usd": "2.320000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SPCX",
+   "side": "buy",
+   "quantity": "0.035363",
+   "price": "141.389900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SPG",
+   "side": "buy",
+   "quantity": "0.010045",
+   "price": "230.956600",
+   "amount_usd": "2.320000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "STM",
+   "side": "buy",
+   "quantity": "0.111887",
+   "price": "44.687900",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "STX",
+   "side": "buy",
+   "quantity": "0.005610",
+   "price": "499.108600",
+   "amount_usd": "2.800000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "SYY",
+   "side": "buy",
+   "quantity": "0.029531",
+   "price": "77.545000",
+   "amount_usd": "2.290000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TEL",
+   "side": "buy",
+   "quantity": "0.009048",
+   "price": "219.917400",
+   "amount_usd": "1.990000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TOPT",
+   "side": "buy",
+   "quantity": "0.094159",
+   "price": "33.559900",
+   "amount_usd": "3.160000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TRIN",
+   "side": "buy",
+   "quantity": "0.059551",
+   "price": "17.967500",
+   "amount_usd": "1.070000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TRLV",
+   "side": "buy",
+   "quantity": "0.183016",
+   "price": "10.982600",
+   "amount_usd": "2.010000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TRLV",
+   "side": "buy",
+   "quantity": "0.609739",
+   "price": "10.889900",
+   "amount_usd": "6.640000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TSLA",
+   "side": "buy",
+   "quantity": "0.005380",
+   "price": "377.279900",
+   "amount_usd": "2.030000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.020557",
+   "price": "59.345800",
+   "amount_usd": "1.220000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "TXN",
+   "side": "buy",
+   "quantity": "0.006607",
+   "price": "296.640200",
+   "amount_usd": "1.960000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "USFD",
+   "side": "buy",
+   "quantity": "0.018064",
+   "price": "108.499900",
+   "amount_usd": "1.960000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "VCX",
+   "side": "buy",
+   "quantity": "0.247700",
+   "price": "20.185700",
+   "amount_usd": "5.000000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "VIAV",
+   "side": "buy",
+   "quantity": "0.082287",
+   "price": "30.624400",
+   "amount_usd": "2.520000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "VRT",
+   "side": "buy",
+   "quantity": "0.014782",
+   "price": "197.529900",
+   "amount_usd": "2.920000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "VT",
+   "side": "buy",
+   "quantity": "0.018731",
+   "price": "155.354700",
+   "amount_usd": "2.910000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "WDC",
+   "side": "buy",
+   "quantity": "0.007513",
+   "price": "282.159900",
+   "amount_usd": "2.120000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "WELL",
+   "side": "buy",
+   "quantity": "0.013691",
+   "price": "244.669900",
+   "amount_usd": "3.350000"
+  },
+  {
+   "date": "2026-11-10",
+   "ticker": "XLG",
+   "side": "buy",
+   "quantity": "0.048556",
+   "price": "60.959900",
+   "amount_usd": "2.960000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.044034",
+   "price": "39.287300",
+   "amount_usd": "1.730000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "AAAU",
+   "side": "buy",
+   "quantity": "0.049268",
+   "price": "39.578700",
+   "amount_usd": "1.950000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "AMZN",
+   "side": "buy",
+   "quantity": "0.013529",
+   "price": "266.086700",
+   "amount_usd": "3.600000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "AWK",
+   "side": "buy",
+   "quantity": "0.024986",
+   "price": "148.479900",
+   "amount_usd": "3.710000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "BDX",
+   "side": "buy",
+   "quantity": "0.007088",
+   "price": "211.600500",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "CAH",
+   "side": "buy",
+   "quantity": "0.004914",
+   "price": "276.719900",
+   "amount_usd": "1.360000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "CCI",
+   "side": "buy",
+   "quantity": "0.011215",
+   "price": "89.159900",
+   "amount_usd": "1.000000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "CHD",
+   "side": "buy",
+   "quantity": "0.014290",
+   "price": "111.260000",
+   "amount_usd": "1.590000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "CL",
+   "side": "buy",
+   "quantity": "0.017660",
+   "price": "97.959900",
+   "amount_usd": "1.730000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "CVS",
+   "side": "buy",
+   "quantity": "0.022300",
+   "price": "87.889900",
+   "amount_usd": "1.960000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "DFTX",
+   "side": "buy",
+   "quantity": "0.036046",
+   "price": "34.399900",
+   "amount_usd": "1.240000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "DGX",
+   "side": "buy",
+   "quantity": "0.004105",
+   "price": "258.190000",
+   "amount_usd": "1.060000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "DXYZ",
+   "side": "buy",
+   "quantity": "0.058323",
+   "price": "25.890000",
+   "amount_usd": "1.510000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "EBAY",
+   "side": "buy",
+   "quantity": "0.009745",
+   "price": "123.139900",
+   "amount_usd": "1.200000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "ED",
+   "side": "buy",
+   "quantity": "0.014029",
+   "price": "119.037500",
+   "amount_usd": "1.670000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.002576",
+   "price": "504.648900",
+   "amount_usd": "1.300000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "HCA",
+   "side": "buy",
+   "quantity": "0.002636",
+   "price": "500.599900",
+   "amount_usd": "1.320000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "HLT",
+   "side": "buy",
+   "quantity": "0.005035",
+   "price": "377.309900",
+   "amount_usd": "1.900000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "HRL",
+   "side": "buy",
+   "quantity": "0.182069",
+   "price": "21.749900",
+   "amount_usd": "3.960000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "KIM",
+   "side": "buy",
+   "quantity": "0.104361",
+   "price": "25.488400",
+   "amount_usd": "2.660000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "LH",
+   "side": "buy",
+   "quantity": "0.002754",
+   "price": "370.279900",
+   "amount_usd": "1.020000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "MCK",
+   "side": "buy",
+   "quantity": "0.002568",
+   "price": "1070.561200",
+   "amount_usd": "2.750000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "MRK",
+   "side": "buy",
+   "quantity": "0.022412",
+   "price": "145.900000",
+   "amount_usd": "3.270000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "MRSH",
+   "side": "buy",
+   "quantity": "0.007309",
+   "price": "205.219600",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "PFGC",
+   "side": "buy",
+   "quantity": "0.013595",
+   "price": "110.329900",
+   "amount_usd": "1.500000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "QUBT",
+   "side": "buy",
+   "quantity": "0.283875",
+   "price": "6.199900",
+   "amount_usd": "1.760000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.112664",
+   "price": "11.449900",
+   "amount_usd": "1.290000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "RGTI",
+   "side": "buy",
+   "quantity": "0.293090",
+   "price": "11.429900",
+   "amount_usd": "3.350000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "SJM",
+   "side": "buy",
+   "quantity": "0.021468",
+   "price": "131.820000",
+   "amount_usd": "2.830000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "SPCX",
+   "side": "buy",
+   "quantity": "0.010885",
+   "price": "141.470000",
+   "amount_usd": "1.540000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "SPG",
+   "side": "buy",
+   "quantity": "0.005679",
+   "price": "234.159900",
+   "amount_usd": "1.330000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "SYY",
+   "side": "buy",
+   "quantity": "0.021422",
+   "price": "77.489900",
+   "amount_usd": "1.660000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "TRIN",
+   "side": "buy",
+   "quantity": "0.090363",
+   "price": "17.927500",
+   "amount_usd": "1.620000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "TRV",
+   "side": "buy",
+   "quantity": "0.003809",
+   "price": "399.050000",
+   "amount_usd": "1.520000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.050628",
+   "price": "58.859900",
+   "amount_usd": "2.980000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "TSN",
+   "side": "buy",
+   "quantity": "0.067354",
+   "price": "59.089900",
+   "amount_usd": "3.980000"
+  },
+  {
+   "date": "2026-11-11",
+   "ticker": "WELL",
+   "side": "buy",
+   "quantity": "0.011114",
+   "price": "245.629900",
+   "amount_usd": "2.730000"
+  }
+ ]
+}

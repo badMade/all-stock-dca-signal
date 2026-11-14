@@ -76,6 +76,7 @@ environment (see the repository README).
 | [dca_operational_todos.md](dca_operational_todos.md) | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
 | [OPEN_ISSUES_2026-10-22.md](OPEN_ISSUES_2026-10-22.md) | Open issue record: Gate 6 weekly-history completeness aborting the 0935 and 1030 live slots; operator decision is log-and-continue, fix not started |
 | [adr-octopus-ledger-filesystem-boundary.md](adr-octopus-ledger-filesystem-boundary.md) | ADR: the Octopus ledger's descriptor-relative, no-follow filesystem boundary |
+| [adr-octopus-band-scorecard.md](adr-octopus-band-scorecard.md) | ADR (proposed): interval score and breach-side fields for the Octopus bands, date-block uncertainty, and replay-only evaluation of candidate calibrators |
 | [local_env_file.md](local_env_file.md) | The gitignored local `.env` that supplies the account number and alert address to the executor sandbox: setup, verification, troubleshooting (`dca_env.py`) |
 | [adr-dotenv-loader.md](adr-dotenv-loader.md) | ADR: why a small allowlisted, mode-0600 `.env` loader runs from `dca_paths` instead of per-command sourcing in the prompts |
 | [adr-simultaneous-start-guard.md](adr-simultaneous-start-guard.md) | ADR: closing the simultaneous-start race (two executors both seeing an empty window) with a per-order history re-pull, a slot claim and the deterministic broker `ref_id`; DCA Issues keys `duplicate_fills`, `competing_executor` |

@@ -1,4 +1,4 @@
-"""Find the newest script-built orders_pages envelope an EARLIER slot saved today (read only).
+"""Find the newest script-built orders_pages envelope saved before this slot (read only).
 
 Why this exists (2026-11-12, 14:30 ET): the 2:30 slot reached Gate 6 with 57 BUY candidates
 and aborted ``ABORT_GATE6_HISTORY_NOT_PERSISTABLE`` / ``output_cap_exceeded`` with 0 orders.
@@ -16,9 +16,15 @@ complete, unmodified envelope from earlier today is therefore a valid base, and 
 makes the increment smallest. This script picks it, and nothing else: it never writes, never
 copies, and never decides on its own that history is complete.
 
+The 2026-11-13 10:30 miss exposed the week analogue: 9:35 did not fire, so no current-day week
+envelope existed and the session fell back to a 135,748-character full-week fetch it could not
+persist. A previous trading day's week envelope is equally safe because merge rechecks the gap,
+payload and every row; week lookup therefore searches Monday through yesterday as well.
+
 A candidate is ``<cron root>/<slot run dir>/orders_pages_<day>_<slot>.json`` (``--kind day``)
-or ``orders_pages_week_<Monday>_<slot>.json`` (``--kind week``) for every slot EARLIER than
-``--slot`` in ``scripts.verify_schedule.SLOT_EVIDENCE_LAYOUT``. It is accepted only when:
+or ``orders_pages_week_<Monday>_<slot>.json`` (``--kind week``). Day candidates are from slots
+EARLIER than ``--slot`` today; week candidates also include every slot on each earlier trading
+day of this ISO week. It is accepted only when:
 
 * it parses as JSON with no duplicate keys and no NaN/Infinity, and is an envelope with a
   ``pages`` list;
@@ -29,7 +35,8 @@ or ``orders_pages_week_<Monday>_<slot>.json`` (``--kind week``) for every slot E
   hand-edited file is never a base (those are exactly the files the 2026-11-11 morning runs
   left behind with no ``ingest``);
 * every row passes ``assemble_order_pages``' row checks (no placeholder id, no condensed row);
-* ``snapshot_at`` is offset-aware, falls on the trading day in ET, and is not in the future.
+* ``snapshot_at`` is offset-aware, falls today in ET for day envelopes or between Monday and
+  today for week envelopes, and is not in the future.
 
 A rejected candidate is listed with its reason and skipped, never fatal: falling back to an
 older valid base only widens the increment. No valid candidate is exit 2, and the caller
@@ -123,8 +130,8 @@ def _aware(value: Any) -> datetime:
     return parsed
 
 
-def candidate_paths(kind: str, slot: str, day: date, root: Optional[Path] = None) -> List[tuple[str, Path]]:
-    """``(slot, path)`` for every slot earlier than ``slot``, oldest first. Paths may not exist."""
+def candidate_paths(kind: str, slot: str, day: date, root: Optional[Path] = None) -> List[tuple[str, date, Path]]:
+    """Return eligible slot/day paths in oldest-first order; paths may not exist."""
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}")
     if slot not in SLOT_EVIDENCE_LAYOUT:
@@ -138,7 +145,16 @@ def candidate_paths(kind: str, slot: str, day: date, root: Optional[Path] = None
         named_day = monday_of(day).isoformat()
     # Slot ids are zero-padded HHMM, so string order is time order.
     earlier = sorted(s for s in SLOT_EVIDENCE_LAYOUT if s < slot)
-    return [(s, base / slot_run_dir_relative(s, day) / name.format(day=named_day, slot=s)) for s in earlier]
+    if kind == "day":
+        return [(s, day, base / slot_run_dir_relative(s, day) / name.format(day=named_day, slot=s)) for s in earlier]
+    result = [(s, day, base / slot_run_dir_relative(s, day) / name.format(day=named_day, slot=s)) for s in earlier]
+    monday = monday_of(day)
+    # 2026-11-13: a missed 9:35 run left no same-day week file; prior-day slots are valid bases
+    # because merge_order_pages independently refuses any history gap and revalidates each row.
+    for prior_day in (monday + timedelta(days=i) for i in range((day - monday).days)):
+        for prior_slot in sorted(SLOT_EVIDENCE_LAYOUT):
+            result.append((prior_slot, prior_day, base / slot_run_dir_relative(prior_slot, prior_day) / name.format(day=named_day, slot=prior_slot)))
+    return result
 
 
 def check_candidate(path: Path, *, kind: str, account: str, day: date, now: datetime) -> dict:
@@ -172,8 +188,10 @@ def check_candidate(path: Path, *, kind: str, account: str, day: date, now: date
         raise BaselineRejected("bad_rows", exc.reason) from exc
 
     snapshot = _aware(envelope.get("snapshot_at"))
-    if snapshot.astimezone(ET).date() != day:
-        raise BaselineRejected("snapshot_not_today", envelope.get("snapshot_at", ""))
+    snapshot_day = snapshot.astimezone(ET).date()
+    earliest = monday_of(day) if kind == "week" else day
+    if not earliest <= snapshot_day <= day:
+        raise BaselineRejected("snapshot_outside_window" if kind == "week" else "snapshot_not_today", envelope.get("snapshot_at", ""))
     if snapshot > now:
         raise BaselineRejected("snapshot_in_future", envelope.get("snapshot_at", ""))
     return {"snapshot": snapshot, "envelope": envelope}
@@ -208,28 +226,32 @@ def find_baseline(
         return {"ok": False, "reason": "bad_argument", "detail": str(exc), "rejected": []}
 
     rejected: List[dict] = []
-    best: Optional[tuple[datetime, str, Path, dict]] = None
-    for cand_slot, path in candidates:
+    best: Optional[tuple[datetime, str, date, Path, dict]] = None
+    for cand_slot, cand_day, path in candidates:
         try:
             found = check_candidate(path, kind=kind, account=account, day=day, now=moment)
         except BaselineRejected as exc:
             if exc.reason != "absent":  # a slot that saved nothing is normal, not news
-                rejected.append({"slot": cand_slot, "path": str(path), "reason": exc.reason})
+                item = {"slot": cand_slot, "path": str(path), "reason": exc.reason}
+                if kind == "week":
+                    item["day"] = cand_day.isoformat()
+                rejected.append(item)
             continue
         # Newest snapshot wins; on a tie the later slot (iterated later) wins.
         if best is None or found["snapshot"] >= best[0]:
-            best = (found["snapshot"], cand_slot, path, found["envelope"])
+            best = (found["snapshot"], cand_slot, cand_day, path, found["envelope"])
 
     if best is None:
         return {
             "ok": False,
             "reason": "no_valid_baseline",
-            "detail": f"no usable {kind} envelope from a slot earlier than {slot} today",
+            "detail": (f"no usable {kind} envelope from a slot earlier than {slot} today" if kind == "day"
+                       else f"no usable {kind} envelope from an eligible earlier slot/day for {slot}"),
             "rejected": rejected,
         }
-    snapshot, cand_slot, path, envelope = best
+    snapshot, cand_slot, cand_day, path, envelope = best
     rows = [row for page in envelope["pages"] for row in asm._order_rows(page)]
-    return {
+    result = {
         "ok": True,
         "tool": TOOL,
         "kind": kind,
@@ -244,6 +266,9 @@ def find_baseline(
         "order_count": len({str(row.get("id", "")).lower() for row in rows}),
         "rejected": rejected,
     }
+    if kind == "week":
+        result["base_day"] = cand_day.isoformat()
+    return result
 
 
 def _utc_z(moment: datetime) -> str:
