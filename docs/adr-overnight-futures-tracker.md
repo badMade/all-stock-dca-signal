@@ -239,6 +239,20 @@ about 22:30 ET on Thursday 2026-11-12, while ES and NQ trade on Globex.
 5. **Live shadow:** a daily task that places no orders writes forecasts before 09:35 ET; the outcome
    ledger scores them.
 
+## Implementation status (2026-11-14)
+
+| Step | State | PRs | Notes |
+|---|---|---|---|
+| 1. Boundaries | Done | #2241 | `overnight_futures` registered both ways in `tests/test_architecture_boundaries.py`, which since 2026-11-12 runs in CI (`Lint & test (dca-sizing-signals)`) |
+| 2. Pure computation | Done | #2263 | `overnight_futures/fair_value.py` and `tracker.py`, 49 test cases, written test first |
+| 3. Ingestion: store | Done | #2264, #2265 | `market_data_ingest/futures/` append-only store. #2265 fixed four review findings after #2264: vendor reverts kept, reads split by source, ambiguous batches refused, versioned dedupe. Uses the shared `market_data_ingest/duckdb_batch.py` from #2254 |
+| 3. Ingestion: Databento loader | **Blocked** | None | Waits on the operator confirming Databento's licence terms for storing raw 1-minute bars locally, and the cost of a sample download (open questions 2 and 3). No loader or real data until then |
+| 4. Offline evaluation | Not started | None | Needs real data from step 3 |
+| 5. Live shadow | Not started | None | Needs step 4 to pass D8; the 6-month shadow period starts here |
+
+Related: open question 4 was answered by the Robinhood probe above (#2251). Nothing in steps 1 to 3
+is imported by the core, the three entry points or `sizing_adjustment_reader.py`.
+
 ## Verification
 
 - `pytest dca-sizing-signals/tests` passes, including the boundary test with `overnight_futures`
