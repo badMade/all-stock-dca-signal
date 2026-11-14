@@ -148,6 +148,11 @@ def merge(
     merged_rows = sorted(merged_by_id.values(), key=_sort_key)
     merged_pages = [{"orders": merged_rows}]
     total = asm._validate_rows(merged_pages)
+    # 2026-11-14 (Perplexity backup hybrid): record which writer built the base, so a reader that must refuse a
+    # merge onto a hand-built base (backup_planner --week-envelope) can tell. Copied, never asserted: a base
+    # with no ingest block records null. Not covered by payload_sha256 (that hashes the pages only).
+    base_ingest = base.get("ingest")
+    base_tool = base_ingest.get("tool") if isinstance(base_ingest, dict) else None
 
     return {
         "account_number": account,
@@ -164,6 +169,8 @@ def merge(
             "total_usd": float(total),
             "created_at_gte": created_at_gte,
             "overlap_seconds": overlap_seconds,
+            "base_ingest_tool": base_tool if isinstance(base_tool, str) else None,
+            "base_snapshot_at": base.get("snapshot_at"),
             "base_payload_sha256": hashlib.sha256(_canonical(base_pages)).hexdigest(),
             "increment_payload_sha256": incoming["ingest"]["payload_sha256"],
             "payload_sha256": hashlib.sha256(_canonical(merged_pages)).hexdigest(),
