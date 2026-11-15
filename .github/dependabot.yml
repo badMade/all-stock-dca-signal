@@ -29,6 +29,7 @@ updates:
       - dependency-name: "pip-tools"
       - dependency-name: "pyright"
       - dependency-name: "pytest-cov"
+      - dependency-name: "pytest-xdist"
       - dependency-name: "pyyaml"
       - dependency-name: "referencing"
       - dependency-name: "ruamel-yaml"

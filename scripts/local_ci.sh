@@ -48,7 +48,9 @@ fi
 # A git worktree (.claude/worktrees/*) has no .venv of its own, and a bare `python3` fallback
 # picked up Homebrew's 3.14 with no pytest/ruff, so every worktree run died with "No module
 # named ruff" (2026-10-31). Stop with the fix instead. (--dry-run and --help only print, so they skip this.)
-if [[ " $* " != *" --dry-run "* && " $* " != *" --help "* && " $* " != *" -h "* ]] && { [ -z "$PY" ] || ! "$PY" -c 'import pytest, ruff, pytest_cov' 2>/dev/null; }; then
+# xdist joined the check 2026-11-14: a .venv built before the pin otherwise fails the coverage
+# step with "unrecognized arguments: -n" instead of this message.
+if [[ " $* " != *" --dry-run "* && " $* " != *" --help "* && " $* " != *" -h "* ]] && { [ -z "$PY" ] || ! "$PY" -c 'import pytest, ruff, pytest_cov, xdist' 2>/dev/null; }; then
   echo "local_ci: no interpreter with the dev tooling (tried \$PYTHON, ./.venv, $main_checkout/.venv)." >&2
   echo "  Fix: python3.12 -m venv $main_checkout/.venv && $main_checkout/.venv/bin/pip install -r requirements-dev.txt" >&2
   exit 2
@@ -295,8 +297,9 @@ fi
 run_step "ruff check ." "$PY" -m ruff check .
 
 if [ "$quick" -eq 0 ]; then
+  # -n auto matches ci.yml's core step (2026-11-14; tests/test_ci_parallel_coverage.py).
   run_step "pytest (coverage gate, same as CI)" \
-    "$PY" -m pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
+    "$PY" -m pytest -n auto --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 fi
 
 if [ "$py311" -eq 1 ]; then
