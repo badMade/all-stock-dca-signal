@@ -678,7 +678,7 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
 
 
 # -- launcher cost (2026-11-15: 8 launcher tests hit _run_launcher's 120 s timeout under `pytest -n auto` on the
-# self-hosted runner, PR 2328 run 43670958050). Each run spawns ~190 interpreters; the 62 inline rescue-pass snippets
+# self-hosted runner, PR 2328's core CI job). Each run spawns ~190 interpreters; the 62 inline rescue-pass snippets
 # that call _load_chunk each imported dca_runner (and with it near_close_dca) for one 6-line hook, ~0.3 s of CPU apiece,
 # so a stub build took ~28 s serially and minutes once every core was busy. The hook now lives in robinhood_payload.
 

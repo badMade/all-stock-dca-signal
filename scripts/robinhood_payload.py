@@ -580,7 +580,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     costs ~0.3 s of CPU per process. The launcher's rescue pass calls ``_load_chunk`` from two inline ``python -c``
     snippets per chunk (62 fresh interpreters for a 31-chunk plan), so that import alone was ~20 s of every build and
     made the launcher tests in tests/test_robinhood_payload.py time out under ``pytest -n auto`` on the self-hosted
-    runner (PR 2328, run 43670958050). tests/test_robinhood_payload.py pins the parity and that the import stays out.
+    runner (PR 2328's core CI job, 2026-11-15). tests/test_robinhood_payload.py pins the parity and that the import stays out.
     """
     seen: set[str] = set()
     result: dict[str, Any] = {}
