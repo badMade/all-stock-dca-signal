@@ -677,6 +677,49 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
     return done, len(json.loads(plan.stdout)["chunks"])
 
 
+# -- launcher cost (2026-11-15: 8 launcher tests hit _run_launcher's 120 s timeout under `pytest -n auto` on the
+# self-hosted runner, PR 2328's core CI job). Each run spawns ~190 interpreters; the 62 inline rescue-pass snippets
+# that call _load_chunk each imported dca_runner (and with it near_close_dca) for one 6-line hook, ~0.3 s of CPU apiece,
+# so a stub build took ~28 s serially and minutes once every core was busy. The hook now lives in robinhood_payload.
+
+
+def test_load_chunk_does_not_import_dca_runner(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
+    probe = (
+        "import sys\nfrom scripts.robinhood_payload import _load_chunk\n_load_chunk(sys.argv[1])\n"
+        "heavy = sorted(m for m in ('dca_runner', 'near_close_dca') if m in sys.modules)\n"
+        "assert not heavy, heavy\n"
+    )
+    repo = Path(__file__).resolve().parents[1]
+    done = subprocess.run([sys.executable, "-c", probe, str(chunk)], cwd=repo, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+
+
+def test_load_chunk_duplicate_key_hook_matches_dca_runner():
+    import dca_runner
+
+    for text in ('{"a": 1, "a": 2}', '{"AAA": {"close": 1, "close": 2}}'):
+        with pytest.raises(ValueError, match="duplicate key"):
+            json.loads(text, object_pairs_hook=dca_runner._reject_duplicate_keys)
+        with pytest.raises(ValueError, match="duplicate key"):
+            json.loads(text, object_pairs_hook=rp._reject_duplicate_keys)
+    clean = '{"AAA": {"close": 1, "bars": [{"o": 1}]}, "BBB": {}}'
+    assert json.loads(clean, object_pairs_hook=rp._reject_duplicate_keys) == json.loads(
+        clean, object_pairs_hook=dca_runner._reject_duplicate_keys
+    )
+
+
+def test_load_chunk_still_rejects_a_duplicate_ticker(tmp_path):
+    path = tmp_path / "chunk_0.json"
+    path.write_text('{"AAA": {"close": 1}, "AAA": {"close": 2}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key 'AAA'"):
+        rp._load_chunk(str(path))
+
+
 def test_launcher_logs_each_chunks_duration_attempts_and_the_build_total(tmp_path):
     import re
 
