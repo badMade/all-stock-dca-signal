@@ -140,3 +140,52 @@ def test_the_account_number_is_never_echoed_in_the_usage_error(monkeypatch, caps
     with pytest.raises(SystemExit):
         account_arg.resolve_account(parser, parser.parse_args([]))
     assert ACCOUNT not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------------------------------------------
+# 2026-11-15 (#2323 rebased onto this helper): the environment value must also have the repo's canonical account
+# shape (dca_config.ACCOUNT_NUMBER_SHAPE, 6 to 12 digits). "Set and not a placeholder" let a malformed value such
+# as a stray word or the morning modes' ``read_only`` literal through, to surface only later as a confusing
+# ``orders_pages_account_mismatch``. An explicit --account stays untouched (tests above): each script validates it
+# against its envelope, and the prompts already pasted keep passing it.
+# --------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["12345", "9" * 13, "12 34", "not-an-account", "read_only"])
+def test_malformed_environment_account_fails_closed_with_exit_2(monkeypatch, capsys, value):
+    monkeypatch.setenv(account_arg.ACCOUNT_ENV, value)
+    parser = _parser()
+    with pytest.raises(SystemExit) as exc:
+        account_arg.resolve_account(parser, parser.parse_args([]))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "no usable account number" in err and "6 to 12 digits" in err
+    assert value not in err  # never echo the value, malformed or not (AGENTS.md secrets policy)
+
+
+@pytest.mark.parametrize("value", [str(10**5), "9" * 12])
+def test_environment_account_at_either_shape_bound_is_accepted(monkeypatch, value):
+    monkeypatch.setenv(account_arg.ACCOUNT_ENV, value)
+    parser = _parser()
+    assert account_arg.resolve_account(parser, parser.parse_args([])) == value
+
+
+@pytest.mark.parametrize("name", sorted(_CLIS))
+def test_every_gate_cli_refuses_a_malformed_environment_account(monkeypatch, capsys, tmp_path, name):
+    """Wiring check: the shape rule reaches every CLI before any file is read."""
+    main, argv = _CLIS[name]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(account_arg.ACCOUNT_ENV, "not-an-account")
+    with pytest.raises(SystemExit) as exc:
+        main(list(argv))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "6 to 12 digits" in err and "not-an-account" not in err
+
+
+def test_the_helper_shape_matches_the_canonical_config_shape():
+    """account_arg restates dca_config.ACCOUNT_NUMBER_SHAPE to stay standard-library only; keep them in step."""
+    import dca_config
+
+    for value in ["1" * n for n in range(4, 15)] + ["12a456", "read_only"]:
+        assert bool(account_arg._ACCOUNT_SHAPE.fullmatch(value)) == bool(dca_config.ACCOUNT_NUMBER_SHAPE.fullmatch(value))
