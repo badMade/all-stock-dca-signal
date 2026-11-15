@@ -118,6 +118,8 @@ py-modules = [
     # Phase 2 goal progress: TWR/MWR and the missed-snapshot / bad-config alerts
     # (docs/adr-goals-and-loss-hedge-shadow.md). Pure functions; reads goals via dca_goals.
     "dca_goal_progress",
+    # 2026-11-14: Phase 2 snapshot capture (ADR tests 22-26); imported by the 07:31 task session.
+    "dca_goal_snapshot",
     "dca_fileio",
     # Provenance sidecars (SHA-256, source, fetch time) for fetched market-data
     # files; imported by ticker-market-breadth, yfinance-prefetch and ml-forecaster,

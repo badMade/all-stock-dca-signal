@@ -84,7 +84,8 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.backup_strategy", "scripts.backup_state_root", "dca_goals", "scripts.propose_goal_pr",
     )),
     ("reporting_ops", "Reporting & monitoring", (
-        "dca_alerts", "dca_average_cost_snapshot", "dca_goal_progress", "dca_notion_sync", "dca_reporting",
+        "dca_alerts", "dca_average_cost_snapshot", "dca_goal_progress", "dca_goal_snapshot", "dca_notion_sync",
+        "dca_reporting",
         "dca_weekly_dashboard",
         "scripts.alert_digest", "scripts.check_live_prompt_drift", "scripts.check_slot_fills",
         "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
