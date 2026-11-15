@@ -1122,10 +1122,14 @@ def test_sigterm_stops_console_cleanly(tmp_path):
     venv_existed_before = (Path(dca_console.REPO) / ".venv").exists()
     child_env = dict(os.environ)
     child_env["PYTHONUNBUFFERED"] = "1"
+    # `-m dca_console`, not from.py: the SIGTERM handler under test is installed by
+    # dca_console.main(), and from.py's ensure_venv() would build and pip-install a .venv
+    # first (see the assertions at the end of this test).
     process = subprocess.Popen(
         [
             sys.executable,
-            "from.py",
+            "-m",
+            "dca_console",
             "--local",
             "--no-browser",
             "--port",
