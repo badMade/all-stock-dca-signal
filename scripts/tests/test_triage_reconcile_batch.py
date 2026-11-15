@@ -220,6 +220,49 @@ def test_cli_missing_input_file_fails_closed(tmp_path, capsys):
     assert "prs.json" in json.loads(capsys.readouterr().out)["error"]
 
 
+def test_pr_number_given_as_this_repos_pr_url_is_read_as_the_number():
+    # 2026-11-14: the Notion fetch handed the PR number column over as URLs.
+    rows = [{"Key": "cap_breach", "Progress": "PR open", "PR number": f"{URL}/pull/10"}]
+    assert _decision(_reconcile(rows, prs=[_gh_pr()]), "cap_breach")["updates"] == {"Progress": _tr().PROGRESS_MERGED_GREEN}
+    assert _batch().recorded_pr_numbers(rows + [{"PR number": f"{URL}/pull/7/"}]) == [7, 10]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["https://github.com/someone-else/all-stock-dca/pull/10", f"{URL}/issues/10", f"{URL}/pull/10/files"],
+)
+def test_a_pr_url_outside_this_repo_or_not_a_pr_is_still_refused(value):
+    d = _decision(_reconcile([{"Key": "cap_breach", "PR number": value}], prs=[_gh_pr()]), "cap_breach")
+    assert d["action"] == "skip" and "EvidenceError" in d["skip_reason"]
+
+
+def test_notion_escaped_key_is_unescaped_and_nothing_else_changes():
+    rows = [{"Key": "max\\_orders\\_per\\_day\\_unenforced", "Proposed plan": "keep \\_ here", "PR number": 1745}]
+    normalized = _batch().normalize_rows(rows)
+    assert normalized == [{"Key": "max_orders_per_day_unenforced", "Proposed plan": "keep \\_ here", "PR number": 1745}]
+    assert rows[0]["Key"] == "max\\_orders\\_per\\_day\\_unenforced"  # the caller's rows are not mutated
+
+
+def test_cli_accepts_escaped_keys_and_pr_urls_from_the_notion_fetch(tmp_path, capsys):
+    work = _work_dir(tmp_path, [_gh_pr()])
+    rows = tmp_path / "rows.json"
+    rows.write_text(json.dumps([{"Key": "cap\\_breach", "Progress": "PR open", "PR number": f"{URL}/pull/10"}]))
+    assert _batch().main(["--rows", str(rows), "--work-dir", str(work)]) == 0
+    decision = json.loads(capsys.readouterr().out)["decisions"][0]
+    assert decision["key"] == "cap_breach" and decision["action"] == "update"
+
+
+def test_cli_refuses_a_cache_collected_for_other_rows(tmp_path, capsys):
+    # 2026-11-14: prs.json from a --collect that could not parse the PR column lacked #1745, and the rerun on fixed
+    # rows reported a merged fix that cites its Key as recorded_pr_unconfirmed. It must refuse instead.
+    work = _work_dir(tmp_path, [_gh_pr()])
+    rows = tmp_path / "rows.json"
+    rows.write_text(json.dumps([{"Key": "cap_breach", "PR number": 10}, {"Key": "max_orders_per_day_unenforced", "PR number": 1745}]))
+    assert _batch().main(["--rows", str(rows), "--work-dir", str(work)]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "#1745" in error and "--collect" in error and "#10" not in error
+
+
 def test_recorded_helpers():
     rows = [
         {"Commit URL": f"{URL}/commit/{'a' * 40}", "PR number": 5},

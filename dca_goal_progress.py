@@ -222,7 +222,7 @@ def close_day(day: date, *, snapshot: Optional[Sequence[Mapping[str, Any]]], con
 
 # The Friday Notion refresh runs at 5:00 PM ET (operator instruction, 2026-11-14); the Goal
 # progress section rides that run's payload on Fridays only.
-FRIDAY_REFRESH_TIME = time(17, 0)
+FRIDAY_REFRESH_TIME = time(17, 30)  # task 041d9d90 in config/scheduled_tasks.json (Fridays 5:30 PM ET)
 GOAL_PROGRESS_SECTION = "Goal progress"
 _FRIDAY = 4  # date.weekday()
 # Under a year of window an annualized figure extrapolates noise (a 9-day 8% reads as several
