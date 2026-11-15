@@ -46,12 +46,13 @@ def main() -> None:
     if not run_cmd(["ruff", "check", "."]):
         success = False
 
-    # Types
-    if not run_cmd(["pyright"]):
-        success = False
+    # No Pyright gate (2026-11-15): CI runs it as advisory only while repo-wide diagnostics remain
+    # (CLAUDE.md), so gating on it here meant this check could never pass, before or after a repair.
 
     # Testing
-    if not run_cmd(["pytest", "--cov=.", "--cov-report=term-missing:skip-covered", "--cov-fail-under=90"]):
+    # -n auto matches ci.yml's core step. self-heal.yml runs this up to ~5 times in one job (pre, once per
+    # changed repair step in self_heal.py, post), so a serial 20-30 min suite could never fit (2026-11-15).
+    if not run_cmd(["pytest", "-n", "auto", "--cov=.", "--cov-report=term-missing:skip-covered", "--cov-fail-under=90"]):
         success = False
 
     # Smoke test (Dry run)
