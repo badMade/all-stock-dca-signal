@@ -348,6 +348,24 @@ raw) with band width, plus point-inside-realized-range hit-rates, skill vs persi
 the fraction of close-error variance that is market-wide vs idiosyncratic). Multi-model
 comparisons are restricted to (ticker, origin day) pairs present for all compared models.
 
+**Band scorecard.** Each score record also carries the interval score of the calibrated and
+raw bands (width plus ten times the distance of a miss, Gneiting and Raftery 2007) and which
+side a miss fell on. `report.json` reports `interval_score`, `interval_score_raw`,
+`below_rate` and `above_rate` per regime and per horizon. Ledgers written before these
+fields existed still report: the calibrated interval score is recovered from the stored
+pinball losses, and the fields that cannot be recovered are `null`.
+
+**Uncertainty (`band_uncertainty.py`).** Coverage over millions of ticker-days is not
+millions of independent observations: horizon-h targets from consecutive days overlap, and
+every ticker on a date shares that date's market move. `ratio_interval` and `skill_interval`
+resample whole dates in contiguous blocks (block length at least the horizon) and return a
+percentile interval, or `None` bounds with a reason when there are fewer than two blocks.
+`kupiec_pof` and the two Christoffersen tests check one time-ordered breach sequence; the
+independence test is meaningful at horizon 1 only. `daily_band_series` builds the per-date
+arrays from score records. Not yet wired into `report.json`; that is the trust scorecard in
+`claude/band-calibration/PLAN.md`. See
+[the band scorecard decision](adr-octopus-band-scorecard.md).
+
 ## Production-safety safeguards
 
 The five production-safe-loop primitives (spec → circuit breaker → ledger → bounded loop →
