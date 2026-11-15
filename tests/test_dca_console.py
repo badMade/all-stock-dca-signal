@@ -1119,17 +1119,18 @@ def test_server_header_does_not_leak_python_version(auth_server):
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGTERM lifecycle coverage requires POSIX signals")
 def test_sigterm_stops_console_cleanly(tmp_path):
+    venv_existed_before = (Path(dca_console.REPO) / ".venv").exists()
     child_env = dict(os.environ)
     child_env["PYTHONUNBUFFERED"] = "1"
-    # `-m dca_console`, not `from.py` (2026-11-15): from.py runs dca_bootstrap.ensure_venv first, and on a checkout
-    # whose .venv is not the test interpreter (the self-hosted runner's fresh checkout) that created a .venv and ran
-    # pip before the banner, so under `pytest -n auto` the 10 s readiness wait failed (PR 2328, run 43670958050).
-    # The SIGTERM handling under test is dca_console.main's; the bootstrap has its own tests in test_dca_bootstrap.py.
+    # Launch dca_console.main directly, not through from.py. from.py first runs dca_bootstrap.ensure_venv, which on a
+    # checkout with no .venv builds one (python -m venv, then a pip upgrade over the network) before the console starts;
+    # on the macOS CI runners that took longer than this test's 10 s readiness wait ("Creating virtual environment at
+    # .../.venv", CI 2026-11-15). The SIGTERM-before-banner race this test guards lives in main(), not in the trampoline.
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "dca_console",
+            "-c",
+            "import sys; from dca_console import main; raise SystemExit(main(sys.argv[1:]))",
             "--local",
             "--no-browser",
             "--port",
@@ -1193,6 +1194,15 @@ def test_sigterm_stops_console_cleanly(tmp_path):
     stdout = "".join(output_lines)
     assert "DCA console (local)" in stdout
     assert "Stopping local console." in stdout
+    # 2026-11-15: launched via from.py, this test ran dca_bootstrap.ensure_venv(), which created
+    # <repo>/.venv and pip-installed requirements-dev.txt before the banner. On a fresh
+    # self-hosted runner workspace that took longer than the 10s banner wait and failed both core
+    # legs ("Creating virtual environment at .../_work/.../.venv"). The SIGTERM handler under test
+    # lives in dca_console.main(), so the test must reach it without the launcher's bootstrap.
+    assert "Creating virtual environment" not in stdout
+    assert not (Path(dca_console.REPO) / ".venv").exists() or venv_existed_before, (
+        "the console SIGTERM test created the repository .venv as a side effect"
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")

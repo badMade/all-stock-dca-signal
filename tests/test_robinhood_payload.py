@@ -621,6 +621,13 @@ def test_refusal_before_the_anchor_is_recorded_too(tmp_path):
 LAUNCHER = "deploy/launchd/robinhood_payload.sh"
 
 
+# A ceiling, not an expectation: the 429 tests run the real fetch loop over 31 chunks (about 124 logged attempts), which takes
+# ~17 s on a quiet Linux box and ~65 s with the CPU oversubscribed 6x there. The macOS CI runners spawn processes more slowly
+# still and run these alongside ~12 xdist workers, and the old 120 s ceiling expired (CI 2026-11-15, "timed out after 120
+# seconds"). A real hang still fails, just later.
+LAUNCHER_TIMEOUT_SECONDS = 300
+
+
 def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_script=None):
     """Run the real launcher for a past trading day with a stub `codex` (default: answers every chunk with `{}`).
 
@@ -660,7 +667,9 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
         "CODEX_HOME": str(tmp_path / "codex_home"),
         **(extra_env or {}),
     }
-    done = subprocess.run(["bash", str(repo / LAUNCHER), "0935"], env=env, capture_output=True, text=True, timeout=120)
+    done = subprocess.run(
+        ["bash", str(repo / LAUNCHER), "0935"], env=env, capture_output=True, text=True, timeout=LAUNCHER_TIMEOUT_SECONDS
+    )
     plan = subprocess.run(
         [sys.executable, "-m", "scripts.robinhood_payload", "plan", "--slot", "0935", "--day", "2026-10-20"],
         env=env, capture_output=True, text=True, cwd=repo, check=True,

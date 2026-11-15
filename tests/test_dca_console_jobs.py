@@ -193,17 +193,22 @@ def test_deadline_and_shutdown_reap_descendants_that_retain_stdout(tmp_path, mon
         (sys.executable, "-c", parent, child, str(tmp_path / "ready")),
         tmp_path,
         dict(os.environ),
-        timeout=0.5 if stop_kind == "timeout" else 30,
+        # The deadline must outlast the two nested interpreter starts plus the ready handshake below, or it fires
+        # first and SIGTERMs the parent before it can exit 0 (-15). 0.5 s was enough on a quiet Linux box but not on
+        # a loaded macOS runner (CI 2026-11-15, both Mac runners). Slowing every interpreter start by 0.35 s
+        # (a sitecustomize sleep) reproduces it deterministically; 6 s leaves room for a start ten times slower.
+        timeout=6 if stop_kind == "timeout" else 30,
     )
     try:
         manager.submit("demo-dca", "Descendant cleanup", lambda job_id, log: manager.run_command(command, log))
-        assert launched.wait(2)
+        assert launched.wait(5)
         # The pipe remains open after the process that run_command owns exits.
-        assert processes[0].wait(timeout=2) == 0
+        assert processes[0].wait(timeout=5) == 0
         if stop_kind == "shutdown":
             manager.close()
         assert manager.worker is not None
-        manager.worker.join(timeout=13)
+        # Deadline (6 s) + the 10 s SIGTERM grace in run_command + slack; it was 13 s for the old 0.5 s deadline.
+        manager.worker.join(timeout=25)
         assert not manager.worker.is_alive()
         result = manager.snapshot()[0]
         assert result["status"] == "interrupted"

@@ -93,7 +93,10 @@ def test_no_flag_and_no_environment_account_aborts_and_names_the_account(tmp_pat
 
 @pytest.mark.parametrize(
     ("bad", "exit_code"),
-    [("${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", 2), ("not-an-account", 1), ("", 2), ("12 34", 1)],
+    # 2026-11-15 (#2323): a malformed value is now refused by scripts/account_arg.py's shape check at the command
+    # line (exit 2, like an unset one) instead of reaching account_pin and printing ABORT (exit 1). Either way the
+    # budget is never computed.
+    [("${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", 2), ("not-an-account", 2), ("", 2), ("12 34", 2)],
 )
 def test_an_unusable_environment_account_aborts(tmp_path, bad, exit_code):
     done = _run_budget(tmp_path, [], env_account=bad)
