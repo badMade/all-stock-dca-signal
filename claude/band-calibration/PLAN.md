@@ -106,15 +106,25 @@ appends nothing.
 
 ### Rock 4: Synthetic-truth recovery
 
-**Scope.** Simulated archives with a known answer, run through the unmodified harness and
-scorecard: a random walk (no skill is possible), a volatility-clustering process with a
-leverage effect, and a planted weak drift of known size.
+**Scope.** `synthetic_truth.py` writes simulated archives with a known answer and replays
+them through the unmodified harness: a random walk (no skill is possible), a
+volatility-clustering process with a leverage effect (size is predictable, direction is
+not), and a planted drift with lag-1 correlation 0.5 (skill must be found).
 
 **Non-goals.** No claim that the simulators resemble real markets. They test the harness.
+Only the GBM quantile model is replayed; replaying Octopus itself is a longer run and is
+listed in `DEFERRED.md`.
 
-**Proof.** On the random walk the skill interval covers zero and the hit rate interval
-covers 50%. The planted drift is detected. Any lookahead leak shows up as skill on the
-random walk, which fails the test.
+**Proof.** `python wondrous-octopus/synthetic_truth.py --scenario all --work-dir <dir>`
+exits 0. On the random walk and the volatility process the skill interval does not lie
+above zero and the hit-rate interval does not lie above 50%. On the planted drift both do.
+A unit test plants a lookahead leak in score records and confirms the check fails.
+
+**Status.** Implemented on the PR stacked on #2304. All three scenarios pass; the measured
+table is in `docs/wondrous_octopus.md`.
+
+**Finding for Rock 5.** Calibrated coverage was about 77% in all three runs, with intervals
+that exclude 80%. On 390 scored dates the adaptive calibrator had not closed the gap.
 
 ### Rock 5: Calibrator replay and candidates
 
