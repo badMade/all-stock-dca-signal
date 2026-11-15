@@ -27,6 +27,9 @@ import dca_env
 
 ACCOUNT = "999000111"  # conftest.py's synthetic value; any other account-shaped literal trips the secrets guard
 VAR = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+# A second valid-shaped account, derived rather than written out: tests/test_config_invariants.py takes no
+# account-shaped literal other than ACCOUNT (use conftest.FIXTURE_ACCOUNT_NUMBER or keep a number to 5 digits or fewer).
+OTHER = str(int(ACCOUNT) + 1)
 
 
 def test_reads_the_account_from_the_environment(monkeypatch):
@@ -41,7 +44,7 @@ def test_strips_stray_whitespace_from_the_environment_value(monkeypatch):
 
 def test_an_explicit_cli_value_is_still_honoured_and_wins(monkeypatch):
     monkeypatch.setenv(VAR, ACCOUNT)
-    assert dca_config.resolve_order_account("123456") == "123456"
+    assert dca_config.resolve_order_account(OTHER) == OTHER
 
 
 def test_a_literal_placeholder_as_the_cli_value_expands_from_the_environment(monkeypatch):
@@ -91,7 +94,7 @@ def test_the_operators_dotenv_is_loaded_when_the_variable_is_not_exported(monkey
 
 def test_an_exported_variable_wins_over_the_dotenv(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text(f"{VAR}=123456\n", encoding="utf-8")
+    env_file.write_text(f"{VAR}={OTHER}\n", encoding="utf-8")
     os.chmod(env_file, 0o600)
     monkeypatch.setenv(VAR, ACCOUNT)
     monkeypatch.delenv(dca_env.DISABLE_FLAG, raising=False)
