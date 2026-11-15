@@ -593,6 +593,18 @@ class TestResumeCli:
         # No history/universe/model/config flags need to be remembered.
         assert run_walkforward.main(["--resume", str(run_dir)]) == 0
 
+    def test_bare_resume_restores_custom_eval_horizons(self, synthetic_history_dir, tmp_path):
+        """A multi-horizon run with non-default --eval-horizons must resume without re-passing them (it was
+        refused on 'eval_horizons' because only max_horizon, not the eval set, was restored from the run)."""
+        run_dir = tmp_path / "run"
+        original = [
+            "--history-dir", str(synthetic_history_dir), "--all-tickers-in-archive",
+            "--model", "persistence", "--start", "2021-11-01", "--window-len", "96",
+            "--max-horizon", "8", "--eval-horizons", "2,3,4,5,6,7,8", "--max-steps", "2", "--run-dir", str(run_dir),
+        ]
+        assert run_walkforward.main(original) == 3
+        assert run_walkforward.main(["--resume", str(run_dir)]) == 0
+
     def test_resume_metadata_reads_use_explicit_utf8(self, synthetic_history_dir, tmp_path, monkeypatch):
         # json.loads(path.read_text()) without an explicit encoding defers
         # to the platform's preferred encoding, which is not always UTF-8;

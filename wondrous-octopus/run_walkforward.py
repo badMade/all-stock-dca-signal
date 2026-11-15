@@ -1090,6 +1090,11 @@ def _restore_recorded_resume_args(args: argparse.Namespace) -> None:
             args._resolved_models = tuple(config["models"])
         elif meta.get("model_selection"):
             args.model = meta["model_selection"]
+    if "--eval-horizons" not in provided and config.get("eval_horizons"):
+        # Frozen at fresh() time but, unlike max_horizon (restored below through model_hyper), never put back
+        # on args: a bare ``--resume`` then rebuilt the default (5,10,15,20) and the config-hash check refused
+        # every multi-horizon run whose eval horizons were customised (found resuming the all-tickers run).
+        args.eval_horizons = [int(h) for h in config["eval_horizons"]]
     if "--no-calibration" not in provided and "calibration" in config:
         args.no_calibration = not config["calibration"]
     for attr, value in meta.get("model_hyper", {}).items():
