@@ -14,7 +14,8 @@ Each script now takes ``--account`` as OPTIONAL. Omitted, the number comes from 
 the prompts already pasted into the scheduled tasks keep passing it until the operator re-pastes, and a run must
 not abort over that.
 
-Fail closed: with ``--account`` omitted, an unset, empty or unexpanded environment value is a usage error (exit
+Fail closed: with ``--account`` omitted, an unset, empty, unexpanded or malformed (not 6 to 12 digits) environment
+value is a usage error (exit
 2, argparse's own convention and the exit a missing ``required=True`` argument gave before), never an empty-string
 account that would only surface later as an ``orders_pages_account_mismatch``. An explicit ``--account`` is
 validated by each script against its envelope, exactly as before. The number is never printed, in the error or anywhere else
@@ -25,9 +26,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from typing import Optional
 
 ACCOUNT_ENV = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+# Mirrors dca_config.ACCOUNT_NUMBER_SHAPE; scripts/tests/test_account_arg.py pins the two together.
+_ACCOUNT_SHAPE = re.compile(r"[0-9]{6,12}")
 
 _DEFAULT_NOTE = (
     f"Optional: defaults to ${ACCOUNT_ENV} (the gitignored .env counts). Prefer the default; a number on the "
@@ -55,6 +59,12 @@ def _unusable_reason(value: str) -> Optional[str]:
     if "${" in value:
         # An unexpanded placeholder copied from config or a prompt; it would only mismatch every envelope.
         return "is an unexpanded ${...} placeholder"
+    if not _ACCOUNT_SHAPE.fullmatch(value):
+        # 2026-11-15 (#2323): "set and not a placeholder" let a stray word or the morning modes' ``read_only``
+        # literal through, to surface only later as a confusing ``orders_pages_account_mismatch``. Same shape as
+        # dca_config.ACCOUNT_NUMBER_SHAPE, restated rather than imported: dca_config pulls in near_close_dca, and
+        # this helper is bundled into backup_planner.pyz, so it stays standard-library only.
+        return "is not 6 to 12 digits"
     return None
 
 

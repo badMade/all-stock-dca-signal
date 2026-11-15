@@ -1122,14 +1122,15 @@ def test_sigterm_stops_console_cleanly(tmp_path):
     venv_existed_before = (Path(dca_console.REPO) / ".venv").exists()
     child_env = dict(os.environ)
     child_env["PYTHONUNBUFFERED"] = "1"
-    # `-m dca_console`, not from.py: the SIGTERM handler under test is installed by
-    # dca_console.main(), and from.py's ensure_venv() would build and pip-install a .venv
-    # first (see the assertions at the end of this test).
+    # Launch dca_console.main directly, not through from.py. from.py first runs dca_bootstrap.ensure_venv, which on a
+    # checkout with no .venv builds one (python -m venv, then a pip upgrade over the network) before the console starts;
+    # on the macOS CI runners that took longer than this test's 10 s readiness wait ("Creating virtual environment at
+    # .../.venv", CI 2026-11-15). The SIGTERM-before-banner race this test guards lives in main(), not in the trampoline.
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "dca_console",
+            "-c",
+            "import sys; from dca_console import main; raise SystemExit(main(sys.argv[1:]))",
             "--local",
             "--no-browser",
             "--port",

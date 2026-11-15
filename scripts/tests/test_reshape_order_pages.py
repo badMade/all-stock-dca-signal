@@ -33,6 +33,9 @@ import dca_runner as r  # noqa: E402
 from scripts import reshape_order_pages as reshape  # noqa: E402
 
 ACCOUNT = "999000111"  # synthetic; conftest assigns the same value
+# Derived, never written as a literal: tests/test_config_invariants.py takes no account-shaped literal other than
+# the synthetic ACCOUNT (use conftest.FIXTURE_ACCOUNT_NUMBER or keep a number to 5 digits or fewer).
+OTHER_ACCOUNT = str(int(ACCOUNT) + 1)
 MONDAY = "2026-11-02"
 TODAY = date(2026, 11, 5)
 
@@ -316,7 +319,7 @@ def test_refuses_a_condensed_capture_via_the_shared_proof(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     "override,reason",
-    [({"account": "another-account"}, "orders_pages_account_mismatch"), ({"day": "2026-10-26"}, "orders_pages_trading_day_mismatch")],
+    [({"account": OTHER_ACCOUNT}, "orders_pages_account_mismatch"), ({"day": "2026-10-26"}, "orders_pages_trading_day_mismatch")],
 )
 def test_refuses_an_envelope_for_another_account_or_week(tmp_path, capsys, override, reason):
     code, out = _run(tmp_path, _envelope(tmp_path, _week_rows()), **override)

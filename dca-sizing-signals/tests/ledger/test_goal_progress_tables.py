@@ -99,3 +99,44 @@ def test_goal_progress_refuses_annualized_value_under_one_year(ledger):
     with pytest.raises(LedgerValidationError):
         ledger.ingest_goal_progress([bad], source="goal_progress", run_id="gp-4", as_of=utc(2026, 11, 13, 12))
     assert ledger.row_count("goal_progress") == 0
+
+
+# ---- the no-holdings marker (regression: the ledger used to refuse it) -------------------------
+# dca_goal_snapshot.capture_previous_close emits exactly this row for a trading day on which the
+# account holds nothing (tests/test_goal_snapshot_capture.py). It must round-trip unchanged.
+NO_HOLDINGS = {"snapshot_day": "2026-11-13", "symbol": None, "quantity": 0.0,
+               "close_day": None, "prior_close": None, "market_value": 0.0}
+
+
+def test_no_holdings_marker_is_accepted_and_reads_back_unchanged(ledger):
+    assert ledger.ingest_portfolio_snapshots([NO_HOLDINGS], source="robinhood_readonly", run_id="snap-7",
+                                             as_of=utc(2026, 11, 13, 12)) == 1
+    assert ledger.ingest_portfolio_snapshots([NO_HOLDINGS], source="robinhood_readonly", run_id="snap-7",
+                                             as_of=utc(2026, 11, 13, 12)) == 0
+    [row] = ledger.portfolio_snapshots(known_at=utc(2026, 11, 14))
+    assert {k: row[k] for k in NO_HOLDINGS} == {**NO_HOLDINGS, "snapshot_day": row["snapshot_day"]}
+    assert row["snapshot_day"].isoformat() == "2026-11-13"
+    assert row["symbol"] is None and row["close_day"] is None and row["prior_close"] is None
+
+
+def test_no_holdings_marker_cannot_share_a_batch_with_positions(ledger):
+    with pytest.raises(LedgerValidationError):
+        ledger.ingest_portfolio_snapshots([SNAP, NO_HOLDINGS], source="robinhood_readonly", run_id="snap-8",
+                                          as_of=utc(2026, 11, 13, 12))
+    assert ledger.row_count("portfolio_snapshots") == 0
+
+
+@pytest.mark.parametrize("field, value", [("quantity", 2.0), ("market_value", 20.0), ("prior_close", 10.0),
+                                          ("close_day", "2026-11-12")])
+def test_a_symbolless_row_that_is_not_the_exact_marker_is_refused(ledger, field, value):
+    with pytest.raises(LedgerValidationError):
+        ledger.ingest_portfolio_snapshots([{**NO_HOLDINGS, field: value}], source="robinhood_readonly",
+                                          run_id="snap-9", as_of=utc(2026, 11, 13, 12))
+    assert ledger.row_count("portfolio_snapshots") == 0
+
+
+def test_the_marker_sentinel_is_not_accepted_as_a_real_symbol(ledger):
+    with pytest.raises(LedgerValidationError):
+        ledger.ingest_portfolio_snapshots([{**SNAP, "symbol": ledger.NO_HOLDINGS_SYMBOL}],
+                                          source="robinhood_readonly", run_id="snap-10",
+                                          as_of=utc(2026, 11, 13, 12))
