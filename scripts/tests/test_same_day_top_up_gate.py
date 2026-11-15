@@ -52,7 +52,11 @@ from scripts.reason_codes import (  # noqa: E402
     UNLOGGED_REFERENCE_PRICE,
 )
 
-ACCOUNT = "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
+ACCOUNT = "999000111"  # synthetic; conftest assigns the same value. The CLI now expands and shape-checks --account,
+# so a literal ${...} placeholder or a fake like ACC1 is no longer a usable account.
+# Derived, never written as a literal: tests/test_config_invariants.py takes no account-shaped literal other than
+# the synthetic ACCOUNT (use conftest.FIXTURE_ACCOUNT_NUMBER or keep a number to 5 digits or fewer).
+OTHER_ACCOUNT = str(int(ACCOUNT) + 1)
 DAY = "2026-07-30"
 
 
@@ -1115,11 +1119,11 @@ def test_cli_exits_two_when_candidates_is_not_a_json_array(tmp_path, capsys):
 def test_main_proceeds_when_the_saved_metadata_matches(tmp_path, capsys):
     orders_path = tmp_path / "orders.json"
     candidates_path = tmp_path / "candidates.json"
-    _write_json(orders_path, {"account_number": "ACC1", "trading_day": "2026-07-31", "pages": [_page([])]})
+    _write_json(orders_path, {"account_number": ACCOUNT, "trading_day": "2026-07-31", "pages": [_page([])]})
     _write_json(candidates_path, [{"ticker": "SPCX", "desired_usd": 1.0, "current_price": 100.0}])
     exit_code = gate.main(
         [
-            "--account", "ACC1",
+            "--account", ACCOUNT,
             "--trading-day", "2026-07-31",
             "--orders-pages", str(orders_path),
             "--candidates", str(candidates_path),
@@ -1135,11 +1139,11 @@ def test_main_rejects_orders_pages_saved_for_a_different_account(tmp_path, capsy
     "Bind replayed pages to the requested account and day")."""
     orders_path = tmp_path / "orders.json"
     candidates_path = tmp_path / "candidates.json"
-    _write_json(orders_path, {"account_number": "SOME_OTHER_ACCOUNT", "trading_day": "2026-07-31", "pages": [_page([])]})
+    _write_json(orders_path, {"account_number": OTHER_ACCOUNT, "trading_day": "2026-07-31", "pages": [_page([])]})
     _write_json(candidates_path, [{"ticker": "SPCX", "desired_usd": 1.0, "current_price": 100.0}])
     exit_code = gate.main(
         [
-            "--account", "ACC1",
+            "--account", ACCOUNT,
             "--trading-day", "2026-07-31",
             "--orders-pages", str(orders_path),
             "--candidates", str(candidates_path),
@@ -1154,11 +1158,11 @@ def test_main_rejects_orders_pages_saved_for_a_different_account(tmp_path, capsy
 def test_main_rejects_orders_pages_saved_for_a_different_trading_day(tmp_path, capsys):
     orders_path = tmp_path / "orders.json"
     candidates_path = tmp_path / "candidates.json"
-    _write_json(orders_path, {"account_number": "ACC1", "trading_day": "2026-07-30", "pages": [_page([])]})
+    _write_json(orders_path, {"account_number": ACCOUNT, "trading_day": "2026-07-30", "pages": [_page([])]})
     _write_json(candidates_path, [{"ticker": "SPCX", "desired_usd": 1.0, "current_price": 100.0}])
     exit_code = gate.main(
         [
-            "--account", "ACC1",
+            "--account", ACCOUNT,
             "--trading-day", "2026-07-31",
             "--orders-pages", str(orders_path),
             "--candidates", str(candidates_path),
@@ -1178,7 +1182,7 @@ def test_main_rejects_the_pre_pinning_bare_array_shape(tmp_path, capsys):
     _write_json(candidates_path, [{"ticker": "SPCX", "desired_usd": 1.0, "current_price": 100.0}])
     exit_code = gate.main(
         [
-            "--account", "ACC1",
+            "--account", ACCOUNT,
             "--trading-day", "2026-07-31",
             "--orders-pages", str(orders_path),
             "--candidates", str(candidates_path),
