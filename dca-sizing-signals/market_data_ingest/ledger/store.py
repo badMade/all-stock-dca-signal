@@ -138,6 +138,28 @@ CREATE TABLE IF NOT EXISTS goal_versions (
     {_PROV},
     PRIMARY KEY (goal_id, goal_version, content_hash)
 );
+-- Goal progress Phase 2 (docs/adr-goals-and-loss-hedge-shadow.md). A correction usually lands
+-- with the SAME as_of as the row it corrects (it restates the same close) and, under a fixed
+-- test clock, the same ingested_at too, so content_hash alone would pick an arbitrary winner.
+-- ingest_seq is a monotonic insertion order the readers use as the final tie-break: the row
+-- ingested last wins. It is outside content_hash and the primary key, so an identical
+-- re-ingest is still dropped by ON CONFLICT DO NOTHING (it only burns a sequence value).
+CREATE SEQUENCE IF NOT EXISTS goal_progress_ingest_seq;
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    snapshot_day DATE NOT NULL, symbol VARCHAR NOT NULL, quantity DOUBLE NOT NULL,
+    close_day DATE NOT NULL, prior_close DOUBLE NOT NULL, market_value DOUBLE NOT NULL,
+    ingest_seq BIGINT NOT NULL DEFAULT nextval('goal_progress_ingest_seq'),
+    {_PROV},
+    PRIMARY KEY (snapshot_day, symbol, content_hash)
+);
+CREATE TABLE IF NOT EXISTS goal_progress (
+    "day" DATE NOT NULL, goal_id VARCHAR NOT NULL, goal_version INTEGER NOT NULL,
+    window_days INTEGER NOT NULL, period_return DOUBLE NOT NULL,
+    annualized_return DOUBLE, mwr_annualized DOUBLE,
+    ingest_seq BIGINT NOT NULL DEFAULT nextval('goal_progress_ingest_seq'),
+    {_PROV},
+    PRIMARY KEY ("day", goal_id, goal_version, content_hash)
+);
 """
 
 
@@ -959,3 +981,130 @@ class LedgerStore:
             if effective_day <= day:
                 in_effect.append(row)
         return max(in_effect, key=lambda row: row["effective_from"], default=None)
+
+    # --- portfolio snapshots and goal progress (ADR Phase 2, tests 19-21) ---------------------
+    # Same store rules as every other ledger table. Two differences, both deliberate:
+    # * Day fields accept a date OR an ISO "YYYY-MM-DD" string, because the 07:31 capture
+    #   writes them straight from a JSON payload; anything else is refused.
+    # * Readers are bitemporal like goal_versions (as_of AND ingested_at <= known_at) and break
+    #   a full as_of/ingested_at tie by ingest_seq, so a same-close correction always wins.
+
+    _SNAPSHOT_KEYS = {"snapshot_day", "symbol", "quantity", "close_day", "prior_close", "market_value"}
+    # market_value is the broker's own figure; it must agree with quantity x prior_close to
+    # within this many dollars, or the row is a mis-keyed snapshot (wrong close or quantity).
+    _SNAPSHOT_VALUE_TOLERANCE = 0.01
+
+    @staticmethod
+    def _aware_as_of(as_of: object, table: str) -> None:
+        """Refuse a naive ``as_of`` as a validation failure (to_utc_naive raises a bare ValueError)."""
+        if not isinstance(as_of, datetime) or as_of.tzinfo is None:
+            raise LedgerValidationError(f"{table}: as_of must be a timezone-aware datetime")
+
+    @staticmethod
+    def _iso_day(r: _Row, key: str) -> date | None:
+        value = r.row.get(key)
+        if isinstance(value, str):
+            try:
+                value = date.fromisoformat(value) if len(value) == 10 else None
+            except ValueError:
+                value = None
+        if not isinstance(value, date) or isinstance(value, datetime):
+            r.problems.append(f"{r.where}: {key} must be a date or an ISO YYYY-MM-DD string")
+            return None
+        return value
+
+    def ingest_portfolio_snapshots(
+        self, rows: Iterable[dict[str, Any]], *, source: str, run_id: str, as_of: datetime
+    ) -> int:
+        """Read-only per-symbol holdings at a prior close. No account field of any kind: the
+        snapshot is of the one strategy account, and an account-named key is refused outright."""
+        self._aware_as_of(as_of, "portfolio_snapshots")
+        problems: list[str] = []
+        prepared = []
+        for i, raw in enumerate(rows):
+            r = _Row(raw, kind="portfolio_snapshots", index=i, required=self._SNAPSHOT_KEYS)
+            guard_account_keys(raw, where=r.where)
+            out: dict[str, Any] = {
+                "snapshot_day": self._iso_day(r, "snapshot_day"),
+                "symbol": r.text("symbol"),
+                "quantity": r.number("quantity", positive=True),
+                "close_day": self._iso_day(r, "close_day"),
+                "prior_close": r.number("prior_close", positive=True),
+                "market_value": r.number("market_value"),
+            }
+            if out["snapshot_day"] and out["close_day"] and out["close_day"] > out["snapshot_day"]:
+                r.problems.append(f"{r.where}: close_day is after snapshot_day (lookahead)")
+            if None not in (out["quantity"], out["prior_close"], out["market_value"]) and abs(
+                out["quantity"] * out["prior_close"] - out["market_value"]
+            ) > self._SNAPSHOT_VALUE_TOLERANCE:
+                r.problems.append(f"{r.where}: market_value disagrees with quantity x prior_close")
+            problems += r.problems
+            out["content_hash"] = _hash([out[k] for k in sorted(out)])
+            prepared.append(out)
+        _raise_if(problems, "portfolio_snapshots")
+        return self._insert("portfolio_snapshots", prepared, source=source, run_id=run_id, as_of=as_of)
+
+    def portfolio_snapshots(self, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
+        """Latest version of each (snapshot_day, symbol) asserted AND ingested by ``known_at``."""
+        known = self._known(known_at)
+        return self._rows(
+            "SELECT * EXCLUDE (rn, ingest_seq) FROM (SELECT *, row_number() OVER (PARTITION BY snapshot_day, "
+            "symbol ORDER BY as_of DESC, ingested_at DESC, ingest_seq DESC) AS rn FROM portfolio_snapshots "
+            "WHERE as_of <= ? AND ingested_at <= ?) WHERE rn = 1 ORDER BY snapshot_day, symbol",
+            [known, known],
+        )
+
+    _PROGRESS_KEYS = {"day", "goal_id", "goal_version", "window_days", "period_return",
+                      "annualized_return", "mwr_annualized"}
+    # Annualizing a return over less than a year extrapolates noise (a 10% fortnight reads as
+    # several thousand percent a year), so under this window both annualized fields must be None.
+    _ANNUALIZE_MIN_DAYS = 365
+
+    def ingest_goal_progress(
+        self, rows: Iterable[dict[str, Any]], *, source: str, run_id: str, as_of: datetime
+    ) -> int:
+        """Daily progress against one goal version. ``period_return`` is a fraction (0.10 = 10%)."""
+        self._aware_as_of(as_of, "goal_progress")
+        problems: list[str] = []
+        prepared = []
+        for i, raw in enumerate(rows):
+            r = _Row(raw, kind="goal_progress", index=i, required=self._PROGRESS_KEYS)
+            guard_account_keys(raw, where=r.where)
+            for key in ("goal_version", "window_days"):
+                value = raw.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    r.problems.append(f"{r.where}: {key} must be a positive int")
+            period = raw.get("period_return")
+            if not _finite(period) or period < -1:
+                r.problems.append(f"{r.where}: period_return must be a finite fraction >= -1")
+            out: dict[str, Any] = {
+                "day": self._iso_day(r, "day"),
+                "goal_id": r.text("goal_id"),
+                "goal_version": raw.get("goal_version"),
+                "window_days": raw.get("window_days"),
+                "period_return": float(period) if _finite(period) else None,
+                "annualized_return": r.signed("annualized_return"),
+                "mwr_annualized": r.signed("mwr_annualized"),
+            }
+            window = out["window_days"]
+            if isinstance(window, int) and window < self._ANNUALIZE_MIN_DAYS:
+                for key in ("annualized_return", "mwr_annualized"):
+                    if raw.get(key) is not None:
+                        r.problems.append(
+                            f"{r.where}: {key} must be None under a {self._ANNUALIZE_MIN_DAYS}-day window"
+                        )
+            problems += r.problems
+            out["content_hash"] = _hash([out[k] for k in sorted(out)])
+            prepared.append(out)
+        _raise_if(problems, "goal_progress")
+        return self._insert("goal_progress", prepared, source=source, run_id=run_id, as_of=as_of)
+
+    def goal_progress(self, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
+        """Latest version of each (day, goal_id, goal_version) asserted AND ingested by ``known_at``."""
+        known = self._known(known_at)
+        return self._rows(
+            'SELECT * EXCLUDE (rn, ingest_seq) FROM (SELECT *, row_number() OVER (PARTITION BY "day", goal_id, '
+            "goal_version ORDER BY as_of DESC, ingested_at DESC, ingest_seq DESC) AS rn FROM goal_progress "
+            'WHERE as_of <= ? AND ingested_at <= ?) WHERE rn = 1 ORDER BY "day", goal_id, goal_version',
+            [known, known],
+        )

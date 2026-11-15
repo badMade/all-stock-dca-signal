@@ -55,6 +55,11 @@ jobs:
 
       - name: Check oscillation guard
         id: oscillation_guard
+        # 2026-11-15: this step had no GH_TOKEN, so `gh pr list` exited 4 ("set the GH_TOKEN environment
+        # variable") and every scheduled run failed here (6 of 6, last 2026-11-01). The later gh steps
+        # already set it; scripts/tests/test_workflow_gh_token.py now checks every workflow's gh steps.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LAST_UPDATED=$(gh pr list --label self-heal-schedule --state merged --json mergedAt --jq '.[0].mergedAt // empty')
           if [ -n "$LAST_UPDATED" ]; then

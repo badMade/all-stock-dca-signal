@@ -337,3 +337,52 @@ def test_eval_horizons_is_forwarded_only_when_given(tmp_path: Path):
     assert given[given.index("--eval-horizons") + 1] == "2,3,90"
     omitted, _ = run_sharded.build_shard_cmd(["AAPL"], tmp_path / "s2", _fresh_args(max_horizon=90))
     assert "--eval-horizons" not in omitted
+
+
+# --- merged multi-horizon forecasts (the 90-day daily output across shards) ------------------------------------
+
+
+def _write_horizon_csv(shard: Path, origin: str, model: str, rows: list[tuple[str, int]], cols=("ticker", "horizon")):
+    daily = shard / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    with open(daily / f"{origin}_horizon_forecasts_{model}.csv", "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(cols)
+        writer.writerows(rows)
+
+
+def test_horizon_merge_concatenates_every_shard_for_the_newest_origin(tmp_path: Path):
+    base, dirs = _two_shards(tmp_path)
+    _write_horizon_csv(dirs[0], "2026-11-12", "octopus", [("OLD", 1)])  # an older origin must be ignored
+    for shard, ticker in zip(dirs, ("AAPL", "MSFT"), strict=True):
+        _write_horizon_csv(shard, "2026-11-13", "octopus", [(ticker, 1), (ticker, 2)])
+        _write_horizon_csv(shard, "2026-11-13", "persistence", [(ticker, 1)])
+    written = run_sharded.merge_shard_horizon_forecasts(base, dirs)
+    assert {p.name for p in written} == {
+        "2026-11-13_horizon_forecasts_octopus.csv",
+        "2026-11-13_horizon_forecasts_persistence.csv",
+    }
+    rows = list(csv.DictReader(open(base / "daily" / "2026-11-13_horizon_forecasts_octopus.csv", encoding="utf-8")))
+    assert [(r["ticker"], r["horizon"]) for r in rows] == [("AAPL", "1"), ("AAPL", "2"), ("MSFT", "1"), ("MSFT", "2")]
+
+
+def test_horizon_merge_refuses_when_a_shard_is_missing_the_newest_origin(tmp_path: Path):
+    base, dirs = _two_shards(tmp_path)
+    _write_horizon_csv(dirs[0], "2026-11-13", "octopus", [("AAPL", 1)])
+    _write_horizon_csv(dirs[1], "2026-11-12", "octopus", [("MSFT", 1)])  # lagging shard
+    with pytest.raises(run_sharded.ShardExportError, match="shard_2"):
+        run_sharded.merge_shard_horizon_forecasts(base, dirs)
+    assert not list((base / "daily").glob("2026-11-13_horizon_forecasts_*.csv"))
+
+
+def test_horizon_merge_refuses_differing_columns(tmp_path: Path):
+    base, dirs = _two_shards(tmp_path)
+    _write_horizon_csv(dirs[0], "2026-11-13", "octopus", [("AAPL", 1)])
+    _write_horizon_csv(dirs[1], "2026-11-13", "octopus", [("MSFT", 1)], cols=("ticker", "h"))
+    with pytest.raises(run_sharded.ShardExportError, match="columns differ"):
+        run_sharded.merge_shard_horizon_forecasts(base, dirs)
+
+
+def test_horizon_merge_is_a_no_op_for_a_next_day_only_run(tmp_path: Path):
+    base, dirs = _two_shards(tmp_path)
+    assert run_sharded.merge_shard_horizon_forecasts(base, dirs) == []
