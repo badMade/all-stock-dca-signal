@@ -18,10 +18,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pytest
-
-dca_goal_snapshot = pytest.importorskip("dca_goal_snapshot", reason="Phase 2 snapshot task (ADR tests 25-26)")
-dca_goal_progress = pytest.importorskip("dca_goal_progress", reason="Phase 2 section and info (ADR tests 27-28)")
+import dca_goal_progress
+import dca_goal_snapshot
 
 ET = ZoneInfo("America/New_York")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,14 +85,25 @@ def test_section_is_part_of_the_friday_refresh_only():
     assert dca_goal_progress.in_friday_refresh(date(2026, 11, 19)) is False  # Thursday
 
 
-def test_goal_progress_section_rides_the_5_pm_friday_refresh():
-    # The Friday Notion refresh runs at 5:00 PM ET (operator instruction, 2026-11-14). The section
-    # is part of that run's payload on Fridays only, and the run time is pinned here.
-    assert dca_goal_progress.FRIDAY_REFRESH_TIME == time(17, 0)
-    friday = dca_goal_progress.friday_refresh_sections(date(2026, 11, 20))
-    assert "Goal progress" in friday
-    thursday = dca_goal_progress.friday_refresh_sections(date(2026, 11, 19))
-    assert "Goal progress" not in thursday
+def _weekly_refresh_time():
+    # Task 041d9d90 (weekly Notion dashboard refresh) is the source of truth for the Friday time.
+    # Its et_equivalent reads "Fridays 5:30 PM ET (EDT)"; this lookup fails if the task moves.
+    import json
+    import re
+
+    tasks = json.loads((REPO_ROOT / "config" / "scheduled_tasks.json").read_text(encoding="utf-8"))["tasks"]
+    (task,) = [t for t in tasks if t["id"] == "041d9d90"]
+    match = re.search(r"Fridays (\d{1,2}):(\d{2}) (AM|PM) ET", task["et_equivalent"])
+    assert match, task["et_equivalent"]
+    hour = int(match.group(1)) % 12 + (12 if match.group(3) == "PM" else 0)
+    return time(hour, int(match.group(2)))
+
+
+def test_goal_progress_section_rides_the_friday_weekly_refresh_at_its_config_time():
+    assert _weekly_refresh_time() == time(17, 30)
+    assert dca_goal_progress.FRIDAY_REFRESH_TIME == _weekly_refresh_time()
+    assert "Goal progress" in dca_goal_progress.friday_refresh_sections(date(2026, 11, 20))
+    assert "Goal progress" not in dca_goal_progress.friday_refresh_sections(date(2026, 11, 19))
 
 
 def test_inactive_goal_is_info_not_an_alert(tmp_path):
