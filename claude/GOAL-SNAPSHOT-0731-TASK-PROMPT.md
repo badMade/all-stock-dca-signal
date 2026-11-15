@@ -1,4 +1,4 @@
-# 07:31 ET goal progress snapshot -- task prompt (DRAFT, not registered)
+# 07:31 ET goal progress snapshot -- task prompt (not registered)
 
 Phase 2 of `docs/adr-goals-and-loss-hedge-shadow.md`, approved 2026-11-14. The code is on `main`:
 `dca_goal_snapshot.py` (capture, `previous_trading_day`, `should_run`, `scheduled_task_spec`) and
