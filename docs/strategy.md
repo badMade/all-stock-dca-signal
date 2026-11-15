@@ -341,7 +341,7 @@ above.
 >
 > **What is actually running today — be precise about this.** The gate is a
 > **standalone CLI**, invoked as
-> `python3 -m scripts.same_day_top_up_gate --account … --trading-day …
+> `python3 -m scripts.same_day_top_up_gate --trading-day …
 > --orders-pages … --candidates …`. It is called by the **external executor
 > prompts**, NOT from any in-repo Python: `market_open_dca.py`,
 > `morning_dca.py`, `midday_dca.py`, `intraday_dca.py`, `near_close_dca.py`,

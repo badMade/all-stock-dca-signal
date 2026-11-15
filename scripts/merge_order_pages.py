@@ -48,9 +48,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from dca_config import InvalidAccountNumberError, MissingConfigEnvError, _reject_duplicate_keys, resolve_order_account
+from dca_config import _reject_duplicate_keys
 from dca_fileio import atomic_write_text
 from scripts import assemble_order_pages as asm
+from scripts.account_arg import add_account_argument, resolve_account
 
 TOOL = "scripts.merge_order_pages"
 
@@ -181,14 +182,7 @@ def merge(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", required=True, help="The saved orders_pages envelope to extend.")
-    parser.add_argument(
-        "--account",
-        default=None,
-        help=(
-            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
-            "Account number; must match the base envelope."
-        ),
-    )
+    add_account_argument(parser, "Account number; must match the base envelope.")
     parser.add_argument("--trading-day", required=True, help="Trading day, YYYY-MM-DD; must match the base envelope.")
     parser.add_argument("--created-at-gte", required=True, help="The created_at_gte the increment was fetched with (offset-aware ISO).")
     parser.add_argument("--snapshot-at", required=True, help="Offset-aware ISO instant taken right after the increment's last page.")
@@ -196,12 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out", required=True, help="Merged envelope path (may be the same file as --base).")
     parser.add_argument("page_files", nargs="+", help="Saved increment page files, in fetch order.")
     args = parser.parse_args(argv)
-    # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
-    # existing caller. A failure is a usage error that names the VARIABLE and never the value.
-    try:
-        args.account = resolve_order_account(args.account)
-    except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
-        parser.error(str(exc))
+    resolve_account(parser, args)
 
     try:
         envelope = merge(

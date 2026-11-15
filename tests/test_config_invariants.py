@@ -5070,6 +5070,22 @@ def test_every_live_slot_bridge_protocol_exports_the_account_number_for_shell_co
     assert not offenders, "\n".join(offenders)
 
 
+def test_no_live_slot_prompt_passes_the_account_number_on_the_command_line():
+    """2026-11-14 (the follow-up #2290's review left open): the live prompts ran seven gate scripts with
+    ``--account <the resolved account>`` or ``--account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}``, which put the
+    brokerage account number in the session transcript and the process list. Those scripts now read the
+    variable themselves (scripts/account_arg.py), so a prompt that adds ``--account`` back reintroduces the
+    leak for nothing. The BRIDGE PROTOCOL's export line stays required (the test above): it is what the
+    scripts read.
+    """
+    offenders = []
+    for mirror in sorted((PROMPTS_DIR / "live-mirror").glob("[0-9][0-9][0-9][0-9]ET-*.txt")):
+        for lineno, line in enumerate(mirror.read_text(encoding="utf-8").splitlines(), start=1):
+            for match in re.finditer(r"--account(?:\s*=\s*|\s+)(\S+)", line):
+                offenders.append(f"{mirror.name}:{lineno}: --account {match.group(1)[:40]}")
+    assert not offenders, "\n".join(offenders)
+
+
 def test_live_mirror_payload_floor_numbers_follow_the_publisher():
     """The live prompts restate the payload publisher's limits, so they must not drift from its constants.
 

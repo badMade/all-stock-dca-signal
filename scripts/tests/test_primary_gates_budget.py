@@ -87,15 +87,21 @@ def test_the_account_flag_still_works_for_an_existing_caller(tmp_path):
 
 def test_no_flag_and_no_environment_account_aborts_and_names_the_account(tmp_path):
     done = _run_budget(tmp_path, [], env_account=None)
-    assert done.returncode == 1
-    doc = _doc(done)
-    assert doc["status"] == "ABORT" and "account" in doc["reason"].lower()
+    assert done.returncode == 2
+    assert "no usable account number" in done.stderr
 
 
-@pytest.mark.parametrize("bad", ["${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "not-an-account", "", "12 34"])
-def test_an_unusable_environment_account_aborts(tmp_path, bad):
+@pytest.mark.parametrize(
+    ("bad", "exit_code"),
+    [("${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", 2), ("not-an-account", 1), ("", 2), ("12 34", 1)],
+)
+def test_an_unusable_environment_account_aborts(tmp_path, bad, exit_code):
     done = _run_budget(tmp_path, [], env_account=bad)
-    assert done.returncode == 1 and _doc(done)["status"] == "ABORT"
+    assert done.returncode == exit_code
+    if exit_code == 2:
+        assert "no usable account number" in done.stderr
+    else:
+        assert _doc(done)["status"] == "ABORT"
 
 
 def test_an_envelope_for_another_account_aborts(tmp_path):

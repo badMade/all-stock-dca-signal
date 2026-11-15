@@ -131,6 +131,7 @@ from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+from scripts.account_arg import add_account_argument, resolve_account
 from scripts.broker_reconciliation import (
     BrokerOrder,
     EffectivePrior,
@@ -634,14 +635,7 @@ def _bind_saved_pages(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--account",
-        default=None,
-        help=(
-            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
-            "Robinhood account number the orders were fetched for."
-        ),
-    )
+    add_account_argument(parser, "Robinhood account number the orders were fetched for.")
     parser.add_argument("--trading-day", required=True, help="Trading day, YYYY-MM-DD, America/New_York.")
     parser.add_argument(
         "--orders-pages",
@@ -681,15 +675,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="The minimum order size allowed by the broker (defaults to minimum_order_usd in config/per_ticker_sizing.json, or 1.0).",
     )
     args = parser.parse_args(argv)
-    # Imported here, not at module level: dca_config pulls in near_close_dca, which this script otherwise avoids.
-    from dca_config import InvalidAccountNumberError, MissingConfigEnvError, resolve_order_account
-
-    # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
-    # existing caller. A failure is a usage error that names the VARIABLE and never the value.
-    try:
-        args.account = resolve_order_account(args.account)
-    except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
-        parser.error(str(exc))
+    resolve_account(parser, args)
 
     try:
         with open(args.orders_pages, encoding="utf-8") as handle:
