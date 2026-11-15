@@ -121,7 +121,11 @@ def _number(value: Any, name: str, low: float, high: float, *, low_inclusive: bo
     # bool is an int subclass; True must not pass for 1.0. A string must not pass either.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number")
-    value = float(value)
+    # Float conversion of an oversized JSON integer raises OverflowError; fail closed to ValueError.
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be finite") from exc
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     if (value < low) if low_inclusive else (value <= low):
@@ -313,7 +317,7 @@ def load_goals(config_dir: Path, *, now: datetime) -> GoalSet:
                 hedge, effective_from = _hedge(entry)
                 if effective_from <= now:
                     hedges.append(hedge)
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             # A broken entry neutralises its own kind only; the other kind is unaffected (test 5).
             if isinstance(kind, str):
                 broken_kinds.add(kind)
@@ -359,7 +363,7 @@ def validate_goal_proposal(payload: Any, *, now: datetime) -> Dict[str, Any]:
             effective_from = _hedge(entry, versioned=False, strict_instruments=True)[1]
         else:
             raise ValueError("kind must be 'aspirational' or 'loss_hedge'")
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, OverflowError) as exc:
         raise ValueError(f"malformed goal: {exc}") from exc
     if effective_from <= now:
         raise ValueError("effective_from must be in the future")
