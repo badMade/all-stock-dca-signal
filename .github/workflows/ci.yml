@@ -499,14 +499,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.wondrous-octopus == 'true'
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
-    # 20 (not the sibling-standard 10) on GitHub-hosted Linux: the CPU torch
-    # wheel adds ~200 MB of download plus the transformer tests' training time,
-    # and the suite ran in ~10 min there (2026-11-15, 167c4aed). Raised to 60
-    # for the self-hosted Mac (CI_RUNS_ON=self-hosted since 2026-11-15): the
-    # 4b08d472 full run's re-run was cancelled at exactly 20 min mid-test, and
-    # the same suite took ~47 min in scripts/local_ci.sh on that Mac while the
-    # other runners shared its cores. The ceiling still stops a real hang.
-    timeout-minutes: 60
+    # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
+    # download plus the transformer tests' training time. The tests run in
+    # parallel (see "Run tests" below), which is what keeps this ceiling valid on
+    # the self-hosted Mac: run serially there they took ~47 min locally and were
+    # cancelled at both 20 and 60 min in CI (2026-11-15).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -549,7 +547,16 @@ jobs:
 
       - name: Run tests
         working-directory: wondrous-octopus
-        run: python -m pytest tests/
+        # Parallel with ONE torch/BLAS thread per worker (2026-11-15). Serially, every
+        # test's torch call spread over all cores and the suite took ~47 min on the
+        # self-hosted Mac (cancelled at both the 20- and 60-minute ceilings in CI); with
+        # -n auto and one thread each, the same 931 tests ran in ~2 min there. Without
+        # the thread caps, N workers x N torch threads oversubscribe the CPU instead.
+        # pytest-xdist comes from requirements-dev.txt, installed above.
+        env:
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+        run: python -m pytest tests/ -n auto
 
   ticker-market-breadth:
     name: Lint & test (ticker-market-breadth)

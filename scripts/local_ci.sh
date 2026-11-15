@@ -239,7 +239,13 @@ test_sibling() {
   local vpy
   vpy="$VENVS/$proj/bin/python"
   "$vpy" -m ruff check --isolated --select=E,F,B --line-length=120 "$proj" \
-    && (cd "$proj" && "$vpy" -m pytest tests/)
+    && (cd "$proj" && if [ "$proj" = wondrous-octopus ]; then
+          # Same as ci.yml's wondrous-octopus "Run tests" step (2026-11-15): parallel, one torch/BLAS
+          # thread per worker. Serially the suite took ~47 min on the operator's Mac; this way ~2 min.
+          OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "$vpy" -m pytest tests/ -n auto
+        else
+          "$vpy" -m pytest tests/
+        fi)
 }
 
 demo_smoke() {
