@@ -60,9 +60,10 @@ def test_scripted_clock_takes_an_offset_aware_now(slot):
 
 @pytest.mark.parametrize("slot", FULL + CLOCK_ONLY)
 def test_gate_4_rogue_classification_stays_in_the_prompt(slot):
+    # Still true after Gate 4 was scripted (tests/test_live_prompt_scripted_gate4.py): the prose rules remain as the
+    # manual fallback beside the command.
     gate4 = _between(slot, "GATE 4 - SOLE-EXECUTOR INTERLOCK", "GATE 5 - BUY LIST")
     assert "rogue" in gate4 and "placed_agent" in gate4
-    assert "primary_gates" not in gate4
 
 
 def test_the_3_30_clock_command_clamps_the_start_to_the_prompts_3_55_close():
