@@ -228,7 +228,13 @@ def test_malformed_trading_day_is_refused(tmp_path, capsys, day):
 
 
 def test_blank_account_is_refused(tmp_path, capsys):
-    _assert_refused(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], "missing_account", capsys, account="  ")
+    # --account is resolved by dca_config.resolve_order_account before the script runs, so a blank value is now a
+    # usage error (exit 2, nothing written) instead of the script's own JSON "missing_account" refusal, which still
+    # guards a direct call of assemble().
+    with pytest.raises(SystemExit) as excinfo:
+        _run(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], account="  ")
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "orders_pages_out.json").exists()
 
 
 def test_refusal_leaves_an_existing_envelope_untouched(tmp_path, capsys):

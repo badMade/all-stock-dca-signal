@@ -328,11 +328,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Diagnose a same-day top-up gate --orders-pages rejection",
     )
     orders.add_argument("--orders-pages-file", required=True, help="Path to the rejected --orders-pages JSON file")
-    orders.add_argument("--account", required=True, help="The account this run is trading")
+    orders.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
+            "The account this run is trading"
+        ),
+    )
     orders.add_argument("--trading-day", required=True, help="Today's trading day (YYYY-MM-DD)")
     orders.add_argument("--log-path", default=None, help="Override the default JSONL log location")
 
     args = parser.parse_args(argv)
+    # Imported here, not at module level: dca_config pulls in near_close_dca, which this script otherwise avoids.
+    from dca_config import InvalidAccountNumberError, MissingConfigEnvError, resolve_order_account
+
+    if args.command == "orders-pages":
+        # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
+        # existing caller. A failure is a usage error that names the VARIABLE and never the value.
+        try:
+            args.account = resolve_order_account(args.account)
+        except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
+            parser.error(str(exc))
 
     if args.command == "afternoon-evidence":
         as_of = date.fromisoformat(args.as_of)

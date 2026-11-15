@@ -23,6 +23,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import dca_env
 from near_close_dca import WHOLE_SHARE_TICKERS, StrategyConfig
 
 logger = logging.getLogger("near_close_dca.config")
@@ -162,6 +163,36 @@ def resolve_broker_account(value: Any, *, source: str) -> str:
             f"exist."
         )
     return expanded
+
+
+ORDER_ACCOUNT_ENV = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+
+
+def resolve_order_account(cli_value: Optional[str] = None, *, source: str = "the order-script account") -> str:
+    """The brokerage account an order-history script is working on, kept OFF its command line.
+
+    The live prompts used to pass ``--account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}``; the shell expands that, so the
+    real number sat on the command line, in process listings and in any transcript that records the command
+    (AGENTS.md secrets policy). Those scripts now call this instead. With no ``cli_value`` the account comes from
+    ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``, after ``dca_env.load_dotenv()`` has had its chance to fill it from the
+    operator's gitignored ``.env`` (the executor sandbox does not inherit the operator's shell; a variable that is
+    already exported is never overridden). An explicit ``cli_value`` is still honoured so an existing caller keeps
+    working, and a literal ``${...}`` placeholder in it expands from the environment like any config value.
+
+    Built on :func:`resolve_broker_account`, so the 6-12 digit shape rule and the "value withheld from the error"
+    rule are not copied. Unset or empty raises :class:`MissingConfigEnvError` (naming the VARIABLE); a malformed
+    value raises :class:`InvalidAccountNumberError`. The read-only literal is a valid ``broker_account`` for the
+    read-only morning modes but is not an account an order script can work on, so it is refused here.
+    """
+    if cli_value is None or "${" in cli_value:
+        dca_env.load_dotenv()
+    value = "${" + ORDER_ACCOUNT_ENV + "}" if cli_value is None else cli_value
+    account = resolve_broker_account(value, source=source)
+    if account == READ_ONLY_ACCOUNT:
+        raise InvalidAccountNumberError(
+            f"{source} resolved to the read-only literal, which is not an account an order script can work on."
+        )
+    return account
 
 
 def _reject_duplicate_keys(pairs: List[Any]) -> Dict[str, Any]:

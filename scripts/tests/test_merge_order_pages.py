@@ -37,6 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts import merge_order_pages as merge  # noqa: E402
 
 ACCOUNT = "999000111"  # synthetic; conftest assigns the same value
+# Derived, never written as a literal: tests/test_config_invariants.py takes no account-shaped literal other than
+# the synthetic ACCOUNT (use conftest.FIXTURE_ACCOUNT_NUMBER or keep a number to 5 digits or fewer).
+OTHER_ACCOUNT = str(int(ACCOUNT) + 1)
 DAY = "2026-10-29"
 OVERLAP = 120
 
@@ -228,7 +231,7 @@ def test_refuses_an_unparseable_page(tmp_path):
     assert not out.exists()
 
 
-@pytest.mark.parametrize("override", [{"account": "other-account"}, {"day": "2026-10-28"}])
+@pytest.mark.parametrize("override", [{"account": OTHER_ACCOUNT}, {"day": "2026-10-28"}])
 def test_refuses_an_account_or_trading_day_that_does_not_match_the_base(tmp_path, override):
     base = _base(tmp_path, [_order("o1", "14:00:00")])
     page = _write(tmp_path, "p1.json", {"orders": []})

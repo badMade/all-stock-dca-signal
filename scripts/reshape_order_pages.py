@@ -53,7 +53,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from dca_config import _reject_duplicate_keys
+from dca_config import InvalidAccountNumberError, MissingConfigEnvError, _reject_duplicate_keys, resolve_order_account
 from dca_fileio import atomic_write_text
 from dca_runner import _is_dead_order_state
 from scripts import assemble_order_pages as asm
@@ -245,10 +245,23 @@ def reshape(envelope_path: str, *, account_number: str, trading_day: str) -> lis
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--envelope", required=True, help="Saved orders_pages envelope (assembled or merged).")
-    parser.add_argument("--account", required=True, help="Account number; must match the envelope.")
+    parser.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
+            "Account number; must match the envelope."
+        ),
+    )
     parser.add_argument("--trading-day", required=True, help="The envelope's trading_day, YYYY-MM-DD (the week's Monday).")
     parser.add_argument("--out", required=True, help="Path of the orders_week.json list to write.")
     args = parser.parse_args(argv)
+    # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
+    # existing caller. A failure is a usage error that names the VARIABLE and never the value.
+    try:
+        args.account = resolve_order_account(args.account)
+    except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
+        parser.error(str(exc))
 
     try:
         rows = reshape(args.envelope, account_number=args.account, trading_day=args.trading_day)

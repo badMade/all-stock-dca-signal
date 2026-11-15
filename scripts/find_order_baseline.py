@@ -86,7 +86,7 @@ from typing import Any, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 import dca_paths
-from dca_config import _reject_duplicate_keys
+from dca_config import InvalidAccountNumberError, MissingConfigEnvError, _reject_duplicate_keys, resolve_order_account
 from scripts import assemble_order_pages as asm
 from scripts.verify_schedule import SLOT_EVIDENCE_LAYOUT, slot_run_dir_relative
 
@@ -340,10 +340,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--slot", required=True, choices=sorted(SLOT_EVIDENCE_LAYOUT), help="THIS run's slot (HHMM).")
     parser.add_argument("--trading-day", required=True, help="Today, YYYY-MM-DD (not the Monday, even for --kind week).")
-    parser.add_argument("--account", required=True, help="Account number; must match the envelope. Never printed.")
+    parser.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
+            "Account number; must match the envelope. Never printed."
+        ),
+    )
     parser.add_argument("--overlap-seconds", type=int, default=120, help="Overlap subtracted from snapshot_at (default 120).")
     parser.add_argument("--now", help="Offset-aware ISO instant to judge 'not in the future' against (tests only).")
     args = parser.parse_args(argv)
+    # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
+    # existing caller. A failure is a usage error that names the VARIABLE and never the value.
+    try:
+        args.account = resolve_order_account(args.account)
+    except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
+        parser.error(str(exc))
 
     now = None
     if args.now:

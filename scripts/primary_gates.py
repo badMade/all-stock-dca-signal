@@ -36,11 +36,11 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+import dca_config
 import dca_runner
 from dca_runner import BrokerOrder
 
 ET = ZoneInfo("America/New_York")
-_ACCOUNT_SHAPE = re.compile(r"[0-9]+")
 _HHMM_SHAPE = re.compile(r"[0-9]{2}:[0-9]{2}")
 
 
@@ -83,14 +83,16 @@ def evaluate_clock(slot_id: str, now: datetime, latest_start: Optional[time] = N
 def account_pin(raw: Optional[str]) -> dict:
     """Validate the account number as resolved from the environment; fail closed on anything unusable.
 
-    The unexpanded ``${...}`` placeholder, an empty value and anything that is not all digits are refused. The
-    number is returned only on success and the CLI never prints it.
+    The shape is the repo's canonical one, ``dca_config.ACCOUNT_NUMBER_SHAPE`` (6 to 12 digits), not "any run of
+    digits": the unexpanded ``${...}`` placeholder, the ``read_only`` literal, an empty value and anything else that is
+    not an account number are refused. Surrounding whitespace is stripped. The number is returned only on success
+    and the CLI never prints it.
     """
     value = (raw or "").strip()
     if not value:
         return {"ok": False, "reason": "account number is unset or empty"}
-    if not _ACCOUNT_SHAPE.fullmatch(value):
-        return {"ok": False, "reason": "account number is not all digits (placeholder or malformed)"}
+    if not dca_config.ACCOUNT_NUMBER_SHAPE.fullmatch(value):
+        return {"ok": False, "reason": "account number is not 6 to 12 digits (placeholder or malformed)"}
     return {"ok": True, "account_number": value}
 
 

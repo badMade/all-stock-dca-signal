@@ -94,7 +94,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
-from dca_config import _reject_duplicate_keys
+from dca_config import InvalidAccountNumberError, MissingConfigEnvError, _reject_duplicate_keys, resolve_order_account
 from dca_fileio import atomic_write_text
 from dca_live_adapters import (
     _is_provable_orders_page,
@@ -416,7 +416,14 @@ def _decimal_arg(text: str) -> Decimal:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--account", required=True, help="Account number the pages were fetched for.")
+    parser.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line (AGENTS.md secrets policy). "
+            "Account number the pages were fetched for."
+        ),
+    )
     parser.add_argument("--trading-day", required=True, help="Trading day, YYYY-MM-DD, America/New_York.")
     parser.add_argument("--out", required=True, help="Envelope path (the gate's orders_pages_<day>_<slot>.json).")
     parser.add_argument("--snapshot-at", default=None, help="Optional ISO timestamp; the 09:35 envelope carries it.")
@@ -433,6 +440,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("page_files", nargs="*", help="Saved page files, in fetch order; '-' reads one page from stdin.")
     args = parser.parse_args(argv)
+    # The account comes from the environment (dca_config.resolve_order_account); --account is still accepted for an
+    # existing caller. A failure is a usage error that names the VARIABLE and never the value.
+    try:
+        args.account = resolve_order_account(args.account)
+    except (MissingConfigEnvError, InvalidAccountNumberError) as exc:
+        parser.error(str(exc))
 
     try:
         if args.slice:
