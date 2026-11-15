@@ -11,6 +11,7 @@ scoped to a path), and a drift they cause still fails tests/test_uv_lock_sync.py
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from pathlib import Path
 
@@ -29,12 +30,26 @@ def _pyproject_packages() -> set[str]:
     return {canonicalize_name(Requirement(entry).name) for entry in entries}
 
 
+def _in_nested_checkout(path: Path) -> bool:
+    # A directory below REPO that holds its own .git is another checkout, not part of this repo.
+    # 2026-11-15: in the operator's main checkout, .claude/worktrees/<name>/ holds a full git
+    # worktree per agent session, and each one's root requirements-dev.txt was counted as a
+    # "sibling manifest" -- so the dev pins (pytest-xdist, ruff, uv ...) all read as frozen and this
+    # test failed there while passing in CI and in every clean worktree (PR #2329's local CI).
+    for parent in path.relative_to(REPO).parents:
+        if parent != Path(".") and (REPO / parent / ".git").exists():
+            return True
+    return False
+
+
 def _sibling_manifest_packages() -> set[str]:
     # Every requirements file except the root dev manifest, which the uv job maintains.
     names: set[str] = set()
     for path in REPO.rglob("requirements*.txt"):
         rel = path.relative_to(REPO)
         if rel.parts[0] in {".venv", "node_modules"} or rel == Path("requirements-dev.txt"):
+            continue
+        if _in_nested_checkout(path):
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.split("#", 1)[0].strip()
@@ -76,3 +91,15 @@ def test_pip_job_does_not_freeze_sibling_manifest_pins():
     )
     stale = sorted(_pip_ignored() - _pyproject_packages())
     assert not stale, f"the pip job ignores packages pyproject.toml no longer declares: {stale}"
+
+
+def test_sibling_scan_ignores_nested_checkouts(tmp_path, monkeypatch):
+    # Regression for the 2026-11-15 false failure: a nested worktree's root dev manifest is not a sibling.
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "requirements.txt").write_text("requests==1.0\n", encoding="utf-8")
+    nested = tmp_path / ".claude" / "worktrees" / "other"
+    nested.mkdir(parents=True)
+    (nested / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")  # a worktree's .git is a file
+    (nested / "requirements-dev.txt").write_text("ruff==0.1\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    assert _sibling_manifest_packages() == {"requests"}
