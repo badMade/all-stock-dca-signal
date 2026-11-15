@@ -107,6 +107,9 @@ _DONE_OK = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
 _NOT_CHANGED = re.compile(r"\bnot\s+changed\b", re.IGNORECASE)
 _SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+# GitHub's merge-commit subject. Anchored and requiring " from ", so a squash subject that merely ends "(#N)" or
+# quotes another merge is never read as one.
+_MERGE_SUBJECT = re.compile(r"Merge pull request #(\d+) from \S")
 _REPO_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
@@ -361,8 +364,21 @@ def match_git_evidence(
     # change whose body only discussed five Keys, claim all five rows, four of which already held their real fix
     # commit (2026-10-26 digest). The subject line is the squash's PR title, so this mirrors the title rule.
     parsed_commits = [_parse_commit(raw, repo_url) for raw in commits]
+
+    def _merge_of_matched_pr(subject: str) -> bool:
+        # 2026-11-13/14 digests: the operator moved two rows' Commit URL to the merge commit of their matched fix PR
+        # (632fd257 for #2224, b90e6025 for #2221). A "Merge pull request #N from ..." subject never names the Key,
+        # so the recorded value lost to the branch commit every day and the digest had to hold both rows by hand.
+        # The merge commit of the very PR this function matched to the Key is the same fix, so it pins the row too.
+        found = _MERGE_SUBJECT.match(subject)
+        return pr is not None and found is not None and int(found.group(1)) == pr.number
+
     commit_url = next(
-        (url for url, _subject, message in parsed_commits if url == recorded_commit_url and _mentions(key, message)),
+        (
+            url
+            for url, subject, message in parsed_commits
+            if url == recorded_commit_url and (_mentions(key, message) or _merge_of_matched_pr(subject))
+        ),
         None,
     ) or next((url for url, subject, _message in parsed_commits if _mentions(key, subject)), None)
     commit_status = None
