@@ -661,6 +661,10 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None, fake_s
         # chunk. The backoff tests switch it back on with a short wait.
         "DCA_RATE_LIMIT_BACKOFF_SECONDS": "0",
         "TMPDIR": str(tmp_path),
+        # record_failure() globs and reads $CODEX_HOME/sessions on every failed chunk; unset, that is the runner
+        # account's real ~/.codex, which on the shared self-hosted Mac pushed the failing-chunk tests past the 120 s
+        # cap below (PRs 2328/2329, 2026-11-15). An empty directory keeps the diagnostics path exercised and hermetic.
+        "CODEX_HOME": str(tmp_path / "codex_home"),
         **(extra_env or {}),
     }
     done = subprocess.run(
