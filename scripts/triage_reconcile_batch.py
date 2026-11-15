@@ -35,8 +35,12 @@ CLI::
     python -m scripts.triage_reconcile_batch --rows rows.json --work-dir "$TMP"   # reuse collected inputs
 
 ``rows.json`` is a JSON array of objects keyed by the Notion property names (Key, Approval, Status, Progress,
-Proposed plan, GitHub issue, Branch, Commit URL, PR number). Output is one JSON report on stdout. Exit 0 when
-every Key was decided (skips included), 1 when an input file is unusable or ``gh``/``git`` failed.
+Proposed plan, GitHub issue, Branch, Commit URL, PR number). Feed it the Notion rows as fetched: a Key's
+``\\_`` escapes are undone and a PR number given as this repository's PR URL is read as its number, so a session
+never hand-edits the rows (2026-11-14). After changing rows.json in any way, rerun with ``--collect``: a reuse whose
+``prs.json`` lacks a row's recorded PR exits 1 instead of reporting that row ``recorded_pr_unconfirmed``.
+Output is one JSON report on stdout. Exit 0 when every Key was decided (skips included), 1 when an input file is
+unusable, the cached inputs do not cover the rows, or ``gh``/``git`` failed.
 """
 
 from __future__ import annotations
@@ -58,6 +62,10 @@ REPO_URL = f"https://github.com/{REPO}"
 # per PR, only for the merged PRs that actually match a Key (see collect_files).
 _PR_FIELDS = "number,url,state,mergedAt,headRefName,title,body,statusCheckRollup"
 _SHA_IN_URL = re.compile(r"/commit/([0-9a-f]{40})$")
+# 2026-11-14 digest: the Notion fetch handed the PR number column over as PR URLs, and the session's first
+# --collect then silently backfilled none of the recorded PRs (recorded_pr_numbers skips what it cannot parse).
+# A URL into THIS repository is the same fact as its number; a URL anywhere else stays an error.
+_PR_IN_URL = re.compile(rf"^{re.escape(REPO_URL)}/pull/(\d+)/?$")
 # Columns the routine may write, in report order. Status/Class/Severity/Fix state/Approval are never written here.
 WRITABLE = ("Progress", "GitHub issue", "Branch", "Commit URL", "PR number")
 
@@ -74,6 +82,8 @@ def _recorded_pr(row: Mapping[str, Any]) -> int | None:
         raise tr.EvidenceError(f"row PR number {value!r} is not a number")
     if isinstance(value, float) and value.is_integer():
         value = int(value)
+    if isinstance(value, str) and (url := _PR_IN_URL.fullmatch(value.strip())):
+        value = url.group(1)
     if isinstance(value, str):
         text = value.strip().lstrip("#")
         if not text.isdigit():
@@ -82,6 +92,22 @@ def _recorded_pr(row: Mapping[str, Any]) -> int | None:
     if not isinstance(value, int) or value <= 0:
         raise tr.EvidenceError(f"row PR number {value!r} is not a positive integer")
     return value
+
+
+def normalize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Copies of ``rows`` with Notion's markdown escaping undone in each Key.
+
+    The Notion fetch renders ``max_orders_per_day_unenforced`` as ``max\\_orders\\_per\\_day\\_unenforced``
+    (2026-11-14 digest), which the Key pattern rightly refuses. Only ``\\_`` is undone, and only in the Key:
+    every other cell is compared or written back verbatim.
+    """
+    out = []
+    for row in rows:
+        copy = dict(row)
+        if isinstance(copy.get("Key"), str):
+            copy["Key"] = copy["Key"].replace("\\_", "_")
+        out.append(copy)
+    return out
 
 
 def _blank(value: object) -> bool:
@@ -318,6 +344,15 @@ def _load(work_dir: Path, name: str) -> Any:
 
 def run(rows: Sequence[Mapping[str, Any]], work_dir: Path, candidates: Iterable[str]) -> dict[str, Any]:
     raw_prs = _load(work_dir, "prs.json")
+    # Fail closed on a work dir collected for DIFFERENT rows. 2026-11-14: the first --collect saw PR URLs it could
+    # not parse, so it backfilled none of the recorded PRs beyond the 150-PR list window (#1745, #1752, #2008, ...);
+    # the session then fixed rows.json and reused that cache, and 21 rows whose recorded PR plainly cites the Key
+    # came out recorded_pr_unconfirmed. A recorded PR absent from prs.json is a stale cache, never evidence.
+    have = {raw.get("number") for raw in raw_prs if isinstance(raw, Mapping)}
+    missing = [number for number in recorded_pr_numbers(rows) if number not in have]
+    if missing:
+        listed = ", ".join(f"#{number}" for number in missing)
+        raise InputError(f"prs.json lacks recorded PR(s) {listed}: it was collected for other rows; rerun with --collect")
     pr_files = _load(work_dir, "pr_files.json") if (work_dir / "pr_files.json").exists() else {}
     for raw in raw_prs:
         paths = pr_files.get(str(raw.get("number")))
@@ -352,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = json.loads(args.rows.read_text(encoding="utf-8"))
         if not isinstance(rows, list):
             raise InputError("--rows must hold a JSON array")
+        rows = normalize_rows(rows)
         if args.collect:
             collect(args.work_dir, rows)
             collect_files(args.work_dir, rows, args.candidate)
