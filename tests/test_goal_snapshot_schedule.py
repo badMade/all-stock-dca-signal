@@ -87,6 +87,16 @@ def test_section_is_part_of_the_friday_refresh_only():
     assert dca_goal_progress.in_friday_refresh(date(2026, 11, 19)) is False  # Thursday
 
 
+def test_goal_progress_section_rides_the_5_pm_friday_refresh():
+    # The Friday Notion refresh runs at 5:00 PM ET (operator instruction, 2026-11-14). The section
+    # is part of that run's payload on Fridays only, and the run time is pinned here.
+    assert dca_goal_progress.FRIDAY_REFRESH_TIME == time(17, 0)
+    friday = dca_goal_progress.friday_refresh_sections(date(2026, 11, 20))
+    assert "Goal progress" in friday
+    thursday = dca_goal_progress.friday_refresh_sections(date(2026, 11, 19))
+    assert "Goal progress" not in thursday
+
+
 def test_inactive_goal_is_info_not_an_alert(tmp_path):
     import json
 
