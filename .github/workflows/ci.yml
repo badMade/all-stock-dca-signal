@@ -499,9 +499,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.wondrous-octopus == 'true'
     runs-on: ${{ inputs.runner || vars.CI_RUNS_ON || 'ubuntu-26.04' }}
-    # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
-    # download plus the transformer tests' training time.
-    timeout-minutes: 20
+    # 20 (not the sibling-standard 10) on GitHub-hosted Linux: the CPU torch
+    # wheel adds ~200 MB of download plus the transformer tests' training time,
+    # and the suite ran in ~10 min there (2026-11-15, 167c4aed). Raised to 60
+    # for the self-hosted Mac (CI_RUNS_ON=self-hosted since 2026-11-15): the
+    # 4b08d472 full run's re-run was cancelled at exactly 20 min mid-test, and
+    # the same suite took ~47 min in scripts/local_ci.sh on that Mac while the
+    # other runners shared its cores. The ceiling still stops a real hang.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
