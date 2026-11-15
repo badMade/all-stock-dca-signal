@@ -147,7 +147,9 @@ CREATE TABLE IF NOT EXISTS goal_versions (
 CREATE SEQUENCE IF NOT EXISTS goal_progress_ingest_seq;
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     snapshot_day DATE NOT NULL, symbol VARCHAR NOT NULL, quantity DOUBLE NOT NULL,
-    close_day DATE NOT NULL, prior_close DOUBLE NOT NULL, market_value DOUBLE NOT NULL,
+    -- close_day and prior_close are NULL only on the "no holdings" marker row (see
+    -- LedgerStore.NO_HOLDINGS_SYMBOL): a day with nothing held has no close to record.
+    close_day DATE, prior_close DOUBLE, market_value DOUBLE NOT NULL,
     ingest_seq BIGINT NOT NULL DEFAULT nextval('goal_progress_ingest_seq'),
     {_PROV},
     PRIMARY KEY (snapshot_day, symbol, content_hash)
@@ -993,6 +995,13 @@ class LedgerStore:
     # market_value is the broker's own figure; it must agree with quantity x prior_close to
     # within this many dollars, or the row is a mis-keyed snapshot (wrong close or quantity).
     _SNAPSHOT_VALUE_TOLERANCE = 0.01
+    # A trading day on which the account holds nothing is a real state, not a missed read, and
+    # dca_goal_snapshot.capture_previous_close emits exactly one marker row for it: symbol,
+    # close_day and prior_close None, quantity and market_value 0. The primary key cannot hold a
+    # NULL symbol, so the marker is stored under this sentinel (no real ticker can contain
+    # underscores at both ends) and turned back into None on read, so a round trip is lossless.
+    # Without this the ledger refused the marker and an empty-account day read as an error.
+    NO_HOLDINGS_SYMBOL = "__NO_HOLDINGS__"
 
     @staticmethod
     def _aware_as_of(as_of: object, table: str) -> None:
@@ -1021,9 +1030,18 @@ class LedgerStore:
         self._aware_as_of(as_of, "portfolio_snapshots")
         problems: list[str] = []
         prepared = []
+        rows = list(rows)
         for i, raw in enumerate(rows):
             r = _Row(raw, kind="portfolio_snapshots", index=i, required=self._SNAPSHOT_KEYS)
             guard_account_keys(raw, where=r.where)
+            if isinstance(raw, dict) and raw.get("symbol") is None:
+                out = self._no_holdings_row(r, batch_size=len(rows))
+                problems += r.problems
+                out["content_hash"] = _hash([out[k] for k in sorted(out)])
+                prepared.append(out)
+                continue
+            if isinstance(raw, dict) and raw.get("symbol") == self.NO_HOLDINGS_SYMBOL:
+                r.problems.append(f"{r.where}: symbol is reserved for the no-holdings marker")
             out: dict[str, Any] = {
                 "snapshot_day": self._iso_day(r, "snapshot_day"),
                 "symbol": r.text("symbol"),
@@ -1044,15 +1062,43 @@ class LedgerStore:
         _raise_if(problems, "portfolio_snapshots")
         return self._insert("portfolio_snapshots", prepared, source=source, run_id=run_id, as_of=as_of)
 
+    def _no_holdings_row(self, r: _Row, *, batch_size: int) -> dict[str, Any]:
+        """Validate the exact no-holdings marker. Anything short of it is refused: a row with no
+        symbol but a quantity, a close or a value is a mangled position, not an empty account."""
+        raw = r.row
+        if batch_size != 1:
+            # "Nothing held" and "these positions" in one batch contradict each other.
+            r.problems.append(f"{r.where}: the no-holdings marker must be the only row in its batch")
+        for key in ("close_day", "prior_close"):
+            if raw.get(key) is not None:
+                r.problems.append(f"{r.where}: {key} must be None on the no-holdings marker")
+        for key in ("quantity", "market_value"):
+            value = raw.get(key)
+            if not _finite(value) or value != 0:
+                r.problems.append(f"{r.where}: {key} must be 0 on the no-holdings marker")
+        return {
+            "snapshot_day": self._iso_day(r, "snapshot_day"),
+            "symbol": self.NO_HOLDINGS_SYMBOL,
+            "quantity": 0.0,
+            "close_day": None,
+            "prior_close": None,
+            "market_value": 0.0,
+        }
+
     def portfolio_snapshots(self, *, known_at: datetime | None = None) -> list[dict[str, Any]]:
-        """Latest version of each (snapshot_day, symbol) asserted AND ingested by ``known_at``."""
+        """Latest version of each (snapshot_day, symbol) asserted AND ingested by ``known_at``.
+        The no-holdings marker comes back with ``symbol`` None, exactly as the capture wrote it."""
         known = self._known(known_at)
-        return self._rows(
+        rows = self._rows(
             "SELECT * EXCLUDE (rn, ingest_seq) FROM (SELECT *, row_number() OVER (PARTITION BY snapshot_day, "
             "symbol ORDER BY as_of DESC, ingested_at DESC, ingest_seq DESC) AS rn FROM portfolio_snapshots "
             "WHERE as_of <= ? AND ingested_at <= ?) WHERE rn = 1 ORDER BY snapshot_day, symbol",
             [known, known],
         )
+        for row in rows:
+            if row["symbol"] == self.NO_HOLDINGS_SYMBOL:
+                row["symbol"] = None
+        return rows
 
     _PROGRESS_KEYS = {"day", "goal_id", "goal_version", "window_days", "period_return",
                       "annualized_return", "mwr_annualized"}
