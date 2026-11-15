@@ -572,6 +572,26 @@ def ingest(
 # --------------------------------------------------------------------------- merge / publish
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that raises on a duplicate key in one JSON object, at every nesting level.
+
+    Mirrors ``dca_runner._reject_duplicate_keys`` exactly (as ``dca_config``'s copy does), duplicated rather than
+    imported (2026-11-15): ``_load_chunk`` used to import it from ``dca_runner``, which pulls in ``near_close_dca`` and
+    costs ~0.3 s of CPU per process. The launcher's rescue pass calls ``_load_chunk`` from two inline ``python -c``
+    snippets per chunk (62 fresh interpreters for a 31-chunk plan), so that import alone was ~20 s of every build and
+    made the launcher tests in tests/test_robinhood_payload.py time out under ``pytest -n auto`` on the self-hosted
+    runner (PR 2328, run 43670958050). tests/test_robinhood_payload.py pins the parity and that the import stays out.
+    """
+    seen: set[str] = set()
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in JSON document")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
 def _load_chunk(path: str) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8").strip()
     if text.startswith("```"):  # tolerate a fenced reply despite the instruction
@@ -580,8 +600,6 @@ def _load_chunk(path: str) -> dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
         raise PayloadError("no JSON object in chunk output")
-    from dca_runner import _reject_duplicate_keys
-
     loaded = json.loads(text[start : end + 1], object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(loaded, dict):
         raise PayloadError("chunk output is not an object")

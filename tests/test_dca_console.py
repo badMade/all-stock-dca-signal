@@ -1121,10 +1121,15 @@ def test_server_header_does_not_leak_python_version(auth_server):
 def test_sigterm_stops_console_cleanly(tmp_path):
     child_env = dict(os.environ)
     child_env["PYTHONUNBUFFERED"] = "1"
+    # `-m dca_console`, not `from.py` (2026-11-15): from.py runs dca_bootstrap.ensure_venv first, and on a checkout
+    # whose .venv is not the test interpreter (the self-hosted runner's fresh checkout) that created a .venv and ran
+    # pip before the banner, so under `pytest -n auto` the 10 s readiness wait failed (PR 2328, run 43670958050).
+    # The SIGTERM handling under test is dca_console.main's; the bootstrap has its own tests in test_dca_bootstrap.py.
     process = subprocess.Popen(
         [
             sys.executable,
-            "from.py",
+            "-m",
+            "dca_console",
             "--local",
             "--no-browser",
             "--port",
