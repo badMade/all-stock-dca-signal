@@ -1,6 +1,6 @@
 """Read-only snapshot capture of the PREVIOUS trading day's close (Phase 2, ADR tests 22-24).
 
-Written FIRST. Skipped until ``dca_goal_snapshot.py`` lands. The capture takes injected read-only
+Written FIRST. Skipped until ``py`` lands. The capture takes injected read-only
 callables (positions, prior close) that the scheduled agent session wires to Robinhood read tools.
 The repo itself makes no broker or network call.
 
@@ -16,11 +16,7 @@ import re
 from datetime import date
 from pathlib import Path
 
-import pytest
-
-dca_goal_snapshot = pytest.importorskip(
-    "dca_goal_snapshot", reason="dca_goal_snapshot.py lands with Phase 2 (ADR tests 22-24)"
-)
+from dca_goal_snapshot import capture_previous_close, previous_trading_day  # noqa: E501
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_MODULE = REPO_ROOT / "dca_goal_snapshot.py"
@@ -52,7 +48,7 @@ def _raises(*_):
 # ---- capture: one row per day, or an alert ----------------------------------------------------
 
 def test_capture_writes_one_row_per_position_for_a_trading_day(tmp_path):
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         FRIDAY, positions_fn=_positions, prior_close_fn=_prior_close, is_trading_day=_is_trading_day)
     assert len(result.rows) == 1
     row = result.rows[0]
@@ -63,14 +59,14 @@ def test_capture_writes_one_row_per_position_for_a_trading_day(tmp_path):
 
 
 def test_a_failed_read_is_a_missed_snapshot_with_no_row():
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         FRIDAY, positions_fn=_raises, prior_close_fn=_prior_close, is_trading_day=_is_trading_day)
     assert result.rows == []
     assert [a.kind for a in result.alerts] == ["missed_snapshot"]
 
 
 def test_a_failed_price_read_is_a_missed_snapshot_with_no_partial_rows():
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         FRIDAY, positions_fn=_positions, prior_close_fn=_raises, is_trading_day=_is_trading_day)
     assert result.rows == []
     assert [a.kind for a in result.alerts] == ["missed_snapshot"]
@@ -78,7 +74,7 @@ def test_a_failed_price_read_is_a_missed_snapshot_with_no_partial_rows():
 
 def test_an_empty_positions_read_on_a_trading_day_is_still_a_row_per_day_not_silence():
     # Zero holdings is a real state (a fully sold account), not a missed read.
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         FRIDAY, positions_fn=lambda day: [], prior_close_fn=_prior_close, is_trading_day=_is_trading_day)
     assert result.rows == [{"snapshot_day": FRIDAY.isoformat(), "symbol": None, "quantity": 0.0,
                             "close_day": None, "prior_close": None, "market_value": 0.0}]
@@ -86,14 +82,14 @@ def test_an_empty_positions_read_on_a_trading_day_is_still_a_row_per_day_not_sil
 
 
 def test_a_weekend_or_holiday_with_no_read_is_exempt():
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         date(2026, 11, 14), positions_fn=_raises, prior_close_fn=_prior_close, is_trading_day=_is_trading_day)
     assert result.rows == []
     assert result.alerts == []
 
 
 def test_snapshot_rows_carry_no_account_identifier():
-    result = dca_goal_snapshot.capture_previous_close(
+    result = capture_previous_close(
         FRIDAY, positions_fn=_positions, prior_close_fn=_prior_close, is_trading_day=_is_trading_day)
     for row in result.rows:
         assert not any("account" in key.lower() for key in row)
@@ -102,12 +98,12 @@ def test_snapshot_rows_carry_no_account_identifier():
 # ---- previous trading day ---------------------------------------------------------------------
 
 def test_previous_trading_day_skips_weekends():
-    assert dca_goal_snapshot.previous_trading_day(MONDAY, _is_trading_day) == FRIDAY
+    assert previous_trading_day(MONDAY, _is_trading_day) == FRIDAY
 
 
 def test_previous_trading_day_skips_a_holiday_with_the_real_calendar():
     # 2026-11-26 is Thanksgiving (config/market_calendar.json). Friday 11-27 looks back to Wednesday 11-25.
-    assert dca_goal_snapshot.previous_trading_day(date(2026, 11, 27), None) == date(2026, 11, 25)
+    assert previous_trading_day(date(2026, 11, 27), None) == date(2026, 11, 25)
 
 
 # ---- read-only boundary -----------------------------------------------------------------------
