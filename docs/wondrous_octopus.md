@@ -362,9 +362,38 @@ resample whole dates in contiguous blocks (block length at least the horizon) an
 percentile interval, or `None` bounds with a reason when there are fewer than two blocks.
 `kupiec_pof` and the two Christoffersen tests check one time-ordered breach sequence; the
 independence test is meaningful at horizon 1 only. `daily_band_series` builds the per-date
-arrays from score records. Not yet wired into `report.json`; that is the trust scorecard in
-`claude/band-calibration/PLAN.md`. See
-[the band scorecard decision](adr-octopus-band-scorecard.md).
+arrays from score records. See [the band scorecard decision](adr-octopus-band-scorecard.md).
+
+### The trust scorecard (`trust_scorecard.py`)
+
+The standing answer to "how well are the bands doing, and is that changing?"
+
+```bash
+python wondrous-octopus/trust_scorecard.py --run-dir <run>              # append today's rows
+python wondrous-octopus/trust_scorecard.py --run-dir <run> --dry-run    # print, write nothing
+python wondrous-octopus/trust_scorecard.py --run-dir <run> --as-of 2026-11-13
+```
+
+It appends one row per (as-of date, model, horizon) to `<run>/trust/trust_scorecard.jsonl`.
+Rows are never rewritten, and a second run for the same date adds nothing, so it is safe to
+schedule after the daily update. It reads the ledger through the same checkpoint-bounded
+reader as `inspect_run.py`, takes no run lock, and reads only the last three origin years.
+
+| Field | Meaning |
+|---|---|
+| `coverage` | Share of forecasts inside the p10-p90 band over the rolling window, with a 95% date-block interval |
+| `below_rate`, `above_rate` | Which side the misses fell on (`null` for ledgers that predate the field) |
+| `interval_score` | Mean interval score, lower is better |
+| `skill_vs_persistence` | `1 - model / persistence` on interval score, over dates both were scored on |
+| `coverage_tests` | Horizon 1 only: share of tickers whose own breach sequence fails the Kupiec and Christoffersen tests at 5%. About 5% is expected by chance. Context, not part of the status. |
+| `status` | `ok` if the coverage interval contains 80%, `flagged` if it excludes it (too narrow or too wide), `unknown` if there is too little history |
+
+Defaults: horizons 1, 5, 21, 63 and 90, and a 63-trading-day window. Horizons 21, 63 and 90
+use 84, 252 and 360 dates, because an interval needs several blocks at least as long as the
+horizon. Until that much history exists the status is `unknown`, never `ok`.
+
+`flagged` is a label on research output. It reaches no order and no sizing; the tool exits 0
+when a band is flagged and 1 only when it refuses to read or write.
 
 ## Production-safety safeguards
 
