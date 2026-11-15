@@ -399,6 +399,17 @@ class TestBasicProtocol:
         step_lines = [line for line in lines if "coverage-to-date" in line]
         assert len(step_lines) == 4
 
+    def test_progress_line_carries_a_wall_clock_timestamp_and_eventually_an_eta(self, panel, tmp_path):
+        """ETAs must be derivable from the log alone: every step line is timestamped, and once a few
+        steps have run it reports a rate (steps/h)."""
+        lines = []
+        config = _config(panel, n_steps=8)
+        harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=lines.append)
+        harness.run()
+        step_lines = [line for line in lines if "coverage-to-date" in line]
+        assert all(" | at 20" in line for line in step_lines)
+        assert any("steps/h" in line for line in step_lines[5:])
+
 
 class TestDiagnostics:
     def test_non_finite_reconstruction_error_is_clamped_not_propagated(self, panel, tmp_path):
