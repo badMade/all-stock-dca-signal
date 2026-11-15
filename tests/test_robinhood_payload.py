@@ -750,7 +750,7 @@ def test_launcher_backoff_never_eats_the_retry_s_minimum_time_before_the_deadlin
 
     # A 600 s wait against a 60 s deadline: the wait shrinks so the retry still starts with MIN_ATTEMPT_SECONDS (20) left,
     # i.e. never more than 60 - 20 = 40 s. The deadline was 25 s (wait <= 5 s) until 2026-11-15, when the shared
-    # self-hosted Mac took over 6 s just to reach chunk 7 (PR 2330, run 43677473271): every chunk was then skipped on the
+    # self-hosted Mac took over 6 s just to reach chunk 7 (PR 2330's core CI job): every chunk was then skipped on the
     # deadline before its first attempt, no backoff line was logged, and `waits` came back empty. 60 s leaves room for
     # a slow start while the 600 s request still has to shrink by more than an order of magnitude.
     done, _ = _run_launcher(
