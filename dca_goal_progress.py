@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -216,3 +216,62 @@ def close_day(day: date, *, snapshot: Optional[Sequence[Mapping[str, Any]]], con
                 ALERT_MISSED_SNAPSHOT, day, f"no account snapshot on trading day {day.isoformat()}")])
         return DayResult()
     return DayResult(progress_rows=[{"day": day, "positions": [dict(row) for row in snapshot]}])
+
+
+# ---- Friday "Goal progress" section and INFO status (ADR tests 27-28) ------------------------
+
+# The Friday Notion refresh runs at 5:00 PM ET (operator instruction, 2026-11-14); the Goal
+# progress section rides that run's payload on Fridays only.
+FRIDAY_REFRESH_TIME = time(17, 0)
+GOAL_PROGRESS_SECTION = "Goal progress"
+_FRIDAY = 4  # date.weekday()
+# Under a year of window an annualized figure extrapolates noise (a 9-day 8% reads as several
+# hundred percent a year), so the section shows the period return only and never the word.
+_ANNUALIZE_MIN_DAYS = 365
+
+
+def in_friday_refresh(day: date) -> bool:
+    return day.weekday() == _FRIDAY
+
+
+def friday_refresh_sections(day: date) -> list[str]:
+    """Sections this module contributes to the refresh run on ``day``: Goal progress on Fridays."""
+    return [GOAL_PROGRESS_SECTION] if in_friday_refresh(day) else []
+
+
+def _pct(value: Any) -> str:
+    return f"{float(value) * 100:.2f}%"
+
+
+def goal_progress_section(rows: Iterable[Mapping[str, Any]], *, today: date) -> dict[str, Any]:
+    """The Friday section text. One line per goal; an annualized figure only from a full year on."""
+    lines = []
+    for row in rows:
+        window = int(row["window_days"])
+        line = f"{row['goal_id']}: period return {_pct(row['period_return'])} over {window} days"
+        annualized = row.get("annualized_return")
+        if window >= _ANNUALIZE_MIN_DAYS and annualized is not None:
+            line += f", annualized {_pct(annualized)}"
+        lines.append(line)
+    if not lines:
+        lines.append("no goal progress recorded yet")
+    return {"title": GOAL_PROGRESS_SECTION, "day": today.isoformat(), "text": "\n".join(lines)}
+
+
+def goal_status_info(config_dir: Path | str, now: datetime) -> Optional[dict[str, Any]]:
+    """INFO (never an alert) for a goal set that is intentionally off: a paused status or an empty
+    goal list. None when goals are active, and also when the config is bad -- that case is
+    goal_config_alert's to raise, and reporting it twice would hide which channel owns it."""
+    path = Path(config_dir) / dca_goals.GOALS_FILENAME
+    if not path.exists():
+        return {"kind": "goal_list_empty", "level": "info", "reason": "no goals file; no goals configured"}
+    try:
+        doc = dca_goals.parse_document(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    status = doc.get("status")
+    if status != "active":
+        return {"kind": "goal_inactive", "level": "info", "reason": f"goals.json status is {status!r}"}
+    if isinstance(doc.get("goals"), list) and not doc["goals"]:
+        return {"kind": "goal_list_empty", "level": "info", "reason": "no goals configured"}
+    return None
