@@ -3,8 +3,10 @@
 - **Status:** Accepted (2026-11-13). The operator approved the 12 tests as written (including
   test 12's synthetic returns) and accepted every proposed default under "Open questions".
   Phases 0 and 1, the console Goals panel and the hedge shadow pricing/scorecard functions are
-  implemented; the daily hedge capture task and its DuckDB tables, Phase 2 progress tables and
-  Phase 4 stay open.
+  implemented; Phase 2 goal progress tables and snapshot capture are implemented (the
+  `dca-sizing-signals/tests/ledger` and `tests/test_goal_snapshot_capture.py` suites pass, 379
+  and 12 tests on 2026-11-15). The daily hedge capture task and its DuckDB tables, the stale-goal
+  alert, the 07:31 ET task registration and Phase 4 stay open.
 - **Scope:** goals as versioned data, a console page that proposes goal changes as pull
   requests, and a shadow-only loss hedge (options and crypto). **Nothing here changes a live
   dollar amount, places, previews or reviews an order, or edits a file under `config/` at
