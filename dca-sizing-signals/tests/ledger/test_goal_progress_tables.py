@@ -48,7 +48,9 @@ def test_snapshot_identical_reingest_is_a_no_op(ledger):
 def test_snapshot_correction_is_a_new_row_and_latest_is_read(ledger):
     ledger.ingest_portfolio_snapshots([SNAP], source="robinhood_readonly", run_id="snap-1", as_of=utc(2026, 11, 13, 12))
     fixed = {**SNAP, "prior_close": 11.0, "market_value": 22.0}
-    ledger.ingest_portfolio_snapshots([fixed], source="robinhood_readonly", run_id="snap-2", as_of=utc(2026, 11, 13, 12))
+    ledger.ingest_portfolio_snapshots(
+        [fixed], source="robinhood_readonly", run_id="snap-2", as_of=utc(2026, 11, 13, 12)
+    )
     assert ledger.row_count("portfolio_snapshots") == 2
     latest = ledger.portfolio_snapshots(known_at=utc(2026, 11, 14))
     assert [r["market_value"] for r in latest] == [22.0]
