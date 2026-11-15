@@ -32,15 +32,15 @@ python3.12 -m venv ~/.cache/all-stock-dca/goal-snapshot-venv
 After it is registered, add its row (with the task ID) to the canonical table in
 `docs/schedule_manifest.md` and delete the "Planned, not yet registered" note there.
 
-## Open decisions before registering
+## Decisions (resolved 2026-11-15: operator chose the defaults)
 
-1. **Ledger database file.** Nothing in the repo names the production ledger file yet (the README
-   example uses `data/backfill.duckdb`). The prompt below uses
-   `dca_paths.stream_root("goal_snapshot", "ledger.duckdb")` (under `$DCA_CRON_TRACKING_ROOT`); change it if the ledger should live
-   elsewhere. Whatever is chosen, the Friday section and any future goal-progress job must read
-   the same file.
-2. **Where a `missed_snapshot` alert goes.** The prompt writes it to `alerts.json` and ends the
-   run with a visible failure. Wiring it into Gate 9 email / `scripts/alert_digest.py` is not done.
+1. **Ledger database file.** Resolved: the prompt uses
+   `dca_paths.stream_root("goal_snapshot", "ledger.duckdb")`, which resolves under
+   `$DCA_CRON_TRACKING_ROOT`. The Friday section and any future goal-progress job must read the
+   same file.
+2. **Where a `missed_snapshot` alert goes.** Resolved: the prompt writes it to `alerts.json` and
+   ends the run with a visible failure. Wiring it into Gate 9 email / `scripts/alert_digest.py`
+   is a later change, not part of this registration.
 
 ---
 
