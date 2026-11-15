@@ -39,8 +39,11 @@ ruff check .
 .venv/bin/python -m pytest tests/test_midday_dca.py -q
 .venv/bin/python -m pytest tests/test_midday_dca.py::test_some_case -q
 
-# The coverage gate CI enforces
-pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
+# The coverage gate CI enforces. -n auto (pytest-xdist) uses every core; on the 3.12 leg CI
+# also sets COVERAGE_CORE=sysmon. 2026-11-14, 14,568 tests: 24m05s serial on the operator's Mac;
+# 32m06s serial -> 6m45s parallel in a 4-core Linux container. Linux reads ~0.08 pts lower than
+# macOS (90.97% vs 91.05%), so CI's real margin over 90 is under 1 pt.
+pytest -n auto --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 
 # Every CI job, run locally (core by default; --all adds both audits and every sibling
 # suite in its own venv under ~/.cache; --changed runs only the siblings CI would run;

@@ -177,6 +177,7 @@
   "snap": "A scratch file holding a few sample price lists. Not part of normal operation.",
   "dca_console_rank": "Feeds the Composite rank page: reads the daily composite-rank job's output (the ranked S&P 500 list, who entered or left the above-80 list, and how ranks move) and only displays it.",
   "dca_goals": "Holds the operator's goals, like the yearly growth target and the loss hedge. It checks them, falls back to no goal if anything is wrong, and keeps hedge trading switched off.",
+  "dca_goal_progress": "Calculates goal performance from supplied account snapshots and prices, using time- and money-weighted returns, and flags missed snapshots or invalid goal settings.",
   "dca_console_goals": "Feeds the Goals panel on the Config page. It checks a proposed goal change and saves it as a proposal file; it never edits the settings files.",
   "scripts.propose_goal_pr": "Turns the newest saved goal proposal into a draft pull request against the goals settings file, so a goal only changes when the operator merges it."
 }

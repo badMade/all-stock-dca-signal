@@ -3,4 +3,4 @@
 # deliberate commit (docs/adr-price-source-massive-alpaca.md).
 requests==2.34.2
 duckdb==2.0.0
-pytest==9.1.1
+pytest==9.2.0

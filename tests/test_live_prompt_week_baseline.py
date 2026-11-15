@@ -96,7 +96,7 @@ def test_rule_only_narrows_by_created_at_gte(slot):
 
 def test_rule_falls_back_to_the_full_fetch_when_no_baseline_or_merge_refuses(slot):
     rule = _rule(slot)
-    assert "exit 2" in rule or "exits 2" in rule
+    assert "exit 2" in rule
     assert "full" in rule and "OVERSIZED ORDER PAGES" in rule
 
 
@@ -106,6 +106,7 @@ def test_missed_935_uses_prior_week_baseline_before_full_fetch(slot):
         assert "scripts.find_order_baseline --kind week" in rule
         assert "prior_baseline_merge" in rule
         assert "full ISO" in rule and "OVERSIZED ORDER PAGES" in rule
+        assert "do not retype anything" in rule
 
 
 def test_rule_covers_the_gate_7_per_order_week_refetch(slot):
@@ -130,7 +131,7 @@ def test_1230_builds_orders_week_with_the_reshape_script_never_by_hand(slot):
     assert "NEVER reshape a row by hand" in rule
     # The merged envelope replaces the re-emitted raw copies, and a reshape refusal falls back too.
     assert "orders_week_raw.json" in rule and "orders_week_raw_final.json" in rule
-    assert "reshape" in rule and "refuses" in rule
+    assert "reshape_order_pages ends with exit 2" in rule
 
 
 def test_1230_gate_4_and_gate_6_5_point_back_at_the_rule(slot):
