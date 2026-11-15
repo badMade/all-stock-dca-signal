@@ -15,8 +15,10 @@ account number.
 Usage::
 
     python3 -m scripts.primary_gates clock --slot 1130 [--now <offset-aware ISO-8601>] [--latest-start HH:MM]
-    python3 -m scripts.primary_gates budget --orders-pages <week baseline json> --account <number> \\
-        --trading-day YYYY-MM-DD --buying-power <usd>
+    python3 -m scripts.primary_gates budget --orders-pages <week baseline json> --trading-day YYYY-MM-DD \\
+        --buying-power <usd> [--tier normal|elevated|high_volatility|stress] [--weekly-rollover-reserve <usd>]
+
+``budget`` reads the account from ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (``--account`` is still accepted).
 
 Exit codes: 0 for PROCEED, END_SILENTLY, OK and NO_HEADROOM; 1 for ABORT; 2 for a usage error.
 """
@@ -131,6 +133,29 @@ def evaluate_budget(
     }
 
 
+def resolve_tier_caps(tier: str, weekly_rollover_reserve_usd: Any = None) -> tuple[float, float]:
+    """The (daily, weekly) dollar caps for a budget tier the PROMPT has already selected.
+
+    Tier SELECTION (by today's count of 3x-or-greater signals) stays in the 3:30 prompt; this only turns a chosen
+    tier into caps. The stress tier's weekly ceiling is ``min(nominal, NORMAL weekly + available rollover reserve)``,
+    computed by ``dca_runner._effective_weekly_cap`` itself so there is no second copy of the rule. A tier that does
+    not use a reserve ignores one that is passed, as the runner does. Fail closed: an unknown tier name (names are
+    exact, lower-case), a stress tier with no reserve, or a reserve that is not a finite non-negative number raises
+    ``ValueError``.
+    """
+    by_name = {candidate.name: candidate for candidate in dca_runner.BUDGET_TIERS}
+    if tier not in by_name:
+        raise ValueError(f"unknown budget tier {tier!r}; expected one of {', '.join(by_name)}")
+    chosen = by_name[tier]
+    if not chosen.uses_rollover_reserve:
+        return float(chosen.daily_cap_usd), float(chosen.weekly_cap_usd)
+    if weekly_rollover_reserve_usd is None:
+        raise ValueError(f"the {tier} tier requires a weekly rollover reserve (--weekly-rollover-reserve)")
+    if not _usable_buying_power(weekly_rollover_reserve_usd):  # same finite, non-negative, non-bool number check
+        raise ValueError("the weekly rollover reserve must be a finite, non-negative number")
+    return float(chosen.daily_cap_usd), float(dca_runner._effective_weekly_cap(chosen, weekly_rollover_reserve_usd))
+
+
 def _load_orders(path: Path, account: str) -> list[BrokerOrder]:
     """Rows of a saved ``orders_pages`` envelope as ``BrokerOrder``; refuses a mismatched account."""
     from scripts.assemble_order_pages import _order_rows
@@ -195,18 +220,31 @@ def _cmd_clock(args: argparse.Namespace) -> int:
 
 
 def _cmd_budget(args: argparse.Namespace) -> int:
+    # The account comes from the environment, like `clock`; AGENTS.md keeps the number off command lines and out of
+    # logs. `--account` stays accepted so an existing caller keeps working. Neither path ever prints the number.
+    raw_account = args.account if args.account is not None else os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
+    pin = account_pin(raw_account)
+    if not pin["ok"]:
+        document = {"status": "ABORT", "reason": pin["reason"]}
+        _emit(document)
+        return _exit_code(document)
     try:
         day = date.fromisoformat(args.trading_day)
-        orders = _load_orders(args.orders_pages, args.account)
-        tier = dca_runner.BUDGET_TIERS[0]  # the intraday slots use the NORMAL tier unconditionally
+        daily_cap, weekly_cap = resolve_tier_caps(args.tier, args.weekly_rollover_reserve)
+        orders = _load_orders(args.orders_pages, pin["account_number"])
         document = evaluate_budget(
             orders,
             day,
             buying_power_usd=args.buying_power,
-            daily_cap_usd=tier.daily_cap_usd,
-            weekly_cap_usd=tier.weekly_cap_usd,
+            daily_cap_usd=daily_cap,
+            weekly_cap_usd=weekly_cap,
             max_orders_per_day=dca_runner.MAX_ORDERS_PER_DAY,
         )
+        document["tier"] = args.tier
+    except ValueError as exc:
+        # A tier problem names itself (no connector text, no account); anything else reports its type only.
+        reason = str(exc) if "tier" in str(exc) or "rollover" in str(exc) else f"orders_pages unusable: {type(exc).__name__}"
+        document = {"status": "ABORT", "reason": reason}
     except Exception as exc:  # noqa: BLE001 - fail closed; type name only
         document = {"status": "ABORT", "reason": f"orders_pages unusable: {type(exc).__name__}"}
     _emit(document)
@@ -227,9 +265,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     budget = sub.add_parser("budget", help="Gate 6 cap arithmetic from a saved week-baseline orders_pages file.")
     budget.add_argument("--orders-pages", type=Path, required=True)
-    budget.add_argument("--account", required=True)
+    budget.add_argument(
+        "--account",
+        default=None,
+        help="Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line.",
+    )
     budget.add_argument("--trading-day", required=True)
     budget.add_argument("--buying-power", type=float, required=True)
+    budget.add_argument(
+        "--tier",
+        choices=[candidate.name for candidate in dca_runner.BUDGET_TIERS],
+        default="normal",
+        help="The budget tier the prompt selected (default normal, the tier every slot but 3:30 uses).",
+    )
+    budget.add_argument(
+        "--weekly-rollover-reserve",
+        type=float,
+        default=None,
+        help="Available prior-week rollover reserve in USD; required with --tier stress, ignored otherwise.",
+    )
     args = parser.parse_args(argv)
     return _cmd_clock(args) if args.command == "clock" else _cmd_budget(args)
 

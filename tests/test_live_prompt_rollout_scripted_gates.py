@@ -85,9 +85,38 @@ def test_gate_6_cap_arithmetic_runs_through_the_script_for_normal_tier_slots(slo
     assert "--orders-pages" in budget and "--buying-power" in budget
 
 
-@pytest.mark.parametrize("slot", ("1530", "1230"))
-def test_3_30_and_12_30_keep_their_own_gate_6(slot):
-    assert "primary_gates budget" not in _text(slot)
+def test_12_30_keeps_its_own_gate_6():
+    assert "primary_gates budget" not in _text("1230")
+
+
+def _budget_paragraph(slot: str) -> str:
+    (line,) = [ln for ln in _text(slot).splitlines() if "primary_gates budget" in ln]
+    return line
+
+
+def test_3_30_gate_6_uses_the_script_with_the_tier_it_selected():
+    # Follow-up (2026-11-14): `budget --tier` lets the dynamic-tier slot use the script too. The tier is still
+    # chosen in the prompt; the script only turns it into caps.
+    paragraph = _budget_paragraph("1530")
+    assert "--tier" in paragraph and "--weekly-rollover-reserve" in paragraph
+
+
+def test_3_30_still_selects_its_tier_in_the_prompt_text():
+    budget = _between("1530", "GATE 6 - BUDGET", "GATE 6.5 - SAME-DAY TOP-UP GUARD")
+    assert "Elevated (6-10)" in budget and "Stress (>17)" in budget
+    assert "SOLELY today's count of 3x-or-greater signals" in budget
+
+
+@pytest.mark.parametrize("slot", FULL)
+def test_the_normal_tier_prompts_do_not_pass_a_tier(slot):
+    assert "--tier" not in _budget_paragraph(slot)
+
+
+@pytest.mark.parametrize("slot", FULL + CLOCK_ONLY)
+def test_the_budget_command_takes_the_account_from_the_environment_not_the_command_line(slot):
+    paragraph = _budget_paragraph(slot)
+    assert "--account" not in paragraph
+    assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" in paragraph
 
 
 def test_the_3_30_dynamic_budget_tiers_are_untouched():
