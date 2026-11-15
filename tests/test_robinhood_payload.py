@@ -748,14 +748,18 @@ def test_launcher_rate_limit_backoff_zero_turns_the_wait_off(tmp_path):
 def test_launcher_backoff_never_eats_the_retry_s_minimum_time_before_the_deadline(tmp_path):
     import re
 
-    # A 600 s wait against a 25 s deadline: the wait shrinks so the retry still starts with MIN_ATTEMPT_SECONDS (20) left.
+    # A 600 s wait against a 60 s deadline: the wait shrinks so the retry still starts with MIN_ATTEMPT_SECONDS (20) left,
+    # i.e. never more than 60 - 20 = 40 s. The deadline was 25 s (wait <= 5 s) until 2026-11-15, when the shared
+    # self-hosted Mac took over 6 s just to reach chunk 7 (PR 2330's core CI job): every chunk was then skipped on the
+    # deadline before its first attempt, no backoff line was logged, and `waits` came back empty. 60 s leaves room for
+    # a slow start while the 600 s request still has to shrink by more than an order of magnitude.
     done, _ = _run_launcher(
         tmp_path, _RATE_LIMITED_ONCE,
-        extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "600", "DCA_BUILD_DEADLINE_SECONDS": "25", "DCA_CODEX_PARALLEL": "64"},
+        extra_env={"DCA_RATE_LIMIT_BACKOFF_SECONDS": "600", "DCA_BUILD_DEADLINE_SECONDS": "60", "DCA_CODEX_PARALLEL": "64"},
     )
     log = done.stdout + done.stderr
     waits = [int(s) for s in re.findall(r"rate_limited chunk=\d+ attempt=1 backoff_seconds=(\d+)", log)]
-    assert waits and all(s <= 5 for s in waits), log
+    assert waits and all(s <= 60 - 20 for s in waits), log
 
 
 @pytest.mark.parametrize("value", ["x", "-1", "1.5"])

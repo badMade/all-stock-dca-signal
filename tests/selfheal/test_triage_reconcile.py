@@ -215,6 +215,37 @@ def test_recorded_commit_cited_only_in_body_keeps_counting_and_beats_newer_match
     assert _match(commits=[newer, unrelated], recorded_commit_url=url).commit_url == f"{REPO_URL}/commit/{'d' * 40}"
 
 
+def test_recorded_merge_commit_of_the_matched_pr_beats_the_branch_commit() -> None:
+    # 2026-11-14 digest: b90e6025 ("Merge pull request #2221 from ...") was the operator's hand-set Commit URL for
+    # this row, and the reconciler kept proposing the branch commit e3745609 because a merge subject never cites a Key.
+    branch_commit = _commit("e", f"[AI-Assisted] {KEY}: back off before retrying (#2221)")
+    merge = _commit("b", "Merge pull request #2221 from badMade/badMade/payload-429-backoff")
+    url = f"{REPO_URL}/commit/{'b' * 40}"
+    pr = _pr(2221, title=f"{KEY}: back off", state="closed", merged=True, checks="green")
+    assert _match(prs=[pr], commits=[branch_commit, merge], recorded_commit_url=url).commit_url == url
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Merge pull request #2224 from badMade/other-fix",  # merge of a DIFFERENT PR than the one matched
+        "Squash: Merge pull request #2221 from x",  # not a merge subject (not anchored at the start)
+        "Merge pull request #2221",  # no " from <branch>"
+    ],
+)
+def test_recorded_commit_that_is_not_the_matched_prs_merge_does_not_pin_the_row(subject: str) -> None:
+    branch_commit = _commit("e", f"[AI-Assisted] {KEY}: back off before retrying (#2221)")
+    recorded = _commit("b", subject)
+    pr = _pr(2221, title=f"{KEY}: back off", state="closed", merged=True, checks="green")
+    ev = _match(prs=[pr], commits=[branch_commit, recorded], recorded_commit_url=f"{REPO_URL}/commit/{'b' * 40}")
+    assert ev.commit_url == f"{REPO_URL}/commit/{'e' * 40}"
+
+
+def test_recorded_merge_commit_needs_a_matched_pr() -> None:
+    merge = _commit("b", "Merge pull request #2221 from badMade/badMade/payload-429-backoff")
+    assert _match(commits=[merge], recorded_commit_url=f"{REPO_URL}/commit/{'b' * 40}").commit_url is None
+
+
 def test_recorded_commit_url_must_be_a_string() -> None:
     with pytest.raises(tr.EvidenceError):
         _match(recorded_commit_url=123)

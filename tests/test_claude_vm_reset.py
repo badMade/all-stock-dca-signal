@@ -49,9 +49,14 @@ def mac(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # Claude "runs" while state/running exists; quitting removes it unless state/stuck exists.
+    # A "late" quit lands only once the script has given up and called `open -a Claude`, not after a fixed 3 s: the
+    # script's give-up point is CLAUDE_VM_QUIT_WAIT loop turns (sleep 1 + a pgrep each), which a loaded runner stretched
+    # past 3 s, so the quit landed inside the wait and the disk was deleted (PR 2330's core CI job, 2026-11-15). The
+    # wait is bounded (30 s) so a run that never calls open leaves no stray process behind.
     _stub(bin_dir, "osascript", f'echo "osascript $*" >> "{calls}"; '
           f'if [ -e "{state}/denied" ]; then echo "execution error: Not authorized to send Apple events to Claude. (-1743)" >&2; exit 1; fi; '
-          f'if [ -e "{state}/late" ]; then (sleep 3; rm -f "{state}/running"; touch "{state}/late_quit") & '
+          f'if [ -e "{state}/late" ]; then (n=0; until grep -q "^open " "{calls}" || [ $n -ge 300 ]; do sleep 0.1; '
+          f'n=$((n + 1)); done; rm -f "{state}/running"; touch "{state}/late_quit") & '
           f'elif [ ! -e "{state}/stuck" ]; then rm -f "{state}/running"; fi')
     _stub(bin_dir, "pgrep", f'echo "pgrep $*" >> "{calls}"; [ -e "{state}/running" ]')
     _stub(bin_dir, "open", f'echo "open $*" >> "{calls}"; '
