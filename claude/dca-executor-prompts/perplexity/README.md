@@ -80,17 +80,53 @@ that bought:
 `sources.live_prompt_placements` plus `sources.plan_first_placements` should equal the number of orders placed. Zero
 for a slot that bought means the recognition chain is broken, and the backup will stand down (fail closed).
 
-## Order history: full seven-day fetch, no baseline reuse (2026-11-14)
+## Order history: Mac-side week envelope when the Mac is up, full seven-day fetch otherwise (2026-11-14)
 
 The Claude live-mirror prompts reuse a saved week envelope (WEEK BASELINE REUSE, and since 67d9d617 an
-earlier-day envelope via `scripts.find_order_baseline --kind week`) so a missed 9:35 does not force an
-unsaveable full-week fetch (the 2026-11-13 10:30 `output_cap_exceeded` abort). The backups deliberately do
-NOT, yet: step 2 fetches from 00:00 ET seven days back (the kill-switch figure is a trailing seven-day sum a
-Monday-start envelope cannot supply), the planner refuses any envelope not dated today
-(`orders_pages_trading_day_mismatch`), and the saved envelopes exist only on the Mac. A very large week can
-therefore still stop a backup run fail-closed with nothing placed. The operator's chosen follow-up is a hybrid:
-when the Mac is online, look up and merge the baseline and run the planner there; otherwise keep this full
-fetch. `scripts/tests/test_backup_week_history.py` pins the current behavior and must change with that work.
+earlier-day envelope via `scripts.find_order_baseline --kind week`), so a missed 9:35 does not force an
+unsaveable full-week fetch (the 2026-11-13 10:30 `output_cap_exceeded` abort). The backups fetch SEVEN days
+through the Perplexity sandbox, which has the same shape, and the saved envelopes exist only on the Mac. The backups
+now use a hybrid (procedure step 2, "WEEK HISTORY"):
+
+* **`week_history_mode prior_baseline_merge`**: only when `mac_status` is online and `mac_path_abandoned` is false.
+  On the Mac, `python3 -m scripts.backup_week_history lookup` finds the newest complete week envelope of this ISO
+  week (`find_order_baseline --kind week`). The sandbox fetches only the increment since the printed
+  `created_at_gte` and puts the raw pages, unchanged, in the printed `work_dir`. Then
+  `backup_week_history merge` re-checks the base and merges with `scripts.merge_order_pages` into the WEEK FILE
+  (`<cron root>/perplexity_backup/<YYYYMMDD>_<slot>ET/orders_pages_week_<Monday>_backup_<slot>_<label>.json`).
+  Every planner command that reads history (classify, compute, finalize, check-placement) runs ON THE MAC with
+  `--week-envelope --account-last4 NNNN` against the current WEEK FILE. The late-start recheck (`poll1b`),
+  poll 2 (`poll2`) and every step 7c repull (`order<N>`) merge onto the previous WEEK FILE from the
+  `next_created_at_gte` its merge printed. The WEEK FILE never moves into the sandbox. No account number is on any
+  command line: the Mac reads its own `$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`, and it must end in the last four digits
+  this run resolved.
+* **`week_history_mode full`**: any lookup exit 2, merge refusal, or a Mac that is offline or abandoned leads to
+  today's full seven-day sandbox fetch, unchanged. Once full, the run stays full. A failure in step 7 before an
+  order is submitted switches to full the same way. A failure AFTER a submission, when its check-placement cannot
+  run on the Mac, records that order as `unverified` and stops the batch with `failed_unexpected_error`. There is no
+  history from before the submission to fall back to.
+* **The days before Monday are never sourced from last week's envelope** (operator decision 2026-11-14, option 1).
+  That envelope ends at Friday's last 3:30 snapshot. That snapshot comes before that slot's own last orders, the
+  15:40 backup's orders and any weekend order. `get_equity_orders` has only `created_at_gte`, so the seam cannot be
+  fetched without fetching the whole week. Instead, the planner treats the trailing-seven-day kill switch as ENGAGED
+  whenever it reads a week envelope: `compute` sizes at 1x at most (`kill_switch_basis
+  week_envelope_treated_as_engaged`), and `finalize` refuses an over-1x computed or plan-first plan with
+  `kill_switch_unproven`. The procedure then falls back once to the full fetch and finalizes in the sandbox. This can
+  only shrink a buy. Caps, Gate 4, the order ceiling and the 120-second freshness bound
+  (`dca_runner.MAX_ORDERS_FETCH_AGE_SECONDS`) are unchanged and need only Monday onward.
+* **The today-binding is unchanged for everything else.** Without `--week-envelope`, the planner still refuses any
+  envelope not dated today (`orders_pages_trading_day_mismatch`). With it, the planner accepts only a
+  `scripts.merge_order_pages` output that meets all of these:
+  * dated this ISO week's Monday, with a `snapshot_at` from today;
+  * pinned to the Mac's configured account;
+  * built on a base whose recorded `base_ingest_tool` is a trusted writer;
+  * pages that still hash to `ingest.payload_sha256`.
+
+  A hand-built file, or one merged onto a hand-built base, is refused.
+
+The state record carries `week_history_mode` and `week_history_sha256`. Known limit: the 3-minute Mac budget
+(step 3b) still covers every Mac command, so a long run that spends it falls back to `full` at its next history
+read. `scripts/tests/test_backup_week_history.py` pins all of the above.
 
 ## Which slots take the safety-gate path
 

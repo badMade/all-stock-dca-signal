@@ -349,7 +349,9 @@ def test_both_polls_fetch_seven_days_so_the_weekly_cap_and_the_kill_switch_figur
     assert "00:00 ET seven days before today" in text
     assert "created_at_gte set to today" not in text
     assert "Monday of the current ISO week" not in text
-    assert "repeat the full poll of step 2" in text  # poll 2 inherits the same window
+    # Poll 2 inherits the same window in full mode (2026-11-14 hybrid: a Mac-side WEEK FILE merge otherwise,
+    # pinned in scripts/tests/test_backup_week_history.py).
+    assert "in week_history_mode full the FULL POLL from scratch into orders_pages_poll2.json" in text
 
 
 # -- review gaps found 2026-10-07 (ADR "Open design gaps") ------------------------------------
