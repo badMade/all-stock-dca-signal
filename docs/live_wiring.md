@@ -518,7 +518,7 @@ reach for an existing entry point before writing new code or re-deriving logic f
 module. A few representative ones, beyond the CLI above:
 
 ```bash
-python3 -m scripts.same_day_top_up_gate --account <acct> --trading-day <YYYY-MM-DD> \
+python3 -m scripts.same_day_top_up_gate --trading-day <YYYY-MM-DD> \
   --orders-pages <file> --candidates <file>        # authoritative same-day top-up sizing
 python scripts/drift_detection.py --run-dir <dir> [--slack]   # post-run drift detection
 python -c "import scripts.run_classification"     # scheduled-vs-manual; library API, no CLI --

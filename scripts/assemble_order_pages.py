@@ -53,7 +53,7 @@ step.
 
 Usage::
 
-    python3 -m scripts.assemble_order_pages --account "$ACCT" --trading-day 2026-09-09 \\
+    python3 -m scripts.assemble_order_pages --trading-day 2026-09-09 \\
         --out "$ROOT/orders_pages_2026-09-09_1230.json" [--expect-count N --expect-total-usd X] \\
         page1.txt page2.txt
 
@@ -64,7 +64,7 @@ unreachable from the repo shell), fetch the window once per order state instead 
 every page of every state with ``--slice STATE=PAGE_FILE`` (repeat per page, in fetch order
 within a state)::
 
-    python3 -m scripts.assemble_order_pages --account "$ACCT" --trading-day 2026-11-03 \\
+    python3 -m scripts.assemble_order_pages --trading-day 2026-11-03 \\
         --out "$ROOT/orders_pages_2026-11-03_1230.json" \\
         --slice filled=filled_p1.json --slice filled=filled_p2.json --slice cancelled=cancelled_p1.json \\
         ... one or more pages for EVERY state in ``ORDER_STATES``
@@ -101,6 +101,7 @@ from dca_live_adapters import (
     _orders_in_settled_layer_or_nested,
     _unwrap_seeking_order_evidence,
 )
+from scripts.account_arg import add_account_argument, resolve_account
 from scripts.broker_reconciliation import same_day_order_snapshot
 from scripts.same_day_top_up_gate import _PageReplayer
 
@@ -416,7 +417,7 @@ def _decimal_arg(text: str) -> Decimal:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--account", required=True, help="Account number the pages were fetched for.")
+    add_account_argument(parser, "Account number the pages were fetched for.")
     parser.add_argument("--trading-day", required=True, help="Trading day, YYYY-MM-DD, America/New_York.")
     parser.add_argument("--out", required=True, help="Envelope path (the gate's orders_pages_<day>_<slot>.json).")
     parser.add_argument("--snapshot-at", default=None, help="Optional ISO timestamp; the 09:35 envelope carries it.")
@@ -433,6 +434,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("page_files", nargs="*", help="Saved page files, in fetch order; '-' reads one page from stdin.")
     args = parser.parse_args(argv)
+    resolve_account(parser, args)
 
     try:
         if args.slice:

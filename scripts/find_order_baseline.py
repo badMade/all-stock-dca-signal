@@ -88,6 +88,7 @@ from zoneinfo import ZoneInfo
 import dca_paths
 from dca_config import _reject_duplicate_keys
 from scripts import assemble_order_pages as asm
+from scripts.account_arg import add_account_argument, resolve_account
 from scripts.verify_schedule import SLOT_EVIDENCE_LAYOUT, slot_run_dir_relative
 
 TOOL = "scripts.find_order_baseline"
@@ -340,10 +341,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--slot", required=True, choices=sorted(SLOT_EVIDENCE_LAYOUT), help="THIS run's slot (HHMM).")
     parser.add_argument("--trading-day", required=True, help="Today, YYYY-MM-DD (not the Monday, even for --kind week).")
-    parser.add_argument("--account", required=True, help="Account number; must match the envelope. Never printed.")
+    add_account_argument(parser, "Account number; must match the envelope. Never printed.")
     parser.add_argument("--overlap-seconds", type=int, default=120, help="Overlap subtracted from snapshot_at (default 120).")
     parser.add_argument("--now", help="Offset-aware ISO instant to judge 'not in the future' against (tests only).")
     args = parser.parse_args(argv)
+    resolve_account(parser, args)
 
     now = None
     if args.now:

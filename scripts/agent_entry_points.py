@@ -76,7 +76,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     EntryPoint(
         need="Size a same-day top-up buy from broker order history",
         command=(
-            "python3 -m scripts.same_day_top_up_gate --account <acct> "
+            "python3 -m scripts.same_day_top_up_gate "
             "--trading-day <YYYY-MM-DD> --orders-pages <file> --candidates <file>"
         ),
         exists_path="scripts/same_day_top_up_gate.py",
@@ -132,7 +132,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     EntryPoint(
         need="Assemble saved oversized get_equity_orders pages into an orders_pages envelope",
         command=(
-            "python3 -m scripts.assemble_order_pages --account <acct> --trading-day <YYYY-MM-DD> "
+            "python3 -m scripts.assemble_order_pages --trading-day <YYYY-MM-DD> "
             "--out <orders_pages file> [--snapshot-at <ISO>] [--expect-count <N>] "
             "[--expect-total-usd <X>] <page file | -> [<page file> ...]"
         ),

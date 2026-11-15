@@ -57,6 +57,7 @@ from dca_config import _reject_duplicate_keys
 from dca_fileio import atomic_write_text
 from dca_runner import _is_dead_order_state
 from scripts import assemble_order_pages as asm
+from scripts.account_arg import add_account_argument, resolve_account
 from scripts.broker_reconciliation import same_day_order_snapshot
 from scripts.same_day_top_up_gate import _bind_saved_pages, _PageReplayer
 
@@ -245,10 +246,11 @@ def reshape(envelope_path: str, *, account_number: str, trading_day: str) -> lis
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--envelope", required=True, help="Saved orders_pages envelope (assembled or merged).")
-    parser.add_argument("--account", required=True, help="Account number; must match the envelope.")
+    add_account_argument(parser, "Account number; must match the envelope.")
     parser.add_argument("--trading-day", required=True, help="The envelope's trading_day, YYYY-MM-DD (the week's Monday).")
     parser.add_argument("--out", required=True, help="Path of the orders_week.json list to write.")
     args = parser.parse_args(argv)
+    resolve_account(parser, args)
 
     try:
         rows = reshape(args.envelope, account_number=args.account, trading_day=args.trading_day)

@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 import dca_runner
 from dca_runner import BrokerOrder
+from scripts.account_arg import add_account_argument, resolve_account
 
 ET = ZoneInfo("America/New_York")
 _ACCOUNT_SHAPE = re.compile(r"[0-9]+")
@@ -265,11 +266,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     budget = sub.add_parser("budget", help="Gate 6 cap arithmetic from a saved week-baseline orders_pages file.")
     budget.add_argument("--orders-pages", type=Path, required=True)
-    budget.add_argument(
-        "--account",
-        default=None,
-        help="Deprecated: leave it out. Defaults to $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER so the number stays off the command line.",
-    )
+    add_account_argument(budget, "Account the week envelope was fetched for; must match it.")
     budget.add_argument("--trading-day", required=True)
     budget.add_argument("--buying-power", type=float, required=True)
     budget.add_argument(
@@ -285,6 +282,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Available prior-week rollover reserve in USD; required with --tier stress, ignored otherwise.",
     )
     args = parser.parse_args(argv)
+    if args.command == "budget":
+        resolve_account(budget, args)
     return _cmd_clock(args) if args.command == "clock" else _cmd_budget(args)
 
 
