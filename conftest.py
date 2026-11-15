@@ -44,6 +44,12 @@ os.environ["DCA_DISABLE_DOTENV"] = "1"
 # test local, before any module is imported, so the suite can never push to the real remote.
 os.environ["DCA_DISABLE_SLOT_STATUS_PUBLISH"] = "1"
 
+# deploy/launchd/robinhood_payload.sh exports DCA_NOTIFY_REFUSAL=1 unless the caller already set it, and the
+# launcher tests in test_robinhood_payload.py run that real script against a stubbed Codex that refuses the fake
+# 2026-10-20 09:35 slot at 0/122 -- so every suite run on the operator's Mac raised real "Payload refused" macOS
+# notifications (2026-11-14). Pin it off for the whole suite; tests of the notifier opt back in with monkeypatch.
+os.environ["DCA_NOTIFY_REFUSAL"] = "0"
+
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

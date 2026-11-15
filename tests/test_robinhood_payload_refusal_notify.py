@@ -137,3 +137,12 @@ def test_the_launcher_turns_the_notification_on_by_default_but_lets_the_operator
     text = SCRIPT.read_text(encoding="utf-8")
 
     assert 'export DCA_NOTIFY_REFUSAL="${DCA_NOTIFY_REFUSAL:-1}"' in text
+
+
+def test_the_suite_pins_the_notification_off_so_launcher_tests_never_raise_a_real_one():
+    # 2026-11-14: the launcher tests run the real robinhood_payload.sh, which defaults DCA_NOTIFY_REFUSAL to 1, and
+    # refuse a fake 2026-10-20 09:35 slot at 0/122 -- each suite run popped real "Payload refused" notifications on
+    # the operator's Mac. conftest.py pins it to 0 before any test runs; the launcher keeps a caller's value.
+    import os
+
+    assert os.environ.get("DCA_NOTIFY_REFUSAL") == "0"
