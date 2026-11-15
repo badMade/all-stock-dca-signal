@@ -53,9 +53,10 @@ def test_gate_6_cap_arithmetic_runs_through_the_script():
 
 
 def test_gate_4_rogue_classification_stays_in_the_prompt():
+    # Still true after Gate 4 was scripted (tests/test_live_prompt_scripted_gate4.py): the prose rules remain as the
+    # manual fallback beside the command.
     gate4 = _between("GATE 4 - SOLE-EXECUTOR INTERLOCK", "GATE 5 - BUY LIST")
     assert "rogue" in gate4 and "placed_agent" in gate4
-    assert "primary_gates" not in gate4
 
 
 # ---- parallel per-order reads ---------------------------------------------------------------------------------
