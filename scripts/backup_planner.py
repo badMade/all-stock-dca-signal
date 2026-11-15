@@ -51,9 +51,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import math
+import os
 import re
 import sys
 import tempfile
@@ -100,7 +102,7 @@ from near_close_dca import (  # noqa: E402
 )
 from scripts import backup_stream_specs, stream_candidates  # noqa: E402
 from scripts import generate_buy_candidates as gbc  # noqa: E402
-from scripts.assemble_order_pages import _order_rows  # noqa: E402
+from scripts.assemble_order_pages import AssemblyRefused, _order_rows, _validate_rows  # noqa: E402
 from scripts.broker_reconciliation import _has_continuation, _unwrap  # noqa: E402
 from scripts.reason_codes import UNSUPPORTED_NUMBER  # noqa: E402
 from scripts.same_day_top_up_gate import _bind_saved_pages  # noqa: E402
@@ -250,27 +252,121 @@ def _to_broker_order(row: Any) -> BrokerOrder:
     )
 
 
-def _load_history(path: Path, trading_day: date) -> list[BrokerOrder]:
+def _load_history(path: Path, trading_day: date, week_last4: str | None = None) -> list[BrokerOrder]:
     """Saved order pages as broker history, only once they are proven pinned and complete."""
     try:
-        return [_to_broker_order(row) for row in _load_rows(path, trading_day)]
+        return [_to_broker_order(row) for row in _load_rows(path, trading_day, week_last4)]
     except (ValueError, TypeError) as exc:
         raise _Refused(PlanError("history_unusable", type(exc).__name__)) from exc
 
 
-def _load_rows(path: Path, trading_day: date) -> list[Any]:
+# ---------------------------------------------------------------------------
+# The Mac-side week envelope (Perplexity backup "hybrid", 2026-11-14)
+# ---------------------------------------------------------------------------
+# 2026-11-13: the 9:35 Claude slot did not fire and the 10:30 slot's full-week fetch was too large to save
+# (output_cap_exceeded, 0 orders). The backups fetch SEVEN days through the Perplexity sandbox, the same oversized
+# shape. When the Mac is reachable, the backup now looks up the newest complete week envelope on the Mac
+# (scripts.backup_week_history -> scripts.find_order_baseline --kind week), fetches only the increment since it,
+# merges with scripts.merge_order_pages, and runs every history-reading command here, ON THE MAC, against that
+# merged file. These are the only rules under which the planner reads an envelope NOT dated today. The today-binding
+# of every other envelope (_bind_saved_pages) is untouched, so a hand-built or Monday-dated file passed without
+# --week-envelope is still refused with orders_pages_trading_day_mismatch.
+#
+# What a week envelope proves: every order from this ISO week's Monday 00:00 ET to its snapshot. What it does NOT
+# prove is the trailing seven days the kill switch sums (operator decision 2026-11-14, option 1): last week's newest
+# envelope ends before that week's final 3:30 orders and before any weekend order, and get_equity_orders has no
+# created_at_lte to fetch only that seam, so the days before Monday are never sourced from it. Instead the planner
+# treats the kill switch as ENGAGED whenever it reads a week envelope: compute sizes at 1x at most, and finalize
+# refuses an over-1x plan with kill_switch_unproven (the prompt then falls back to the full seven-day fetch). That can
+# only shrink a buy; caps, Gate 4 and the freshness bound are unchanged and need only Monday onward.
+WEEK_ENVELOPE_WRITER = "scripts.merge_order_pages"
+# The writers whose output proves a complete page chain (scripts.find_order_baseline.TRUSTED_WRITERS, restated so the
+# pyz closure does not grow by a Mac-only module). A merge onto a base from any other writer is refused.
+_TRUSTED_BASE_WRITERS = ("scripts.assemble_order_pages", "scripts.merge_order_pages")
+ACCOUNT_ENV = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
+_LAST4_RE = re.compile(r"^\d{4}$")
+
+
+def _canonical(obj: Any) -> bytes:
+    # Byte-identical to assemble_order_pages / merge_order_pages, so the recomputed hash is the one they recorded.
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _bind_week_envelope(payload: Any, trading_day: date, last4: str) -> list[Any]:
+    """The pages of a merged ISO-week envelope, once every binding below holds; else a structured refusal.
+
+    * account: the envelope's ``account_number`` is EXACTLY the Mac's configured account (``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``,
+      which dca_paths loads from the checkout's .env) and ends in ``--account-last4``, the last four of the account the
+      backup itself resolved. Unlike the today-binding (pinned to the file's own account), this pins to an account the
+      file did not supply, and no account number ever appears on a command line.
+    * day: ``trading_day`` is this ISO week's Monday and ``snapshot_at`` is offset-aware and falls on ``trading_day`` in ET
+      (the merge ran in this run; an older merged file is a base, never history).
+    * writer: ``ingest.tool`` is scripts.merge_order_pages, its recorded ``base_ingest_tool`` is a trusted writer, and the
+      pages still hash to ``ingest.payload_sha256`` (a file edited after the merge is refused).
+    * rows: every row passes assemble_order_pages' row checks (no placeholder id, no condensed row).
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
+        raise _Refused(PlanError("orders_pages_missing_query_metadata"))
+    account = os.environ.get(ACCOUNT_ENV, "").strip()
+    if not account:
+        raise _Refused(PlanError("week_envelope_account_unset", f"{ACCOUNT_ENV} is not set on this machine"))
+    if str(payload.get("account_number") or "").strip() != account:
+        raise _Refused(PlanError("orders_pages_account_mismatch"))
+    if not account.endswith(last4):
+        raise _Refused(PlanError("week_envelope_last4_mismatch", "the configured account is not the resolved one"))
+    monday = trading_day - timedelta(days=trading_day.weekday())
+    if payload.get("trading_day") != monday.isoformat():
+        raise _Refused(PlanError("week_envelope_not_this_week", f"expected trading_day {monday.isoformat()}"))
+    ingest = payload.get("ingest")
+    if not isinstance(ingest, dict) or ingest.get("tool") != WEEK_ENVELOPE_WRITER:
+        raise _Refused(PlanError("week_envelope_not_merged", "ingest.tool is not scripts.merge_order_pages"))
+    if ingest.get("base_ingest_tool") not in _TRUSTED_BASE_WRITERS:
+        raise _Refused(PlanError("week_envelope_untrusted_base", "the merge's base was not script-built"))
+    if hashlib.sha256(_canonical(payload["pages"])).hexdigest() != ingest.get("payload_sha256"):
+        raise _Refused(PlanError("week_envelope_payload_mismatch", "pages were changed after the merge wrote them"))
+    try:
+        _validate_rows(payload["pages"])
+    except AssemblyRefused as exc:
+        raise _Refused(PlanError("week_envelope_bad_rows", exc.reason)) from exc
+    snapshot = payload.get("snapshot_at")
+    try:
+        moment = datetime.fromisoformat(str(snapshot).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _Refused(PlanError("week_envelope_bad_snapshot", "snapshot_at is not ISO-8601")) from exc
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise _Refused(PlanError("week_envelope_bad_snapshot", "snapshot_at has no UTC offset"))
+    if moment.astimezone(ET).date() != trading_day:
+        raise _Refused(PlanError("week_envelope_snapshot_not_today", str(snapshot)))
+    return payload["pages"]
+
+
+def _engaged_floor(config: Any) -> float | None:
+    """The smallest trailing-7-day figure that engages the kill switch, or None when the guard is disabled."""
+    allocation = config.monthly_cash_allocation_usd
+    fraction = config.kill_switch_7d_deploy_fraction
+    if allocation <= 0 or not 0 <= fraction <= 1:
+        return None
+    return math.nextafter(fraction * allocation, math.inf)
+
+
+def _load_rows(path: Path, trading_day: date, week_last4: str | None = None) -> list[Any]:
     """The raw order rows of saved pages, de-duplicated by order id, once proven pinned and complete.
 
     Split out of :func:`_load_history` for ``classify``, which needs the raw ``id``, ``placed_agent`` and
     ``ref_id`` a ``BrokerOrder`` does not keep. Same proof, same de-duplication, so both read the same orders.
+    ``week_last4`` (``--week-envelope --account-last4``) switches to the Mac-side week-envelope binding,
+    :func:`_bind_week_envelope`; without it the envelope must be dated today, exactly as before.
     """
     payload = _read_json(path, missing="orders_pages_missing", corrupt="orders_pages_corrupt")
-    saved_account = str(payload.get("account_number") or "") if isinstance(payload, dict) else ""
-    # The envelope is pinned to ITS OWN account and the requested day: it proves the pages
-    # carry both, not that the account is the right one (the prompt's own poll wrote the file).
-    pages, problem = _bind_saved_pages(payload, account_number=saved_account, trading_day=trading_day.isoformat())
-    if problem is not None:
-        raise _Refused(PlanError(problem))
+    if week_last4 is not None:
+        pages = _bind_week_envelope(payload, trading_day, week_last4)
+    else:
+        saved_account = str(payload.get("account_number") or "") if isinstance(payload, dict) else ""
+        # The envelope is pinned to ITS OWN account and the requested day: it proves the pages
+        # carry both, not that the account is the right one (the prompt's own poll wrote the file).
+        pages, problem = _bind_saved_pages(payload, account_number=saved_account, trading_day=trading_day.isoformat())
+        if problem is not None:
+            raise _Refused(PlanError(problem))
     chain = [_unwrap(page) for page in pages]
     if not chain or not all(isinstance(page, dict) and page for page in chain):
         raise _Refused(PlanError("orders_pages_incomplete", "no pages, or an empty page object"))
@@ -759,7 +855,7 @@ def _cmd_classify(args: argparse.Namespace, trading_day: date) -> int:
     when any other order is there, so the prompt stands down. The output names symbols, times and the recognition
     basis only, never an account number or an order id.
     """
-    rows = _load_rows(args.orders_pages, trading_day)
+    rows = _load_rows(args.orders_pages, trading_day, _week_last4(args))
     executor_ids = _load_executor_ids(args.executor_ids, trading_day, args.slot) if args.executor_ids else set()
     published: dict[str, float] = {}
     if args.published is not None and args.executor_ids is None:
@@ -813,7 +909,7 @@ def _cmd_check_placement(args: argparse.Namespace, trading_day: date) -> int:
     state record; anything else is NOT_PLACED (exit 2), a failure the prompt never retries.
     """
     prior: set[str] = set()
-    for row in _load_rows(args.prior_orders_pages, trading_day):
+    for row in _load_rows(args.prior_orders_pages, trading_day, _week_last4(args)):
         order_id = row.get("id") if isinstance(row, dict) else None
         if isinstance(order_id, str) and order_id.strip():
             prior.add(order_id.strip())
@@ -848,7 +944,7 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     if now is None:
         raise _Refused(PlanError("bad_now", "expected a timezone-aware ISO timestamp"))
     buying_power = _parse_buying_power(args.buying_power)
-    history = _load_history(args.orders_pages, trading_day)
+    history = _load_history(args.orders_pages, trading_day, _week_last4(args))
     result = dop.compute_plan_from_file(
         args.quotes, config=config, trading_day=trading_day, slot=args.slot, generated_at_et=now,
         ladder_version=ladder_version, orders_today=history, tier=_NORMAL_TIER, buying_power_usd=buying_power,
@@ -872,10 +968,19 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     if now is None or now.astimezone(ET).date() != trading_day:
         raise _Refused(PlanError("bad_now", "expected a timezone-aware ISO timestamp on the trading day"))
     buying_power = _parse_buying_power(args.buying_power)
-    history = _load_history(args.orders_pages, trading_day)
+    week_last4 = _week_last4(args)
+    history = _load_history(args.orders_pages, trading_day, week_last4)
     deployed = _parse_deployed(args.deployed_last_7d_usd, history, now)
     payload = _load_market_data(args.market_data)
     directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
+    extra: dict[str, Any] = {}
+    if week_last4 is not None:
+        # A week envelope cannot prove the days before Monday, so the kill switch is treated as engaged (module note
+        # above): the figure is raised to the threshold, never lowered, and the generators then size at 1x at most.
+        floor = _engaged_floor(dca_config.load_strategy_config(directory))
+        if floor is not None and deployed < floor:
+            deployed = floor
+        extra = {"kill_switch_basis": "week_envelope_treated_as_engaged"}
     try:
         config = dca_config.load_strategy_config(directory, deployed_last_7d_usd=deployed)
         # Computed plans cannot resize a top-up, so any buy already made today keeps the ticker out (the same
@@ -897,8 +1002,9 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
         weekly_cap_usd=weekly_cap, buying_power_usd=buying_power, trim_to_fit=True,
     )
     if result.errors or result.plan is None:
-        return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
+        return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors), **extra}, 2)
+    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": [],
+                  **extra}, 0)
 
 
 def _decisions_final_buy(payload: dict[str, Any], config: Any, directory: Path, trading_day: date,
@@ -1099,7 +1205,8 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     plan = _load_plan_any(args.plan, config=config, ladder_version=ladder_version, trading_day=trading_day,
                           slot=args.slot)
     errors: list[PlanError] = list(plan.errors)
-    history = _collect(errors, lambda: _load_history(args.orders_pages, trading_day))
+    week_last4 = _week_last4(args)
+    history = _collect(errors, lambda: _load_history(args.orders_pages, trading_day, week_last4))
     fresh = _collect(errors, lambda: _load_fresh_quotes(args.fresh_quotes))
     spreads = _collect(errors, lambda: _load_fresh_spreads(args.fresh_spreads))
     buying_power = _collect(errors, lambda: _parse_buying_power(args.buying_power))
@@ -1116,11 +1223,12 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     if errors:
         return _abort(*errors)
     if plan.plan["generator"] not in _PRIMARY_SIZED_GENERATORS:
-        guard = _kill_switch_error(plan.orders, history, config, trading_day, args.now)
+        guard = _kill_switch_error(plan.orders, history, config, trading_day, args.now, trailing_proven=week_last4 is None)
         if guard is not None:
             return _abort(guard)
     elif plan_first:
-        guard = _plan_first_kill_switch_error(plan.plan, history, config, trading_day, args.now)
+        guard = _plan_first_kill_switch_error(plan.plan, history, config, trading_day, args.now,
+                                              trailing_proven=week_last4 is None)
         if guard is not None:
             return _abort(guard)
     # A Claude or plan-first plan already carries any top-up resize, so only THIS slot's window counts as
@@ -1158,7 +1266,7 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
 
 
 def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, trading_day: date,
-                       now_text: str | None) -> PlanError | None:
+                       now_text: str | None, *, trailing_proven: bool = True) -> PlanError | None:
     """Poll 2's second look at the trailing-7-day guard for a computed plan, else ``None`` when it still holds.
 
     A computed plan was sized from poll 1's figure; spend that lands between the polls can trip the kill switch
@@ -1167,6 +1275,9 @@ def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, tra
     the window's upper bound, and an earlier day would classify today's orders as future and leave the guard off.
     A Claude plan is sized by the primary and is not rechecked here: its own earlier fills would count toward the
     figure and wrongly abort a partly finished batch.
+
+    ``trailing_proven`` is False for a week envelope (days before Monday unproven): the switch is then treated as
+    engaged, so an over-1x plan is refused with ``kill_switch_unproven`` unless the proven part alone engages it.
     """
     now = _parse_now(now_text)
     if now is None:
@@ -1177,13 +1288,16 @@ def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, tra
         deployed = dop.trailing_deployed_usd(history, now=now)
     except BudgetDataError as exc:
         return PlanError("history_unusable", type(exc).__name__)
-    if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)) and any(o["multiplier"] > 1.0 for o in orders):
+    over_1x = any(o["multiplier"] > 1.0 for o in orders)
+    if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)) and over_1x:
         return PlanError("kill_switch_engaged_since_plan", "trailing seven-day spend now exceeds the kill-switch threshold")
+    if not trailing_proven and over_1x and _engaged_floor(config) is not None:
+        return PlanError("kill_switch_unproven", "a week envelope cannot prove the days before Monday; over-1x refused")
     return None
 
 
 def _plan_first_kill_switch_error(plan: dict[str, Any], history: list[BrokerOrder], config: Any, trading_day: date,
-                                  now_text: str | None) -> PlanError | None:
+                                  now_text: str | None, *, trailing_proven: bool = True) -> PlanError | None:
     """Poll 2's recheck of the trailing-7-day guard for a plan-first set, else ``None`` when it still holds.
 
     The set was sized under the kill-switch state its ``sizing_guard`` records. Other slots' spend can land inside
@@ -1212,6 +1326,9 @@ def _plan_first_kill_switch_error(plan: dict[str, Any], history: list[BrokerOrde
         return PlanError("history_unusable", type(exc).__name__)
     if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)):
         return PlanError("kill_switch_engaged_since_plan", "trailing seven-day spend now exceeds the kill-switch threshold")
+    if not trailing_proven and _engaged_floor(config) is not None:
+        # Treated as engaged (week envelope): an over-1x set is refused; the prompt falls back to the full fetch.
+        return PlanError("kill_switch_unproven", "a week envelope cannot prove the days before Monday; over-1x refused")
     return None
 
 
@@ -1243,6 +1360,18 @@ def _grounding_args(parser: argparse.ArgumentParser) -> None:
                         help="Block on unsupported numbers instead of only reporting them (default OFF: report-only).")
 
 
+def _week_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--week-envelope", action="store_true",
+                   help="MAC ONLY: the orders file is this run's merged ISO-week envelope (scripts.backup_week_history), "
+                        "not a today-dated poll. Requires --account-last4. The kill switch is then treated as engaged.")
+    p.add_argument("--account-last4", default=None,
+                   help="With --week-envelope: the last four digits of the account this run resolved.")
+
+
+def _week_last4(args: argparse.Namespace) -> str | None:
+    return args.account_last4 if getattr(args, "week_envelope", False) else None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1268,6 +1397,7 @@ def _build_parser() -> argparse.ArgumentParser:
     classify.add_argument("--orders-pages", required=True, type=Path)
     classify.add_argument("--executor-ids", type=Path, default=None, help="The Mac's executor-ids output, saved untouched.")
     classify.add_argument("--published", type=Path, default=None, help="The published recommendations payload, if saved.")
+    _week_args(classify)
     executor_ids = sub.add_parser("executor-ids", help="Mac only: order ids Claude's slot saved for this slot.")
     common(executor_ids)
     executor_ids.add_argument("--rec-root", default=None, help="Recommendation store root (default: the cron root's).")
@@ -1284,6 +1414,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument("--prior-orders-pages", required=True, type=Path, help="Poll 2's saved orders envelope.")
     check.add_argument("--placed-responses", type=Path, nargs="*", default=(),
                        help="This run's earlier saved placement responses (their order ids are prior history too).")
+    _week_args(check)
     compute = sub.add_parser("compute", help="Derive a plan: from quotes (ladder only) or through the safety gate.")
     common(compute)
     source = compute.add_mutually_exclusive_group(required=True)
@@ -1296,6 +1427,7 @@ def _build_parser() -> argparse.ArgumentParser:
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
+    _week_args(compute)
     procedure = sub.add_parser("procedure", help="Print one stamped part (0-3) of a backup task's instructions.")
     procedure.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
     procedure.add_argument("--part", required=True, type=int,
@@ -1323,6 +1455,7 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Step 3's local_status. A computed plan places only for off, errored or unreachable.")
     finalize.add_argument("--now", default=None,
                           help="ET-day ISO timestamp for poll 2's kill-switch recheck of a computed plan (default: the clock).")
+    _week_args(finalize)
     _grounding_args(finalize)
     return parser
 
@@ -1356,6 +1489,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--deployed-last-7d-usd is required with --market-data")
         if args.quotes is not None and args.deployed_last_7d_usd is not None:
             parser.error("--deployed-last-7d-usd only applies with --market-data")
+    if getattr(args, "week_envelope", False) and not _LAST4_RE.match(args.account_last4 or ""):
+        parser.error("--week-envelope requires --account-last4 with exactly four digits")
+    if not getattr(args, "week_envelope", False) and getattr(args, "account_last4", None) is not None:
+        parser.error("--account-last4 only applies with --week-envelope")
     failed = _abort if args.command == "finalize" else (lambda *e: _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(e)}, 2))
     if not _DAY_RE.match(args.trading_day):
         return failed(PlanError("bad_trading_day", "expected YYYY-MM-DD"))
