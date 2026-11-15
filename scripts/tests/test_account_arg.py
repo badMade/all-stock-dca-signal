@@ -181,3 +181,11 @@ def test_every_gate_cli_refuses_a_malformed_environment_account(monkeypatch, cap
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "6 to 12 digits" in err and "not-an-account" not in err
+
+
+def test_the_helper_shape_matches_the_canonical_config_shape():
+    """account_arg restates dca_config.ACCOUNT_NUMBER_SHAPE to stay standard-library only; keep them in step."""
+    import dca_config
+
+    for value in ["1" * n for n in range(4, 15)] + ["12a456", "read_only"]:
+        assert bool(account_arg._ACCOUNT_SHAPE.fullmatch(value)) == bool(dca_config.ACCOUNT_NUMBER_SHAPE.fullmatch(value))
