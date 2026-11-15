@@ -303,10 +303,71 @@ def merge_shard_tomorrow_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path
     raise ShardExportError("no next-day forecasts were exported; no merged forecast was written")
 
 
+_HORIZON_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_horizon_forecasts_(.+)\.csv$")
+
+
+def merge_shard_horizon_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path]) -> list[Path]:
+    """Merge each shard's dated multi-horizon forecast CSVs into ``<run_dir_base>/daily/`` (same file names/schema).
+
+    Each shard's daily update writes ``<shard>/daily/<origin>_horizon_forecasts_<model>.csv`` (one row per ticker
+    and horizon). The merge uses the newest origin date any shard has and requires EVERY shard to have it for the
+    same models -- all-or-nothing, like the next-day merge, because a missing shard would silently drop its
+    tickers from the published 90-day forecasts. Returns [] when no shard emits horizon files (a legacy
+    next-day-only run); raises :class:`ShardExportError` on any shard mismatch or schema disagreement.
+    """
+    per_shard: dict[str, dict[str, dict[str, Path]]] = {}  # shard -> origin -> model -> path
+    for shard_dir in shard_dirs:
+        found: dict[str, dict[str, Path]] = {}
+        for path in sorted((shard_dir / "daily").glob("*_horizon_forecasts_*.csv")):
+            match = _HORIZON_FILE_RE.match(path.name)
+            if match:
+                found.setdefault(match.group(1), {})[match.group(2)] = path
+        per_shard[shard_dir.name] = found
+    if not any(per_shard.values()):
+        return []
+    origin = max(o for found in per_shard.values() for o in found)
+    models = {m for found in per_shard.values() for m in found.get(origin, {})}
+    missing = [
+        f"{name} ({model})"
+        for name, found in per_shard.items()
+        for model in sorted(models)
+        if model not in found.get(origin, {})
+    ]
+    out_dir = run_dir_base / "daily"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob(f"{origin}_horizon_forecasts_*.csv"):
+        stale.unlink()  # never leave a partial or earlier merge for this origin looking current
+    if missing:
+        raise ShardExportError(f"horizon forecasts for {origin} missing for {', '.join(missing)}; nothing merged")
+    written: list[Path] = []
+    for model in sorted(models):
+        header: list[str] | None = None
+        rows: list[dict[str, str]] = []
+        for name, found in per_shard.items():
+            with found[origin][model].open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if header is None:
+                    header = list(reader.fieldnames or [])
+                elif list(reader.fieldnames or []) != header:
+                    raise ShardExportError(f"horizon forecast columns differ in {name} ({model}); nothing merged")
+                rows.extend(reader)
+        if not header or not rows:
+            raise ShardExportError(f"no {model} horizon forecast rows for {origin}; nothing merged")
+        target = out_dir / f"{origin}_horizon_forecasts_{model}.csv"
+        with target.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
+        written.append(target)
+        print(f"Merged {len(rows)} {model} horizon rows for {origin} across {len(per_shard)} shards -> {target}")
+    return written
+
+
 def merge_or_exit_code(run_dir_base: Path, shard_dirs: Sequence[Path]) -> int:
     """Run the daily merge for a caller that must return an exit code: 0 on success, 4 when an export failed."""
     try:
         merge_shard_tomorrow_forecasts(run_dir_base, shard_dirs)
+        merge_shard_horizon_forecasts(run_dir_base, shard_dirs)
     except ShardExportError as error:
         print(f"\n{error}")
         return 4
