@@ -46,6 +46,9 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
 | `ledger.py` | Append-only gzip-member JSONL shards with the truncate-or-refuse resume contract |
 | `harness.py` | The engine: reveal → score → diagnose → update → predict, checkpoint/resume, deterministic seeding |
 | `metrics.py` | Scoring payloads, regime × model × component reports, encoder-health verdicts |
+| `band_uncertainty.py` | Date-block bootstrap intervals for coverage and skill, Kupiec and Christoffersen coverage tests, per-date band series (torch-free) |
+| `trust_scorecard.py` | Append-only rolling scorecard of band coverage per model and horizon, with `ok` / `flagged` / `unknown` status (CLI, torch-free) |
+| `synthetic_truth.py` | Simulated archives with a known answer (random walk, volatility clustering with leverage, planted drift) replayed through the real harness; fails if the harness reports skill that cannot exist or misses skill that does (CLI) |
 | `stacking.py` | The regime-weighted ensemble over the models' already-ledgered scores (library-only; see `docs/wondrous_octopus.md`) |
 | `run_walkforward.py` | CLI: the historical replay (`--demo`, `--preset`, `--resume`, `--retrain`, `--report-only`) |
 | `daily_update.py` | CLI: the live one-day cycle; writes the next-day forecast CSV (with expected calendar target date and basis; the resolved `target_date` stays unset) + daily summary |

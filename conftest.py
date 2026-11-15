@@ -24,6 +24,7 @@ unpinned-account cases) sets it explicitly on the config object it builds.
 """
 
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -207,6 +208,29 @@ def _isolate_cron_tracking_root(monkeypatch, tmp_path):
     documented in ``dca_paths`` and is itself under test.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+
+def _clear_in_flight_candidate_outcomes() -> None:
+    """Drop ``near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]`` if that module is loaded.
+
+    The dict is process-global; dozens of tests and several near_close_dca paths fill it and nothing
+    used to reset it, so it stayed populated for every later test in the same process. Serially the
+    two tests asserting it starts empty happened to run while it was clean; under ``pytest -n auto``
+    (PR 2315) the order changes and they failed in 1 of 2 full runs. Pops the key rather than
+    rebinding the attribute, the same move near_close_dca makes when a run finishes, so references
+    already held to the dict stay live. Looks the module up in ``sys.modules`` instead of importing
+    it so tests that never touch it do not pay for a ~40k-line import.
+    """
+    module = sys.modules.get("near_close_dca")
+    if module is not None:
+        module._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_in_flight_candidate_outcomes():
+    """Per-test isolation for module state, as the env fixtures above do for paths
+    (tests/test_conftest_isolation.py)."""
+    _clear_in_flight_candidate_outcomes()
 
 
 if TYPE_CHECKING:

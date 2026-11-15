@@ -143,7 +143,8 @@ def test_parallel_daily_run_fails_when_any_shard_export_fails(tmp_path, monkeypa
     (base / MERGED).write_text("ticker,shard\nYESTERDAY,shard_1\n", encoding="utf-8")
     _fake_subprocess(monkeypatch, failing_exports={"shard_2"})
     # --parallel launches the daily updates with Popen; both complete successfully here
-    monkeypatch.setattr(run_sharded.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(wait=lambda: 0))
+    done = SimpleNamespace(wait=lambda: 0, poll=lambda: 0)
+    monkeypatch.setattr(run_sharded.subprocess, "Popen", lambda *a, **kw: done)
 
     code = run_sharded.main(["--daily", "--parallel", "--run-dir-base", str(base)])
 
@@ -157,7 +158,8 @@ def test_parallel_and_single_shard_healthy_runs_still_merge_every_shard(tmp_path
     for n in (1, 2):
         _make_shard(base, n)
     _fake_subprocess(monkeypatch)
-    monkeypatch.setattr(run_sharded.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(wait=lambda: 0))
+    done = SimpleNamespace(wait=lambda: 0, poll=lambda: 0)
+    monkeypatch.setattr(run_sharded.subprocess, "Popen", lambda *a, **kw: done)
 
     code = run_sharded.main(["--daily", *mode_args, "--run-dir-base", str(base)])
 

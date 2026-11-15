@@ -73,37 +73,58 @@ existing MAE skill.
 
 **Non-goals.** No Model Confidence Set (deferred).
 
-**Proof.** Tests on a seeded synthetic ledger with a known breach rate recover it inside the
-interval at the stated rate, and a ledger with clustered breaches gets a wider interval than
-an independent one. Existing suite passes.
+**Proof.** `cd wondrous-octopus && python -m pytest tests/test_band_uncertainty.py -q`, then
+the full suite. A seeded series with a known 80% rate is recovered inside the interval, and
+the same daily values arranged in runs get a wider interval than when interleaved.
+
+**Status.** Implemented as `band_uncertainty.py` on the PR stacked on #2300. Functions only;
+wiring into reports is Rock 3.
 
 ### Rock 3: Trust scorecard over time
 
-**Scope.** The standing answer to "how well is this working". An append-only history, one
-row per scoring date and model, holding rolling-window coverage, below/above rates, interval
-score, skill vs persistence and the Rock 2 interval and test results, at a small fixed set
-of horizons. A fail-closed band flag: when the coverage tests reject, the bands are marked
-`flagged` in the output and the reason is recorded. Every later Rock reports into the same
-history, so designs are compared on one table.
+**Scope.** The standing answer to "how well is this working". `trust_scorecard.py` appends
+one row per as-of date, model and horizon to `<run>/trust/trust_scorecard.jsonl`:
+rolling-window coverage with a date-block interval, below/above rates, interval score, skill
+vs persistence, and per-ticker coverage-test rejection shares at horizon 1. Each row has a
+status: `ok`, `flagged` (the coverage interval excludes 80%, in either direction) or
+`unknown` (too little history). Every later Rock reports into the same history, so designs
+are compared on one table.
 
-**Non-goals.** No alerting channel. No console page (candidate follow-up). The flag is a
-label on research output and does not reach live sizing.
+**Non-goals.** No alerting channel. No console page (follow-up). No change to
+`daily_update.py`: the scorecard is a separate command, so the hardened daily cycle is
+untouched. The flag is a label on research output and does not reach live sizing.
 
-**Proof.** Tests: appending the same date twice is a no-op; a seeded ledger with a planted
-coverage collapse sets the flag on the right date and a healthy one never does. Existing
-suite passes.
+**Window.** The signed-off 63 trading dates for horizons 1 and 5. Horizons 21, 63 and 90 use
+84, 252 and 360 dates, because 63 dates hold at most one block at those horizons and no
+interval can be estimated from one block.
+
+**Proof.** `cd wondrous-octopus && python -m pytest tests/test_trust_scorecard.py -q`, the
+full suite, and `python trust_scorecard.py --run-dir <demo run>` twice: the second run
+appends nothing.
+
+**Status.** Implemented on the PR stacked on #2303.
 
 ### Rock 4: Synthetic-truth recovery
 
-**Scope.** Simulated archives with a known answer, run through the unmodified harness and
-scorecard: a random walk (no skill is possible), a volatility-clustering process with a
-leverage effect, and a planted weak drift of known size.
+**Scope.** `synthetic_truth.py` writes simulated archives with a known answer and replays
+them through the unmodified harness: a random walk (no skill is possible), a
+volatility-clustering process with a leverage effect (size is predictable, direction is
+not), and a planted drift with lag-1 correlation 0.5 (skill must be found).
 
 **Non-goals.** No claim that the simulators resemble real markets. They test the harness.
+Only the GBM quantile model is replayed; replaying Octopus itself is a longer run and is
+listed in `DEFERRED.md`.
 
-**Proof.** On the random walk the skill interval covers zero and the hit rate interval
-covers 50%. The planted drift is detected. Any lookahead leak shows up as skill on the
-random walk, which fails the test.
+**Proof.** `python wondrous-octopus/synthetic_truth.py --scenario all --work-dir <dir>`
+exits 0. On the random walk and the volatility process the skill interval does not lie
+above zero and the hit-rate interval does not lie above 50%. On the planted drift both do.
+A unit test plants a lookahead leak in score records and confirms the check fails.
+
+**Status.** Implemented on the PR stacked on #2304. All three scenarios pass; the measured
+table is in `docs/wondrous_octopus.md`.
+
+**Finding for Rock 5.** Calibrated coverage was about 77% in all three runs, with intervals
+that exclude 80%. On 390 scored dates the adaptive calibrator had not closed the gap.
 
 ### Rock 5: Calibrator replay and candidates
 

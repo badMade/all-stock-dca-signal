@@ -348,6 +348,89 @@ raw) with band width, plus point-inside-realized-range hit-rates, skill vs persi
 the fraction of close-error variance that is market-wide vs idiosyncratic). Multi-model
 comparisons are restricted to (ticker, origin day) pairs present for all compared models.
 
+**Band scorecard.** Each score record also carries the interval score of the calibrated and
+raw bands (width plus ten times the distance of a miss, Gneiting and Raftery 2007) and which
+side a miss fell on. `report.json` reports `interval_score`, `interval_score_raw`,
+`below_rate` and `above_rate` per regime and per horizon. Ledgers written before these
+fields existed still report: the calibrated interval score is recovered from the stored
+pinball losses, and the fields that cannot be recovered are `null`.
+
+**Uncertainty (`band_uncertainty.py`).** Coverage over millions of ticker-days is not
+millions of independent observations: horizon-h targets from consecutive days overlap, and
+every ticker on a date shares that date's market move. `ratio_interval` and `skill_interval`
+resample whole dates in contiguous blocks (block length at least the horizon) and return a
+percentile interval, or `None` bounds with a reason when there are fewer than two blocks.
+`kupiec_pof` and the two Christoffersen tests check one time-ordered breach sequence; the
+independence test is meaningful at horizon 1 only. `daily_band_series` builds the per-date
+arrays from score records. See [the band scorecard decision](adr-octopus-band-scorecard.md).
+
+### The trust scorecard (`trust_scorecard.py`)
+
+The standing answer to "how well are the bands doing, and is that changing?"
+
+```bash
+python wondrous-octopus/trust_scorecard.py --run-dir <run>              # append today's rows
+python wondrous-octopus/trust_scorecard.py --run-dir <run> --dry-run    # print, write nothing
+python wondrous-octopus/trust_scorecard.py --run-dir <run> --as-of 2026-11-13
+```
+
+It appends one row per (as-of date, model, horizon) to `<run>/trust/trust_scorecard.jsonl`.
+Rows are never rewritten, and a second run for the same date adds nothing, so it is safe to
+schedule after the daily update. It reads the ledger through the same checkpoint-bounded
+reader as `inspect_run.py`, takes no run lock, and reads only the last three origin years.
+
+| Field | Meaning |
+|---|---|
+| `coverage` | Share of forecasts inside the p10-p90 band over the rolling window, with a 95% date-block interval |
+| `below_rate`, `above_rate` | Which side the misses fell on (`null` for ledgers that predate the field) |
+| `interval_score` | Mean interval score, lower is better |
+| `skill_vs_persistence` | `1 - model / persistence` on interval score, over dates both were scored on |
+| `coverage_tests` | Horizon 1 only: share of tickers whose own breach sequence fails the Kupiec and Christoffersen tests at 5%. About 5% is expected by chance. Context, not part of the status. |
+| `status` | `ok` if the coverage interval contains 80%, `flagged` if it excludes it (too narrow or too wide), `unknown` if there is too little history |
+
+Defaults: horizons 1, 5, 21, 63 and 90, and a 63-trading-day window. Horizons 21, 63 and 90
+use 84, 252 and 360 dates, because an interval needs several blocks at least as long as the
+horizon. Until that much history exists the status is `unknown`, never `ok`.
+
+`flagged` is a label on research output. It reaches no order and no sizing; the tool exits 0
+when a band is flagged and 1 only when it refuses to read or write.
+
+### Synthetic-truth recovery (`synthetic_truth.py`)
+
+A check on the measuring instrument, not on the model. It writes small price archives whose
+answer is fixed by construction, replays them through the unmodified harness
+(`run_walkforward.main`), and checks the result.
+
+```bash
+python wondrous-octopus/synthetic_truth.py --scenario all --work-dir /tmp/octopus-truth
+```
+
+| Scenario | Must show | Why |
+|---|---|---|
+| `random_walk` | no skill | Nothing is predictable, so reported skill would be a lookahead leak or a scoring bug |
+| `garch_leverage` | no skill | The size of tomorrow's move is predictable, its direction is not |
+| `planted_drift` | skill | Returns follow yesterday's with lag-1 correlation 0.5; a harness that misses this has no power |
+
+Skill is `1 - sum|predicted - actual| / sum|actual|` on close log-returns, which is skill
+against a no-change forecast. The no-skill check is one-sided: a fitted model on noise comes
+out slightly worse than doing nothing, and that is honest. The command exits 0 only when
+every scenario matches, and writes `synthetic_truth.json` in the work directory. A harness
+run that refuses counts as a failed check.
+
+Measured on 2026-11-14 at the default size (8 tickers, 500 rows, GBM quantile model, seed 0):
+
+| Scenario | Forecasts | Skill (95% interval) | Hit rate | Verdict |
+|---|---|---|---|---|
+| `random_walk` | 3,120 | -2.9% (-4.0% to -1.9%) | 50.0% | pass |
+| `garch_leverage` | 3,120 | -2.7% (-3.8% to -1.6%) | 50.4% | pass |
+| `planted_drift` | 3,120 | +9.3% (+7.5% to +11.3%) | 62.9% | pass |
+
+The planted drift's ceiling for a sign-following forecaster is 66.7%. The run takes about
+six minutes on CPU. One thing it surfaced, outside its pass criteria: calibrated coverage
+was 76.6% to 77.1% in all three runs, with intervals that exclude 80%. On a run this short
+(390 scored dates) the adaptive calibrator has not finished closing the gap. That is input
+to the calibrator work in `claude/band-calibration/PLAN.md`, not a harness fault.
+
 ## Production-safety safeguards
 
 The five production-safe-loop primitives (spec → circuit breaker → ledger → bounded loop →

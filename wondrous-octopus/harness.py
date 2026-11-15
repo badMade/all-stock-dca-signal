@@ -1590,9 +1590,32 @@ class WalkForwardHarness:
             )
             prefix = f"[{bar}] {cur}/{total_run} ({pct:3.0f}%) | "
 
+        # Wall-clock timing so an ETA can be measured from the log alone (the old line had no
+        # timestamp, so steps/hour could not be derived without sampling the file twice). The rate
+        # is the average since this invocation's first step, which already folds in the slow refit
+        # steps; the ETA is therefore a steady-state estimate, not a per-step guess.
+        timing = ""
+        try:
+            now_mono = time.monotonic()
+            cur_steps = getattr(self, "_steps_taken_in_run", self.step_index)
+            if getattr(self, "_eta_t0", None) is None:
+                self._eta_t0, self._eta_s0 = now_mono, cur_steps - 1
+            done = cur_steps - self._eta_s0
+            elapsed = now_mono - self._eta_t0
+            timing = f" | at {time.strftime('%Y-%m-%dT%H:%M:%S')}"
+            if done >= 5 and elapsed > 0:
+                per_hour = done / elapsed * 3600.0
+                timing += f" | {per_hour:.0f} steps/h"
+                if total_run is not None and total_run > cur_steps:
+                    eta_s = (total_run - cur_steps) / (done / elapsed)
+                    eta_at = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + eta_s))
+                    timing += f" | ETA {eta_at} ({eta_s / 3600.0:.1f}h left)"
+        except Exception:  # noqa: BLE001 - timing is cosmetic; never let it fail a scored step
+            timing = ""
+
         self.log(
             f"{prefix}[{date_iso}] scored {len(matured)} | predicted {n_predicted} | "
-            f"coverage-to-date {coverage:.1%} | close-MAE {mae:.4f} | step {self.step_index}"
+            f"coverage-to-date {coverage:.1%} | close-MAE {mae:.4f} | step {self.step_index}{timing}"
         )
         return {"scored": len(matured), "predicted": n_predicted}
 
