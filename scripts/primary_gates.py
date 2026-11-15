@@ -1,4 +1,4 @@
-"""One-command gates for a primary (Claude) executor slot: Gates 0, 1, 3, the account pin and Gate 6's caps.
+"""One-command gates for a primary (Claude) executor slot: Gates 0, 1, 3, 4, the account pin and Gate 6's caps.
 
 Why this exists (2026-11-13, 11:30 slot): the primary started at 11:39:25 ET and spent about five minutes on
 gates before its first order at about 11:44:49, because the prompt had the model walk each gate as its own tool
@@ -7,10 +7,11 @@ gates that need only a clock, two config files and already-fetched order rows ar
 here as ONE command that prints ONE JSON verdict.
 
 This reuses ``dca_runner``'s own gate functions (``market_day_status``, ``gate_time_sanity``,
-``gate_trading_window``, ``budget_snapshot``); it carries no copy of a window or cap rule. Out of scope on
-purpose: Gate 4's rogue/compatible classification (judgement the prompt owns), per-order revalidation (kept as
-is, operator decision 2026-11-13) and anything that contacts the broker. It never writes and never prints the
-account number.
+``gate_trading_window``, ``budget_snapshot``) and window bounds (``SLOTS``); it carries no copy of a window or
+cap rule. ``gate4`` classifies the slot window's orders by ``placed_agent`` exactly as the live prompts' Gate 4
+text does (the owner's own activity is ignored, ``agentic`` is the compatible executor, anything else is rogue).
+Out of scope on purpose: per-order revalidation (kept as is, operator decision 2026-11-13) and anything that
+contacts the broker. It never writes and never prints the account number.
 
 Usage::
 
@@ -18,9 +19,13 @@ Usage::
     python3 -m scripts.primary_gates budget --orders-pages <week baseline json> --trading-day YYYY-MM-DD \\
         --buying-power <usd> [--tier normal|elevated|high_volatility|stress] [--weekly-rollover-reserve <usd>]
 
-``budget`` reads the account from ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (``--account`` is still accepted).
+    python3 -m scripts.primary_gates gate4 --slot 1130 --trading-day YYYY-MM-DD --orders-pages <saved day json>
 
-Exit codes: 0 for PROCEED, END_SILENTLY, OK and NO_HEADROOM; 1 for ABORT; 2 for a usage error.
+``budget`` reads the account from ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (``--account`` is still accepted); ``gate4``
+takes it from the environment only.
+
+Exit codes: 0 for PROCEED, END_SILENTLY, OK, NO_HEADROOM, CLEAR and COMPATIBLE_CONTINUE; 1 for ABORT; 2 for a
+usage error.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import math
 import os
 import re
 import sys
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -43,6 +48,9 @@ from scripts.account_arg import add_account_argument, resolve_account
 
 ET = ZoneInfo("America/New_York")
 _HHMM_SHAPE = re.compile(r"[0-9]{2}:[0-9]{2}")
+# The recognized compatible executor (Perplexity's standing backup task): docs/safeguards.md, and the default of
+# dca_runner.count_compatible_executor_attempts. EXACT match only; unknown provenance is rogue, never compatible.
+COMPATIBLE_EXECUTOR_AGENT = "agentic"
 
 
 def _verdict(status: str, gate: Optional[int], reason: str, now_et: datetime) -> dict:
@@ -159,17 +167,78 @@ def resolve_tier_caps(tier: str, weekly_rollover_reserve_usd: Any = None) -> tup
     return float(chosen.daily_cap_usd), float(dca_runner._effective_weekly_cap(chosen, weekly_rollover_reserve_usd))
 
 
-def _load_orders(path: Path, account: str) -> list[BrokerOrder]:
-    """Rows of a saved ``orders_pages`` envelope as ``BrokerOrder``; refuses a mismatched account."""
+class _EnvelopeRefused(ValueError):
+    """A saved ``orders_pages`` envelope that must not be trusted. The message is a fixed string, safe to print:
+    it never carries a row, an order id or an account number."""
+
+
+def _load_orders(path: Path, account: str, *, expected_day: Optional[str] = None) -> list[BrokerOrder]:
+    """Rows of a saved ``orders_pages`` envelope as ``BrokerOrder``.
+
+    Refuses an envelope for another account and, when ``expected_day`` is given, one saved for another trading day
+    (a stale file left over from an earlier run would otherwise be read as today's history).
+    """
     from scripts.assemble_order_pages import _order_rows
     from scripts.backup_planner import _to_broker_order
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
-        raise ValueError("orders_pages is not an envelope with a pages list")
+        raise _EnvelopeRefused("orders_pages is not an envelope with a pages list")
     if str(payload.get("account_number") or "").strip() != account.strip():
-        raise ValueError("orders_pages account does not match --account")
+        raise _EnvelopeRefused("orders_pages account does not match the environment account")
+    if expected_day is not None and str(payload.get("trading_day") or "").strip() != expected_day:
+        raise _EnvelopeRefused("orders_pages was saved for a different trading day")
     return [_to_broker_order(row) for page in payload["pages"] for row in _order_rows(page)]
+
+
+def classify_window_orders(orders: Sequence[BrokerOrder], slot_id: str, day: date) -> dict:
+    """Gate 4's classification of the slot window's orders, as the live prompts' Gate 4 text states it.
+
+    An order is IN THE WINDOW when its ``created_at`` (submission, not fill time) falls inside the slot's
+    ``dca_runner.SLOTS`` interlock window on ``day``, both ends inclusive. Each is classified by ``placed_agent``
+    alone, EXACT match, so an order's side and state do not matter (a cancelled or rejected attempt, or a sell, is
+    still that executor's activity):
+
+    * ``user``, ``recurring``, ``drip``: the owner's own activity, counted and never blocking;
+    * ``agentic``: the compatible executor, whose tickers are reported as ``already_covered_tickers``;
+    * anything else, including a missing value, a different case or stray whitespace: rogue.
+
+    Any rogue order is an ABORT, even beside a compatible one. No rogue and at least one compatible order is
+    COMPATIBLE_CONTINUE; otherwise CLEAR. Note ``dca_runner.gate_sole_executor`` deliberately ignores ``placed_agent``
+    and treats even a manual order as a second writer; this follows the prompt (and ``backup_planner`` and
+    ``plan_first_slot``), because the prompt is what runs. The output carries counts only, never an order id.
+    """
+    if slot_id not in dca_runner.SLOTS:
+        raise ValueError(f"unknown slot {slot_id!r}")
+    from scripts.backup_planner import _USER_AGENTS  # the owner's agents; one definition, shared with the backup
+
+    start, end = dca_runner.SLOTS[slot_id].window_bounds_utc(day)
+    in_window = own = compatible = rogue = 0
+    covered: set[str] = set()
+    for order in orders:
+        created = dca_runner._require_aware(order.created_at).astimezone(timezone.utc)
+        if not start <= created <= end:
+            continue
+        in_window += 1
+        agent = order.placed_agent
+        if agent in _USER_AGENTS:
+            own += 1
+        elif agent == COMPATIBLE_EXECUTOR_AGENT:
+            compatible += 1
+            covered.add(order.symbol.strip().upper())
+        else:
+            rogue += 1
+    document = {
+        "status": "ABORT" if rogue else ("COMPATIBLE_CONTINUE" if compatible else "CLEAR"),
+        "orders_in_window": in_window,
+        "own_activity": own,
+        "compatible": compatible,
+        "rogue": rogue,
+        "already_covered_tickers": sorted(covered),
+    }
+    if rogue:
+        document["reason"] = "executor-placed order(s) of unknown provenance in the slot window; a second executor may be live"
+    return document
 
 
 def _emit(document: dict) -> None:
@@ -254,6 +323,33 @@ def _cmd_budget(args: argparse.Namespace) -> int:
     return _exit_code(document)
 
 
+def _cmd_gate4(args: argparse.Namespace) -> int:
+    # The account comes from the environment only, read the way `clock` reads it, so an unusable value is an ABORT
+    # verdict (exit 1) naming the account, never the number.
+    pin = account_pin(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"))
+    if not pin["ok"]:
+        document = {"status": "ABORT", "reason": pin["reason"]}
+        _emit(document)
+        return _exit_code(document)
+    try:
+        orders = _load_orders(args.orders_pages, pin["account_number"], expected_day=args.trading_day.isoformat())
+        document = classify_window_orders(orders, args.slot, args.trading_day)
+    except _EnvelopeRefused as exc:
+        document = {"status": "ABORT", "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - fail closed; type name only, never a row or an order id
+        document = {"status": "ABORT", "reason": f"orders_pages unusable: {type(exc).__name__}"}
+    _emit(document)
+    return _exit_code(document)
+
+
+def _iso_date(text: str) -> date:
+    """argparse type: a calendar date as YYYY-MM-DD; anything else is a usage error (exit 2)."""
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r} is not YYYY-MM-DD") from exc
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -283,9 +379,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="Available prior-week rollover reserve in USD; required with --tier stress, ignored otherwise.",
     )
+    gate4 = sub.add_parser("gate4", help="Gate 4: classify the slot window's orders from a saved day orders_pages file.")
+    gate4.add_argument("--slot", required=True, choices=sorted(dca_runner.SLOTS))
+    gate4.add_argument("--trading-day", required=True, type=_iso_date, help="Today's trading day, YYYY-MM-DD.")
+    gate4.add_argument("--orders-pages", type=Path, required=True, help="The saved day envelope; must be for this day.")
     args = parser.parse_args(argv)
     if args.command == "budget":
         resolve_account(budget, args)
+    if args.command == "gate4":
+        return _cmd_gate4(args)
     return _cmd_clock(args) if args.command == "clock" else _cmd_budget(args)
 
 
