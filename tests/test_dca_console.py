@@ -1119,6 +1119,7 @@ def test_server_header_does_not_leak_python_version(auth_server):
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGTERM lifecycle coverage requires POSIX signals")
 def test_sigterm_stops_console_cleanly(tmp_path):
+    venv_existed_before = (Path(dca_console.REPO) / ".venv").exists()
     child_env = dict(os.environ)
     child_env["PYTHONUNBUFFERED"] = "1"
     # Launch dca_console.main directly, not through from.py. from.py first runs dca_bootstrap.ensure_venv, which on a
@@ -1193,6 +1194,15 @@ def test_sigterm_stops_console_cleanly(tmp_path):
     stdout = "".join(output_lines)
     assert "DCA console (local)" in stdout
     assert "Stopping local console." in stdout
+    # 2026-11-15: launched via from.py, this test ran dca_bootstrap.ensure_venv(), which created
+    # <repo>/.venv and pip-installed requirements-dev.txt before the banner. On a fresh
+    # self-hosted runner workspace that took longer than the 10s banner wait and failed both core
+    # legs ("Creating virtual environment at .../_work/.../.venv"). The SIGTERM handler under test
+    # lives in dca_console.main(), so the test must reach it without the launcher's bootstrap.
+    assert "Creating virtual environment" not in stdout
+    assert not (Path(dca_console.REPO) / ".venv").exists() or venv_existed_before, (
+        "the console SIGTERM test created the repository .venv as a side effect"
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")
