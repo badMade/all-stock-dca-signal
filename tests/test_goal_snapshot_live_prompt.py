@@ -6,7 +6,7 @@ Written FIRST. The prompts are not written yet, so these fail until they are. Ap
    records the PREVIOUS trading day's close through the read-only Robinhood tools via
    ``dca_goal_snapshot.py``, places no orders, is marked "Requires this computer", runs
    Sonnet 5.5 at medium effort with a 30-minute budget, and finishes before 3:40 PM ET.
-2. The Friday 041d9d90 Notion refresh section (``claude/goal-snapshot/friday-041d9d90-goal-progress-section.md``):
+2. The complete Friday 041d9d90 Notion refresh prompt (``claude/goal-snapshot/friday-041d9d90-weekly-dashboard-refresh.md``):
    calls ``dca_goal_progress.goal_progress_section`` on Fridays only, period return only under one year.
 
 The live scheduled task bodies are not in this repo; the operator pastes these files in, as with the
@@ -26,7 +26,7 @@ import dca_goal_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "claude" / "goal-snapshot"
 SNAPSHOT_PROMPT = PROMPT_DIR / "0731ET-goal-snapshot.md"
-FRIDAY_PROMPT = PROMPT_DIR / "friday-041d9d90-goal-progress-section.md"
+FRIDAY_PROMPT = PROMPT_DIR / "friday-041d9d90-weekly-dashboard-refresh.md"
 
 READ_ONLY_TOOLS = {"get_equity_positions", "get_equity_historicals", "get_portfolio"}
 ORDER_TOOL = re.compile(
@@ -133,5 +133,7 @@ def test_friday_prompt_shows_period_return_under_one_year_only():
 
 def test_friday_prompt_names_no_order_tool_and_carries_no_account_literal():
     text = _friday_prompt()
-    assert [m.group(0) for m in ORDER_TOOL.finditer(text)] == []
+    # The complete prompt names order tools exactly once, in its "NEVER call" prohibition.
+    hits = [ln for ln in text.splitlines() if ORDER_TOOL.search(ln)]
+    assert all("NEVER call" in ln for ln in hits)
     assert not ACCOUNT_LITERAL.search(text)
