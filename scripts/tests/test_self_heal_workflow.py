@@ -37,3 +37,22 @@ def test_repair_formatter_excludes_disallowed_claude_tree():
     # instead (Codex review, PR #569).
     assert '"ruff", "format", "--exclude", "claude"' in self_heal
     assert '"ruff", "format", "--extend-exclude", "claude"' not in self_heal
+
+
+def _repair_job() -> dict:
+    import yaml
+
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["repair"]
+
+
+def test_repair_job_follows_the_ci_runner_variable():
+    # 2026-11-15: CI moved to the self-hosted Mac runners via vars.CI_RUNS_ON. Self-heal's healthcheck
+    # reruns the full suite, so it belongs on the same (unbilled) runners, with the hosted fallback kept.
+    assert _repair_job()["runs-on"] == "${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}"
+
+
+def test_repair_job_timeout_fits_its_healthcheck_passes():
+    # Pre-healthcheck + one per changed repair step (scripts/self_heal.py) + post-healthcheck is up to ~5
+    # full parallel suite runs at ~6-12 min each on the Mac. The old 15-minute ceiling timed out every
+    # in-scope run (17 of 436 triggers in 2026-11-08..15 ran ~15 min and were cancelled).
+    assert _repair_job()["timeout-minutes"] == 90

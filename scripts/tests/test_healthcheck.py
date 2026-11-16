@@ -96,3 +96,34 @@ def test_main_pip_audit_failure(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         healthcheck.main()
     assert exc.value.code == 1
+
+
+def _commands_run_by_main(monkeypatch) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def record(cmd):
+        commands.append(list(cmd))
+        return True
+
+    monkeypatch.setattr(healthcheck, "run_cmd", record)
+    with pytest.raises(SystemExit):
+        healthcheck.main()
+    return commands
+
+
+def test_main_runs_pytest_in_parallel_and_keeps_the_coverage_gate(monkeypatch):
+    # 2026-11-15: self-heal runs this healthcheck before, during and after a repair (up to ~5 times per
+    # run) inside one job. Serially each pass was the 20-30 min CI suite, so the job could never finish.
+    # Same command shape as ci.yml's core step: -n auto, gate unchanged.
+    pytest_runs = [cmd for cmd in _commands_run_by_main(monkeypatch) if cmd[:1] == ["pytest"]]
+    assert len(pytest_runs) == 1
+    command = pytest_runs[0]
+    assert command[command.index("-n") + 1] == "auto"
+    assert "--cov=." in command
+    assert "--cov-fail-under=90" in command
+
+
+def test_main_does_not_gate_on_pyright(monkeypatch):
+    # CI runs Pyright as advisory only (CLAUDE.md: not a gate while repo-wide diagnostics remain), so a
+    # healthcheck that failed on it could never report healthy, before or after any repair.
+    assert not any(cmd[:1] == ["pyright"] for cmd in _commands_run_by_main(monkeypatch))

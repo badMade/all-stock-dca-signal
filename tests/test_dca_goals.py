@@ -114,6 +114,7 @@ def test_1_a_valid_proposal_is_accepted_and_returned_without_a_version():
     (proposal(target=0.51), "target above the 0.50 ceiling"),
     (proposal(target=float("nan")), "NaN target"),
     (proposal(target=float("inf")), "infinite target"),
+    (proposal(target=10**1000), "oversized integer target"),
     (proposal(target=True), "boolean is not a number"),
     (proposal(target="0.2"), "string is not a number"),
     (proposal(horizon_years=0), "horizon below 1 year"),
@@ -234,6 +235,7 @@ def test_5_the_schema_enum_is_exactly_off_and_shadow():
     hedge_entry(mode=None),
     hedge_entry(max_drawdown=1.5),
     hedge_entry(max_drawdown=float("nan")),
+    hedge_entry(max_drawdown=10**1000),
     hedge_entry(hedge_budget_pct=0.06),
     hedge_entry(surprise_field=1),
     hedge_entry(effective_from="2026-11-01T00:00:00"),
@@ -260,6 +262,14 @@ def test_5_an_inactive_file_is_neutral(tmp_path):
     doc["status"] = "inactive"
     write_goals(tmp_path, doc)
     assert dca_goals.load_goals(tmp_path, now=NOW) == dca_goals.NEUTRAL_GOALS
+
+
+def test_5_oversized_int_target_neutralizes_growth_goal_fail_closed(tmp_path):
+    entry = growth_entry(target=10**1000)
+    write_goals(tmp_path, document(entry, hedge_entry()))
+    goals = dca_goals.load_goals(tmp_path, now=NOW)
+    assert goals.growth is None
+    assert goals.hedge.mode == "shadow"
 
 
 def test_5_a_goal_not_yet_in_effect_is_neutral_until_its_date(tmp_path):
