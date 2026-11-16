@@ -68,12 +68,12 @@ If $PY does not exist, stop and report "goal-snapshot venv missing"; do not fall
 
 STEP 0 -- Should this run? From the repo root:
   "$PY" - <<'PY'
-  from datetime import datetime
-  from zoneinfo import ZoneInfo
-  import dca_goal_snapshot as g
-  today = datetime.now(ZoneInfo("America/New_York")).date()
-  print("run" if g.should_run(today, None) else "skip", g.previous_trading_day(today, None).isoformat())
-  PY
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import dca_goal_snapshot as g
+today = datetime.now(ZoneInfo("America/New_York")).date()
+print("run" if g.should_run(today, None) else "skip", g.previous_trading_day(today, None).isoformat())
+PY
 If it prints "skip", end the run silently (weekend or NYSE holiday from config/market_calendar.json).
 Otherwise call the printed date SNAPSHOT_DAY. If the command errors (for example the calendar has
 run out), stop and report the error; do not guess a date.
@@ -104,45 +104,45 @@ snapshot, not a failure.
 
 STEP 4 -- Capture and store. From the repo root:
   "$PY" - "$ROOT" <<'PY'
-  import json, sys
-  from datetime import date, datetime, timezone
-  from pathlib import Path
-  sys.path.insert(0, "dca-sizing-signals")
-  import dca_goal_snapshot as g
-  from market_data_ingest.ledger.store import LedgerStore
+import json, sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+sys.path.insert(0, "dca-sizing-signals")
+import dca_goal_snapshot as g
+from market_data_ingest.ledger.store import LedgerStore
 
-  root = Path(sys.argv[1])
-  inputs = json.loads((root / "inputs.json").read_text())
-  day = date.fromisoformat(inputs["snapshot_day"])
-  errors = inputs.get("read_errors") or []
+root = Path(sys.argv[1])
+inputs = json.loads((root / "inputs.json").read_text())
+day = date.fromisoformat(inputs["snapshot_day"])
+errors = inputs.get("read_errors") or []
 
-  def positions_fn(_day):
-      if errors:  # any recorded read failure makes the whole day a missed snapshot
-          raise RuntimeError("a read failed; see inputs.json read_errors")
-      return inputs["positions"]
+def positions_fn(_day):
+    if errors:  # any recorded read failure makes the whole day a missed snapshot
+        raise RuntimeError("a read failed; see inputs.json read_errors")
+    return inputs["positions"]
 
-  def prior_close_fn(symbol, _day):
-      close = inputs["closes"].get(symbol)
-      if close is None:
-          raise LookupError("no close for a held symbol")
-      return close
+def prior_close_fn(symbol, _day):
+    close = inputs["closes"].get(symbol)
+    if close is None:
+        raise LookupError("no close for a held symbol")
+    return close
 
-  result = g.capture_previous_close(day, positions_fn=positions_fn, prior_close_fn=prior_close_fn)
-  (root / "snapshot.json").write_text(json.dumps(result.rows, indent=2))
-  alerts = [{"kind": a.kind, "day": a.day.isoformat() if a.day else None, "detail": a.detail}
-            for a in result.alerts]
-  (root / "alerts.json").write_text(json.dumps(alerts, indent=2))
-  if alerts:
-      print("MISSED SNAPSHOT:", alerts[0]["detail"])
-      sys.exit(3)
-  import dca_paths
-  db = Path(dca_paths.stream_root("goal_snapshot", "ledger.duckdb"))
-  with LedgerStore(db) as ledger:
-      n = ledger.ingest_portfolio_snapshots(result.rows, source="robinhood_readonly",
-                                            run_id=f"goal-snapshot-{day.isoformat()}",
-                                            as_of=datetime.now(timezone.utc))
-  print(f"stored {n} new snapshot row(s) for {day.isoformat()} ({len(result.rows)} captured)")
-  PY
+result = g.capture_previous_close(day, positions_fn=positions_fn, prior_close_fn=prior_close_fn)
+(root / "snapshot.json").write_text(json.dumps(result.rows, indent=2))
+alerts = [{"kind": a.kind, "day": a.day.isoformat() if a.day else None, "detail": a.detail}
+          for a in result.alerts]
+(root / "alerts.json").write_text(json.dumps(alerts, indent=2))
+if alerts:
+    print("MISSED SNAPSHOT:", alerts[0]["detail"])
+    sys.exit(3)
+import dca_paths
+db = Path(dca_paths.stream_root("goal_snapshot", "ledger.duckdb"))
+with LedgerStore(db) as ledger:
+    n = ledger.ingest_portfolio_snapshots(result.rows, source="robinhood_readonly",
+                                          run_id=f"goal-snapshot-{day.isoformat()}",
+                                          as_of=datetime.now(timezone.utc))
+print(f"stored {n} new snapshot row(s) for {day.isoformat()} ({len(result.rows)} captured)")
+PY
 
 STEP 5 -- Report. One short message: SNAPSHOT_DAY, how many positions were captured, how many
 new ledger rows were stored (0 is normal on a re-run), and the total market value. If Step 4 exited
