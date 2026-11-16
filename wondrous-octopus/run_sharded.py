@@ -394,6 +394,11 @@ def build_shard_cmd(
             "--run-dir",
             str(shard_dir),
         ]
+        if getattr(args, "history_dir", None):
+            # Without this every shard's daily_update fell back to the history dir RECORDED in its run (the frozen
+            # replay snapshot), saw no new rows and logged "NOOP ... already processed" -- a sharded daily run could
+            # never advance past the snapshot (found catching up the all-tickers run to the live archive).
+            cmd.extend(["--history-dir", str(args.history_dir)])
         if getattr(args, "now", None):
             cmd.extend(["--now", str(args.now)])
         if getattr(args, "dry_run", False):
