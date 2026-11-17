@@ -43,7 +43,11 @@ import pandas as pd
 # ticker names could otherwise escape history_dir via pathlib's
 # absolute-right-operand behavior, and archive debris like "AAA-backup.csv"
 # must never be pooled as a real ticker.
-_TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,6}$")
+# A hyphen is allowed after the first character because share-class tickers
+# are filed that way in the archive (BF-B, AGM-A, AKO-A: 24 files, all with
+# long histories); the old [A-Z.]{1,6} silently dropped them from every
+# forecast. Lowercase debris ("AAA-backup") and a leading hyphen stay rejected.
+_TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z.][A-Z.\-]{0,5}$")
 
 REQUIRED_COLUMNS = ("Date", "Open", "High", "Low", "Close")
 _NUMERIC_RAW_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits")
