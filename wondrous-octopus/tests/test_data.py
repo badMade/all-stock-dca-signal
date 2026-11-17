@@ -30,6 +30,15 @@ class TestDiscoverAvailableTickers:
         # `--tickers aapl` must mean AAPL (Antigravity review finding).
         assert data.discover_available_tickers(synthetic_history_dir, ["aaa", "bbb"]) == ["AAA", "BBB"]
 
+    def test_share_class_tickers_with_a_hyphen_are_discovered(self, synthetic_history_dir):
+        # BF-B / AGM-A style names were silently dropped by the old [A-Z.] pattern.
+        for name in ("BF-B", "AGM-A"):
+            conftest.write_ticker_csv(synthetic_history_dir, name, conftest.make_synthetic_ohlcv(n=200))
+        found = data.discover_available_tickers(synthetic_history_dir)
+        assert "BF-B" in found and "AGM-A" in found
+        assert "AAA-backup" not in found
+        assert data.discover_available_tickers(synthetic_history_dir, ["BF-B", "-AAA", "bf-b"]) == ["BF-B"]
+
     def test_missing_directory_is_empty_not_an_error(self, tmp_path):
         assert data.discover_available_tickers(tmp_path / "absent") == []
 
