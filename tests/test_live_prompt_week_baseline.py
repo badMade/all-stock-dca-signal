@@ -146,3 +146,24 @@ def test_1230_gate_4_and_gate_6_5_point_back_at_the_rule(slot):
     rule = _rule(slot)
     assert "Gate 6.5's SECOND refresh" in rule
     assert "orders_fetched_at" in rule
+
+
+def test_1230_takes_the_newest_week_base_not_always_the_935_file(slot):
+    # 2026-11-16 12:30 ET: ABORT_GATE4_HISTORY_UNSAVABLE / output_cap_exceeded. The increment since
+    # the 9:35 snapshot held 28 orders, came back inline only (no file to hand to the merge), and
+    # hand transcription is forbidden. The 10:30/11:30 week envelopes were newer; the finder picks them.
+    if slot != "1230":
+        pytest.skip("12:30-specific; 10:30/11:30 fall back to the finder only when 9:35 is unusable")
+    rule = _rule(slot)
+    assert "NEWEST BASE FIRST" in rule
+    assert "scripts.find_order_baseline --kind week --slot 1230 --trading-day <YYYY-MM-DD>" in rule
+    assert "--base <the printed base>" in rule
+    assert "--created-at-gte <the printed created_at_gte>" in rule
+    assert "never compare, convert or retype a timestamp yourself" in rule
+    # The finder runs before any fetch, and the old "look for the 9:35 file directly" step is gone.
+    assert rule.index("find_order_baseline") < rule.index("call get_equity_orders")
+    assert "(1) Look for today's" not in rule
+    assert "--base <that 0935 week file>" not in rule
+    # Lookup failure or a refused merge/reshape still falls back to the full week under the same rule.
+    assert "If find_order_baseline exits 2" in rule
+    assert "week_history_mode full" in rule
