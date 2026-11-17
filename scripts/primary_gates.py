@@ -106,7 +106,12 @@ def account_pin(raw: Optional[str]) -> dict:
 
 
 def _usable_buying_power(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 def evaluate_budget(
@@ -181,7 +186,10 @@ def _load_orders(path: Path, account: str, *, expected_day: Optional[str] = None
     from scripts.assemble_order_pages import _order_rows
     from scripts.backup_planner import _to_broker_order
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=dca_config._reject_duplicate_keys,
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
         raise _EnvelopeRefused("orders_pages is not an envelope with a pages list")
     if str(payload.get("account_number") or "").strip() != account.strip():
@@ -313,6 +321,8 @@ def _cmd_budget(args: argparse.Namespace) -> int:
             max_orders_per_day=dca_runner.MAX_ORDERS_PER_DAY,
         )
         document["tier"] = args.tier
+    except _EnvelopeRefused as exc:
+        document = {"status": "ABORT", "reason": str(exc)}
     except ValueError as exc:
         # A tier problem names itself (no connector text, no account); anything else reports its type only.
         reason = str(exc) if "tier" in str(exc) or "rollover" in str(exc) else f"orders_pages unusable: {type(exc).__name__}"

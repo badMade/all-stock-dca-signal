@@ -261,3 +261,24 @@ def test_cli_the_clear_path_never_prints_the_account_number(tmp_path):
 def test_cli_an_unknown_slot_is_a_usage_error(tmp_path):
     done = _run(tmp_path, [], slot="9999")
     assert done.returncode == 2 and "CLEAR" not in done.stdout
+
+
+def test_cli_rejects_duplicate_json_keys_in_orders_pages(tmp_path):
+    rogue_row = json.dumps(_row(1, "CAT", "11:30", None))
+    path = tmp_path / f"orders_pages_{WEDNESDAY.isoformat()}_1130.json"
+    path.write_text(
+        '{"account_number": "' + ACCOUNT + '", "trading_day": "' + WEDNESDAY.isoformat() + '", '
+        '"pages": [{"orders": [' + rogue_row + '], "next": null}], '
+        '"pages": [{"orders": [], "next": null}]}',
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k != "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"}
+    env["DCA_DISABLE_DOTENV"] = "1"
+    env["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = ACCOUNT
+    done = subprocess.run(
+        [sys.executable, "-m", "scripts.primary_gates", "gate4", "--slot", "1130",
+         "--trading-day", WEDNESDAY.isoformat(), "--orders-pages", str(path)],
+        cwd=REPO, capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert done.returncode == 1 and _doc(done)["status"] == "ABORT"
+
