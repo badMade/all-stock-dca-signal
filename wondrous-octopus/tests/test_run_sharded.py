@@ -386,3 +386,15 @@ def test_horizon_merge_refuses_differing_columns(tmp_path: Path):
 def test_horizon_merge_is_a_no_op_for_a_next_day_only_run(tmp_path: Path):
     base, dirs = _two_shards(tmp_path)
     assert run_sharded.merge_shard_horizon_forecasts(base, dirs) == []
+
+
+def test_daily_mode_forwards_history_dir_so_a_sharded_update_reads_the_live_archive(tmp_path: Path):
+    shard_dir = tmp_path / "shard_1"
+    (shard_dir / "checkpoint").mkdir(parents=True)
+    live = tmp_path / "live archive"  # a space, as in the Drive path
+    args = argparse.Namespace(daily=True, now=None, dry_run=False, force=False, history_dir=live)
+    cmd, mode = run_sharded.build_shard_cmd([], shard_dir, args)
+    assert mode == "daily" and cmd[cmd.index("--history-dir") + 1] == str(live)
+    args.history_dir = None
+    cmd, _ = run_sharded.build_shard_cmd([], shard_dir, args)
+    assert "--history-dir" not in cmd
