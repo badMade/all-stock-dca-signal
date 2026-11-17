@@ -109,7 +109,30 @@ def test_an_unusable_environment_account_aborts(tmp_path, bad, exit_code):
 
 def test_an_envelope_for_another_account_aborts(tmp_path):
     done = _run_budget(tmp_path, [_row(1, "10.00")], envelope_account=OTHER_ACCOUNT)
+    doc = _doc(done)
+    assert done.returncode == 1 and doc["status"] == "ABORT"
+    assert doc["reason"] == "orders_pages account does not match the environment account"
+
+
+def test_budget_rejects_duplicate_json_keys_in_orders_pages(tmp_path):
+    spent_row = json.dumps(_row(1, "180.00"))
+    path = tmp_path / f"orders_pages_week_{MONDAY}_1530.json"
+    path.write_text(
+        '{"account_number": "' + ACCOUNT + '", "trading_day": "' + MONDAY + '", '
+        '"pages": [{"orders": [' + spent_row + '], "next": null}], '
+        '"pages": [{"orders": [], "next": null}]}',
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k != "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"}
+    env["DCA_DISABLE_DOTENV"] = "1"
+    env["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = ACCOUNT
+    done = subprocess.run(
+        [sys.executable, "-m", "scripts.primary_gates", "budget", "--orders-pages", str(path),
+         "--trading-day", WEDNESDAY, "--buying-power", "1000"],
+        cwd=REPO, capture_output=True, text=True, timeout=30, env=env,
+    )
     assert done.returncode == 1 and _doc(done)["status"] == "ABORT"
+
 
 
 @pytest.mark.parametrize(
@@ -149,10 +172,25 @@ def test_the_stress_tier_without_a_reserve_fails_closed():
         primary_gates.resolve_tier_caps("stress")
 
 
-@pytest.mark.parametrize("bad", [-1, math.nan, math.inf, True, "5"])
+@pytest.mark.parametrize("bad", [-1, math.nan, math.inf, True, "5", 10**400])
 def test_a_malformed_stress_reserve_is_refused(bad):
     with pytest.raises(ValueError):
         primary_gates.resolve_tier_caps("stress", bad)
+
+
+def test_evaluate_budget_aborts_on_oversized_int_buying_power():
+    from datetime import date
+
+    out = primary_gates.evaluate_budget(
+        [],
+        date.fromisoformat(WEDNESDAY),
+        buying_power_usd=10**400,
+        daily_cap_usd=180.0,
+        weekly_cap_usd=900.0,
+        max_orders_per_day=120,
+    )
+    assert out["status"] == "ABORT" and "buying power" in out["reason"].lower()
+
 
 
 @pytest.mark.parametrize("bad", ["bogus", "Stress", "NORMAL", "", "high-volatility"])
