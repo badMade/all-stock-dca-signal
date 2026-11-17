@@ -92,9 +92,9 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.shard_heartbeat` | 133 | 0 |
 | `scripts.slot_status_watch` | 107 | 0 |
 | `scripts.snapshot_cycle` | 328 | 2 |
-| `scripts.sync_live_prompts` | 233 | 1 |
+| `scripts.sync_live_prompts` | 233 | 0 |
 | `scripts.triage_log_summary` | 240 | 3 |
-| `scripts.triage_reconcile_batch` | 404 | 1 |
+| `scripts.triage_reconcile_batch` | 424 | 1 |
 | `scripts.workflow_policy` | 230 | 4 |
 | `scripts.workspace_probe` | 138 | 0 |
 | `selfheal` | 5 | 0 |
@@ -286,9 +286,9 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.slot_status_watch` | 107 | 3 | 0 | 0 | `dca_paths`, `scripts.slot_status`, `scripts.verify_schedule` |
 | `scripts.snapshot_cycle` | 328 | 14 | 0 | 2 | `dca_config`, `dca_fileio`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, +6 more |
 | `scripts.stream_candidates` | 1967 | 5 | 8 | 3 | `dca_config`, `dca_runner`, `morning_dca`, `near_close_dca`, `scripts.generate_buy_candidates` |
-| `scripts.sync_live_prompts` | 233 | 1 | 0 | 1 | `scripts.check_live_prompt_drift` |
+| `scripts.sync_live_prompts` | 233 | 1 | 0 | 0 | `scripts.check_live_prompt_drift` |
 | `scripts.triage_log_summary` | 240 | 3 | 0 | 3 | `dca_paths`, `dca_runner`, `scripts.verify_schedule` |
-| `scripts.triage_reconcile_batch` | 404 | 1 | 0 | 1 | `selfheal.triage_reconcile` |
+| `scripts.triage_reconcile_batch` | 424 | 1 | 0 | 1 | `selfheal.triage_reconcile` |
 | `scripts.validate_native_placement` | 281 | 6 | 5 | 27 | `dca_config`, `dca_env`, `dca_fileio`, `dca_runner`, `near_close_dca`, `scripts.idempotency` |
 | `scripts.verify_perplexity_pair` | 182 | 0 | 1 | 1 |  |
 | `scripts.verify_schedule` | 367 | 6 | 12 | 21 | `dca_paths`, `dca_runner`, `scripts.finalize_run_evidence`, `scripts.same_day_pointer`, `scripts.scheduled_artifacts`, `scripts.slot_attribution` |
