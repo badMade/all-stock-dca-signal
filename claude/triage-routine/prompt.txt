@@ -61,6 +61,7 @@ STEP 5b: Fix briefs (text only, for a later Claude Code agent)
 
 STEP 6: Approved rows
 - keys = tr.approved_keys(rows). List them in the digest with their Progress. Do nothing else with them.
+- Every count in this section comes from the batch's `approved_groups` (`total`, and each group's `label`, `count`, `keys`); print those numbers verbatim and never count, add up or re-split keys yourself (2026-11-16: the digest said "No work (10)" over 9 keys and "docs only (15)" over 16, because the groups were counted by hand). If you did not run the batch, write each group's keys first, then take its count as the number of keys you just wrote, and print the total as the sum of those counts; if the total disagrees with the number of keys from tr.approved_keys, say so in the digest instead of printing either number as settled.
 
 STEP 7: Digest (your final message, plain markdown, under 60 lines)
 - Header: date, COMPLETE or PARTIAL, LOGS UNAVAILABLE flag if set, counts (rows read, created, updated, skipped, notes kept). COMPLETE means STEPs 1-6 ran for every Key and STEP 5b emitted a brief for every qualifying row; rows skipped by rule (notes kept, recorded PR unconfirmed, recently edited) do not make a run PARTIAL. PARTIAL must name the step and the error or limit that stopped it.

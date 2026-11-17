@@ -178,6 +178,31 @@ def test_approved_rows_are_listed_with_cell_and_derived_label():
     assert report["approved"] == [{"key": "cap_breach", "progress_cell": "note", "derived": _tr().PROGRESS_MERGED_GREEN}]
 
 
+def test_approved_groups_counts_come_from_the_lists_and_partition_the_total():
+    rows = [
+        {"Key": "cap_breach", "Approval": "Approved", "PR number": 10},
+        {"Key": "cap_consumed", "Approval": "Approved"},
+        {"Key": "no_pr_key", "Approval": "Approved"},
+        {"Key": "not_approved"},
+    ]
+    report = _reconcile(rows, prs=[_gh_pr()])
+    groups = report["approved_groups"]
+    assert groups["total"] == 3 == len(report["approved"])
+    assert all(g["count"] == len(g["keys"]) for g in groups["groups"])
+    assert sum(g["count"] for g in groups["groups"]) == groups["total"]
+    by_label = {g["label"]: g["keys"] for g in groups["groups"]}
+    assert by_label[_tr().PROGRESS_MERGED_GREEN] == ["cap_breach"]
+    assert sorted(k for label, keys in by_label.items() if label != _tr().PROGRESS_MERGED_GREEN for k in keys) == [
+        "cap_consumed",
+        "no_pr_key",
+    ]
+    assert "not_approved" not in sum(by_label.values(), [])
+
+
+def test_approved_groups_with_no_approved_rows_is_empty():
+    assert _reconcile([{"Key": "cap_breach"}])["approved_groups"] == {"total": 0, "groups": []}
+
+
 # --- CLI over a collected work dir ---------------------------------------------------------------------------
 
 
