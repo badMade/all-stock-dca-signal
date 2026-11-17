@@ -258,15 +258,35 @@ def reconcile(
         "progress_notes_kept": sum(bool(d.get("progress_note_kept")) for d in decisions),
         "progress_regressions_blocked": sum(bool(d.get("progress_regression_blocked")) for d in decisions),
     }
+    approved_rows = [
+        {"key": key, "progress_cell": by_key[key].get("Progress"), "derived": d.get("progress")}
+        for d in decisions
+        if (key := d["key"]) in approved
+    ]
     return {
         "counts": counts,
         "decisions": decisions,
-        "approved": [
-            {"key": key, "progress_cell": by_key[key].get("Progress"), "derived": d.get("progress")}
-            for d in decisions
-            if (key := d["key"]) in approved
-        ],
+        "approved": approved_rows,
+        "approved_groups": approved_groups(approved_rows),
     }
+
+
+def approved_groups(approved_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Group approved rows by derived Progress label, with counts computed here and never by the model.
+
+    2026-11-16: the digest stated 34 approved rows (right) but split them "No work (10)" over a list of 9 and
+    "docs only (15)" over a list of 16, because the model counted by hand. Every count the digest prints for
+    this section now comes from ``total`` and each group's ``count``, which are ``len()`` of the same lists the
+    keys come from, so a stated count can never disagree with its list. A row whose label could not be derived
+    is grouped under ``"No work"`` only when the batch said so; otherwise under ``"(no derived label)"``.
+    """
+    groups: dict[str, list[str]] = {}
+    for row in approved_rows:
+        groups.setdefault(row.get("derived") or "(no derived label)", []).append(row["key"])
+    ordered = [{"label": label, "count": len(keys), "keys": sorted(keys)} for label, keys in sorted(groups.items())]
+    total = len(approved_rows)
+    assert sum(g["count"] for g in ordered) == total  # grouping must partition the approved rows exactly
+    return {"total": total, "groups": ordered}
 
 
 # ---------------------------------------------------------------------------------------------------------------
