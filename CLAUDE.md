@@ -258,6 +258,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/module_graph.md` | **Generated, never hand-edit.** Live import graph (importers, import counts, line counts, modules nothing imports). `python -m scripts.generate_module_graph --impact <module>` lists everything that depends on a module before you change it. Refreshed by `.github/workflows/refresh-generated-docs.yml` on every push to `main` |
 | `docs/codebase_roadmap.md` | Verified end-to-end flow and layer map built from the import graph; lists where older docs overstate (e.g. "zero in-repo callers") |
 | `docs/dead_code_report.md` | Tiered dead/obsolete code candidates with evidence; nothing deleted |
+| `docs/bug_patterns.md` | Confirmed recurring bug patterns (symptom, root cause, how to check for it, guard); add an entry when a fix reveals a shape that will recur. Security and performance learnings stay in `.jules/` |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
 | `agent-vault/README.md` | Vendored loop-and-gate memory vault (self-improving agent memory, three task skills, runbooks). Start `claude` from inside `agent-vault/`; dry-run only, Notion read-only, pinned in `UPSTREAM.md` |
 | `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
