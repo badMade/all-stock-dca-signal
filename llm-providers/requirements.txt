@@ -3,7 +3,7 @@
 # httpx2 is listed only because tests/conftest.py builds SDK error fixtures from it:
 # current openai/anthropic/google-genai releases (3.48/2.7/3.0) depend on httpx2, not httpx, so httpx
 # stopped arriving transitively and conftest's old `import httpx` broke (CI 2026-11-09).
-openai>=3.49.0
+openai>=3.51.0
 anthropic>=2.8.0
 google-genai>=3.3.0
 httpx2>=2.16.0
