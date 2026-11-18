@@ -4085,6 +4085,18 @@
       "trigger_gate": "Final-eligible-market-day gate: end silently (no notification, no market-data pulls, no Notion updates, no reporting) unless the current America/New_York date is the final eligible market day of the month.",
       "policy": "month_end_volatility_risk_policy",
       "notes": "Analytics and reporting only, no trading (no order reviews, submissions, cancellations, sells, options, crypto, margin, or broker/account changes). EST-months half of the paired month-end volatility risk schedule (EDT half is c9fb1fb8); programmatic month-end trigger checks are disabled so both fire on days 25-31 and each self-gates on the final-eligible-market-day check. After the gate passes, pulls the last 30 trading days, computes daily drops from the prior completed regular-session close, counts 3x-or-higher risk-tier events, surfaces any ticker with more than two 3x-or-higher events, computes average drawdown recovery time (trading days to recover to at least the prior signal close; unrecovered if not recovered by window end), refreshes the All Stock DCA Master Summary Dashboard in Notion with a Month-End Volatility Risk Table section preserving unrelated content, and writes compact CSV/JSON artifacts under /home/user/workspace/cron_tracking/month_end_volatility_risk/YYYYMM/. Finance connector primary; Alpaca/Robinhood read-only validation; no fallback source; GFUZ may use Robinhood primary when Finance cannot resolve it; data-confidence rules unchanged. Notifies in-app and email only if the Notion refresh fails, data quality blocks the run, or one or more tickers triggered the 3x tier more than twice (email subject 'Month-end DCA volatility risk table'); no Slack. Full monthly volatility risk reporting lives here, not in daily execution tasks; the daily cost-saving operating mode is unchanged. See month_end_volatility_risk_policy."
+    },
+    {
+      "id": "goal-snapshot-0731",
+      "name": "Goal progress snapshot: previous trading day close (read only)",
+      "type": "analytics",
+      "status": "active",
+      "trades": false,
+      "et_equivalent": "7:31 AM America/New_York, trading days (the scheduler adds a few minutes of dispatch delay, so it fires about 7:37 AM)",
+      "trigger_gate": "dca_goal_snapshot.should_run(today, None): weekends and NYSE holidays from config/market_calendar.json end silently",
+      "added_to_manifest_on_et": "2026-11-17",
+      "added_reason": "Phase 2 of docs/adr-goals-and-loss-hedge-shadow.md (approved 2026-11-14). Registered 2026-11-17 as a local Claude Desktop scheduled task on the operator's Mac (local cron 31 7 * * 1-5; the Mac's timezone is America/New_York).",
+      "notes": "Records the previous trading day's closing holdings for goal tracking through Robinhood READ tools only (get_equity_positions, get_equity_historicals); places, previews and reviews no orders. Prompt: claude/goal-snapshot/0731ET-goal-snapshot.md. Interpreter: ~/.cache/all-stock-dca/goal-snapshot-venv (duckdb). Capture via dca_goal_snapshot.capture_previous_close is all-or-nothing; a failed read writes no row and a missed_snapshot alert to <stream_root(goal_snapshot)>/<day>/alerts.json (not yet routed to Gate 9 email). Rows go to the ledger at dca_paths.stream_root('goal_snapshot', 'ledger.duckdb') via LedgerStore.ingest_portfolio_snapshots; re-runs are idempotent."
     }
   ]
 }
