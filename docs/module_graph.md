@@ -42,7 +42,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `guardrails` | 25 | 0 |
 | `market_open_quote_shadow` | 167 | 2 |
 | `run_market_open_signals` | 110 | 0 |
-| `scripts` | 0 | 260 |
+| `scripts` | 0 | 258 |
 | `scripts.adhoc_orders` | 490 | 0 |
 | `scripts.auto_resume_walkforward` | 179 | 0 |
 | `scripts.backfill_afternoon_evidence` | 533 | 0 |
@@ -187,7 +187,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `near_close_dca` | 41753 | 17 | 32 | 25 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
 | `run_dca` | 4722 | 17 | 1 | 29 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
 | `run_market_open_signals` | 110 | 2 | 0 | 0 | `market_open_dca`, `near_close_dca` |
-| `scripts` | 0 | 0 | 0 | 260 |  |
+| `scripts` | 0 | 0 | 0 | 258 |  |
 | `scripts.abort_markers` | 193 | 3 | 3 | 0 | `dca_config`, `scripts.finalize_run_evidence`, `scripts.verify_schedule` |
 | `scripts.account_arg` | 87 | 1 | 7 | 0 | `dca_paths` |
 | `scripts.adhoc_orders` | 490 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `near_close_dca` |
@@ -248,7 +248,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.kill_switch_gap_proof` | 297 | 6 | 0 | 0 | `dca_config`, `dca_runner`, `scripts.abort_markers`, `scripts.assemble_order_pages`, `scripts.broker_reconciliation`, `scripts.same_day_top_up_gate` |
 | `scripts.local_ci_sweep` | 312 | 0 | 0 | 0 |  |
 | `scripts.local_heartbeat` | 331 | 5 | 1 | 1 | `dca_execution_router`, `dca_paths`, `scripts.file_lock`, `scripts.scheduler_lease`, `scripts.slot_status` |
-| `scripts.merge_order_pages` | 230 | 4 | 1 | 18 | `dca_config`, `dca_fileio`, `scripts.account_arg`, `scripts.assemble_order_pages` |
+| `scripts.merge_order_pages` | 230 | 4 | 1 | 16 | `dca_config`, `dca_fileio`, `scripts.account_arg`, `scripts.assemble_order_pages` |
 | `scripts.model_usage_log` | 336 | 1 | 4 | 3 | `dca_paths` |
 | `scripts.order_refetch` | 68 | 4 | 0 | 0 | `dca_runner`, `scripts.assemble_order_pages`, `scripts.backup_planner`, `scripts.broker_reconciliation` |
 | `scripts.plan_first_slot` | 362 | 8 | 0 | 28 | `dca_config`, `dca_market_history`, `dca_order_plan`, `dca_rec_models`, `dca_rec_store`, `dca_runner`, `scripts.assemble_order_pages`, `scripts.backup_planner` |
