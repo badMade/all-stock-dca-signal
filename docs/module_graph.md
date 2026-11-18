@@ -274,7 +274,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.run_ticker_maintenance` | 132 | 4 | 0 | 4 | `dca_paths`, `dca_ticker_paths`, `scripts.daily_per_ticker_calibration`, `scripts.run_tickers_daily_update` |
 | `scripts.run_tickers_daily_update` | 538 | 4 | 1 | 1 | `dca_fileio`, `dca_paths`, `dca_ticker_paths`, `scripts.file_lock` |
 | `scripts.same_day_pointer` | 1042 | 3 | 7 | 5 | `dca_fileio`, `dca_paths`, `scripts.run_classification` |
-| `scripts.same_day_top_up_gate` | 721 | 4 | 6 | 53 | `dca_config`, `scripts.account_arg`, `scripts.broker_reconciliation`, `scripts.reason_codes` |
+| `scripts.same_day_top_up_gate` | 741 | 4 | 6 | 53 | `dca_config`, `scripts.account_arg`, `scripts.broker_reconciliation`, `scripts.reason_codes` |
 | `scripts.schedule_watchdog` | 414 | 8 | 5 | 6 | `dca_fileio`, `dca_net_utils`, `dca_paths`, `near_close_dca`, `scripts.abort_markers`, `scripts.run_classification`, `scripts.scheduled_artifacts`, `scripts.verify_schedule` |
 | `scripts.scheduled_artifacts` | 1360 | 2 | 10 | 8 | `dca_fileio`, `scripts.same_day_pointer` |
 | `scripts.scheduler_lease` | 465 | 1 | 4 | 2 | `scripts.file_lock` |
