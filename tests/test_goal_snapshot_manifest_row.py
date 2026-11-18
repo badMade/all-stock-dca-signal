@@ -1,7 +1,8 @@
 """The schedule manifest holds the active row for the 07:31 ET goal snapshot task (Phase 2).
 
-The operator registered the Desktop scheduled task on 2026-11-16 (its ID is its task name, ``goal-snapshot-0731``),
-so the row is ``active``. It still must not appear in
+The operator registered a Desktop scheduled task on 2026-11-16 (``07:31 ET goal progress
+snapshot``), but its cron fired at 7:31 PM daily; on 2026-11-17 the operator paused it and kept
+``goal-snapshot-0731`` (cron ``31 7 * * 1-5`` on the Mac), so the row names that ID and is ``active``. It still must not appear in
 ``config/scheduled_tasks.json``: this is a read-only snapshot, not a trading slot.
 """
 

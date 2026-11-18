@@ -2,7 +2,7 @@
 
 Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; `--check` exits 1 when this copy is stale and `--impact <module>` lists everything that depends on a module. A workflow refreshes this file on every push to `main`.
 
-197 core modules, 615 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
+197 core modules, 616 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
 
 ## Most depended-on modules (change these with care)
 
@@ -10,7 +10,7 @@ Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; 
 | --- | ---: | --- |
 | `dca_paths` | 58 | `dca_alerts`, `dca_console`, `dca_console_alerts`, `dca_console_launch`, `dca_console_runs`, `dca_cumulative`, +52 more |
 | `dca_fileio` | 48 | `dca_alerts`, `dca_average_cost_snapshot`, `dca_console`, `dca_console_jobs`, `dca_console_launch`, `dca_cost_tracker`, +42 more |
-| `dca_config` | 43 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +37 more |
+| `dca_config` | 44 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +38 more |
 | `near_close_dca` | 32 | `dca_alerts`, `dca_config`, `dca_console_config`, `dca_console_jobs`, `dca_live_adapters`, `dca_market_graph`, +26 more |
 | `dca_runner` | 28 | `dca_console`, `dca_console_config`, `dca_console_data`, `dca_console_schedule`, `dca_console_state`, `dca_goal_progress`, +22 more |
 | `dca_console_reader` | 17 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_docs`, `dca_console_env`, `dca_console_launch`, +11 more |
@@ -81,7 +81,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.publish_octopus_sizing` | 404 | 1 |
 | `scripts.read_recommendation` | 95 | 0 |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 |
-| `scripts.refresh_market_open_candidates` | 158 | 0 |
+| `scripts.refresh_market_open_candidates` | 154 | 0 |
 | `scripts.reshape_order_pages` | 281 | 1 |
 | `scripts.robinhood_payload` | 1097 | 23 |
 | `scripts.run_90day_prediction_experiment` | 422 | 2 |
@@ -115,7 +115,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_average_cost_snapshot` | 207 | 1 | 1 | 0 | `dca_fileio` |
 | `dca_bootstrap` | 220 | 0 | 2 | 0 |  |
 | `dca_common` | 99 | 0 | 4 | 0 |  |
-| `dca_config` | 1542 | 1 | 43 | 3 | `near_close_dca` |
+| `dca_config` | 1542 | 1 | 44 | 3 | `near_close_dca` |
 | `dca_console` | 1575 | 13 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_goals`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, +5 more |
 | `dca_console_alerts` | 650 | 12 | 1 | 0 | `dca_alerts`, `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_paths`, `dca_risk`, `scripts.alert_digest`, +4 more |
 | `dca_console_config` | 857 | 6 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_runner`, `near_close_dca` |
@@ -263,7 +263,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.read_recommendation` | 95 | 3 | 0 | 0 | `dca_rec_models`, `dca_rec_store`, `scripts.backup_planner` |
 | `scripts.reason_codes` | 224 | 0 | 4 | 1 |  |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 | 0 | 1 | `dca_ticker_paths` |
-| `scripts.refresh_market_open_candidates` | 158 | 3 | 0 | 0 | `market_open_dca`, `near_close_dca`, `scripts.stream_candidates` |
+| `scripts.refresh_market_open_candidates` | 154 | 4 | 0 | 0 | `dca_config`, `market_open_dca`, `near_close_dca`, `scripts.stream_candidates` |
 | `scripts.reshape_order_pages` | 281 | 7 | 0 | 1 | `dca_config`, `dca_fileio`, `dca_runner`, `scripts.account_arg`, `scripts.assemble_order_pages`, `scripts.broker_reconciliation`, `scripts.same_day_top_up_gate` |
 | `scripts.robinhood_payload` | 1097 | 19 | 0 | 23 | `dca_config`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, `dca_rec_store`, +11 more |
 | `scripts.run_90day_prediction_experiment` | 422 | 1 | 0 | 2 | `scripts.sequestered_truth_comparator` |
