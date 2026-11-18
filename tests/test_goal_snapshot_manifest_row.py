@@ -1,7 +1,7 @@
 """The schedule manifest holds the active row for the 07:31 ET goal snapshot task (Phase 2).
 
-The operator registered the Desktop scheduled task on 2026-11-16 (its ID is its name, ``07:31 ET
-goal progress snapshot``), so the row is ``active``. It still must not appear in
+The operator registered the Desktop scheduled task on 2026-11-16 (its ID is its task name, ``goal-snapshot-0731``),
+so the row is ``active``. It still must not appear in
 ``config/scheduled_tasks.json``: this is a read-only snapshot, not a trading slot.
 """
 
@@ -29,7 +29,7 @@ def test_row_is_at_0731_et_on_trading_days_with_the_registered_id():
     cells = [c.strip() for c in row.strip("|").split("|")]
     assert cells[0] == "7:31 AM"
     assert "previous trading day" in row.lower()
-    assert "`07:31 ET goal progress snapshot`" in cells
+    assert "`goal-snapshot-0731`" in cells
     assert "`31 7 * * 1-5`" in cells
     assert cells[-1] == "active"
 
