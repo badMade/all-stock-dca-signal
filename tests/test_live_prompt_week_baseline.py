@@ -148,15 +148,16 @@ def test_1230_gate_4_and_gate_6_5_point_back_at_the_rule(slot):
     assert "orders_fetched_at" in rule
 
 
-def test_1230_takes_the_newest_week_base_not_always_the_935_file(slot):
+def test_the_newest_week_base_is_taken_not_always_the_935_file(slot):
     # 2026-11-16 12:30 ET: ABORT_GATE4_HISTORY_UNSAVABLE / output_cap_exceeded. The increment since
     # the 9:35 snapshot held 28 orders, came back inline only (no file to hand to the merge), and
     # hand transcription is forbidden. The 10:30/11:30 week envelopes were newer; the finder picks them.
-    if slot != "1230":
-        pytest.skip("12:30-specific; 10:30/11:30 fall back to the finder only when 9:35 is unusable")
+    # 2026-11-17: 10:30 and 11:30 carried the same "start from the 9:35 file" rule, so they get it too.
+    if slot not in ("1030", "1130", "1230"):
+        pytest.skip("9:35 is the oldest candidate itself; later slots only")
     rule = _rule(slot)
     assert "NEWEST BASE FIRST" in rule
-    assert "scripts.find_order_baseline --kind week --slot 1230 --trading-day <YYYY-MM-DD>" in rule
+    assert f"scripts.find_order_baseline --kind week --slot {slot} --trading-day <YYYY-MM-DD>" in rule
     assert "--base <the printed base>" in rule
     assert "--created-at-gte <the printed created_at_gte>" in rule
     assert "never compare, convert or retype a timestamp yourself" in rule
