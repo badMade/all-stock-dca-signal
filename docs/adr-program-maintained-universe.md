@@ -63,26 +63,25 @@ The operator wants the list maintained by the program, with every ticker ranked.
    set is that day's ranks 1 to 100. There is no phase-in: on the first approved run the 22
    lowest-ranked of the current 122 stop receiving new buys immediately. The daily recalculation
    replaces the quarterly review of the dynamic-universe ADR, so its quarterly cadence, 8-swap
-   limit and 75/150 buffers do not apply. The 90-to-100 size check does not apply to the first
-   run only. Demotion means new buys stop. Shares are never sold. A name can leave and re-enter
+   limit and 75/150 buffers do not apply. There is no limit on how many names change in one day
+   (operator-directed 2026-11-19): as many names enter or leave as the ranking requires. Demotion
+   means new buys stop. Shares are never sold. A name can leave and re-enter
    as its rank moves, so boundary churn is open question 2.
 4. **One gated writer.** A single function is the only code allowed to write the file. It must:
    validate against `schemas/tickers.schema.json`; reject duplicates and names in `excluded`;
-   refuse a proposal whose content hash does not match an approval record; enforce the cap, the
-   90-name floor (the first run excepted, item 3) and a bound on names changed in one day (open
-   question 7); write to a temp file and rename it atomically; append that day's active set to
+   refuse a proposal whose content hash does not match an approval record; enforce the cap of 100 and
+   the 90-name floor; apply no limit on the number of names changed; write to a temp file and rename it atomically; append that day's active set to
    `config/ticker_history.csv` in the existing `date,ticker` format when it changed; and record
    the source (`program` or `operator`) and approval ID in `universe_proposal.json` and the
    `universe_membership` table. Any failed check keeps the last approved list. The dynamic-universe
    ADR's fail-closed input checks (pool coverage, stale quotes, missing factors) run on every
    daily proposal.
 5. **Approval.** A daily operator approval is not workable, so this ADR changes the
-   dynamic-universe ADR's operator-only rule (operator confirmed auto-apply within the bound,
-   2026-11-19). The program applies a daily proposal by itself when
-   every gate passes and the change is within the daily bound, and the approval ID then records
-   the standing operator approval of this ADR plus the proposal hash. A proposal outside the
-   bound, a failed gate, or any change to the scoring itself needs the operator. No approval means
-   the last approved list stays in force. A program write with no approval ID is rejected.
+   dynamic-universe ADR's operator-only rule (operator confirmed auto-apply, 2026-11-19). The
+   program applies a daily proposal by itself when every gate passes, and the approval ID then
+   records the standing operator approval of this ADR plus the proposal hash. A failed gate, or
+   any change to the scoring itself, needs the operator. No approval means the last approved list
+   stays in force. A program write with no approval ID is rejected.
 6. **When a change takes effect.** The daily job runs after the prior close and finishes before
    the earliest slot (9:35 ET), then writes once per trading day. The executor reads the list at
    process start. A write never lands mid-run. Runs already in progress keep the list they
@@ -114,11 +113,12 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
 | 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
 | 6 | Are ranks taken among buy-eligible names only, or among all names? | Among buy-eligible names; ineligible names are listed with a reason |
-| 7 | Resolved 2026-11-19: the operator accepted auto-apply within a daily bound. The bound is 8 names changed per day, taken from the proposal and not separately confirmed | Keep 8 unless the operator names another number. It lives in config, so changing it needs no code change |
+| 7 | Resolved 2026-11-19: no limit on names changed per day. The "8 per day" figure in earlier drafts was copied from the quarterly swap limit of the dynamic-universe ADR and was never set by the operator | None. The engine's `max_swaps` safeguard must be neutralized (open question 8) |
+| 8 | `ticker-advisor/universe.py` enforces `max_swaps` (default 8) as the `too_many_swaps` failure and as a deferral budget, and admits an entrant only if its prior-review rank was within `entry_rank` (two reviews running). With no limit and a strict daily top 100, how is that handled? | Construct `UniverseConfig(entry_rank=100, incumbent_keep_rank=100, min_tenure_quarters=0)` and either set `max_swaps` to at least the pool size or add an explicit no-limit setting. A new entrant then needs a prior-day rank within 100, so one day in the top 100 is not enough; say if a name should enter on the first day it ranks |
 
 ## Consequences
 
-- Fewer hidden edits: every list change carries a source and an approval ID. The list can now change every trading day, so a scoring bug reaches buying within a day. The daily bound and the fail-closed checks are the controls.
+- Fewer hidden edits: every list change carries a source and an approval ID. The list can now change every trading day, so a scoring bug reaches buying within a day. The cap of 100, the 90-name floor and the fail-closed input checks are the controls, since the number of names changed is not limited.
 - 22 current names stop receiving new buys on the first approved run. Their existing shares stay. One ranking decides all 22, so the first ranking needs review before approval.
 - Removing the hardcoded constant changes how bare `StrategyConfig()` paths get their list. It
   needs its own review and acceptance run.
@@ -127,7 +127,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 
 ## Verification
 
-- Unit tests for the writer: duplicate, excluded name, over-cap, under-floor, over-swap-limit,
+- Unit tests for the writer: duplicate, excluded name, over-cap, under-floor,
   bad hash, missing approval ID, and atomic-write interruption each leave the file unchanged.
 - `tests/test_config_invariants.py` passes after the constants are derived.
 - A dry run produces a proposal that ranks all 122 current names and lists the 22 names that would stop receiving buys,
