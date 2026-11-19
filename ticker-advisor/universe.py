@@ -10,8 +10,9 @@ What this module deliberately is NOT:
 
 - It never edits ``config/tickers.json``, ``near_close_dca.ACTIVE_TICKERS``
   or ``config/scheduled_tasks.json``. Its only output is a
-  ``universe_proposal.json`` a human reviews; an operator approval step and
-  any executor wiring are a later, separate ADR.
+  ``universe_proposal.json``. Applying a passing proposal to the buy list is the job of
+  ``universe_apply.apply_proposal`` alone (docs/adr-program-maintained-universe.md); executor
+  wiring is still a later, separate step.
 - It makes no network calls and reads no files. Every input is passed in
   already computed (prices, EDGAR facts, SIC sectors, prior-review ranks,
   tenure). The single side effect is the explicit ``write_proposal`` helper.
@@ -1064,6 +1065,24 @@ def proposal_to_dict(proposal: Proposal) -> dict:
     }
     digest = hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
     return {**content, "generated_at": proposal.generated_at.isoformat(), "content_sha256": digest}
+
+
+def proposal_hash_matches(document: Mapping) -> bool:
+    """True when a stored proposal's ``content_sha256`` matches its own content.
+
+    Recomputes the digest the way ``proposal_to_dict`` builds it (everything except
+    ``generated_at`` and the hash itself), so a proposal edited after it was written no longer
+    matches. ``universe_apply`` refuses a proposal for which this is False.
+    """
+    stored = document.get("content_sha256")
+    if not isinstance(stored, str):
+        return False
+    content = {k: v for k, v in document.items() if k not in ("generated_at", "content_sha256")}
+    try:
+        digest = hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return False
+    return digest == stored
 
 
 def write_proposal(path: str | os.PathLike[str], proposal: Proposal) -> str:

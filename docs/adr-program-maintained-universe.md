@@ -128,7 +128,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 
 ## Verification
 
-- Unit tests for the writer: duplicate, excluded name, over-cap, under-floor,
+- Unit tests for the writer (implemented in `ticker-advisor/universe_apply.py`, tests in `ticker-advisor/tests/test_universe_apply.py`): duplicate, excluded name, over-cap, under-floor,
   bad hash, missing approval ID, and atomic-write interruption each leave the file unchanged.
 - `tests/test_config_invariants.py` passes after the constants are derived.
 - A dry run produces a proposal that ranks all 122 current names and lists the 22 names that would stop receiving buys,

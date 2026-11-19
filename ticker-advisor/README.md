@@ -120,9 +120,10 @@ a single-candidate run, only the composite/classification are affected.
 
 `universe.py` is a pure-stdlib engine that turns a scored candidate pool into a *proposed*
 quarterly membership change. It is research-only: no network calls, no broker calls, no file
-I/O except the explicit `write_proposal(path, proposal)` helper, and it **never edits
-`config/tickers.json`**, `near_close_dca.ACTIVE_TICKERS`, or `config/scheduled_tasks.json`.
-Nothing in the repo imports it, and it is not wired into live sizing or any scheduled task.
+I/O except the explicit `write_proposal(path, proposal)` helper, and `universe.py` itself **never
+edits `config/tickers.json`**, `near_close_dca.ACTIVE_TICKERS`, or `config/scheduled_tasks.json`.
+The only code allowed to change the buy list is `universe_apply.apply_proposal` (see below). Nothing
+in the repo calls either module yet, and neither is wired into live sizing or any scheduled task.
 
 | Step | Function | Rule (spec default, NOT operator-approved) |
 | --- | --- | --- |
@@ -144,3 +145,16 @@ Tests: `python -m pytest tests/test_universe.py -q` (synthetic, hand-computed in
 See `docs/ticker_advisory.md` for how this fits into the existing manual ticker-add workflow, and
 its closing section on the (not-yet-built) idea of eventually letting a composite score influence
 sizing, not just universe membership.
+
+### Applying a proposal (`universe_apply.py`)
+
+`universe_apply.apply_proposal(proposal_path, tickers_path, history_path, approval_id=..., applied_on=...)`
+is the one gated writer for the **buy list**. It applies a proposal only when the proposal is
+`pending_approval`, its `content_sha256` still matches its content, it was built on the `active`
+list `tickers.json` holds right now, and an approval id is given. It also refuses a symbol that fails
+the schema pattern, a duplicate, an `excluded` or `whole_share` name, a list over 100 or under 90.
+There is no limit on how many names change in one day. Any refusal raises `ApplyRefused` (with a
+stable `code`) and leaves both files byte-identical. Only the `active` array is rewritten, the rest of
+the file is untouched, the write is atomic, and the new active set is appended to the history file.
+A name that leaves `active` is reported as `stopped_buying`: it stops receiving new buys, and nothing
+here sells. Tests: `tests/test_universe_apply.py`. Design: `docs/adr-program-maintained-universe.md`.
