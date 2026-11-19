@@ -46,9 +46,12 @@ The operator wants the list maintained by the program, with every ticker ranked.
    **The ranked pool is every symbol in `tickers.txt`, not just the 122.** `tickers.txt` holds
    5,502 well-formed symbols (checked 2026-11-19), but 18 of today's 122 active names are not in
    it (AAAU, CBRS, DFTX, DRAM, DXYZ, FLKR, GFUZ, MRSH, QQQ, QTOP, RVI, SATA, SPCX, TOPT, TRLV,
-   VCX, VT, XLG). The pool is therefore the union of `tickers.txt` and the current `active`,
-   `excluded` and `whole_share` lists, so no current name goes unranked. `tickers.txt` is
-   protected operational data (`CLAUDE.md`, "Do not modify") and the program only reads it. This
+   VCX, VT, XLG). On 2026-11-19 the operator directed that these 18 be added, so this PR adds
+   them to `tickers.txt` (5,502 to 5,520 symbols, sorted order kept). The pool is still defined as
+   the union of `tickers.txt` and the current `active`, `excluded` and `whole_share` lists, so a
+   future active addition cannot go unranked before `tickers.txt` catches up. `tickers.txt` is
+   protected operational data (`CLAUDE.md`, "Do not modify"). Apart from that operator-directed
+   one-time addition, the program only reads it. This
    replaces item 1 of the dynamic-universe ADR as a filter on who gets ranked. Its tests (price,
    market cap, dollar volume, fractional eligibility, history length) become per-name eligibility
    flags with a reason. A name that fails a flag, or lacks the data to be scored, is still listed
