@@ -76,4 +76,4 @@ still goes in `tests/` per CLAUDE.md; this file records the *shape*.
 - **Symptom:** duplicate keys in `budgets.json` silently apply last-one-wins, `true` silently becomes `$1.00`, and oversized integers raise unhandled `OverflowError`.
 - **Root cause:** sibling cap loaders in the same module were hardened individually without a shared helper or sweep across all `json.loads()` / `float()` cap readers.
 - **Check for it:** `rg -n "json\\.loads\\(" *.py scripts/*.py` on safety-bound configs and verify `object_pairs_hook=_reject_duplicate_keys`, `isinstance(v, bool)`, and `OverflowError` handling.
-- **Guard:** `tests/test_morning_dca.py::test_load_max_per_order_usd_rejects_bool_overflow_string_and_duplicates` and `::test_load_max_orders_per_day_rejects_duplicate_keys`.
+- **Guard:** `tests/test_morning_dca.py::test_load_max_per_order_usd_rejects_duplicate_keys`, `::test_load_max_per_order_usd_rejects_booleans_strings_and_oversized_ints` and `::test_load_max_orders_per_day_rejects_duplicate_keys`.

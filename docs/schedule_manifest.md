@@ -838,14 +838,7 @@ see the note at the top of this section for why that ordering is load-bearing.
 | 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 8 1-7 * 1-5` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 17 25-31 3-10 *` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 17 25-31 1,2,11,12 *` | no | active |
-| 7:31 AM | Goal snapshot: previous trading day close, read only (`claude/goal-snapshot/0731ET-goal-snapshot.md`) | TBD-task-id | Trading days (holidays skip via `dca_goal_snapshot.should_run`) | `31 7 * * 1-5` | no | pending |
-
-**Planned, not yet registered: 07:31 AM goal progress snapshot** (Phase 2 of
-`docs/adr-goals-and-loss-hedge-shadow.md`, approved 2026-11-14). Trading days only; records the
-previous trading day's close through Robinhood read tools (`dca_goal_snapshot.py`), places no
-orders, runs on the Mac ("Requires this computer"), 30-minute budget so it ends long before the
-3:40 PM chain. It has no task ID yet, so it is deliberately not a row in the table above; add the
-row when the task is created.
+| 7:31 AM | Goal snapshot: previous trading day close, read only (`claude/goal-snapshot/0731ET-goal-snapshot.md`) | `goal-snapshot-0731` | Trading days at 07:31 ET (holidays skip via `dca_goal_snapshot.should_run`) | `31 7 * * 1-5` | no | active |
 
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own

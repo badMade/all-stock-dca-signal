@@ -1,4 +1,4 @@
-<!-- Complete, single-piece prompt for task 041d9d90 (Weekly DCA Notion performance dashboard refresh, Fridays 5:30 PM ET). Paste this whole file as the task prompt. Replace <GOAL_LEDGER_DB> with the real ledger path at paste time. -->
+<!-- Complete, single-piece prompt for task 041d9d90 (Weekly DCA Notion performance dashboard refresh, Fridays 5:30 PM ET). Paste this whole file as the task prompt. No edits or substitutions are needed. -->
 
 Run the **weekly DCA Notion performance dashboard refresh** (mirrors Perplexity task `041d9d90`). Analytics only, no trading. This is the one approved post-3:40 PM DCA task and carries all the heavy analysis deferred from the weekday compact chain.
 
@@ -24,7 +24,7 @@ Run the **weekly DCA Notion performance dashboard refresh** (mirrors Perplexity 
 5. Compute: total invested this week, week notional vs the weekly cap, cost basis, slippage trend, missing-fill analysis, order counts and reliability per stream, candidates analyzed vs bought, and cost-basis/control comparison. Update the cost tracker (see `docs/cost_tracking.md`).
 6. Refresh the **full** Notion performance dashboard (this is the only run that does a full page rebuild). After the dashboard refresh, add one Notion section titled "Goal progress" (Fridays only; analytics only, places no orders):
    a. Confirm the day with `dca_goal_progress.friday_refresh_sections(today)`. If it does not return `["Goal progress"]`, skip the Goal progress section entirely.
-   b. Read the latest row per goal from the ledger: `LedgerStore(<GOAL_LEDGER_DB>).goal_progress()` (`dca-sizing-signals`, its own venv), keeping for each `goal_id` the row with the latest `day`. If that venv or the ledger is unreadable, say so in the section and do not invent figures.
+   b. Read the latest row per goal from the ledger: `LedgerStore(Path(dca_paths.stream_root("goal_snapshot", "ledger.duckdb"))).goal_progress()` (`dca-sizing-signals`, run with `~/.cache/all-stock-dca/goal-snapshot-venv/bin/python`, the same ledger the 07:31 task writes), keeping for each `goal_id` the row with the latest `day`. If that venv or the ledger is unreadable, say so in the section and do not invent figures.
    c. Build the section text with the module, not by hand: `section = dca_goal_progress.goal_progress_section(rows, today=today)`. Publish `section["title"]` as the heading and `section["text"]` as the body, unchanged.
    d. A goal whose window is under one year shows its period return only, never an annualized figure: the function already enforces that, so do not add, compute or restate an annualized number anywhere in the section. With no rows, the function returns "no goal progress recorded yet"; publish that line as is.
    e. No account number, no position-level dollar values, and no order or trade tool in this section.
