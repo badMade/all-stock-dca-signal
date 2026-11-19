@@ -5,7 +5,7 @@
 - **Supersedes:** item 8 ("Suggest-only boundary") of `docs/adr-dynamic-universe.md`. Every other
   item of that ADR stays in force unless this one says otherwise.
 - **Scope:** who writes `config/tickers.json`, how the executor reads it, how the 122 current names
-  are ranked and phased down to 100, and which checks stop a bad write. The graded ladder, budgets
+  are ranked and cut to the top 100 for buys, and which checks stop a bad write. The graded ladder, budgets
   and the "never sell" rule are untouched.
 
 ## Context
@@ -58,15 +58,16 @@ The operator wants the list maintained by the program, with every ticker ranked.
    with its status and reason and is never silently dropped. Ranks 1 to 100 for buys are taken
    among names that pass every flag. A name that cannot be scored shows as `unscored`, not as a
    low rank.
-3. **Cap of 100 with a phase-in.** The active set is at most 100. The 22 lowest-ranked of the
-   current 122 are demoted over three quarterly reviews (8, 8, then 6), using the dynamic-universe
-   ADR's 8-swap limit. Demotion means new buys stop. Shares are never sold. Until the phase-in
-   completes, the cap check allows a documented transition ceiling that falls each review: 114,
-   106, then 100.
+3. **Cap of 100, applied at once.** The active set is at most 100. On the first approved run
+   (operator-directed 2026-11-19, no phase-in) only ranks 1 to 100 are considered for buys, so the
+   22 lowest-ranked of the current 122 stop receiving new buys immediately. That first application
+   is exempt from the 8-swap limit and from the 90-to-100 range check of the dynamic-universe ADR,
+   because it is a one-time reset to the cap. Demotion means new buys stop. Shares are never sold.
+   Turnover at later reviews is open question 2.
 4. **One gated writer.** A single function is the only code allowed to write the file. It must:
    validate against `schemas/tickers.schema.json`; reject duplicates and names in `excluded`;
    refuse a proposal whose content hash does not match an approval record; enforce the cap, the
-   90-name floor and the swap limit; write to a temp file and rename it atomically; and append one
+   90-name floor and the swap limit (the first application excepted, item 3); write to a temp file and rename it atomically; and append one
    row per change to `config/ticker_history.csv` with source (`program` or `operator`) and
    approval ID. Any failed check keeps the last approved list.
 5. **Approval owner.** Operator only, as in the dynamic-universe ADR's proposed default. No
@@ -85,7 +86,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | # | Question | Proposed default |
 |---|---|---|
 | 1 | Does the 0935 live run read this repo's working copy or a separate checkout (`DCA_CONFIG_DIR`)? | Must be answered before implementation. If separate, the writer needs a delivery step to that copy |
-| 2 | Is the phase-in pace (8 per quarter) acceptable, or should the 22 be demoted at once? | 8 per quarter, to match the existing swap limit |
+| 2 | After the first application, does each quarterly review re-take a strict top 100, or keep the dynamic-universe ADR's 75/150 buffers and 8-swap limit? | Keep the buffers and the limit, so ranking noise cannot churn the list. A strict top 100 each quarter is the alternative |
 | 3 | Where do ranks 101 and below live in `tickers.json`? They stay ranked but are not considered for buys | Move to a `bench` key outside `active`, so they keep a rank and history |
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
 | 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
@@ -94,7 +95,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 ## Consequences
 
 - Fewer hidden edits: every list change carries a source and an approval ID.
-- 22 current names stop receiving new buys over three quarters. Their existing shares stay.
+- 22 current names stop receiving new buys on the first approved run. Their existing shares stay. One ranking decides all 22, so the first ranking needs review before approval.
 - Removing the hardcoded constant changes how bare `StrategyConfig()` paths get their list. It
   needs its own review and acceptance run.
 - A program that can change what gets bought is a larger blast radius than a suggester. The
@@ -105,7 +106,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 - Unit tests for the writer: duplicate, excluded name, over-cap, under-floor, over-swap-limit,
   bad hash, missing approval ID, and atomic-write interruption each leave the file unchanged.
 - `tests/test_config_invariants.py` passes after the constants are derived.
-- A dry run produces a proposal that ranks all 122 current names and lists the 8 first demotions,
+- A dry run produces a proposal that ranks all 122 current names and lists the 22 names that would stop receiving buys,
   with no change to `config/tickers.json`.
 - A report compares rank with realized performance for ranks 1 to 100 and for 101 and lower, so a
   poorly ranked name that performs well is visible.
