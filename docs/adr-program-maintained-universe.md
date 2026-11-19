@@ -43,6 +43,18 @@ The operator wants the list maintained by the program, with every ticker ranked.
    rank against realized performance for ranks 1 to 100 and for 101 and lower. Any scoring change
    that follows is a new variant recorded in `trials` and goes through operator approval like a
    list change. Tracking never places an order.
+   **The ranked pool is every symbol in `tickers.txt`, not just the 122.** `tickers.txt` holds
+   5,502 well-formed symbols (checked 2026-11-19), but 18 of today's 122 active names are not in
+   it (AAAU, CBRS, DFTX, DRAM, DXYZ, FLKR, GFUZ, MRSH, QQQ, QTOP, RVI, SATA, SPCX, TOPT, TRLV,
+   VCX, VT, XLG). The pool is therefore the union of `tickers.txt` and the current `active`,
+   `excluded` and `whole_share` lists, so no current name goes unranked. `tickers.txt` is
+   protected operational data (`CLAUDE.md`, "Do not modify") and the program only reads it. This
+   replaces item 1 of the dynamic-universe ADR as a filter on who gets ranked. Its tests (price,
+   market cap, dollar volume, fractional eligibility, history length) become per-name eligibility
+   flags with a reason. A name that fails a flag, or lacks the data to be scored, is still listed
+   with its status and reason and is never silently dropped. Ranks 1 to 100 for buys are taken
+   among names that pass every flag. A name that cannot be scored shows as `unscored`, not as a
+   low rank.
 3. **Cap of 100 with a phase-in.** The active set is at most 100. The 22 lowest-ranked of the
    current 122 are demoted over three quarterly reviews (8, 8, then 6), using the dynamic-universe
    ADR's 8-swap limit. Demotion means new buys stop. Shares are never sold. Until the phase-in
@@ -73,6 +85,8 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | 2 | Is the phase-in pace (8 per quarter) acceptable, or should the 22 be demoted at once? | 8 per quarter, to match the existing swap limit |
 | 3 | Where do ranks 101 and below live in `tickers.json`? They stay ranked but are not considered for buys | Move to a `bench` key outside `active`, so they keep a rank and history |
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
+| 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
+| 6 | Are ranks taken among buy-eligible names only, or among all names? | Among buy-eligible names; ineligible names are listed with a reason |
 
 ## Consequences
 
