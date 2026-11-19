@@ -328,8 +328,11 @@ def _config_float(raw: object, *, field: str) -> float:
     """
     if isinstance(raw, bool):
         raise ValueError(f"{field} must be a number, got boolean {raw!r}")
-    if isinstance(raw, (int, float, str)):
-        return float(raw)
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except OverflowError as exc:
+            raise ValueError(f"{field} must be a finite number, got {raw!r}") from exc
     raise ValueError(f"{field} must be a number, got {type(raw).__name__} {raw!r}")
 
 
@@ -616,7 +619,12 @@ def _reject_bool_numeric(raw_value: Any, description: str) -> float:
     """
     if isinstance(raw_value, bool):
         raise ValueError(f"{description} must be a number, not a boolean")
-    return float(raw_value)
+    if isinstance(raw_value, str):
+        raise ValueError(f"{description} must be a number, not a string")
+    try:
+        return float(raw_value)
+    except OverflowError as exc:
+        raise ValueError(f"{description} must be finite") from exc
 
 
 def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
@@ -631,9 +639,9 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     for tier in tiers_raw:
         if "min_drop_pct" not in tier or "multiplier" not in tier:
             raise ValueError(f"sizing tier missing min_drop_pct/multiplier: {tier}")
-        threshold = float(tier["min_drop_pct"]) / 100.0
-        multiplier = float(tier["multiplier"])
-        if threshold < 0 or multiplier < 0:
+        threshold = _reject_bool_numeric(tier["min_drop_pct"], "sizing tier min_drop_pct") / 100.0
+        multiplier = _reject_bool_numeric(tier["multiplier"], "sizing tier multiplier")
+        if not math.isfinite(threshold) or not math.isfinite(multiplier) or threshold < 0 or multiplier < 0:
             raise ValueError(f"sizing tier has negative threshold/multiplier: {tier}")
         tiers.append((threshold, multiplier))
     tiers.sort()
@@ -647,7 +655,7 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
         )
     if "minimum_order_usd" in data:
         min_order = _reject_bool_numeric(data["minimum_order_usd"], "sizing_ladder.json minimum_order_usd")
-        if min_order <= 0:
+        if not math.isfinite(min_order) or min_order <= 0:
             raise ValueError(f"sizing_ladder.json minimum_order_usd must be positive, got {min_order}")
         out["minimum_order_usd"] = min_order
     return out
@@ -672,9 +680,19 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
         for tier in tiers:
             if not isinstance(tier, dict) or "min_drop_pct" not in tier or "multiplier" not in tier:
                 raise ValueError(f"per-ticker sizing tier malformed for {ticker}")
-            parsed_tiers.append((float(tier["min_drop_pct"]) / 100.0, float(tier["multiplier"])))
-        full_base = max(1.0, float(model.get("base_amount_usd", 1.0)))
-        reduced_base = max(1.0, float(model.get("base_amount_below_close_usd", 1.0)))
+            threshold = _reject_bool_numeric(tier["min_drop_pct"], f"per-ticker sizing min_drop_pct for {ticker}") / 100.0
+            multiplier = _reject_bool_numeric(tier["multiplier"], f"per-ticker sizing multiplier for {ticker}")
+            if not math.isfinite(threshold) or not math.isfinite(multiplier) or threshold < 0 or multiplier < 0:
+                raise ValueError(f"per-ticker sizing tier malformed for {ticker}")
+            parsed_tiers.append((threshold, multiplier))
+        full_base_raw = _reject_bool_numeric(model.get("base_amount_usd", 1.0), f"per-ticker sizing base_amount_usd for {ticker}")
+        reduced_base_raw = _reject_bool_numeric(
+            model.get("base_amount_below_close_usd", 1.0), f"per-ticker sizing base_amount_below_close_usd for {ticker}"
+        )
+        if not math.isfinite(full_base_raw) or not math.isfinite(reduced_base_raw) or full_base_raw <= 0 or reduced_base_raw <= 0:
+            raise ValueError(f"per-ticker sizing base amount must be positive and finite for {ticker}")
+        full_base = max(1.0, full_base_raw)
+        reduced_base = max(1.0, reduced_base_raw)
         normalized[ticker.upper()] = {
             "tiers": tuple(sorted(parsed_tiers)),
             "base_amount_usd": full_base,
@@ -686,7 +704,7 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
     out: Dict[str, Any] = {"per_ticker_sizing": normalized}
     if "minimum_order_usd" in data:
         min_order = _reject_bool_numeric(data["minimum_order_usd"], "per_ticker_sizing.json minimum_order_usd")
-        if min_order <= 0:
+        if not math.isfinite(min_order) or min_order <= 0:
             raise ValueError(f"per_ticker_sizing.json minimum_order_usd must be positive, got {min_order}")
         out["minimum_order_usd"] = min_order
     return out
@@ -918,13 +936,18 @@ def load_ml_sizing_adjustment(config_dir: Path, *, now: Optional[datetime] = Non
     max_staleness_hours = data.get("max_staleness_hours")
     if not isinstance(generated_at_raw, str) or not isinstance(max_staleness_hours, (int, float)):
         return {}
-    if isinstance(max_staleness_hours, bool) or not math.isfinite(max_staleness_hours) or max_staleness_hours <= 0:
-        # A NaN/Infinity/nonpositive value passes the bare isinstance check
-        # above but would raise ValueError/OverflowError constructing the
-        # timedelta below -- since this loader runs during
-        # load_strategy_config, that would abort strategy startup instead of
-        # returning the documented empty no-op (Codex review: "Fail closed
-        # on non-finite staleness values").
+    if isinstance(max_staleness_hours, bool):
+        return {}
+    try:
+        if not math.isfinite(max_staleness_hours) or max_staleness_hours <= 0:
+            # A NaN/Infinity/nonpositive value passes the bare isinstance check
+            # above but would raise ValueError/OverflowError constructing the
+            # timedelta below -- since this loader runs during
+            # load_strategy_config, that would abort strategy startup instead of
+            # returning the documented empty no-op (Codex review: "Fail closed
+            # on non-finite staleness values").
+            return {}
+    except OverflowError:
         return {}
     try:
         generated_at = datetime.fromisoformat(generated_at_raw)
