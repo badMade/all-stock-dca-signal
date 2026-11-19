@@ -1,7 +1,7 @@
 # Scope: the fundamentals feed for the daily universe ranking
 
 - **Status:** Scoping (2026-11-19). Decision 1 (pinned list) is resolved. The pinned-list mechanics (schema,
-  config validation, engine helper, writer guard) are being built test-first. The data feed itself is not built.
+  config validation, engine helper, writer guard) are built and tested. The data feed itself is not built.
 - **Why:** `docs/adr-program-maintained-universe.md` ranks every symbol in `tickers.txt` each day. The
   engine (`ticker-advisor/universe.py`) needs four factors per name. Two come from prices. Two come from
   SEC filings, and no code produces them for the whole pool.

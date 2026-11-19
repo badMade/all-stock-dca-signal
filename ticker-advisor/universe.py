@@ -598,6 +598,9 @@ class Proposal:
     status: str = "unvalidated"
     safeguard_failures: tuple[SafeguardFailure, ...] = ()
     recommended_active: tuple[str, ...] = ()
+    # Hand-held names kept in ``active`` outside the ranking (see ``apply_pinned``); recorded so the
+    # stored proposal and its hash show exactly what was pinned.
+    pinned: tuple[str, ...] = ()
 
 
 class _CapCounter:
@@ -806,6 +809,39 @@ def select_universe(
         # not ranked at the prior review at all.
         prior_ranks={t: ranks_prior_review[t] for t in adds if t in ranks_prior_review},
         classification=classification,
+    )
+
+
+def apply_pinned(proposal: Proposal, pinned: Iterable[str]) -> Proposal:
+    """Add the hand-held ``pinned`` names to a proposal's ``prior_active``, ``active`` and ``holds``.
+
+    ETFs, funds and filers with no us-gaap facts cannot be scored, so the operator pins them
+    (``config/tickers.json``'s ``pinned``, docs/fundamentals_feed_scope.md). The caller runs
+    ``select_universe`` on the NON-pinned pool with ``strict_daily_top(100 - len(pinned))`` and calls this
+    BEFORE ``apply_safeguards``, so the size floor and cap are checked over the real total. Pinned names are
+    never ranked, added or dropped by the program.
+
+    Raises:
+        ValueError: the proposal was already validated, or a pinned name was also ranked, added or dropped
+            by the engine (the caller must take pinned names out of the scored pool and the incumbents first).
+    """
+    names = tuple(sorted(set(pinned)))
+    if not names:
+        return proposal
+    if proposal.status != "unvalidated":
+        raise ValueError("apply_pinned must run before the safeguards (the proposal is already validated)")
+    engine_touched = set(proposal.ranks) | set(proposal.adds) | set(proposal.drops) | set(proposal.hard_fail_drops)
+    engine_touched |= set(proposal.ineligible_drops)
+    clash = sorted(set(names) & engine_touched)
+    if clash:
+        raise ValueError(f"pinned name(s) {clash} were also ranked, added or dropped by the engine")
+    return dataclasses.replace(
+        proposal,
+        prior_active=tuple(sorted({*proposal.prior_active, *names})),
+        active=tuple(sorted({*proposal.active, *names})),
+        holds=tuple(sorted({*proposal.holds, *names})),
+        reasons={**proposal.reasons, **{t: "hold:pinned" for t in names}},
+        pinned=names,
     )
 
 
@@ -1082,6 +1118,7 @@ def proposal_to_dict(proposal: Proposal) -> dict:
         "drops": list(proposal.drops),
         "hard_fail_drops": list(proposal.hard_fail_drops),
         "ineligible_drops": list(proposal.ineligible_drops),
+        "pinned": list(proposal.pinned),
         "prior_ranks": dict(proposal.prior_ranks),
         "classification": {t: dict(c) for t, c in proposal.classification.items()},
         "holds": list(proposal.holds),

@@ -248,6 +248,28 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
                 f"tickers.json's 'whole_share' field contains invalid ticker symbol(s): {invalid_whole_share!r}"
             )
         out["whole_share_tickers"] = frozenset(str(t) for t in whole_share)
+    pinned = data.get("pinned")
+    if pinned is not None:
+        # Hand-held names the daily ranking never adds, ranks or drops (docs/fundamentals_feed_scope.md).
+        # Rejected outright when malformed, like "whole_share" above: a quietly ignored pinned list would
+        # let the program drop a name the operator meant to keep. It is a SUBSET of active (so it adds no
+        # fourth category to the partition below) and can never be an excluded name.
+        if not isinstance(pinned, list):
+            raise ValueError(f"tickers.json's 'pinned' field must be a list, got {type(pinned).__name__}")
+        invalid_pinned = [
+            item for item in pinned if not isinstance(item, str) or not _WHOLE_SHARE_SYMBOL_PATTERN.match(item)
+        ]
+        if invalid_pinned:
+            raise ValueError(f"tickers.json's 'pinned' field contains invalid ticker symbol(s): {invalid_pinned!r}")
+        if len(set(pinned)) != len(pinned):
+            raise ValueError("tickers.json's 'pinned' field repeats a symbol")
+        active_set = set(out.get("tickers", ()))
+        not_active = sorted(set(pinned) - active_set)
+        if not_active:
+            raise ValueError(f"tickers.json's 'pinned' names are not in 'active': {not_active!r}")
+        pinned_and_excluded = sorted(set(pinned) & set(out.get("excluded_tickers", ())))
+        if pinned_and_excluded:
+            raise ValueError(f"tickers.json's 'pinned' names are also excluded: {pinned_and_excluded!r}")
     # active/excluded/whole_share are a THREE-WAY DISJOINT partition of the
     # universe (see docs/whole_share_accumulation.md) -- a symbol in more
     # than one category leaves near_close_dca._run_once_impl's ticker-list

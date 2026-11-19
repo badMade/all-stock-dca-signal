@@ -160,6 +160,15 @@ the number of names changed per day is unlimited (`UNLIMITED_SWAPS`). The input 
 90-name floor and 100-name cap are unchanged. The default `UniverseConfig()` keeps the quarterly
 behaviour exactly as before.
 
+### Pinned names
+
+`config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap
+facts) that cannot be scored. They stay in `active`, count toward the cap of 100, and are never ranked, added
+or dropped by the program. Run `select_universe` on the non-pinned pool with
+`UniverseConfig.strict_daily_top(100 - len(pinned))`, then `universe.apply_pinned(proposal, pinned)` BEFORE
+`apply_safeguards`. `dca_config.load_tickers` validates `pinned` (a subset of `active`, canonical symbols,
+no repeats, never excluded) and `universe_apply` refuses a proposal that drops a pinned name.
+
 ### Applying a proposal (`universe_apply.py`)
 
 `universe_apply.apply_proposal(proposal_path, tickers_path, history_path, approval_id=..., applied_on=...)`

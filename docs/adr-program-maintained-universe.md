@@ -104,8 +104,11 @@ The operator wants the list maintained by the program, with every ticker ranked.
    them as an input from `universe_scores` and makes its own decision. Until that ADR is
    accepted, the "shares are never sold" rule stands, with only the exception already recorded in
    `docs/adr-tax-loss-sale.md`.
-9. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `symbol_corrections` and the
-   free-text notes are not written by the program in this ADR.
+9. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `pinned`, `symbol_corrections` and
+   the free-text notes are not written by the program in this ADR. `pinned` (operator-approved
+   2026-11-19, `docs/fundamentals_feed_scope.md`) lists ETFs, funds and filers with no us-gaap facts that
+   cannot be scored: they stay in `active` outside the ranking and count toward the cap of 100, and the
+   writer refuses any proposal that drops one.
 
 ## Open questions
 
