@@ -361,6 +361,36 @@ def test_run_consumes_octopus_sources_but_leaves_scores_unchanged_at_zero_weight
     assert len(cr.read_history(shadowed / "shadow_octopus_history.csv")) == 3
 
 
+def test_run_survives_ml_tickers_that_octopus_did_not_forecast(tmp_path):
+    # Regression: a ticker present only in the ML history had no "octopus" key and raised KeyError in cmd_run.
+    data = tmp_path / "data"
+    (data / "inputs").mkdir(parents=True)
+    (data / "inputs" / "holdings.json").write_text(json.dumps({"symbols": []}))
+    members = [["AAA", "A", "T"], ["BBB", "B", "T"], ["CCC", "C", "T"]]
+    (data / "inputs" / "sp500.json").write_text(json.dumps(members))
+    ext = {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+           for t, s in {"AAA": make_series(0.001), "BBB": make_series(-0.0002), "CCC": make_series(0.0004)}.items()}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+    src = tmp_path / "oct"
+    src.mkdir()
+    _octopus_csv(src / "x_next_day_forecasts.csv",
+                 [("AAA", "octopus", "2026-11-04", 100, 101, 99, 102, "2026-11-05")])
+    (data / "inputs" / "octopus_sources.json").write_text(json.dumps([str(src)]))
+    ml_root = tmp_path / "sizing_suggestions"
+    (ml_root / "ml_forecaster").mkdir(parents=True)
+    (ml_root / "ml_forecaster" / "2026.jsonl").write_text(
+        _ml_line("2026-11-03", {"AAA": 1.0, "BBB": 1.2, "CCC": 0.8}) + "\n")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    assert cr.main(["--data-dir", str(data), "--archive-dir", str(empty), "--config-dir", str(cfg),
+                    "--ml-root", str(ml_root), "run", "--as-of", "2026-11-04"]) == 0
+    shadow = cr.read_history(data / "shadow_octopus_history.csv")
+    assert [r["ticker"] for r in shadow] == ["AAA"]
+    assert len(cr.read_history(data / "shadow_ml_history.csv")) == 3
+
+
 def test_stale_origin_dates_in_an_octopus_export_are_not_logged(tmp_path):
     _octopus_csv(tmp_path / "a_next_day_forecasts.csv", [
         ("OLD", "octopus", "2012-11-08", 100, 101, 99, 102, "2012-11-09"),

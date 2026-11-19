@@ -947,7 +947,8 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     (data_dir / "latest_ranked_all.csv").write_text((run_dir / "ranked_all.csv").read_text(encoding="utf-8"),
                                                    encoding="utf-8")
     if octopus:
-        pcts = {as_of.isoformat(): {t: f["octopus"] for t, f in forward.items()}}
+        # Only tickers Octopus forecast have an octopus value; ML-only tickers have none and must not crash the run.
+        pcts = {as_of.isoformat(): {t: f["octopus"] for t, f in forward.items() if "octopus" in f}}
         upsert_shadow(data_dir / "shadow_octopus_history.csv", octopus, pcts)
     if ml_runs:
         upsert_shadow_ml(data_dir / "shadow_ml_history.csv", ml_runs)

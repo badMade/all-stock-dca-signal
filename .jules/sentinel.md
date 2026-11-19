@@ -89,10 +89,12 @@
 **Vulnerability:** Standard `json.loads` in `dca_console.py` POST endpoints silently resolved duplicate keys by keeping the last occurrence. If an attacker supplied a payload like `{"action": "valid_job", "action": "malicious_job"}`, initial routing or validation could see one value while execution triggered on the other, bypassing safety checks.
 **Learning:** `json.loads` allows parameter pollution when accepting untrusted API payloads unless explicitly protected.
 **Prevention:** Always use `json.loads(body, object_pairs_hook=_reject_duplicate_keys)` when parsing safety-bound configs or untrusted POST requests to explicitly raise `ValueError` on duplicate JSON keys.
+
 - Testing (Pytest Discovery): When refactoring or renaming tests, ensure the function names continue to start with `test_`. Removing the underscore (e.g., `testproxy_...`) will cause Pytest to silently skip the test during discovery without raising an error.
 - Workflow (Knowledge Retention): At the end of a testing or debugging task, append any new test isolation insights or scalar boundary rules to `.jules/sentinel.md` or `.jules/bolt.md` (using `>>`) to maintain team knowledge and prevent architectural drift.
 
 ## 2024-11-20 - Boolean Coercion Bypass in Validation
+
 **Vulnerability:** Unbounded numeric parsing missed an explicit `bool` check before checking `isinstance(value, (int, float))`.
 **Learning:** In Python, `isinstance(True, int)` evaluates to `True`, which can bypass safety invariants (like `pending_usd`).
 **Prevention:** Always guard against booleans explicitly (`not isinstance(v, bool)`) before evaluating `isinstance(v, (int, float))`.
