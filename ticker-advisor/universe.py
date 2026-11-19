@@ -59,6 +59,10 @@ DEFAULT_FACTOR_WEIGHTS: Mapping[str, float] = {
 # 0.0 that would read as "exactly sector-average".
 MIN_SECTOR_SIZE = 2
 
+# ``max_swaps`` value meaning "no limit on names changed per review" (strict daily mode). Far above any
+# real pool, so neither the exit deferral nor the ``too_many_swaps`` safeguard can ever bind.
+UNLIMITED_SWAPS = 10**9
+
 # Same floating-point-noise tolerance scoring._zscore uses: a sector whose
 # values differ only by summation noise is treated as zero-dispersion
 # instead of producing huge z-scores from a micro-epsilon stdev.
@@ -141,11 +145,39 @@ class UniverseConfig:
     # A ticker missing MORE than this many factors is unscored. The spec's
     # "missing >= 2 factors is unscored" is max_missing_factors=1.
     max_missing_factors: int = 1
+    # True (the spec default): a non-member enters only if it ranked inside the entry band at the PRIOR
+    # review too ("two reviews running"). False: it enters on the first review it ranks inside the band.
+    # The strict daily top-N mode (``strict_daily_top``) sets this False.
+    entry_requires_prior_review: bool = True
     hard_fail_min_price: float = 5.0
     hard_fail_low_price_sessions: int = 20
     factor_weights: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_FACTOR_WEIGHTS))
 
+    @classmethod
+    def strict_daily_top(cls, size: int = 100) -> "UniverseConfig":
+        """The operator's daily rule (docs/adr-program-maintained-universe.md, decision item 3).
+
+        The buy-eligible set is each day's ranks 1..``size``: one band (no 75/150 hysteresis), a name
+        enters on the first day it ranks inside it, leaves the day it falls out, nothing is
+        tenure-protected, the sector and industry caps cannot bind a top-``size`` name, and the number
+        of names changed per day is effectively unlimited. Every input safeguard (pool coverage, stale
+        data, missing factors) and the active-size floor and cap stay as they are.
+        """
+        return cls(
+            max_active=size,
+            min_active=min(90, size),
+            entry_rank=size,
+            incumbent_keep_rank=size,
+            sector_cap=size,
+            industry_cap=size,
+            min_tenure_quarters=0,
+            max_swaps=UNLIMITED_SWAPS,
+            entry_requires_prior_review=False,
+        )
+
     def __post_init__(self) -> None:
+        if not isinstance(self.entry_requires_prior_review, bool):
+            raise ValueError("UniverseConfig.entry_requires_prior_review must be a bool")
         positive_ints = (
             "max_active", "min_active", "entry_rank", "incumbent_keep_rank", "sector_cap", "industry_cap",
             "bench_min_rank", "bench_max_rank", "max_quote_age_sessions", "max_quote_age_calendar_days",
@@ -722,10 +754,11 @@ def select_universe(
             break
         if ticker in incumbents_with_tenure:
             continue
-        prior_rank = _strict_int(ranks_prior_review.get(ticker))
-        if prior_rank is None or prior_rank < 1 or prior_rank > config.entry_rank:
-            reasons[ticker] = "skip:not_in_entry_band_prior_review"
-            continue
+        if config.entry_requires_prior_review:
+            prior_rank = _strict_int(ranks_prior_review.get(ticker))
+            if prior_rank is None or prior_rank < 1 or prior_rank > config.entry_rank:
+                reasons[ticker] = "skip:not_in_entry_band_prior_review"
+                continue
         if seats + len(adds) >= config.max_active:
             reasons[ticker] = "skip:no_room"
             continue
@@ -738,7 +771,7 @@ def select_universe(
             reasons[ticker] = f"skip:{blocked}_cap"
             continue
         adds.append(ticker)
-        reasons[ticker] = "add:entry_band_two_reviews"
+        reasons[ticker] = "add:entry_band_two_reviews" if config.entry_requires_prior_review else "add:entry_band"
         caps.add(sector, industry)
 
     active = tuple(sorted({*holds, *adds}))
@@ -769,7 +802,9 @@ def select_universe(
         pool_stats=pool_stats,
         config=config,
         ineligible_drops=tuple(sorted(t for t in rank_drops if t in ineligible)),
-        prior_ranks={t: ranks_prior_review[t] for t in adds},
+        # Only adds that HAD a prior rank carry one: strict daily mode admits a first-day entrant that was
+        # not ranked at the prior review at all.
+        prior_ranks={t: ranks_prior_review[t] for t in adds if t in ranks_prior_review},
         classification=classification,
     )
 
@@ -926,7 +961,7 @@ def _add_failures(proposal: Proposal, config: UniverseConfig) -> list[SafeguardF
         sector, industry = info.get("sector"), info.get("industry")
         if rank is None or not 1 <= rank <= config.entry_rank:
             problems.append(f"{ticker}: rank {rank!r} outside entry band {config.entry_rank}")
-        elif prior is None or not 1 <= prior <= config.entry_rank:
+        elif config.entry_requires_prior_review and (prior is None or not 1 <= prior <= config.entry_rank):
             problems.append(f"{ticker}: prior-review rank {prior!r} outside entry band {config.entry_rank}")
         elif sector is None or industry is None:
             problems.append(f"{ticker}: sector/industry unknown")

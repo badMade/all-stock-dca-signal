@@ -150,6 +150,16 @@ See `docs/ticker_advisory.md` for how this fits into the existing manual ticker-
 its closing section on the (not-yet-built) idea of eventually letting a composite score influence
 sizing, not just universe membership.
 
+### Strict daily top-N mode
+
+`UniverseConfig.strict_daily_top(100)` is the operator's daily rule (see the ADR): the buy-eligible set
+is each day's ranks 1 to 100. One band (no 75/150 hysteresis), a name enters on the first day it ranks
+inside it (`entry_requires_prior_review=False`) and leaves the day it falls out, nothing is
+tenure-protected, the sector and industry caps are set to 100 so they never block a top-100 name, and
+the number of names changed per day is unlimited (`UNLIMITED_SWAPS`). The input safeguards and the
+90-name floor and 100-name cap are unchanged. The default `UniverseConfig()` keeps the quarterly
+behaviour exactly as before.
+
 ### Applying a proposal (`universe_apply.py`)
 
 `universe_apply.apply_proposal(proposal_path, tickers_path, history_path, approval_id=..., applied_on=...)`
