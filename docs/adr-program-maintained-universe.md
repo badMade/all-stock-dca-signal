@@ -36,6 +36,13 @@ The operator wants the list maintained by the program, with every ticker ranked.
    `universe_proposal.json` (operator-confirmed 2026-11-19: all tickers ranked, only the top 100
    considered for buys). Rank decides buy eligibility: ranks 1 to 100 are considered for buys,
    and every name ranked 101 or lower is ranked and tracked but not considered for buys.
+   The tracking exists to evaluate the score. A name that ranks poorly but performs well is
+   evidence the scoring needs adjusting, so every ranked name keeps a dated rank history and a
+   counterfactual record (what the same buy rules would have bought, using the existing
+   `universe_scores` and counterfactual tables of the dynamic-universe ADR). Each review reports
+   rank against realized performance for ranks 1 to 100 and for 101 and lower. Any scoring change
+   that follows is a new variant recorded in `trials` and goes through operator approval like a
+   list change. Tracking never places an order.
 3. **Cap of 100 with a phase-in.** The active set is at most 100. The 22 lowest-ranked of the
    current 122 are demoted over three quarterly reviews (8, 8, then 6), using the dynamic-universe
    ADR's 8-swap limit. Demotion means new buys stop. Shares are never sold. Until the phase-in
@@ -83,6 +90,8 @@ The operator wants the list maintained by the program, with every ticker ranked.
 - `tests/test_config_invariants.py` passes after the constants are derived.
 - A dry run produces a proposal that ranks all 122 current names and lists the 8 first demotions,
   with no change to `config/tickers.json`.
+- A report compares rank with realized performance for ranks 1 to 100 and for 101 and lower, so a
+  poorly ranked name that performs well is visible.
 
 ## Rollback
 
