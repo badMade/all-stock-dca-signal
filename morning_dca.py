@@ -969,8 +969,10 @@ def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
     if not budgets_path.exists():
         return None
     try:
-        budgets_raw = json.loads(budgets_path.read_bytes())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        # Reject duplicate JSON keys (matching load_max_consecutive_placement_failures
+        # and dca_config) so a duplicated safety cap cannot silently resolve last-one-wins.
+        budgets_raw = json.loads(budgets_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError(
             f"budgets.json exists but could not be read or parsed; "
             f"refusing to silently bypass the per-order cap ({exc})"
@@ -989,9 +991,15 @@ def load_max_per_order_usd(config_dir_path: Path) -> Optional[float]:
     if "max_per_order_usd" not in cb:
         return None
     raw_val = cb["max_per_order_usd"]
+    # Guard bool before (int, float) so True cannot silently coerce to $1.00,
+    # reject non-numeric strings, and catch OverflowError on oversized ints.
+    if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+        raise ValueError(
+            f"budgets.json circuit_breakers.max_per_order_usd must be a finite positive number, got {raw_val!r}"
+        )
     try:
         max_order = float(raw_val)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
             f"budgets.json circuit_breakers.max_per_order_usd must be a finite positive number, got {raw_val!r}"
         ) from exc
@@ -1016,8 +1024,10 @@ def load_max_orders_per_day(config_dir_path: Path) -> Optional[int]:
     if not budgets_path.exists():
         return None
     try:
-        budgets_raw = json.loads(budgets_path.read_bytes())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        # Reject duplicate JSON keys so a duplicated order-count cap cannot silently
+        # resolve last-one-wins (matching load_max_consecutive_placement_failures).
+        budgets_raw = json.loads(budgets_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError(
             f"budgets.json exists but could not be read or parsed; "
             f"refusing to silently bypass the daily order-count cap ({exc})"
