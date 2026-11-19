@@ -980,7 +980,33 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
 # ----------------------------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------------------------
+def archive_settling_mtime(archive_dir, quiet_minutes, now=None):
+    """Newest mtime among the archive's CSVs if it falls inside the quiet window, else None.
+
+    The daily archive update rewrites thousands of files (and restates whole histories) over a window of minutes.
+    A run that reads mid-update mixes old and new bars, so the run refuses to score until the folder has been quiet.
+    """
+    now = now or dt.datetime.now().timestamp()
+    newest = None
+    for path in Path(archive_dir).glob("*.csv"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        newest = mtime if newest is None else max(newest, mtime)
+    if newest is None or now - newest >= quiet_minutes * 60:
+        return None
+    return newest
+
+
 def cmd_run(args):
+    if not args.allow_active_archive:
+        settling = archive_settling_mtime(args.archive_dir, args.quiet_minutes)
+        if settling is not None:
+            stamp = dt.datetime.fromtimestamp(settling).strftime("%H:%M:%S")
+            print(f"error: archive {args.archive_dir} changed at {stamp} (within {args.quiet_minutes} min); "
+                  "wait for the daily update to finish, or pass --allow-active-archive", file=sys.stderr)
+            return 3
     tickers, held, names, sectors, series = prepare(args)
     as_of = dt.date.fromisoformat(args.as_of) if args.as_of else default_as_of(series)
     summary = run_once(args, tickers, held, names, sectors, series, as_of)
@@ -1169,6 +1195,10 @@ def build_parser():
     run.add_argument("--threshold", type=float, default=None, help="default: params.json evaluate_threshold")
     run.add_argument("--top", type=int, default=0, help="list the top N instead of score > threshold")
     run.add_argument("--as-of", default="", help="YYYY-MM-DD (default: latest price date)")
+    run.add_argument("--quiet-minutes", type=float, default=30,
+                     help="refuse to score if any archive CSV changed more recently than this (default 30)")
+    run.add_argument("--allow-active-archive", action="store_true",
+                     help="score even while the archive is still being updated (not for scheduled runs)")
     run.set_defaults(func=cmd_run)
     back = sub.add_parser("backfill", help="re-score a date range to seed history")
     back.add_argument("--start", required=True)

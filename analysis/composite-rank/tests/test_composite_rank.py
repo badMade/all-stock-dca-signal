@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -389,6 +390,23 @@ def test_run_survives_ml_tickers_that_octopus_did_not_forecast(tmp_path):
     shadow = cr.read_history(data / "shadow_octopus_history.csv")
     assert [r["ticker"] for r in shadow] == ["AAA"]
     assert len(cr.read_history(data / "shadow_ml_history.csv")) == 3
+
+
+def test_archive_guard_refuses_while_the_daily_update_is_still_writing(tmp_path):
+    # Regression: a run that read the archive mid-update mixed old and new bars (TRV moved 92.0 -> 78.6).
+    archive = tmp_path / "arch"
+    archive.mkdir()
+    assert cr.archive_settling_mtime(archive, 30) is None  # empty archive is not settling
+    fresh = archive / "TRV.csv"
+    fresh.write_text("Date\n")
+    now = fresh.stat().st_mtime
+    assert cr.archive_settling_mtime(archive, 30, now=now + 60) is not None  # 1 minute after a write: refuse
+    assert cr.archive_settling_mtime(archive, 30, now=now + 31 * 60) is None  # quiet for 31 minutes: allowed
+    data = tmp_path / "data"
+    rc = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "run", "--as-of", "2026-11-04"])
+    assert rc == 3 and not (data / "history.csv").exists()  # refused before writing any output
+    os.utime(fresh, (now - 3600, now - 3600))  # an hour old: the guard no longer blocks
+    assert cr.archive_settling_mtime(archive, 30) is None
 
 
 def test_stale_origin_dates_in_an_octopus_export_are_not_logged(tmp_path):
