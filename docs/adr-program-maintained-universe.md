@@ -76,8 +76,9 @@ The operator wants the list maintained by the program, with every ticker ranked.
    `universe_membership` table. Any failed check keeps the last approved list. The dynamic-universe
    ADR's fail-closed input checks (pool coverage, stale quotes, missing factors) run on every
    daily proposal.
-5. **Approval.** A daily operator approval is not workable, so the proposed default changes the
-   dynamic-universe ADR's operator-only rule. The program applies a daily proposal by itself when
+5. **Approval.** A daily operator approval is not workable, so this ADR changes the
+   dynamic-universe ADR's operator-only rule (operator confirmed auto-apply within the bound,
+   2026-11-19). The program applies a daily proposal by itself when
    every gate passes and the change is within the daily bound, and the approval ID then records
    the standing operator approval of this ADR plus the proposal hash. A proposal outside the
    bound, a failed gate, or any change to the scoring itself needs the operator. No approval means
@@ -113,7 +114,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
 | 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
 | 6 | Are ranks taken among buy-eligible names only, or among all names? | Among buy-eligible names; ineligible names are listed with a reason |
-| 7 | What is the bound on names changed in one day before a proposal needs the operator, and may the program apply within-bound proposals without a per-day approval? | Bound of 8 names per day (reusing the old swap size) and yes to auto-apply, with the operator needed above the bound. Both are changes from the dynamic-universe ADR |
+| 7 | Resolved 2026-11-19: the operator accepted auto-apply within a daily bound. The bound is 8 names changed per day, taken from the proposal and not separately confirmed | Keep 8 unless the operator names another number. It lives in config, so changing it needs no code change |
 
 ## Consequences
 
