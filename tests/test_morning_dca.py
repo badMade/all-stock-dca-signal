@@ -9173,6 +9173,33 @@ def test_load_max_orders_per_day_rejects_non_positive_value(tmp_path):
         load_max_orders_per_day(tmp_path)
 
 
+def test_load_max_per_order_usd_rejects_bool_overflow_string_and_duplicates(tmp_path):
+    from morning_dca import load_max_per_order_usd
+
+    for bad_val in (True, False, "25", 10**1000):
+        (tmp_path / "budgets.json").write_text(
+            json.dumps({"circuit_breakers": {"max_per_order_usd": bad_val}}), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="max_per_order_usd"):
+            load_max_per_order_usd(tmp_path)
+
+    (tmp_path / "budgets.json").write_text(
+        '{"circuit_breakers": {"max_per_order_usd": 10, "max_per_order_usd": 999}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="could not be read or parsed"):
+        load_max_per_order_usd(tmp_path)
+
+
+def test_load_max_orders_per_day_rejects_duplicate_keys(tmp_path):
+    (tmp_path / "budgets.json").write_text(
+        '{"circuit_breakers": {"max_orders_per_day": 2, "max_orders_per_day": 999}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="could not be read or parsed"):
+        load_max_orders_per_day(tmp_path)
+
+
 def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     # Codex review (PR #42): setting prior_allocation_roots=[] disables the per-ticker
     # guard but must NOT skip cap seeding. A morning manual fill of $85 recorded in
