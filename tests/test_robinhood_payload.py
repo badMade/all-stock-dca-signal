@@ -1088,6 +1088,37 @@ def test_launcher_rescues_an_empty_liquid_name_in_a_chunk_that_answered_others(t
 # -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
 
 
+# -- sliding worker pool (2026-11-16: the 14:30 build ran to its deadline after one chunk timed out; the launcher started
+# chunks in lock-step waves of DCA_CODEX_PARALLEL and `wait`ed for the whole wave, so one slow chunk idled the other workers)
+
+# Records when each first-pass chunk's worker starts; chunk_0 is slow, every other chunk answers at once.
+_SLOW_CHUNK_ZERO = (
+    '#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n'
+    'name="$(basename "$out" .json)"\n'
+    'perl -MTime::HiRes=time -e \'print time\' >"$DCA_TEST_STARTS/$name.start"\n'
+    '[ "$name" = chunk_0 ] && sleep 4\n'
+    'echo "{}" >"$out"\n'
+)
+
+
+def test_a_slow_chunk_does_not_hold_back_the_next_chunk_when_a_worker_is_free(tmp_path):
+    starts = tmp_path / "starts"
+    starts.mkdir()
+    # Two workers: chunk 0 takes 4 s, chunk 1 answers at once, so a free worker must pick up chunk 2 right away. In
+    # lock-step waves chunk 2 waits for chunk 0 as well (>= 4 s after chunk 0 began). The deadline only caps the stub
+    # build's rescue passes, which this test does not look at.
+    _run_launcher(
+        tmp_path, fake_script=_SLOW_CHUNK_ZERO,
+        extra_env={
+            "DCA_TEST_STARTS": str(starts), "DCA_CODEX_PARALLEL": "2",
+            "DCA_BUILD_DEADLINE_SECONDS": "20", "DCA_MIN_ATTEMPT_SECONDS": "2",
+        },
+    )
+    begun = {p.name.removesuffix(".start"): float(p.read_text()) for p in starts.glob("chunk_*.start")}
+    assert {"chunk_0", "chunk_1", "chunk_2"} <= set(begun), sorted(begun)
+    assert begun["chunk_2"] - begun["chunk_0"] < 3, begun
+
+
 def test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk(tmp_path):
     import re
 

@@ -256,12 +256,18 @@ print(int(dt.datetime.combine(day, dt.time.fromisoformat(sys.argv[2]), ZoneInfo(
     && echo "robinhood_payload: deadline $BUILD_DEADLINE_ET ET had already passed when the build started; fetching nothing" >&2
 fi
 "$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json" >"$WORK/chunks.txt"
+# Sliding worker pool (2026-11-19). Chunks used to start in lock-step waves of PARALLEL with a `wait` after each wave, so
+# one chunk that ran to its 240 s timeout idled the other workers until it ended (the 2026-11-16 14:30 build, which then
+# ran into its deadline). Now a new chunk starts as soon as any worker finishes. No bash 4 `wait -n` (macOS ships bash
+# 3.2), so this polls the running-job count; 0.2 s against chunks that take tens of seconds costs nothing.
+wait_for_free_worker() {
+  while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$PARALLEL" ]; do sleep 0.2; done
+}
 idx=0
 while IFS= read -r tickers; do
+  wait_for_free_worker
   run_chunk "$idx" "$tickers" &
   idx=$((idx + 1))
-  # Bound concurrency without bash 4's wait -n (macOS ships bash 3.2).
-  if [ $((idx % PARALLEL)) -eq 0 ]; then wait; fi
 done <"$WORK/chunks.txt"
 wait
 
@@ -296,16 +302,14 @@ print(",".join(rescue_targets(reply, [t for t in sys.argv[2].split(",") if t])))
 ' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
   if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
 done
-rescued=0
 for i in ${targets[@]+"${targets[@]}"}; do
   IFS=, read -r -a members <<<"$(cat "$WORK/need_$i.txt")"
   echo "robinhood_payload: rescue chunk=$i tickers=${#members[@]} size=$RESCUE_SIZE" >&2
   for ((k = 0; k * RESCUE_SIZE < ${#members[@]}; k++)); do
     group="$(IFS=,; echo "${members[*]:k*RESCUE_SIZE:RESCUE_SIZE}")"
     echo "$group" >"$WORK/rescue_$i.r$k.tickers"
+    wait_for_free_worker
     run_chunk "$i.r$k" "$group" &
-    rescued=$((rescued + 1))
-    if [ $((rescued % PARALLEL)) -eq 0 ]; then wait; fi
   done
 done
 wait
