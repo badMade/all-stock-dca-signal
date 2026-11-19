@@ -34,7 +34,7 @@ ACCOUNT = "7" * 5 + LAST4  # synthetic; built so no account-shaped literal sits 
 PROJECT_DIR = "/work/projects/dca-synthetic-0001/files"  # synthetic; the real folder is the operator's own
 
 TEMPLATE = """STANDING BACKUP EXECUTOR - slot {slot}
-Task {task}. Fires 09:55 ET on trading days.
+Task {task}. Fires 10:00 ET on trading days.
 2. ACCOUNT: the number must end in ${{ROBINHOOD_AGENTIC_ACCOUNT_LAST4}}.
 Write ${{PPLX_RUN_STATE_DIR}}/run_state_<YYYYMMDD>_<HHMM>ET.json
 Append to ${{PPLX_RUN_STATE_DIR}}/submitted_orders.csv

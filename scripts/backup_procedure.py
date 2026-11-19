@@ -49,7 +49,7 @@ class Backup:
 
 
 BACKUPS = (
-    Backup("0955ET-935-backup.txt", "4412c3c4", ("09:55",), ("0935",)),
+    Backup("1000ET-935-backup.txt", "4412c3c4", ("10:00",), ("0935",)),
     Backup("1050ET-1030-backup.txt", "e028361e", ("10:50",), ("1030",)),
     Backup("1150ET-1130-backup.txt", "e3590042", ("11:50",), ("1130",)),
     Backup("1250ET-1230-backup.txt", "062605c6", ("12:50",), ("1230",)),
