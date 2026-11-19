@@ -1,7 +1,9 @@
 # ADR: Program-maintained ticker universe (supersedes item 8 of the dynamic-universe ADR)
 
-- **Status:** Proposed (2026-11-19). Nothing in this ADR is implemented. It needs operator
-  acceptance before any code is written.
+- **Status:** In progress, operator-directed 2026-11-19. Implemented so far: the gated writer
+  (`ticker-advisor/universe_apply.py`), the derived `ACTIVE_TICKERS`, and the strict daily top-100
+  engine mode. Not built: the data feed for ranking, the `launchd` job on the Mac, and the call
+  sites. Nothing yet applies a proposal to the live list. Open question 9 is unanswered.
 - **Supersedes:** item 8 ("Suggest-only boundary") of `docs/adr-dynamic-universe.md`. Every other
   item of that ADR stays in force unless this one says otherwise.
 - **Scope:** who writes `config/tickers.json`, how the executor reads it, how the 122 current names
@@ -110,7 +112,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | # | Question | Proposed default |
 |---|---|---|
 | 1 | Resolved 2026-11-19 from `claude/dca-executor-prompts/live-mirror/0935ET-935-am-dca-morning-buy.txt` (Gate 2, "PREBUILT ROBINHOOD PAYLOAD"): the 0935 run reads the repo checkout on the operator's Mac (canonical path `/Users/geoffreyplymale/Documents/Git/all-stock-dca`, exposed to the agent sandbox under `/sessions/*/mnt/`), requires exactly one checkout, and treats it as the only source of truth for what to buy. It does not read a cloud session's copy. Other Mac jobs already run under `launchd` (`deploy/launchd/`) | The daily ranking-and-apply job runs on the Mac under `launchd`, in the same pattern as `com.all-stock-dca.octopus-daily-update`, and writes `config/tickers.json` in that checkout before 9:35 ET. No delivery step is needed. A write made from a cloud session reaches the live run only through git and a pull on the Mac |
-| 2 | With daily re-ranking, is membership the strict top 100 each day, or does a held name keep its place until it falls below a lower rank (a buffer)? | Strict top 100, as you stated. The report lists daily entries and exits so you can see boundary churn and add a buffer later |
+| 2 | Resolved 2026-11-19: strict top 100 each day, no buffer, a name enters on the first day it ranks in the top 100 (`UniverseConfig.strict_daily_top`) | The report lists daily entries and exits so boundary churn is visible, and a buffer can be added later if the operator wants one |
 | 3 | Where do ranks 101 and below live in `tickers.json`? They stay ranked but are not considered for buys | Move to a `bench` key outside `active`, so they keep a rank and history |
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
 | 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
