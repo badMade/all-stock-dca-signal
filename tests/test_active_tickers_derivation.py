@@ -87,6 +87,22 @@ def test_a_missing_tickers_json_refuses_the_import(tmp_path):
     assert "tickers.json" in result.stderr
 
 
+def test_importing_the_module_alone_does_not_need_a_valid_tickers_json(tmp_path):
+    # Existing invariant (scripts/tests/test_generate_buy_candidates.py): a plain --help, or a run given
+    # a valid --config-dir, must not crash on a stale $DCA_CONFIG_DIR. So the list is read on first USE,
+    # which fails closed (test above), not when the module is imported.
+    env = {**os.environ, "DCA_CONFIG_DIR": str(tmp_path / "does-not-exist")}
+    result = subprocess.run(
+        [sys.executable, "-c", "import near_close_dca"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_list_is_read_once_and_reused():
+    assert near_close_dca.ACTIVE_TICKERS is near_close_dca.ACTIVE_TICKERS
+
+
 @pytest.mark.parametrize(
     "document",
     [

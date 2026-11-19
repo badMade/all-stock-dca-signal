@@ -80,6 +80,10 @@ with different `--weights`, etc.) from silently overwriting each other:
   three -- skipping the `config/scheduled_tasks.json` edit leaves the scheduled execution universe
   stale even after the other two files are correct, plus a broker-tradability reminder and a
   post-apply checklist.
+  **Update 2026-11-19:** `near_close_dca.ACTIVE_TICKERS` is now derived from `config/tickers.json`
+  at import, so it is no longer a splice target; only `config/tickers.json` and `config/scheduled_tasks.json`
+  need the edit. The advisor's printed snippets and checklist still name all three until `advise_tickers.py`
+  is updated (follow-up).
 
 ## The three signals
 

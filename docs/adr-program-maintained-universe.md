@@ -27,10 +27,12 @@ The operator wants the list maintained by the program, with every ticker ranked.
 ## Decision (proposed)
 
 1. **Single source of truth.** `config/tickers.json` stays the one approved list. The code
-   constants are removed as an independent copy: `near_close_dca.ACTIVE_TICKERS` and
-   `EXCLUDED_TICKERS` are derived from the JSON at import, as `dca_runner.py` already does for its
-   whitelist. The two parity tests are rewritten to assert derivation. This ships as its own PR,
-   separate from the writer, because it touches the live 3:30 PM path.
+   constants are removed as an independent copy: `near_close_dca.ACTIVE_TICKERS` is derived from
+   the JSON at import, as `dca_runner.py` already does for its whitelist, and an unreadable or
+   malformed file refuses the import (implemented 2026-11-19 in `near_close_dca._load_active_tickers`,
+   tests in `tests/test_active_tickers_derivation.py`). `EXCLUDED_TICKERS` stays a hardcoded copy
+   with its parity test, because it is hand-held and the program never writes it. This touches the
+   live 3:30 PM path, so it needs the acceptance run listed in Consequences.
 2. **Rank everything, buy only the top 100.** Every ticker in the current roster, plus the
    candidate pool and bench defined in the dynamic-universe ADR, gets a published rank in
    `universe_proposal.json` (operator-confirmed 2026-11-19: all tickers ranked, only the top 100
