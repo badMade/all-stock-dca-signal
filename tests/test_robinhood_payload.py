@@ -1640,6 +1640,38 @@ def test_no_retry_when_the_first_attempt_began_too_long_ago(tmp_path):
     assert "not retrying: the first attempt began too long ago" in log and log.count("timing total") == 1, log
 
 
+# -- retry must respect the build deadline (2026-11-16: the 14:30 build ran to its 600 s deadline, the last 26 tickers came
+# back empty, 96/122 was refused, and the whole-build retry would have started a SECOND full 600 s deadline; the executor
+# stops waiting for the payload long before that, so the rebuild could only ever land after the slot) ---------------------
+
+#: A worker that is slow and then dies without a reply, like the 11-16 chunks that ran into the deadline.
+_SLOW_THEN_DEAD = 'sleep 4; echo "ERROR: stream disconnected" >&2; exit 1'
+
+_TIGHT_DEADLINE_ENV = {
+    "DCA_BUILD_DEADLINE_SECONDS": "8",
+    "DCA_MIN_ATTEMPT_SECONDS": "2",
+    "DCA_CODEX_PARALLEL": "64",
+    "DCA_BUILD_RETRIES": "1",
+    "DCA_BUILD_RETRY_WAIT_SECONDS": "0",
+}
+
+
+def test_no_retry_when_the_first_attempt_already_spent_the_build_deadline(tmp_path):
+    done, _ = _run_launcher(tmp_path, _SLOW_THEN_DEAD, extra_env=_TIGHT_DEADLINE_ENV)
+    log = done.stdout + done.stderr
+    assert "not retrying: the build deadline" in log, log
+    assert log.count("robinhood_payload: timing total") == 1, log  # one build, never a second full deadline
+
+
+def test_a_fast_refusal_still_retries_inside_the_build_deadline(tmp_path):
+    # The 11-10 shape: every chunk dies in seconds, so nearly the whole deadline is left and the rebuild stays worthwhile.
+    done, _ = _run_launcher(
+        tmp_path, _ALWAYS_429, extra_env={**_TIGHT_DEADLINE_ENV, "DCA_BUILD_DEADLINE_SECONDS": "600", "DCA_MIN_ATTEMPT_SECONDS": "20"}
+    )
+    log = done.stdout + done.stderr
+    assert "retrying in 0s (attempt 2 of 2)" in log and log.count("robinhood_payload: timing total") == 2, log
+
+
 def test_a_healthy_build_writes_no_failure_file_and_never_retries(tmp_path):
     done, _ = _run_launcher(tmp_path)
     log = done.stdout + done.stderr

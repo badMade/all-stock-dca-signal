@@ -242,7 +242,10 @@ run_chunk() {
 
 BUILD_STARTED="$(date +%s)"
 DEADLINE_EPOCH=""
-[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( BUILD_STARTED + BUILD_DEADLINE_SECONDS ))
+# The deadline counts from the FIRST attempt's start (2026-11-19): a whole-build retry used to restart its own clock, so a
+# build that ran to its 600 s deadline and was refused (2026-11-16, 14:30, 96/122) could be rebuilt for another 600 s and
+# land long after the executor stopped waiting. A first attempt has no DCA_BUILD_FIRST_STARTED, so it is unchanged.
+[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( ${DCA_BUILD_FIRST_STARTED:-$BUILD_STARTED} + BUILD_DEADLINE_SECONDS ))
 if [ -n "$BUILD_DEADLINE_ET" ]; then
   # zoneinfo, not the Mac's own clock zone: the cutoff is ET even on a Mac that is not pinned to New York.
   CUTOFF_EPOCH="$("$PY" -c '
@@ -391,6 +394,10 @@ if [ "$MERGE_STATUS" -ne 0 ] && [ "$BUILD_ATTEMPT" -le "$BUILD_RETRIES" ] && [ !
   RETRY_FIRST="${DCA_BUILD_FIRST_STARTED:-$BUILD_STARTED}"
   if [ $(( RETRY_NOW + BUILD_RETRY_WAIT - RETRY_FIRST )) -ge "$BUILD_RETRY_BY" ]; then
     echo "robinhood_payload: not retrying: the first attempt began too long ago (limit ${BUILD_RETRY_BY}s)" >&2
+  elif [ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && [ $(( RETRY_NOW + BUILD_RETRY_WAIT + MIN_ATTEMPT_SECONDS )) -ge $(( RETRY_FIRST + BUILD_DEADLINE_SECONDS )) ]; then
+    # The retry could not start a useful attempt before the shared deadline (the first attempt spent it), so a rebuild
+    # would only publish after the slot's window. Fail now and let Gate 5 name the refusal.
+    echo "robinhood_payload: not retrying: the build deadline (${BUILD_DEADLINE_SECONDS}s from the first attempt) would pass first" >&2
   elif [ -n "${CUTOFF_EPOCH:-}" ] && [ $(( RETRY_NOW + BUILD_RETRY_WAIT + MIN_ATTEMPT_SECONDS )) -ge "$CUTOFF_EPOCH" ]; then
     echo "robinhood_payload: not retrying: the ${BUILD_DEADLINE_ET} ET cutoff would pass first" >&2
   else
