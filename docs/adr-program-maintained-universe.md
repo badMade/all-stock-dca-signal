@@ -31,9 +31,11 @@ The operator wants the list maintained by the program, with every ticker ranked.
    `EXCLUDED_TICKERS` are derived from the JSON at import, as `dca_runner.py` already does for its
    whitelist. The two parity tests are rewritten to assert derivation. This ships as its own PR,
    separate from the writer, because it touches the live 3:30 PM path.
-2. **Rank everything.** Every ticker in the current roster, plus the candidate pool and bench
-   defined in the dynamic-universe ADR, gets a published rank in `universe_proposal.json`.
-   Ranking is for all names. Only the top 100 are active for buying.
+2. **Rank everything, buy only the top 100.** Every ticker in the current roster, plus the
+   candidate pool and bench defined in the dynamic-universe ADR, gets a published rank in
+   `universe_proposal.json` (operator-confirmed 2026-11-19: all tickers ranked, only the top 100
+   considered for buys). Rank decides buy eligibility: ranks 1 to 100 are considered for buys,
+   and every name ranked 101 or lower is ranked and tracked but not considered for buys.
 3. **Cap of 100 with a phase-in.** The active set is at most 100. The 22 lowest-ranked of the
    current 122 are demoted over three quarterly reviews (8, 8, then 6), using the dynamic-universe
    ADR's 8-swap limit. Demotion means new buys stop. Shares are never sold. Until the phase-in
@@ -62,7 +64,7 @@ The operator wants the list maintained by the program, with every ticker ranked.
 |---|---|---|
 | 1 | Does the 0935 live run read this repo's working copy or a separate checkout (`DCA_CONFIG_DIR`)? | Must be answered before implementation. If separate, the writer needs a delivery step to that copy |
 | 2 | Is the phase-in pace (8 per quarter) acceptable, or should the 22 be demoted at once? | 8 per quarter, to match the existing swap limit |
-| 3 | Rank 101 and below: stay in the roster as shadow-tracked, or leave `tickers.json` entirely? | Move to a `bench` key outside `active`, so they keep a rank and history |
+| 3 | Where do ranks 101 and below live in `tickers.json`? They stay ranked but are not considered for buys | Move to a `bench` key outside `active`, so they keep a rank and history |
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
 
 ## Consequences
