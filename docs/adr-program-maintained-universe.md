@@ -6,7 +6,7 @@
   item of that ADR stays in force unless this one says otherwise.
 - **Scope:** who writes `config/tickers.json`, how the executor reads it, how the 122 current names
   are ranked and cut to the top 100 for buys, and which checks stop a bad write. The graded ladder, budgets
-  and the "never sell" rule are untouched.
+  and the "never sell" rule are untouched. Selling is out of scope (item 8).
 
 ## Context
 
@@ -90,7 +90,17 @@ The operator wants the list maintained by the program, with every ticker ranked.
    name the broker cannot find). It must record a `source=operator` entry in `universe_membership`.
    A drift check flags any JSON change with no matching entry. The next daily run may reverse a
    hand edit unless the name is added to `excluded`.
-8. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `symbol_corrections` and the
+8. **This is a buy list, never a sell list (operator-directed 2026-11-19).** The `active` list
+   and the daily ranks answer one question: which names may receive new buys. Falling out of the
+   top 100, being unscored, or failing an eligibility flag stops new buys and does nothing else.
+   No code may read this list, a rank, or a demotion as a reason to sell, trim or close a
+   position. Selling is a later, separate function with its own ADR, and the operator has said it
+   will be built as a separate unit following object-oriented design rules. That function will
+   not share this writer, this file or this approval path. If it ever needs the ranks it reads
+   them as an input from `universe_scores` and makes its own decision. Until that ADR is
+   accepted, the "shares are never sold" rule stands, with only the exception already recorded in
+   `docs/adr-tax-loss-sale.md`.
+9. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `symbol_corrections` and the
    free-text notes are not written by the program in this ADR.
 
 ## Open questions
