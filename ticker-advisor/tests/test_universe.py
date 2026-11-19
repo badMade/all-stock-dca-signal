@@ -33,6 +33,7 @@ from universe import (
     ScoredTicker,
     TickerStatus,
     UniverseConfig,
+    apply_pinned,
     apply_safeguards,
     composite_scores,
     compute_pool_stats,
@@ -1089,3 +1090,77 @@ def test_strict_daily_still_refuses_an_add_with_no_rank_at_all():
     ranks = {t: r for t, r in p.ranks.items() if t != _rank_sym(100)}
     failures = validate_proposal(dataclasses.replace(p, ranks=ranks), _prior_stats(), _fresh(), cfg)
     assert any("outside entry band" in f.detail for f in failures)
+
+
+# --------------------------------------------------------------------------
+# Pinned names (docs/fundamentals_feed_scope.md, operator-approved 2026-11-19)
+#
+# ETFs, funds and filers with no us-gaap facts cannot be scored. A hand-held `pinned` list keeps them in
+# `active` outside the ranking: the caller runs the engine on the NON-pinned pool with
+# strict_daily_top(100 - len(pinned)), then apply_pinned() adds the pinned names back before the
+# safeguards run. Pinned names are never ranked, added or dropped by the program.
+# --------------------------------------------------------------------------
+
+
+
+def _pins(*names: str) -> tuple[str, ...]:
+    return tuple(names) or ("ZZA", "ZZB")
+
+
+def test_apply_pinned_adds_pinned_names_to_prior_active_active_and_holds():
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(98)
+    p = _select(board, _prior_same(board), _incumbents(range(1, 99), tenure=0), config=cfg)
+    pinned = _pins()
+    out = apply_pinned(p, pinned)
+    assert set(out.active) == {_rank_sym(r) for r in range(1, 99)} | set(pinned)
+    assert set(pinned) <= set(out.prior_active) and set(pinned) <= set(out.holds)
+    assert out.pinned == tuple(sorted(pinned))
+    assert all(out.reasons[t] == "hold:pinned" for t in pinned)
+    assert out.adds == p.adds and out.drops == p.drops  # pinned names never count as changes
+
+
+def test_apply_pinned_result_passes_every_safeguard_at_the_full_cap():
+    board = _board(200)
+    cfg98 = UniverseConfig.strict_daily_top(98)
+    p = _select(board, _prior_same(board), _incumbents(range(1, 99), tenure=0), config=cfg98)
+    out = apply_pinned(p, _pins())
+    full = UniverseConfig.strict_daily_top(100)
+    assert len(out.active) == 100
+    assert validate_proposal(dataclasses.replace(out, config=full), _prior_stats(), _fresh(), full) == []
+
+
+def test_apply_pinned_with_no_pinned_names_changes_nothing():
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, _prior_same(board), _incumbents(range(1, 101), tenure=0), config=cfg)
+    assert apply_pinned(p, ()) == p
+
+
+@pytest.mark.parametrize("clash", ["ranked", "added", "dropped"])
+def test_apply_pinned_refuses_a_name_the_engine_also_ranked_added_or_dropped(clash):
+    # The caller must remove pinned names from the scored pool and the incumbents first; otherwise a
+    # pinned name could be dropped for its rank. Refuse loudly rather than guess.
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, _prior_same(board), _incumbents(range(2, 102), tenure=0), config=cfg)
+    name = {"ranked": _rank_sym(50), "added": p.adds[0], "dropped": p.drops[0]}[clash]
+    with pytest.raises(ValueError, match="pinned"):
+        apply_pinned(p, (name,))
+
+
+def test_apply_pinned_must_run_before_the_safeguards():
+    p = _clean_proposal()
+    validated = apply_safeguards(p, _prior_stats(), _fresh(), UniverseConfig())
+    with pytest.raises(ValueError, match="before"):
+        apply_pinned(validated, _pins())
+
+
+def test_the_stored_proposal_records_pinned_names_and_they_change_the_hash():
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(98)
+    p = _select(board, _prior_same(board), _incumbents(range(1, 99), tenure=0), config=cfg)
+    a = proposal_to_dict(apply_pinned(p, ("ZZA", "ZZB")))
+    b = proposal_to_dict(apply_pinned(p, ("ZZA", "ZZC")))
+    assert a["pinned"] == ["ZZA", "ZZB"]
+    assert a["content_sha256"] != b["content_sha256"]

@@ -1,6 +1,7 @@
 # Scope: the fundamentals feed for the daily universe ranking
 
-- **Status:** Scoping only (2026-11-19). No code. It needs operator answers (section 6) before any build.
+- **Status:** Scoping (2026-11-19). Decision 1 (pinned list) is resolved. The pinned-list mechanics (schema,
+  config validation, engine helper, writer guard) are being built test-first. The data feed itself is not built.
 - **Why:** `docs/adr-program-maintained-universe.md` ranks every symbol in `tickers.txt` each day. The
   engine (`ticker-advisor/universe.py`) needs four factors per name. Two come from prices. Two come from
   SEC filings, and no code produces them for the whole pool.
@@ -94,13 +95,19 @@ Steps 1 to 4 need no network in their tests (trimmed fixtures, as `test_edgar_fu
 
 ## 6. Decisions the operator must make
 
-1. **ETFs, funds and foreign filers.** The pool filter requires `common_stock`, so ETFs fail it. ETFs
-   also have no filing facts, so they would be missing two factors and `unscored`. Several current
-   names look like ETFs or funds (for example QQQ, VT, XLG, AAAU), and ASML, TSM and STM are foreign
-   filers that may use a different tagging standard. I have not verified instrument types. Options:
-   exclude them from the ranked buy list, rank them on a reduced factor set, or keep a hand-held
-   pinned list outside the ranking. I recommend a hand-held pinned list, which keeps today's buys and
-   needs no new scoring rule.
+1. **ETFs, funds and foreign filers. Resolved 2026-11-19: a hand-held `pinned` list.** Pinned names stay
+   in `active`, are never ranked, added or dropped by the program, and count toward the cap of 100 (the
+   ranking fills the other seats: `strict_daily_top(100 - number pinned)`, then `apply_pinned` adds them
+   back before the safeguards). `pinned` is a subset of `active` in `config/tickers.json`, validated at
+   config load, and the writer refuses any proposal that drops a pinned name. Candidates, from a
+   read-only Robinhood profile lookup of all 122 current names on 2026-11-19 (a delegated check, not
+   verified by hand): **funds and ETFs (12):** AAAU, DRAM, FLKR, XLG, TOPT, QTOP, QQQ, VT, DXYZ, BTX, RVI,
+   VCX. **Foreign 20-F filers (3, presumed):** ASML, TSM, STM. Not pinned: TRIN (profile does not settle
+   fund versus operating company), GFUZ (recent listing, filing form unknown), and the foreign-headquartered
+   names that normally file 10-Ks (TEL, LULU, ACGL, EG, CB). If any of those has no us-gaap facts it
+   shows as `unscored`, and the engine holds an unscored incumbent rather than dropping it. The list is NOT
+   written to `config/tickers.json` yet: that file is bundled into the backup planner, so changing it
+   forces another planner rebuild. It is added when the ranking job lands.
 2. **Fractional eligibility.** Check only the top 150 or so after ranking, through an agent session
    with broker access, or skip it in the ranking and rely on the existing run-time gate. Skipping can
    leave a top-100 slot on a name that cannot be bought fractionally.

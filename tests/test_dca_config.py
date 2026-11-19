@@ -2250,3 +2250,36 @@ def test_per_ticker_sizing_loader_exposes_linear_interpolation_flag(tmp_path):
     assert loaded["SMOOTH"]["interpolate"] is True
     assert loaded["STEPPED"]["interpolate"] is False
     assert loaded["ODD"]["interpolate"] is False  # anything but "linear" fails safe to the stepped lookup
+
+
+# --- pinned: the hand-held list of buy-list names the daily ranking never adds or removes ---------------
+# docs/fundamentals_feed_scope.md (operator-approved 2026-11-19): ETFs, funds and filers with no
+# us-gaap facts cannot be scored, so a hand-held `pinned` array keeps them in `active` outside the
+# ranking. `pinned` is a SUBSET of `active`, not a fourth category: it never overlaps excluded.
+
+
+def test_load_tickers_accepts_a_pinned_subset_of_active(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL", "QQQ"], "excluded": [], "pinned": ["QQQ"]})
+    assert load_tickers(tmp_path)["tickers"] == ("AAPL", "QQQ")
+
+
+def test_load_tickers_without_a_pinned_key_is_unchanged(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": []})
+    assert load_tickers(tmp_path)["tickers"] == ("AAPL",)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"active": ["AAPL"], "pinned": "AAPL"}, id="not_a_list"),
+        pytest.param({"active": ["AAPL"], "pinned": ["aapl"]}, id="lowercase_symbol"),
+        pytest.param({"active": ["AAPL"], "pinned": [7]}, id="non_string_entry"),
+        pytest.param({"active": ["AAPL", "QQQ"], "pinned": ["QQQ", "QQQ"]}, id="duplicate_entry"),
+        pytest.param({"active": ["AAPL"], "pinned": ["QQQ"]}, id="pinned_name_not_in_active"),
+        pytest.param({"active": ["AAPL"], "excluded": ["QBUT"], "pinned": ["QBUT"]}, id="pinned_name_is_excluded"),
+    ],
+)
+def test_load_tickers_rejects_a_malformed_pinned_list(tmp_path, document):
+    _write(tmp_path, "tickers.json", document)
+    with pytest.raises(ValueError, match="pinned"):
+        load_tickers(tmp_path)
