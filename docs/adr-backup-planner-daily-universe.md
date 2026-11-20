@@ -1,8 +1,8 @@
 # ADR: How a daily-changing universe reaches the Perplexity backup planner
 
 - **Status:** Accepted by the operator 2026-11-20 (option 1, as revised by the second read below). Implementation is
-  in progress, test-first, in separate small pieces. Piece 1 (the recommendation set can carry the list) has failing
-  tests and no code yet.
+  in progress, test-first, in separate small pieces. Piece 1 (the recommendation set can carry the list) is done 2026-11-20
+  (`dca_rec_models.RecommendationSet.universe`, 12 tests). Pieces 2 to 5 are not built.
 - **Why now:** `docs/adr-program-maintained-universe.md` lets the program change the buy list every trading day.
   The backup planner was built for a list that changes by hand, rarely. This ADR is the open question 9 of that
   ADR (item "Mac checkout and the backup planner").
