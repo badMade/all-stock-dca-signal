@@ -35,7 +35,7 @@ def fact(
     val: float = 1.0,
     start: date | None = None,
     form: str = "10-K",
-    accn: str = "0000000000-00-000001",
+    accn: str = "ACC-0",
 ) -> PointInTimeFact:
     return PointInTimeFact(
         start=start, end=end, val=val, fy=end.year, fp="FY", form=form, filed=filed, frame=None, accn=accn
@@ -102,8 +102,8 @@ def test_an_original_beats_an_amendment_filed_the_same_day():
 
 
 def test_a_remaining_tie_is_broken_by_the_lowest_accession_number():
-    a = fact(**FY2024, filed=date(2025, 2, 10), val=1, accn="0000000000-25-000002")
-    b = fact(**FY2024, filed=date(2025, 2, 10), val=2, accn="0000000000-25-000001")
+    a = fact(**FY2024, filed=date(2025, 2, 10), val=1, accn="ACC-2")
+    b = fact(**FY2024, filed=date(2025, 2, 10), val=2, accn="ACC-1")
     assert first_filed_facts([a, b], as_of=AS_OF) == [b]
     assert first_filed_facts([b, a], as_of=AS_OF) == [b]  # input order never matters
 
