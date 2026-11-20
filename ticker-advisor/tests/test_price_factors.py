@@ -204,7 +204,8 @@ def load(text, **kwargs):
 
 
 def test_rows_become_ascending_bars_per_uppercased_ticker():
-    loaded = load(csv_text(row("aaa", "2025-01-03", "11"), row("AAA", "2025-01-02", "10"), row("BBB", "2025-01-02", " ---
+    text = csv_text(row("aaa", "2025-01-03", "11"), row("AAA", "2025-01-02", "10"), row("BBB", "2025-01-02", "5"))
+    loaded = load(text)
     assert sorted(loaded) == ["AAA", "BBB"]
     assert [b.date.isoformat() for b in loaded["AAA"]] == ["2025-01-02", "2025-01-03"]  # sorted, though given reversed
     assert loaded["AAA"][0] == Bar(date=date(2025, 1, 2), close=10.0, volume=1000.0)
