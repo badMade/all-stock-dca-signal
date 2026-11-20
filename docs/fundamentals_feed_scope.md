@@ -84,7 +84,7 @@ Factor definitions I recommend (operator to confirm, section 6):
 | Step | Delivers | Size |
 | --- | --- | --- |
 | 1 | First-filed and point-in-time selection over the existing fact type. **Done 2026-11-20** (`first_filed_facts`, `select_annual_facts`, `latest_fact` in `edgar_fundamentals.py`, 17 tests) | small |
-| 2 | Ticker to CIK map and SIC sector and industry reader | small |
+| 2 | Ticker to CIK map and SIC sector and industry reader. **Done 2026-11-20** (`sec_company_map.py`: `parse_company_tickers`, `cik_for_tickers`, `parse_submissions_sic`, `sic_sector`, `fetch_company_tickers`, `fetch_sic`). Sector is the 2-digit SIC major group, industry the 4-digit code. The SEC layouts are NOT live-verified | small |
 | 3 | Bulk reader that extracts the concepts for every CIK in one pass | medium |
 | 4 | Snapshot writer and its schema, hash and freshness stamp | small |
 | 5 | Price-derived inputs from the archive: momentum, volatility, dollar volume, history length | medium |
