@@ -2250,3 +2250,81 @@ def test_per_ticker_sizing_loader_exposes_linear_interpolation_flag(tmp_path):
     assert loaded["SMOOTH"]["interpolate"] is True
     assert loaded["STEPPED"]["interpolate"] is False
     assert loaded["ODD"]["interpolate"] is False  # anything but "linear" fails safe to the stepped lookup
+
+
+@pytest.mark.parametrize("bad_value", [10**400, "10.0"])
+def test_budgets_rejects_oversized_int_and_string_float_fields(tmp_path, bad_value):
+    _write(
+        tmp_path,
+        "budgets.json",
+        {
+            "circuit_breakers": {
+                "max_per_order_usd": bad_value,
+                "max_consecutive_placement_failures": 3,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="max_per_order_usd"):
+        load_budgets(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [10**400, "2.5", float("nan"), float("inf")])
+def test_sizing_tiers_rejects_non_finite_oversized_or_string_minimum_order_usd(tmp_path, bad_value):
+    _write(
+        tmp_path,
+        "sizing_ladder.json",
+        {
+            "base_amount_usd": 2.0,
+            "minimum_order_usd": bad_value,
+            "tiers": [{"min_drop_pct": 0.1, "multiplier": 1.0}],
+        },
+    )
+    with pytest.raises(ValueError, match="minimum_order_usd"):
+        load_sizing_tiers(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 10**400, float("nan"), float("inf"), "1.0"])
+def test_sizing_tiers_rejects_bool_non_finite_or_oversized_tier_values(tmp_path, bad_value):
+    _write(
+        tmp_path,
+        "sizing_ladder.json",
+        {
+            "base_amount_usd": 2.0,
+            "tiers": [{"min_drop_pct": bad_value, "multiplier": 1.0}],
+        },
+    )
+    with pytest.raises(ValueError):
+        load_sizing_tiers(tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 10**400, float("nan"), float("inf"), "2.0"])
+def test_per_ticker_sizing_rejects_bool_non_finite_or_oversized_numeric_fields(tmp_path, bad_value):
+    _write(
+        tmp_path,
+        "per_ticker_sizing.json",
+        {
+            "status": "active",
+            "tickers": {
+                "AAPL": {
+                    "base_amount_usd": bad_value,
+                    "tiers": [{"min_drop_pct": 0.5, "multiplier": 1.0}],
+                }
+            },
+        },
+    )
+    with pytest.raises(ValueError):
+        load_per_ticker_sizing(tmp_path)
+
+
+def test_ml_sizing_adjustment_oversized_staleness_or_string_bound_is_a_no_op(tmp_path):
+    now = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+    _write(tmp_path, "ml_sizing_adjustment.json", _fresh_ml_payload(max_staleness_hours=10**400))
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
+    _write(
+        tmp_path,
+        "ml_sizing_adjustment.json",
+        _fresh_ml_payload(bounds={"min_multiplier": "0.8", "max_multiplier": 1.2}),
+    )
+    assert load_ml_sizing_adjustment(tmp_path, now=now) == {}
+
