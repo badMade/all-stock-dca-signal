@@ -1,4 +1,4 @@
-"""Tests for the not-yet-written market_data_ingest/fundamentals_snapshot.py (feed step 4, docs/fundamentals_feed_scope.md).
+"""Tests for the not-yet-written market_data_ingest/fundamentals_snapshot.py (feed step 4 of the scope doc).
 
 Written BEFORE the implementation (TDD). Do not implement until these are reviewed and approved.
 
@@ -204,7 +204,7 @@ def test_the_hash_check_accepts_an_untouched_document_and_rejects_an_edited_one(
     assert snapshot_hash_matches({"no": "hash"}) is False
 
 
-# --- write_snapshot ------------------------------------------------------------------------------------------------------
+# --- write_snapshot ------------------------------------------------------------
 
 
 def test_write_snapshot_writes_json_atomically_and_returns_the_hash(tmp_path):
