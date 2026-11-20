@@ -49,11 +49,40 @@ def test_snapshot_correction_is_a_new_row_and_latest_is_read(ledger):
     ledger.ingest_portfolio_snapshots([SNAP], source="robinhood_readonly", run_id="snap-1", as_of=utc(2026, 11, 13, 12))
     fixed = {**SNAP, "prior_close": 11.0, "market_value": 22.0}
     ledger.ingest_portfolio_snapshots(
-        [fixed], source="robinhood_readonly", run_id="snap-2", as_of=utc(2026, 11, 13, 12)
+        [fixed], source="robinhood_readonly", run_id="snap-2", as_of=utc(2026, 11, 13, 12),
+        allow_restate=True,  # a deliberate correction of an existing day must say so
     )
     assert ledger.row_count("portfolio_snapshots") == 2
     latest = ledger.portfolio_snapshots(known_at=utc(2026, 11, 14))
     assert [r["market_value"] for r in latest] == [22.0]
+
+
+def test_snapshot_refuses_a_differing_batch_for_an_existing_day(ledger):
+    # Regression (2026-11-19): a rerun after positions changed stored a second, conflicting set of
+    # rows under the same snapshot_day; symbols missing from the second set survived from the first.
+    ledger.ingest_portfolio_snapshots([SNAP], source="robinhood_readonly", run_id="snap-1", as_of=utc(2026, 11, 13, 12))
+    other = {**SNAP, "symbol": "ZZZC"}
+    changed = {**SNAP, "quantity": 3.0, "market_value": round(3.0 * SNAP["prior_close"], 2)}
+    for batch in ([SNAP, other], [changed]):
+        with pytest.raises(LedgerValidationError, match="already has rows"):
+            ledger.ingest_portfolio_snapshots(batch, source="robinhood_readonly", run_id="snap-r",
+                                              as_of=utc(2026, 11, 14, 12))
+    assert ledger.row_count("portfolio_snapshots") == 1  # nothing was written
+
+
+def test_snapshot_identical_subset_of_an_existing_day_is_still_a_no_op(ledger):
+    other = {**SNAP, "symbol": "ZZZC"}
+    ledger.ingest_portfolio_snapshots([SNAP, other], source="robinhood_readonly", run_id="snap-1",
+                                      as_of=utc(2026, 11, 13, 12))
+    assert ledger.ingest_portfolio_snapshots([SNAP], source="robinhood_readonly", run_id="snap-1",
+                                             as_of=utc(2026, 11, 13, 12)) == 0
+
+
+def test_snapshot_a_new_day_is_unaffected_by_the_guard(ledger):
+    ledger.ingest_portfolio_snapshots([SNAP], source="robinhood_readonly", run_id="snap-1", as_of=utc(2026, 11, 13, 12))
+    nxt = {**SNAP, "snapshot_day": "2026-11-16", "close_day": "2026-11-16"}
+    assert ledger.ingest_portfolio_snapshots([nxt], source="robinhood_readonly", run_id="snap-2",
+                                             as_of=utc(2026, 11, 17, 12)) == 1
 
 
 def test_snapshot_one_bad_row_rejects_the_batch(ledger):
