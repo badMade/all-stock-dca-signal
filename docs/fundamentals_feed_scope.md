@@ -109,10 +109,12 @@ Steps 1 to 4 need no network in their tests (trimmed fixtures, as `test_edgar_fu
    2026-11-20. It is NOT
    written to `config/tickers.json` yet: that file is bundled into the backup planner, so changing it
    forces another planner rebuild. It is added when the ranking job lands.
-2. **Fractional eligibility.** Check only the top 150 or so after ranking, through an agent session
-   with broker access, or skip it in the ranking and rely on the existing run-time gate. Skipping can
-   leave a top-100 slot on a name that cannot be bought fractionally.
-3. **Value factor:** book-to-price first, or earnings yield?
+2. **Fractional eligibility. Resolved 2026-11-20: skipped in the ranking.** The ranking does not check it
+   (no broker call in the daily job). The existing run-time gate (`is_tradable_for_fractional_buy`) still
+   blocks a name that cannot be bought fractionally. Cost, accepted by the operator: a top-100 slot can sit on a
+   name that is never bought. The pool flag for fractional eligibility is therefore not used by the feed.
+3. **Value factor. Resolved 2026-11-20: book-to-price first** (`StockholdersEquity` over market cap, market cap
+   = shares outstanding times price). Earnings yield can follow later.
 4. **Bulk file or per-company requests.** I recommend the bulk file, if the Mac can download it.
 5. **SEC User-Agent contact.** The operator sets `SEC_EDGAR_USER_AGENT` on the Mac. I will not choose
    a contact.
