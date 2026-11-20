@@ -641,22 +641,53 @@ def scores_from_history(rows):
     return scores, eligible
 
 
-def _top_set(scores, eligible, top_n):
+def _top_set(scores, eligible, top_n, previous=None, hold_rank=None):
+    """The ``top_n`` best-scored eligible names. With ``hold_rank`` and a ``previous`` list, incumbents still ranked
+    within ``hold_rank`` stay and the best-ranked non-members fill the remaining slots (a buy/hold buffer in the style
+    of ``docs/adr-dynamic-universe.md``'s 75/150 rule; there is no separate entry rank because the list is always
+    refilled to ``top_n`` in rank order). A hold_rank of ``top_n`` or less is the plain top-N.
+    """
     ranked = sorted((t for t in scores if eligible is None or t in eligible), key=lambda t: (-scores[t], t))
-    return set(ranked[:top_n])
+    if not hold_rank or hold_rank <= top_n or not previous:
+        return set(ranked[:top_n])
+    keep = {t for t in ranked[:hold_rank] if t in previous}
+    chosen = set(keep)
+    for t in ranked:
+        if len(chosen) >= top_n:
+            break
+        chosen.add(t)
+    return chosen
+
+
+def _quintile_means(pairs):
+    """Mean forward return of each fifth of ``pairs`` (sorted ascending by score): Q1 = lowest score, Q5 = highest."""
+    n = len(pairs)
+    return [statistics.fmean(y for _, y in pairs[i * n // 5:(i + 1) * n // 5]) for i in range(5)]
 
 
 def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N, cost_bps=DEFAULT_COST_BPS,
-                 eligible_by_date=None, min_names=30, delist_loss=None):
+                 eligible_by_date=None, min_names=30, delist_loss=None, hold_rank=None, non_overlap=False):
     """Per-date grade of a ranking at one horizon: rank IC, quintile spread, top-N edge vs the eligible pool, and
     turnover against the list ``horizon`` days earlier (a rebalance cadence of one horizon, so costs are not charged
     once per overlapping daily sample). Equal-weighted; no market-cap data exists here for value weighting.
     A date is graded only when its horizon has fully elapsed in the price data and at least ``min_names`` names have
     a forward return.
+
+    ``non_overlap`` grades only dates at least one horizon after the previously graded one, so samples do not overlap
+    (the t-stat is then honest) and turnover is exactly the rebalance turnover. ``hold_rank`` applies the buy/hold
+    buffer of ``_top_set`` along that same date chain.
     """
     dates = sorted(scores_by_date)
+    if non_overlap:
+        picked = []
+        for d in dates:
+            if not picked or (dt.date.fromisoformat(d) - dt.date.fromisoformat(picked[-1])).days >= horizon:
+                picked.append(d)
+        dates = picked
     archive_end = max((s.last_date for s in series_by_ticker.values() if s), default=None)
-    top_sets = {d: _top_set(scores_by_date[d], (eligible_by_date or {}).get(d), top_n) for d in dates}
+    top_sets, previous = {}, None
+    for d in dates:
+        previous = top_sets[d] = _top_set(scores_by_date[d], (eligible_by_date or {}).get(d), top_n, previous, hold_rank)
     rows = []
     for day in dates:
         scores = scores_by_date[day]
@@ -683,6 +714,7 @@ def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N,
         rows.append({"date": day, "n": len(pairs), "delisted": ended, "ic": spearman(pairs), "top_return": top_mean,
                      "pool_return": pool_mean, "edge": edge,
                      "spread": statistics.fmean(y for _, y in pairs[-k:]) - statistics.fmean(y for _, y in pairs[:k]),
+                     "quintiles": _quintile_means(pairs),
                      "turnover": turnover,
                      "net_edge": None if turnover is None else edge - turnover * cost_bps / 10000.0})
     return rows
@@ -704,17 +736,19 @@ def summarize_grade(rows):
             if out["ic_std"] > 0:
                 out["ic_tstat"] = out["mean_ic"] / (out["ic_std"] / math.sqrt(len(ics)))
     out["delisted_fills"] = sum(r.get("delisted", 0) for r in rows)
+    out["mean_quintiles"] = [statistics.fmean(r["quintiles"][i] for r in rows) for i in range(5)] if rows else None
     for key in ("top_return", "pool_return", "edge", "spread", "turnover", "net_edge"):
         values = col(key)
         out[f"mean_{key}"] = statistics.fmean(values) if values else None
     return out
 
 
-def render_grade(label, horizons_summary, top_n, cost_bps):
+def render_grade(label, horizons_summary, top_n, cost_bps, hold_rank=None, non_overlap=False):
     def f(v, pct=False, digits=3):
         return "n/a" if v is None else (f"{v * 100:+.2f}%" if pct else f"{v:+.{digits}f}")
 
-    lines = [f"## {label}: top {top_n} eligible vs eligible pool (equal weight, cost {cost_bps:g} bps round trip)", "",
+    mode = (f", hold-rank {hold_rank}" if hold_rank else "") + (", non-overlapping dates" if non_overlap else "")
+    lines = [f"## {label}: top {top_n} eligible vs eligible pool (equal weight, cost {cost_bps:g} bps round trip{mode})", "",
              "| Horizon | Dates | Mean IC | IC std | IC>0 | IC t* | Top-N | Pool | Edge | Q5-Q1 | Turnover | Net edge |",
              "|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
     for horizon, sm in horizons_summary.items():
@@ -725,8 +759,14 @@ def render_grade(label, horizons_summary, top_n, cost_bps):
                      f"{f(sm['mean_pool_return'], True)} | {f(sm['mean_edge'], True)} | {f(sm['mean_spread'], True)} | "
                      f"{turn} | {f(sm['mean_net_edge'], True)} |")
     fills = sum(sm.get("delisted_fills", 0) for sm in horizons_summary.values())
-    lines += ["", "*t ignores overlap between daily samples (overstated for horizons above 1 day).",
-              f"Delisting-loss fills used across all rows: {fills}.", ""]
+    lines += ["", "Mean forward return by score quintile (Q1 = lowest score, Q5 = highest; whole eligible pool):", "",
+              "| Horizon | Q1 | Q2 | Q3 | Q4 | Q5 |", "|--:|--:|--:|--:|--:|--:|"]
+    for horizon, sm in horizons_summary.items():
+        qs = sm.get("mean_quintiles")
+        lines.append(f"| {horizon}d | " + (" | ".join(f(q, True) for q in qs) if qs else "n/a | n/a | n/a | n/a | n/a") + " |")
+    note = ("samples do not overlap (--non-overlap), so t is a fair guide." if non_overlap else
+            "t ignores overlap between daily samples (overstated for horizons above 1 day).")
+    lines += ["", f"*{note}", f"Delisting-loss fills used across all rows: {fills}.", ""]
     return "\n".join(lines)
 
 
@@ -1365,10 +1405,10 @@ def cmd_grade(args):
         summaries = {}
         for horizon in args.horizons:
             rows = grade_scores(sc, series, horizon, args.top_n, args.cost_bps, el, args.min_names,
-                               args.delist_loss)
+                               args.delist_loss, args.hold_rank, args.non_overlap)
             summaries[horizon] = summarize_grade(rows)
         payload[label] = {str(h): s for h, s in summaries.items()}
-        report.append(render_grade(label, summaries, args.top_n, args.cost_bps))
+        report.append(render_grade(label, summaries, args.top_n, args.cost_bps, args.hold_rank, args.non_overlap))
     text = "# Ranking grade\n\n" + "\n".join(report)
     out_dir = Path(args.data_dir) / "grading"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1515,6 +1555,10 @@ def build_parser():
     gr.add_argument("--delist-loss", type=float, default=None,
                     help="treat series that ended early as delisted with this loss (e.g. 0.30); default: ignore them")
     gr.add_argument("--min-names", type=int, default=30, help="skip dates with fewer names with a forward return")
+    gr.add_argument("--hold-rank", type=int, default=None,
+                    help="buy/hold buffer: incumbents ranked within this rank stay on the list (e.g. 150 with --top-n 100)")
+    gr.add_argument("--non-overlap", action="store_true",
+                    help="grade only dates one horizon apart: non-overlapping samples, exact rebalance turnover")
     gr.add_argument("--compare", action="append", metavar="LABEL=PATH",
                     help="also grade another ranking from a date,ticker,score[,eligible] CSV (repeatable)")
     gr.set_defaults(func=cmd_grade)

@@ -575,6 +575,46 @@ def test_grade_ignores_ineligible_names_and_summarises():
     assert "Top-N" in cr.render_grade("x", {20: summary}, 10, 20.0)
 
 
+def test_grade_reports_quintile_returns_in_score_order():
+    day, series, scores = _graded_world(n=50)
+    rows = cr.grade_scores({day: scores}, series, 20, top_n=10, cost_bps=0, min_names=30)
+    qs = rows[0]["quintiles"]
+    assert len(qs) == 5 and qs == sorted(qs) and qs[4] > qs[0]  # predictive ranking: returns rise with score
+    summary = cr.summarize_grade(rows)
+    assert summary["mean_quintiles"] == pytest.approx(qs)
+    text = cr.render_grade("x", {20: summary}, 10, 20.0)
+    assert "| Q1 | Q2 | Q3 | Q4 | Q5 |" in text
+
+
+def test_top_set_buffer_keeps_incumbents_inside_hold_rank_and_refills_in_rank_order():
+    scores = {f"T{i:02d}": float(100 - i) for i in range(30)}  # T00 best
+    previous = {"T00", "T03", "T07", "T25"}  # T25 has fallen outside the hold rank
+    plain = cr._top_set(scores, None, 5, previous, None)
+    assert plain == {"T00", "T01", "T02", "T03", "T04"}
+    held = cr._top_set(scores, None, 5, previous, 10)
+    assert {"T00", "T03", "T07"} <= held and "T25" not in held and len(held) == 5
+    assert held == {"T00", "T03", "T07", "T01", "T02"}  # refilled by best rank
+    assert cr._top_set(scores, None, 5, None, 10) == plain  # no incumbents yet: plain top-N
+    assert cr._top_set(scores, None, 5, previous, 5) == plain  # hold_rank == top_n is no buffer
+
+
+def test_grade_hold_rank_lowers_turnover_and_non_overlap_spaces_dates():
+    day, series, scores = _graded_world(n=60)
+    origin = dt.date.fromisoformat(day)
+    # three weekly lists whose order is jittered a little each week
+    by_date = {}
+    for w in range(3):
+        d = (origin - dt.timedelta(days=21 - 7 * w)).isoformat()
+        by_date[d] = {t: v + (3.0 if (int(t[1:]) + w) % 2 else 0.0) for t, v in scores.items()}
+    plain = cr.grade_scores(by_date, series, 5, top_n=10, cost_bps=0, min_names=30)
+    held = cr.grade_scores(by_date, series, 5, top_n=10, cost_bps=0, min_names=30, hold_rank=25)
+    t_plain = [r["turnover"] for r in plain if r["turnover"] is not None]
+    t_held = [r["turnover"] for r in held if r["turnover"] is not None]
+    assert t_held and sum(t_held) < sum(t_plain)
+    spaced = cr.grade_scores(by_date, series, 14, top_n=10, cost_bps=0, min_names=30, non_overlap=True)
+    assert [r["date"] for r in spaced] == sorted(by_date)[::2]  # weeks 0 and 2 only (>= 14 days apart)
+
+
 def test_grade_command_reads_history_and_compare_csv(tmp_path, capsys):
     day, series, scores = _graded_world()
     data, archive = tmp_path / "data", tmp_path / "archive"
