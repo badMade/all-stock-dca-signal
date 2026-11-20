@@ -14,23 +14,32 @@ Freshness: the snapshot's fetch date is the "SEC data refreshed" date, the lates
 and the quote age in sessions counts weekdays only (no holiday calendar is available here, so a holiday makes the
 age one session too high, which errs toward rejection).
 
+``main`` is the command line (feed step 7b-1): it reads FILES (the snapshot, the price CSV, the tickers config and an
+optional exchange map), runs the ranking and writes the proposal and report into ``--out-dir``. It is still
+propose-only: it never writes ``config/tickers.json`` or any file outside ``--out-dir``, and has no scheduler,
+network or checkout logic. Exit codes: 0 the proposal passed the safeguards, 1 it was REJECTED (the files are still
+written so a human can read why), 2 bad input (one line on stderr, no traceback, no file contents).
+
 A name enters the ranking only if it passes the pool filter, or is a current holding with an unknown flag (an
 unknown value holds an incumbent, it never demotes it). Pure stdlib, no network.
 """
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from price_factors import PriceInputs
+from price_factors import PriceInputs, load_price_history
+from price_factors import price_inputs as compute_price_inputs
 from universe import (
     Incumbent,
     InputFreshness,
@@ -48,7 +57,7 @@ from universe import (
     select_universe,
     write_proposal,
 )
-from universe_inputs import build_ranking_inputs
+from universe_inputs import build_ranking_inputs, load_snapshot
 
 PROPOSAL_FILENAME = "universe_proposal.json"
 REPORT_FILENAME = "ranking_report.json"
@@ -202,3 +211,159 @@ def write_daily_outputs(directory: str | Path, ranking: DailyRanking) -> tuple[P
     text = json.dumps(dataclasses.asdict(ranking.report), sort_keys=True, indent=2, allow_nan=False) + "\n"
     _write_text_atomically(report_path, text)
     return proposal_path, report_path
+
+
+class _InputError(Exception):
+    """A user-facing input problem; its message is printed as one line."""
+
+
+def _strict_json(path: str, label: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            out[key] = value
+        return out
+
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
+    except OSError:
+        raise _InputError(f"cannot read the {label} file") from None
+    except ValueError:
+        raise _InputError(f"the {label} file is not strict JSON") from None
+
+
+def _string_list(document: Mapping[str, Any], key: str, *, required: bool) -> list[str]:
+    value = document.get(key)
+    if value is None and not required:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value) or (required and not value):
+        raise _InputError(f"the tickers config's '{key}' must be {'a non-empty ' if required else 'a '}list of strings")
+    return value
+
+
+def _load_tickers_config(path: str) -> tuple[list[str], list[str]]:
+    document = _strict_json(path, "tickers config")
+    if not isinstance(document, dict):
+        raise _InputError("the tickers config is not a JSON object")
+    active = _string_list(document, "active", required=True)
+    pinned = _string_list(document, "pinned", required=False)
+    outside = sorted(set(pinned) - set(active))
+    if outside:
+        raise _InputError(f"the tickers config's pinned names are not in 'active': {', '.join(outside)}")
+    return active, pinned
+
+
+def _load_exchanges(path: str | None) -> dict[str, str | None] | None:
+    if path is None:
+        return None
+    document = _strict_json(path, "exchange map")
+    if not isinstance(document, dict) or not all(v is None or isinstance(v, str) for v in document.values()):
+        raise _InputError("the exchange map must be a JSON object of ticker to exchange text")
+    return document
+
+
+def _parse_date(text: str, label: str) -> date:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise _InputError(f"{label} must be an ISO date (YYYY-MM-DD)") from None
+
+
+def _parse_generated_at(text: str | None) -> datetime:
+    if text is None:
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise _InputError("--generated-at must be an ISO timestamp with a timezone") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _InputError("--generated-at must be an ISO timestamp with a timezone")
+    return parsed
+
+
+def _parse_int(text: str | None, label: str, *, minimum: int) -> int | None:
+    if text is None:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise _InputError(f"{label} must be an integer") from None
+    if value < minimum:
+        raise _InputError(f"{label} must be at least {minimum}")
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="daily_ranking",
+        description="Rank the pool and write a universe proposal and report. Propose-only: never edits tickers.json.",
+    )
+    parser.add_argument("--snapshot", required=True, help="fundamentals snapshot JSON (hash-validated)")
+    parser.add_argument("--prices", required=True, help="price archive CSV (ticker,date,...,close,volume,...)")
+    parser.add_argument("--tickers-config", required=True, help="config/tickers.json (active and optional pinned)")
+    parser.add_argument("--exchanges", help="JSON object of ticker to exchange name (for the nms_listed flag)")
+    parser.add_argument("--as-of", required=True, help="ranking date, YYYY-MM-DD")
+    parser.add_argument("--out-dir", required=True, help="directory for universe_proposal.json and ranking_report.json")
+    parser.add_argument("--size", default=str(DEFAULT_SIZE), help="active list size, pinned names included")
+    parser.add_argument("--prior-pool-size", help="the previous run's pool size (omit on the first run)")
+    parser.add_argument("--generated-at", help="ISO timestamp with timezone (default: now, UTC)")
+    parser.add_argument("--min-price", type=float, default=5.0)
+    parser.add_argument("--min-market-cap", type=float, default=2e9)
+    parser.add_argument("--min-dollar-volume", type=float, default=20e6)
+    parser.add_argument("--min-history", type=int, default=252)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the daily ranking from files. Returns 0 (passed), 1 (rejected) or 2 (bad input)."""
+    options = _build_parser().parse_args(argv)
+    try:
+        as_of = _parse_date(options.as_of, "--as-of")
+        generated_at = _parse_generated_at(options.generated_at)
+        size = _parse_int(options.size, "--size", minimum=1)
+        prior_pool_size = _parse_int(options.prior_pool_size, "--prior-pool-size", minimum=0)
+        snapshot = load_snapshot(options.snapshot)
+        active, pinned = _load_tickers_config(options.tickers_config)
+        exchanges = _load_exchanges(options.exchanges)
+        histories = load_price_history(options.prices, tickers=snapshot["symbols"])
+        prices = {t: compute_price_inputs(bars, as_of=as_of, min_price=options.min_price)
+                  for t, bars in histories.items()}
+        thresholds = PoolThresholds(
+            min_price=options.min_price,
+            min_market_cap=options.min_market_cap,
+            min_median_dollar_volume_60d=options.min_dollar_volume,
+            min_history_sessions=options.min_history,
+            require_fractional_eligible=False,
+        )
+        ranking = run_daily_ranking(
+            snapshot=snapshot,
+            price_inputs=prices,
+            prior_active=active,
+            pinned=pinned,
+            exchange_by_symbol=exchanges,
+            as_of=as_of,
+            generated_at=generated_at,
+            size=size,  # type: ignore[arg-type]
+            thresholds=thresholds,
+            prior_pool_size=prior_pool_size,
+        )
+        proposal_path, report_path = write_daily_outputs(options.out_dir, ranking)
+    except (_InputError, ValueError, OSError) as exc:
+        print("error: " + " ".join(str(exc).split()), file=sys.stderr)
+        return 2
+    summary = {
+        "status": ranking.proposal.status,
+        "adds": len(ranking.proposal.adds),
+        "drops": len(ranking.proposal.drops),
+        "failures": sorted({f.code for f in ranking.proposal.safeguard_failures}),
+        "proposal": str(proposal_path),
+        "report": str(report_path),
+    }
+    print(json.dumps(summary, sort_keys=True))
+    return 0 if ranking.proposal.status == "pending_approval" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

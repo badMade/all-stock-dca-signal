@@ -185,6 +185,17 @@ pieces to the engine and returns a proposal and a report (who enters and leaves,
 floors, who could not be scored). `write_daily_outputs(directory, ranking)` writes `universe_proposal.json` and
 `ranking_report.json` atomically. It never writes `config/tickers.json`; `universe_apply` does that.
 
+Command line (propose-only, reads files, writes only into `--out-dir`):
+
+```bash
+python -m daily_ranking --snapshot snapshot.json --prices prices.csv --tickers-config config/tickers.json \
+    --exchanges exchanges.json --as-of 2026-11-20 --out-dir out/
+```
+
+Exit 0: the proposal passed the safeguards. Exit 1: it was rejected (files still written, the summary names the
+failures). Exit 2: bad input. The pool floors are options (`--min-price`, `--min-market-cap`, `--min-dollar-volume`,
+`--min-history`) with the ADR's values as defaults.
+
 ### Pinned names
 
 `config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap
