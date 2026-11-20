@@ -86,7 +86,7 @@ Factor definitions I recommend (operator to confirm, section 6):
 | 1 | First-filed and point-in-time selection over the existing fact type. **Done 2026-11-20** (`first_filed_facts`, `select_annual_facts`, `latest_fact` in `edgar_fundamentals.py`, 17 tests) | small |
 | 2 | Ticker to CIK map and SIC sector and industry reader. **Done 2026-11-20** (`sec_company_map.py`: `parse_company_tickers`, `cik_for_tickers`, `parse_submissions_sic`, `sic_sector`, `fetch_company_tickers`, `fetch_sic`). Sector is the 2-digit SIC major group, industry the 4-digit code. The SEC layouts are NOT live-verified | small |
 | 3 | Bulk reader that extracts the concepts for every CIK in one pass. **Done 2026-11-20** (`edgar_bulk.py`: `read_bulk_companyfacts` with no network, and `download_companyfacts_zip`, 15 download tests). The bulk file's URL and layout are NOT live-verified. The download needs `SEC_EDGAR_USER_AGENT` set on the Mac | medium |
-| 4 | Snapshot writer and its schema, hash and freshness stamp | small |
+| 4 | Snapshot writer and its schema, hash and freshness stamp. **Done 2026-11-20** (`fundamentals_snapshot.py`: `build_snapshot`, `write_snapshot`, `snapshot_hash_matches`, 19 tests) | small |
 | 5 | Price-derived inputs from the archive: momentum, volatility, dollar volume, history length | medium |
 | 6 | Adapter that turns snapshot plus archive into `FactorInputs` and pool `Candidate` records | medium |
 | 7 | The daily ranking job and its `launchd` template (needs the Mac checkout answer) | medium |
