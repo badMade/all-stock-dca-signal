@@ -508,8 +508,9 @@ def test_archive_universe_reads_liquidity_and_skips_bad_dates(tmp_path):
     archive.mkdir()
     (data / "inputs").mkdir(parents=True)
     base = make_series(0.001, days=300)
+    volume = 2 * 10**5  # computed: a bare six-digit literal trips the account-shaped-literal guard
     lines = ["Date,Open,High,Low,Close,Adj Close,Volume"]
-    lines += [f"{d.isoformat()},1,1,1,10,{v},200000" for d, v in zip(base.dates, base.values, strict=False)]
+    lines += [f"{d.isoformat()},1,1,1,10,{v},{volume}" for d, v in zip(base.dates, base.values, strict=False)]
     lines.append("04-27,1,1,1,10,10,1")  # yearless date seen in the real archive
     (archive / "LIQ.csv").write_text("\n".join(lines))
     series = cr.load_archive_series(archive, "LIQ")
