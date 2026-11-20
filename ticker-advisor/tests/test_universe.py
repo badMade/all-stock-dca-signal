@@ -1164,3 +1164,24 @@ def test_the_stored_proposal_records_pinned_names_and_they_change_the_hash():
     b = proposal_to_dict(apply_pinned(p, ("ZZA", "ZZC")))
     assert a["pinned"] == ["ZZA", "ZZB"]
     assert a["content_sha256"] != b["content_sha256"]
+
+
+# --------------------------------------------------------------------------
+# Fractional eligibility can be left out of the pool filter (operator decision 2026-11-20): the ranking does
+# not check it, and the run-time gate still blocks a name that cannot be bought fractionally.
+# --------------------------------------------------------------------------
+
+
+def test_the_pool_filter_requires_fractional_eligibility_by_default():
+    assert PoolThresholds().require_fractional_eligible is True
+    unknown = Candidate("AAA", True, "common_stock", 10.0, 5e9, 3e7, 300, None)
+    assert "missing:fractional_eligible" in filter_pool([unknown], PoolThresholds()).rejections["AAA"]
+
+
+def test_a_pool_filter_that_does_not_require_it_accepts_an_unknown_but_still_rejects_an_explicit_no():
+    thresholds = PoolThresholds(require_fractional_eligible=False)
+    unknown = Candidate("AAA", True, "common_stock", 10.0, 5e9, 3e7, 300, None)
+    explicit_no = Candidate("BBB", True, "common_stock", 10.0, 5e9, 3e7, 300, False)
+    result = filter_pool([unknown, explicit_no], thresholds)
+    assert [c.ticker for c in result.eligible] == ["AAA"]
+    assert "not_fractional_eligible" in result.rejections["BBB"]
