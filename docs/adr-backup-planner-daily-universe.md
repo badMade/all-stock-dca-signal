@@ -3,7 +3,7 @@
 - **Status:** Accepted by the operator 2026-11-20 (option 1, as revised by the second read below). Implementation is
   in progress, test-first, in separate small pieces. Piece 1 (the recommendation set can carry the list) is done 2026-11-20
   (`dca_rec_models.RecommendationSet.universe`, 12 tests). Piece 2 (the recommender carries the list) is done 2026-11-20 (`dca_recommender.py`, 6 tests): the list is carried only
-  when it has at most 100 names, so the live 122 leaves the set as before. Pieces 3 to 5 are not built.
+  when it has at most 100 names, so the live 122 leaves the set as before. Piece 3 (the plan-first plan and `scripts/backup_planner.py` validate against a carried list) is done 2026-11-20 (20 tests). Piece 3(d) (`dca_order_plan.validate_plan` accepts an optional carried `universe` for Mac plans, with the same bounds) is done 2026-11-20 (`tests/test_dca_order_plan_carried_universe.py`). The planner and the six prompts were rebuilt for both. Still not built: the compute fallback and the `universe` command (open question 2), and the final rebuild plus the one manual re-paste into Perplexity (piece 5).
 - **Why now:** `docs/adr-program-maintained-universe.md` lets the program change the buy list every trading day.
   The backup planner was built for a list that changes by hand, rarely. This ADR is the open question 9 of that
   ADR (item "Mac checkout and the backup planner").
