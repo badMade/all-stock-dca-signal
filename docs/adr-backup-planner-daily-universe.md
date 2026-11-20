@@ -2,7 +2,8 @@
 
 - **Status:** Accepted by the operator 2026-11-20 (option 1, as revised by the second read below). Implementation is
   in progress, test-first, in separate small pieces. Piece 1 (the recommendation set can carry the list) is done 2026-11-20
-  (`dca_rec_models.RecommendationSet.universe`, 12 tests). Pieces 2 to 5 are not built.
+  (`dca_rec_models.RecommendationSet.universe`, 12 tests). Piece 2 (the recommender carries the list) is done 2026-11-20 (`dca_recommender.py`, 6 tests): the list is carried only
+  when it has at most 100 names, so the live 122 leaves the set as before. Pieces 3 to 5 are not built.
 - **Why now:** `docs/adr-program-maintained-universe.md` lets the program change the buy list every trading day.
   The backup planner was built for a list that changes by hand, rarely. This ADR is the open question 9 of that
   ADR (item "Mac checkout and the backup planner").
