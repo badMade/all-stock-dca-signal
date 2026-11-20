@@ -476,7 +476,7 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
         from near_close_dca import StrategyConfig
 
         effective_max_per_order = out.get(
-            "max_per_order_usd", StrategyConfig().max_per_order_usd
+            "max_per_order_usd", StrategyConfig(tickers=()).max_per_order_usd
         )
         if whole_share_max < effective_max_per_order:
             raise ValueError(
@@ -1235,7 +1235,14 @@ def load_strategy_config(
     # the canonical WHOLE_SHARE_TICKERS fallback applies at all (see that
     # branch's own comment, after `merged` is known).
     explicit_base_given = base is not None
-    base = base or StrategyConfig()
+    if not base:
+        # StrategyConfig()'s own default tickers come from the AMBIENT config dir ($DCA_CONFIG_DIR),
+        # derived from tickers.json on first use (docs/adr-program-maintained-universe.md). A caller
+        # that passed an explicit config_dir must not depend on a stale or missing ambient one, so
+        # seed the list from THIS dir when it declares one (it would be overlaid by `merged` below
+        # anyway); only a dir with no active list falls back to the ambient default.
+        dir_tickers = load_tickers(config_dir).get("tickers")
+        base = StrategyConfig(tickers=dir_tickers) if dir_tickers else StrategyConfig()
 
     # Surface the fallback-to-defaults case loudly. If the strategy is installed as a
     # wheel and run outside a checkout, the bundled config/ may be absent; without this

@@ -859,17 +859,6 @@ def test_zero_filled_quantity_is_not_read_from_order_quantity():
     assert not order.has_unvalued_fill
 
 
-def test_paginate_bare_token_next_fails_closed():
-    # A `next` that is a bare token (not a URL with ?cursor=) is not something we
-    # can confidently follow; fail closed rather than guess it is a cursor.
-    def fn(**kwargs):
-        return {"orders": [], "next": "cursor_abc123"}
-
-    result = paginate_same_day_orders(fn, account_number="ACCT", created_at_gte="2026-07-23")
-    assert not result.complete
-    assert any("next_url_without_usable_cursor" in r for r in result.incomplete_reasons)
-
-
 def test_raw_sink_persists_each_response_as_fetched(tmp_path):
     # The raw-input contract requires persisting each raw broker response before
     # deriving output. raw_sink must be populated incrementally (pagination pages
@@ -1098,3 +1087,34 @@ def test_live_partially_filled_order_still_has_no_reference():
     order = normalize_order(_raw("m6", "MA", "partially_filled", qty="0.004", price="500.00", notional="4.00"))
     assert order is not None
     assert order.reference_price is None
+
+
+# --- connector returns `next` as a bare opaque cursor (2026-11-19 0935 abort) ---
+
+
+def test_next_cursor_accepts_bare_opaque_next_token():
+    from scripts.broker_reconciliation import _next_cursor
+
+    token = "cD0yMDI2LTExLTE2KzE0JTNBNTclM0EwNy43MzIwNjglMkIwMCUzQTAw"
+    assert _next_cursor({"data": {"orders": [], "next": token}}) == token
+
+
+def test_next_cursor_still_rejects_a_next_url_without_cursor_param():
+    from scripts.broker_reconciliation import _next_cursor
+
+    assert _next_cursor({"orders": [], "next": "https://api.robinhood.com/orders/"}) is None
+
+
+def test_paginate_follows_a_bare_opaque_next_token_to_the_last_page():
+    token = "cD0yMDI2LTExLTE2"
+    seen = []
+
+    def fn(**kwargs):
+        seen.append(kwargs.get("cursor"))
+        if kwargs.get("cursor") is None:
+            return {"data": {"orders": [], "next": token}}
+        return {"data": {"orders": []}}
+
+    result = paginate_same_day_orders(fn, account_number="ACCT", created_at_gte="2026-11-16")
+    assert result.complete
+    assert seen == [None, token]
