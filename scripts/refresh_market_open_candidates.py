@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from dca_config import _reject_duplicate_keys
 from market_open_dca import MARKET_OPEN_LIVE_MODE, MarketOpenDCAExecutor, load_market_open_config
 from near_close_dca import select_first_allocation_base_usd
 from scripts.stream_candidates import _calibration_fields
@@ -23,6 +24,17 @@ from scripts.stream_candidates import _calibration_fields
 MAX_REFRESH_QUOTE_AGE = timedelta(minutes=5)
 MAX_REFRESH_QUOTE_FUTURE_SKEW = timedelta(seconds=30)
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _parse_finite_float(value: Any) -> float | None:
+    """Parse a finite float, rejecting booleans and oversized ints."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def refresh_market_open_candidates(
@@ -48,18 +60,14 @@ def refresh_market_open_candidates(
         if not ticker or not isinstance(quote, Mapping):
             dropped.append({"ticker": ticker, "reason": "missing_refresh_quote"})
             continue
-        price = quote.get("price")
+        price = _parse_finite_float(quote.get("price"))
         as_of_raw = quote.get("as_of")
-        if price is None or isinstance(price, bool):
-            dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
-            continue
         try:
-            price = float(price)
             as_of = datetime.fromisoformat(str(as_of_raw).replace("Z", "+00:00"))
         except (TypeError, ValueError):
             dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
             continue
-        if not math.isfinite(price) or price <= 0 or as_of.tzinfo is None:
+        if price is None or price <= 0 or as_of.tzinfo is None:
             dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
             continue
         as_of_market = as_of.astimezone(MARKET_TIMEZONE)
@@ -71,14 +79,12 @@ def refresh_market_open_candidates(
         ):
             dropped.append({"ticker": ticker, "reason": "stale_refresh_quote"})
             continue
-        try:
-            prior_close = float(candidate["prior_close"])
-            prior_low_raw = candidate.get("prior_low")
-            prior_low = None if prior_low_raw is None else float(prior_low_raw)
-        except (KeyError, TypeError, ValueError):
-            dropped.append({"ticker": ticker, "reason": "invalid_price_reference"})
-            continue
-        if not math.isfinite(prior_close) or prior_close <= 0:
+        prior_close = _parse_finite_float(candidate.get("prior_close"))
+        prior_low_raw = candidate.get("prior_low")
+        prior_low = None if prior_low_raw is None else _parse_finite_float(prior_low_raw)
+        if prior_close is None or prior_close <= 0 or (
+            prior_low_raw is not None and (prior_low is None or prior_low <= 0)
+        ):
             dropped.append({"ticker": ticker, "reason": "invalid_price_reference"})
             continue
 
@@ -87,12 +93,8 @@ def refresh_market_open_candidates(
         base, _ = select_first_allocation_base_usd(
             price, prior_close, prior_low, executor.sizing_config, ticker
         )
-        try:
-            authorized_base = float(candidate["selected_base_amount_usd"])
-        except (KeyError, TypeError, ValueError):
-            dropped.append({"ticker": ticker, "reason": "invalid_authorized_base"})
-            continue
-        if not math.isfinite(authorized_base) or authorized_base <= 0:
+        authorized_base = _parse_finite_float(candidate.get("selected_base_amount_usd"))
+        if authorized_base is None or authorized_base <= 0:
             dropped.append({"ticker": ticker, "reason": "invalid_authorized_base"})
             continue
         if base < authorized_base:
@@ -102,12 +104,8 @@ def refresh_market_open_candidates(
         if desired <= 0:
             dropped.append({"ticker": ticker, "reason": "no_longer_ladder_eligible"})
             continue
-        try:
-            authorized_desired = float(candidate["desired_usd"])
-        except (KeyError, TypeError, ValueError):
-            dropped.append({"ticker": ticker, "reason": "invalid_authorized_amount"})
-            continue
-        if not math.isfinite(authorized_desired) or authorized_desired <= 0:
+        authorized_desired = _parse_finite_float(candidate.get("desired_usd"))
+        if authorized_desired is None or authorized_desired <= 0:
             dropped.append({"ticker": ticker, "reason": "invalid_authorized_amount"})
             continue
         if desired > authorized_desired:
@@ -136,8 +134,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--placement-time", required=True, type=datetime.fromisoformat)
     parser.add_argument("--config-dir", type=Path)
     args = parser.parse_args(argv)
-    candidates = json.loads(args.candidates.read_bytes())
-    quotes = json.loads(args.quotes.read_bytes())
+    try:
+        candidates = json.loads(args.candidates.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        quotes = json.loads(args.quotes.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     if not isinstance(candidates, list) or not all(isinstance(candidate, Mapping) for candidate in candidates):
         parser.error("--candidates must contain a JSON list of objects")
     if not isinstance(quotes, Mapping):
