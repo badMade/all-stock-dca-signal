@@ -138,6 +138,11 @@ def _next_cursor(response: Any) -> Optional[str]:
         cursor_values = params.get("cursor")
         if cursor_values:
             return cursor_values[0]
+        # The Robinhood connector returns ``next`` as a plain page marker, not a URL. Accept it;
+        # a URL-shaped value without a cursor param stays unfollowable (fail closed).
+        bare = nxt.strip()
+        if not any(ch in bare for ch in ":/?#& "):
+            return bare
         # A next URL with no cursor param is still a "there is more" signal we
         # cannot follow deterministically; surface None so the caller stops and
         # (because more may exist) does not treat the run as provably complete.
