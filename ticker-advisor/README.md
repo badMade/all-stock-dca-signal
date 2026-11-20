@@ -178,6 +178,13 @@ assets (revenue minus cost of revenue as a fallback); value is book-to-price (eq
 Pinned names are removed. Fractional eligibility is not checked: pair it with
 `PoolThresholds(require_fractional_eligible=False)`.
 
+### The daily ranking run (`daily_ranking.py`, propose-only)
+
+`daily_ranking.run_daily_ranking(snapshot=..., price_inputs=..., prior_active=..., pinned=..., ...)` ties the feed
+pieces to the engine and returns a proposal and a report (who enters and leaves, sector counts, who fails the pool
+floors, who could not be scored). `write_daily_outputs(directory, ranking)` writes `universe_proposal.json` and
+`ranking_report.json` atomically. It never writes `config/tickers.json`; `universe_apply` does that.
+
 ### Pinned names
 
 `config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap
