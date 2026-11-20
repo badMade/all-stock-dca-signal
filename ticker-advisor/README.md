@@ -160,6 +160,15 @@ the number of names changed per day is unlimited (`UNLIMITED_SWAPS`). The input 
 90-name floor and 100-name cap are unchanged. The default `UniverseConfig()` keeps the quarterly
 behaviour exactly as before.
 
+### Price-derived inputs (`price_factors.py`)
+
+`price_factors.load_price_history` reads the daily price archive's CSV (the shape of the repo's sample
+`historical_stock_data.csv`) into ascending bars per ticker. Exact duplicate rows collapse and conflicting ones are
+refused. `price_factors.price_inputs(bars, as_of=...)` returns 6- and 12-month momentum that skips the latest month,
+one-year volatility, the 60-session median dollar volume, history length, last price and the count of trailing
+sessions below the minimum price, using only bars on or before `as_of`. A figure it cannot compute is `None` with a
+flag. A split-like one-day move blanks momentum and volatility (`possible_unadjusted_split`). Pure stdlib.
+
 ### Pinned names
 
 `config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap
