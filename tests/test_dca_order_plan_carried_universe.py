@@ -88,7 +88,7 @@ def test_the_hash_must_be_the_carried_lists_not_the_readers(config, ctx):
 
 def test_a_tampered_carried_list_fails_its_own_hash(config, ctx):
     plan = _carried_plan(config)
-    plan["universe"] = [*CARRIED, "YYYY"]
+    plan["universe"] = sorted([*CARRIED, "YYYY"])  # still canonical, so only the hash is wrong
     result = dop.validate_plan(plan, **ctx)
     assert result.orders == ()
     assert "universe_hash_mismatch" in _codes(result)
