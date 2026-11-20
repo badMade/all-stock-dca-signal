@@ -18,22 +18,37 @@ Failure rules, fail closed but not brittle for one bad company out of thousands:
   The caller decides how many unreadable members it will tolerate.
 * A file that is not a zip, or a malformed CIK in the request, is refused.
 
+``download_companyfacts_zip`` fetches the file itself (the one network call in this module): one GET with the
+contact-identifying User-Agent the repo requires, streamed to a temporary file and renamed into place only when
+it is complete, under a size cap and a real zip, so a failed download never damages an existing file. Specified
+first by tests/test_edgar_bulk_download.py. The URL is the SEC's documented location as remembered and was NOT
+confirmed by a live request: confirm with one live download on the operator's Mac before relying on it.
+
 Research ingest only: nothing on the live DCA side imports this (tests/test_architecture_boundaries.py).
 """
 
 from __future__ import annotations
 
+import os
+import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
 from ._json_get import parse_strict_json_object
-from .edgar_fundamentals import PointInTimeFact, _normalize_cik, _parse_fact
+from .edgar_fundamentals import USER_AGENT_ENV, PointInTimeFact, _normalize_cik, _parse_fact, build_headers
 
 # The biggest filers' documents are a few tens of MB; this refuses anything absurd rather than parsing it.
 DEFAULT_MAX_MEMBER_BYTES = 256 * 1024 * 1024
 _SOURCE = "SEC EDGAR companyfacts.zip"
+COMPANYFACTS_ZIP_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
+# The bulk file is on the order of a gigabyte; this refuses a runaway body rather than filling the disk.
+DEFAULT_MAX_ZIP_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_DOWNLOAD_TIMEOUT_S = 120.0
+_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -144,3 +159,61 @@ def read_bulk_companyfacts(
                 # Parser messages name the problem, never the body (.jules/sentinel.md).
                 unreadable[cik] = f"unreadable member ({type(exc).__name__}: {exc})"
     return BulkResult(facts=facts, missing_ciks=missing, unreadable=unreadable)
+
+
+def download_companyfacts_zip(
+    dest: str | Path,
+    *,
+    user_agent: str | None = None,
+    max_bytes: int = DEFAULT_MAX_ZIP_BYTES,
+    timeout_s: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
+) -> int:
+    """Download the SEC's ``companyfacts.zip`` to ``dest`` and return the number of bytes written.
+
+    The body is streamed to a temporary file beside ``dest`` and renamed over it only after it is complete (it
+    matches the server's ``Content-Length`` when one is sent), is within ``max_bytes`` and is a real zip. Any
+    failure leaves an existing ``dest`` exactly as it was and leaves no temporary file behind.
+
+    Raises:
+        ValueError: blank or missing User-Agent (checked before any request), a body over the cap, a length
+            that does not match ``Content-Length``, or a body that is not a zip. No response text is quoted.
+        LookupError: the server answered 404.
+        urllib.error.HTTPError: any other non-2xx status.
+        OSError: timeout, connection failure, or a local write failure.
+    """
+    resolved = user_agent if user_agent is not None else os.environ.get(USER_AGENT_ENV)
+    headers = {**build_headers(user_agent=resolved), "Accept": "application/zip"}
+    target = Path(dest)
+    request = urllib.request.Request(COMPANYFACTS_ZIP_URL, headers=headers, method="GET")
+    try:
+        response_cm = urllib.request.urlopen(request, timeout=timeout_s)  # noqa: S310 -- fixed https URL above
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise LookupError(f"{_SOURCE} returned 404") from exc
+        raise
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        written = 0
+        with response_cm as response, os.fdopen(fd, "wb") as out:
+            declared = response.headers.get("Content-Length")
+            expected = int(declared) if declared is not None and declared.strip().isdigit() else None
+            if expected is not None and expected > max_bytes:
+                raise ValueError(f"{_SOURCE}: declared size {expected} bytes exceeds the {max_bytes} byte cap")
+            while True:
+                chunk = response.read(_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError(f"{_SOURCE}: download exceeds the {max_bytes} byte cap")
+                out.write(chunk)
+        if expected is not None and written != expected:
+            raise ValueError(f"{_SOURCE}: downloaded length {written} does not match Content-Length {expected}")
+        if not zipfile.is_zipfile(tmp):
+            raise ValueError(f"{_SOURCE}: the downloaded file is not a zip")
+        os.replace(tmp, target)
+        return written
+    finally:
+        tmp.unlink(missing_ok=True)
