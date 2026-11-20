@@ -154,6 +154,11 @@ PLAN_FIRST_GENERATOR = "plan_first"
 _PRIMARY_SIZED_GENERATORS = frozenset({"claude", PLAN_FIRST_GENERATOR})
 _PLAN_FIRST_KEYS = frozenset({"schema_version", "trading_day", "slot", "generated_at_et", "generator", "ladder_version",
                               "universe_hash", "source", "orders", "sizing_guard"})
+# The one optional plan key: the day's carried universe (docs/adr-backup-planner-daily-universe.md, piece 3). Absent =
+# a set that carries no list, validated against the bundled config exactly as before.
+_PLAN_FIRST_OPTIONAL_KEYS = frozenset({"universe"})
+# The planner keeps its own bound because a carried list cannot lean on the bundled one.
+_MAX_CARRIED_UNIVERSE = 100
 _PLAN_FIRST_ORDER_KEYS = frozenset({"symbol", "notional_usd", "ref_id"})
 _PLAN_FIRST_SOURCES = ("mac_rec", "published_rec")
 # The published payload dca_rec_publish.build_document writes (Notion code block, GitHub `recommendations` branch).
@@ -607,7 +612,7 @@ def _freshness_reason(recommendation: RecommendationSet, slot: str, now: datetim
 
 def _plan_first_document(recommendation: RecommendationSet, source: str) -> dict[str, Any]:
     """The set as the plan document ``finalize`` reads. A copy of the set's own fields; nothing is sized here."""
-    return {
+    document = {
         "schema_version": dop.SCHEMA_VERSION,
         "trading_day": recommendation.trading_day.isoformat(),
         "slot": recommendation.slot,
@@ -620,6 +625,10 @@ def _plan_first_document(recommendation: RecommendationSet, source: str) -> dict
                    for item in recommendation.items],
         "sizing_guard": recommendation.sizing_guard,
     }
+    if recommendation.universe is not None:
+        # Only a set that carries a list yields a plan that does; the old plan shape is untouched otherwise.
+        document["universe"] = list(recommendation.universe)
+    return document
 
 
 def current_config_reason(recommendation: RecommendationSet, *, trading_day: date, slot: str,
@@ -644,7 +653,7 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
     sends for this slot, day and ticker (``validate_native_placement.native_ref_id``). Any defect rejects the whole
     plan. Run by ``plan`` when the set is read and again by ``finalize`` on the saved file.
     """
-    if not isinstance(plan, dict) or set(plan) != _PLAN_FIRST_KEYS:
+    if not isinstance(plan, dict) or (set(plan) - _PLAN_FIRST_OPTIONAL_KEYS) != _PLAN_FIRST_KEYS:
         return dop._fail(PlanError("schema_violation", "plan must be an object with exactly the schema's fields"))
     errors: list[PlanError] = []
     version = plan["schema_version"]
@@ -660,8 +669,29 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
         errors.append(PlanError("schema_violation", "generated_at_et"))
     if plan["ladder_version"] != ladder_version:
         errors.append(PlanError("stale_ladder_version", f"expected {ladder_version}"))
-    if plan["universe_hash"] != dop.universe_hash(config.tickers):
-        errors.append(PlanError("universe_hash_mismatch"))
+    excluded = set(config.excluded_tickers)
+    if "universe" in plan:
+        # A carried list replaces the bundled one: the hash must be the carried list's, and the planner bounds the
+        # list itself (size, canonical form, no hand-held excluded name) since no bundled list vouches for it.
+        carried = plan["universe"]
+        if not (isinstance(carried, list) and carried
+                and all(isinstance(t, str) and dop._SYMBOL_RE.match(t) for t in carried)
+                and carried == sorted(set(carried))):
+            errors.append(PlanError("schema_violation", "universe must be sorted, unique tickers"))
+            active = set()
+        else:
+            active = set(carried)
+            if len(carried) > _MAX_CARRIED_UNIVERSE:
+                errors.append(PlanError("universe_too_large", f"at most {_MAX_CARRIED_UNIVERSE}"))
+            if plan["universe_hash"] != dop.universe_hash(carried):
+                errors.append(PlanError("universe_hash_mismatch"))
+            for symbol in carried:
+                if symbol in excluded:
+                    errors.append(PlanError("excluded_in_universe", symbol))
+    else:
+        active = set(config.tickers)
+        if plan["universe_hash"] != dop.universe_hash(config.tickers):
+            errors.append(PlanError("universe_hash_mismatch"))
     guard = plan["sizing_guard"]
     # None is allowed here (an older, unstamped set still parses) and fails closed later, at finalize's recheck.
     if guard is not None and not (
@@ -673,7 +703,7 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
     orders = plan["orders"]
     if not isinstance(orders, list):
         return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
-    active, excluded, seen = set(config.tickers), set(config.excluded_tickers), set()
+    seen: set[str] = set()
     for order in orders:
         if not isinstance(order, dict) or set(order) != _PLAN_FIRST_ORDER_KEYS:
             errors.append(PlanError("schema_violation", "order must be an object with exactly the schema's fields"))
