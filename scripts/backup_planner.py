@@ -973,6 +973,10 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     now = _parse_now(args.now)
     if now is None:
         raise _Refused(PlanError("bad_now", "expected a timezone-aware ISO timestamp"))
+    carried = _day_universe(args.published, args.slot, config)
+    if carried is not None:
+        # The day's carried list replaces the bundled one for this plan, which then carries it so finalize can check it.
+        config = dataclasses.replace(config, tickers=carried)
     buying_power = _parse_buying_power(args.buying_power)
     history = _load_history(args.orders_pages, trading_day, _week_last4(args))
     result = dop.compute_plan_from_file(
@@ -982,7 +986,8 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     )
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
+    plan = result.plan if carried is None else {**result.plan, "universe": list(carried)}
+    return _emit({"status": "VALID_PLAN", "plan": plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
 
 
 def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
@@ -1192,6 +1197,33 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     return _emit({**report, "build": build_report}, 0)
 
 
+def _day_universe(published: Path | None, slot: str, config: Any) -> tuple[str, ...] | None:
+    """The day's CARRIED list from the slot's published set, or ``None`` when the bundled list is the day's list.
+
+    Piece 4 of docs/adr-backup-planner-daily-universe.md. No ``--published`` argument, no set for the slot, or a set
+    whose hash equals the bundled hash all mean the bundled list (a bundled-list plan is accepted only on a day with no
+    list change). A set that carries a list yields that list, bounded as piece 3 bounds it. A changed hash with no list,
+    or an unreadable payload, is a refusal: the planner cannot know the day's list, so it buys nothing.
+    """
+    if published is None:
+        return None
+    recommendation = _published_set(_read_json(published, missing="published_missing", corrupt="published_corrupt"), slot)
+    if recommendation is None:
+        return None
+    carried = recommendation.universe
+    if carried is None:
+        if recommendation.universe_hash == dop.universe_hash(config.tickers):
+            return None
+        raise _Refused(PlanError("universe_unknown_for_day", "the set's hash differs from the bundled list and carries no list"))
+    errors: list[PlanError] = []
+    if len(carried) > _MAX_CARRIED_UNIVERSE:
+        errors.append(PlanError("universe_too_large", f"at most {_MAX_CARRIED_UNIVERSE}"))
+    errors.extend(PlanError("excluded_in_universe", symbol) for symbol in carried if symbol in set(config.excluded_tickers))
+    if errors:
+        raise _Refused(*errors)
+    return tuple(carried)
+
+
 def _cmd_universe(args: argparse.Namespace) -> int:
     """The buyable symbols from the packaged config: the task fetches exactly these, so no prompt names a stock."""
     directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
@@ -1202,11 +1234,16 @@ def _cmd_universe(args: argparse.Namespace) -> int:
     except ValueError as exc:
         return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("config_invalid", type(exc).__name__)])}, 2)
     config = dca_config.load_strategy_config(directory)
+    try:
+        carried = _day_universe(args.published, args.slot, config)
+    except _Refused as refusal:
+        return _emit({"status": "FAILED", "errors": _error_dicts(refusal.errors)}, 2)
+    day_list = config.tickers if carried is None else carried
     whole_share = set(getattr(config, "whole_share_tickers", ()) or ())
-    symbols = sorted(set(config.tickers) - set(config.excluded_tickers) - whole_share)
+    symbols = sorted(set(day_list) - set(config.excluded_tickers) - whole_share)
     if not symbols:
         return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("universe_unavailable", "no buyable symbols")])}, 2)
-    return _emit({"status": "OK", "symbols": symbols, "count": len(symbols), "universe_hash": dop.universe_hash(config.tickers)}, 0)
+    return _emit({"status": "OK", "symbols": symbols, "count": len(symbols), "universe_hash": dop.universe_hash(day_list)}, 0)
 
 
 def _collect(errors: list[PlanError], load: Any) -> Any:
@@ -1454,6 +1491,8 @@ def _build_parser() -> argparse.ArgumentParser:
     compute.add_argument("--deployed-last-7d-usd", default=None,
                          help="Trailing-7-day deployment for the kill switch, or 'auto' to derive it from --orders-pages. "
                               "Required with --market-data.")
+    compute.add_argument("--published", type=Path, default=None,
+                         help="Quotes path: the published recommendations payload; its set gives the day's list.")
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
@@ -1471,6 +1510,9 @@ def _build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--now", default=None, help="TESTS ONLY: an offset-aware ISO instant instead of the clock.")
     universe = sub.add_parser("universe", help="Print the buyable symbols from config; the task fetches exactly these.")
     universe.add_argument("--config-dir", type=Path, default=None)
+    universe.add_argument("--published", type=Path, default=None,
+                          help="The published recommendations payload; its set gives the day's list (needs --slot).")
+    universe.add_argument("--slot", default=None, help="The slot whose set to read (required with --published).")
     finalize = sub.add_parser("finalize", help="Reconcile and re-validate a plan; print what to place.")
     common(finalize)
     finalize.add_argument("--plan", required=True, type=Path)
@@ -1510,6 +1552,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
             return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
     if args.command == "universe":
+        if args.published is not None and args.slot is None:
+            parser.error("--published needs --slot")
         try:
             return _cmd_universe(args)
         except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
