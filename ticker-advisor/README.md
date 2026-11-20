@@ -169,6 +169,15 @@ one-year volatility, the 60-session median dollar volume, history length, last p
 sessions below the minimum price, using only bars on or before `as_of`. A figure it cannot compute is `None` with a
 flag. A split-like one-day move blanks momentum and volatility (`possible_unadjusted_split`). Pure stdlib.
 
+### Ranking inputs (`universe_inputs.py`)
+
+`universe_inputs.load_snapshot` validates the fundamentals snapshot file (kind, schema version, content hash).
+`build_ranking_inputs(snapshot, price_inputs, pinned=..., exchange_by_symbol=...)` returns the engine's `Candidate`,
+`FactorInputs` and `TickerStatus` records plus a reason for every name left out. Profitability is gross profit over
+assets (revenue minus cost of revenue as a fallback); value is book-to-price (equity over shares times price).
+Pinned names are removed. Fractional eligibility is not checked: pair it with
+`PoolThresholds(require_fractional_eligible=False)`.
+
 ### Pinned names
 
 `config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap

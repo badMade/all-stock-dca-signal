@@ -88,7 +88,7 @@ Factor definitions I recommend (operator to confirm, section 6):
 | 3 | Bulk reader that extracts the concepts for every CIK in one pass. **Done 2026-11-20** (`edgar_bulk.py`: `read_bulk_companyfacts` with no network, and `download_companyfacts_zip`, 15 download tests). The bulk file's URL and layout are NOT live-verified. The download needs `SEC_EDGAR_USER_AGENT` set on the Mac | medium |
 | 4 | Snapshot writer and its schema, hash and freshness stamp. **Done 2026-11-20** (`fundamentals_snapshot.py`: `build_snapshot`, `write_snapshot`, `snapshot_hash_matches`, 19 tests) | small |
 | 5 | Price-derived inputs from the archive: momentum, volatility, dollar volume, history length. **Done 2026-11-20** against the repo's sample CSV (`ticker-advisor/price_factors.py`, 36 tests). The real archive's layout and whether it is split-adjusted are NOT confirmed | medium |
-| 6 | Adapter that turns snapshot plus archive into `FactorInputs` and pool `Candidate` records | medium |
+| 6 | Adapter that turns snapshot plus archive into `FactorInputs` and pool `Candidate` records. **Done 2026-11-20** (`ticker-advisor/universe_inputs.py`, plus `PoolThresholds.require_fractional_eligible`; 51 tests). Needs an exchange map for `nms_listed` (not built) and the pool floors confirmed | medium |
 | 7 | The daily ranking job and its `launchd` template (needs the Mac checkout answer) | medium |
 
 Steps 1 to 4 need no network in their tests (trimmed fixtures, as `test_edgar_fundamentals.py` does).

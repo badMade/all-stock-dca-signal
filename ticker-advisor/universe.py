@@ -111,6 +111,10 @@ class PoolThresholds:
     min_median_dollar_volume_60d: float = 20e6
     min_history_sessions: int = 252
     required_security_type: str = "common_stock"
+    # True (the spec default): an unknown fractional eligibility is "missing:fractional_eligible" and rejects the
+    # name. False: the ranking does not check it (operator decision 2026-11-20; the run-time gate still blocks a
+    # name that cannot be bought fractionally), so an unknown passes. An explicit False is rejected either way.
+    require_fractional_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -273,7 +277,8 @@ def _candidate_rejections(candidate: Candidate, thresholds: PoolThresholds) -> l
     elif history < thresholds.min_history_sessions:
         reasons.append("history_too_short")
     if candidate.fractional_eligible is None:
-        reasons.append("missing:fractional_eligible")
+        if thresholds.require_fractional_eligible:
+            reasons.append("missing:fractional_eligible")
     elif candidate.fractional_eligible is not True:
         reasons.append("not_fractional_eligible")
     return reasons
