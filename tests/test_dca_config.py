@@ -1834,7 +1834,9 @@ def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     for fractional/notional buys either). "excluded" carries QBUT, excluded
     2026-09-18 after Robinhood returned not-found for it on every live run
     (see config/tickers.json's exclusion_reasons.QBUT)."""
-    loaded = load_tickers(get_config_dir())
+    # today pinned past every dated no_buy window: this test is about the PERMANENT excluded list, and the
+    # no_buy overlay (tests/test_no_buy_enforcement.py) would otherwise make it depend on the host clock.
+    loaded = load_tickers(get_config_dir(), today=date(2027, 1, 1))
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
     assert loaded["excluded_tickers"] == frozenset({"QBUT", "KVUE"})
     for whole_share in ("BYDDY", "RVII"):

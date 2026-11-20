@@ -18,6 +18,23 @@
       "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
       "additionalProperties": { "type": "string", "minLength": 1, "not": { "enum": ["", "TODO", "TBD", "N/A", "null"] } }
     },
+    "no_buy": {
+      "type": "object",
+      "description": "Dated buy pauses (wash-sale windows after a tax-loss sale; docs/adr-no-buy-window.md). Keys are tickers from `active`, which stay tracked; each is blocked from buying while blocked_on <= today <= until (both inclusive, US Eastern) unless released_on is set and reached. A release (scripts/no_buy_window.py) sets released_on and never deletes the entry. Distinct from the permanent `excluded` list. dca_config.no_buy_blocked_tickers enforces the stricter rules (symbol in `active`, not in `excluded`, until >= blocked_on, released_on >= blocked_on).",
+      "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["blocked_on", "until", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "blocked_on": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "until": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "reason": { "type": "string", "minLength": 1 },
+          "released_on": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "release_reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "notes": { "type": "string" }
   }
 }

@@ -29,15 +29,7 @@ from pathlib import Path
 
 import pytest
 
-import dca_config
-
-# Test-first gate: the function does not exist until the operator approves this test and the
-# implementation lands. Skipping at module level (not failing) keeps the rest of the suite green
-# in the meantime. REMOVE THIS GATE in the implementation commit so the tests become binding.
-if not hasattr(dca_config, "no_buy_blocked_tickers"):
-    pytest.skip("no_buy_blocked_tickers not implemented yet (TDD, awaiting approval)", allow_module_level=True)
-
-no_buy_blocked_tickers = dca_config.no_buy_blocked_tickers
+from dca_config import no_buy_blocked_tickers
 
 REAL_TICKERS_JSON = Path(__file__).resolve().parent.parent / "config" / "tickers.json"
 
@@ -142,7 +134,7 @@ def test_empty_no_buy_block_blocks_nothing():
         ("reason missing", {"AAA": {k: v for k, v in _entry().items() if k != "reason"}}),
         ("reason empty", {"AAA": _entry(reason="  ")}),
         ("date not ISO", {"AAA": _entry(until="12/21/2026")}),
-        ("date not a string", {"AAA": _entry(until=20261221)}),
+        ("date not a string", {"AAA": _entry(until=2026)}),
         ("impossible date", {"AAA": _entry(until="2026-02-30")}),
         ("until before blocked_on", {"AAA": _entry(blocked_on="2026-12-01", until="2026-11-01")}),
         ("released before blocked_on", {"AAA": _entry(released_on="2026-11-01")}),

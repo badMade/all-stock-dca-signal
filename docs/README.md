@@ -102,6 +102,7 @@ environment (see the repository README).
 | [sizing_suggestion_history.md](sizing_suggestion_history.md) | Append-only per-suggester history of sizing recommendations (`ml_forecaster`, `octopus`): why no suggester writes live sizing, the JSONL record shape, and what the later comparison needs |
 | [market_open_0932_move.md](market_open_0932_move.md) | Proposal (not implemented) to fire the market-open slot at 09:32 on a live-quote decision price; the full change list and the shadow-only `market_open_quote_shadow` recorder that gathers evidence first |
 | [research/2026-11-11-overnight-futures.md](research/2026-11-11-overnight-futures.md) | Research input (not an ADR): overnight ES/NQ/YM futures vs next-day open gaps, false reversals, catalysts, index arbitrage and dividend hedging; feeds the proposed overnight futures tracker ADR. Suggest-only, gap-size and volatility context, not directional alpha |
+| [adr-no-buy-window.md](adr-no-buy-window.md) | Dated `no_buy` block in `config/tickers.json`: pauses buys of tickers sold at a loss for the wash-sale window, enforced through the shared loader and `dca_runner`, with a recorded early release (`scripts/no_buy_window.py`) |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 
 ## Machine-readable backup
