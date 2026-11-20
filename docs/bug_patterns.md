@@ -69,3 +69,11 @@ still goes in `tests/` per CLAUDE.md; this file records the *shape*.
 - **Check for it:** on an unexplained exit 139 while loading the archive, scan for dates outside a
   sane range before blaming memory.
 - **Guard:** none yet.
+
+### Safety-bound config loaders omitting duplicate-key, bool, or overflow guards
+
+- **Confirmed:** 2026-11-19 — `morning_dca.load_max_per_order_usd()` and `morning_dca.load_max_orders_per_day()` used bare `json.loads()` without `object_pairs_hook=_reject_duplicate_keys`, and `load_max_per_order_usd()` called bare `float()` without rejecting `bool` (`True -> 1.0`) or catching `OverflowError` (`10**1000`).
+- **Symptom:** duplicate keys in `budgets.json` silently apply last-one-wins, `true` silently becomes `$1.00`, and oversized integers raise unhandled `OverflowError`.
+- **Root cause:** sibling cap loaders in the same module were hardened individually without a shared helper or sweep across all `json.loads()` / `float()` cap readers.
+- **Check for it:** `rg -n "json\\.loads\\(" *.py scripts/*.py` on safety-bound configs and verify `object_pairs_hook=_reject_duplicate_keys`, `isinstance(v, bool)`, and `OverflowError` handling.
+- **Guard:** `tests/test_morning_dca.py::test_load_max_per_order_usd_rejects_duplicate_keys`, `::test_load_max_per_order_usd_rejects_booleans_strings_and_oversized_ints` and `::test_load_max_orders_per_day_rejects_duplicate_keys`.

@@ -1008,3 +1008,84 @@ def test_hard_fail_drops_apply_even_when_the_proposal_is_rejected():
 )
 def test_quote_age_is_cross_checked_against_quote_date(freshness, code):
     assert code in _codes(validate_proposal(_clean_proposal(), _prior_stats(), freshness, UniverseConfig()))
+
+
+# --------------------------------------------------------------------------
+# Strict daily top-N mode (docs/adr-program-maintained-universe.md, decision item 3)
+#
+# The operator's rule: the list is re-ranked every day, ranks 1..100 are the buy-eligible set, a name
+# enters on the FIRST day it ranks in the top 100 (no two-review rule), leaves the day it falls out, and
+# there is no limit on how many names change in a day. The quarterly default (75/150 hysteresis, two
+# reviews, 8 swaps, tenure) stays exactly as it was; this is a separate, explicit config.
+# --------------------------------------------------------------------------
+
+
+def test_strict_daily_config_values():
+    cfg = UniverseConfig.strict_daily_top(100)
+    assert cfg.max_active == 100 and cfg.min_active == 90
+    assert cfg.entry_rank == 100 and cfg.incumbent_keep_rank == 100  # one band: no hysteresis
+    assert cfg.min_tenure_quarters == 0  # nothing is protected from a rank-based exit
+    assert cfg.sector_cap == 100 and cfg.industry_cap == 100  # caps can never bind a top-100 name
+    assert cfg.entry_requires_prior_review is False
+    assert cfg.max_swaps >= 10_000  # effectively no limit on names changed per day
+
+
+def test_the_default_config_still_requires_a_prior_review_rank():
+    assert UniverseConfig().entry_requires_prior_review is True
+
+
+def test_strict_daily_enters_on_the_first_day_it_ranks_in_the_top_100():
+    # 99 incumbents at ranks 1..99, one free seat. The rank-100 name was NOT in the prior review at all
+    # (absent from prior ranks), which the quarterly default refuses. Strict mode adds it.
+    board = _board(200)
+    prior = _prior_same(board)
+    del prior[_rank_sym(100)]
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, prior, _incumbents(range(1, 100), tenure=0), config=cfg)
+    assert p.adds == (_rank_sym(100),)
+    assert p.reasons[_rank_sym(100)] == "add:entry_band"
+    assert len(p.active) == 100
+    assert validate_proposal(p, _prior_stats(), _fresh(), cfg) == []
+
+
+def test_strict_daily_drops_a_name_the_day_it_falls_out_of_the_top_100():
+    # Incumbents: ranks 1..99 plus rank 101 (one place outside the top 100, tenure 4). Quarterly mode keeps it
+    # (inside the 150 keep band). Strict mode drops it and adds rank 100 the same day.
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, _prior_same(board), _incumbents([*range(1, 100), 101]), config=cfg)
+    assert p.drops == (_rank_sym(101),)
+    assert p.reasons[_rank_sym(101)] == "drop:rank_outside_keep_band"
+    assert p.adds == (_rank_sym(100),)
+    assert set(p.active) == {_rank_sym(r) for r in range(1, 101)}
+
+
+def test_strict_daily_has_no_limit_on_how_many_names_change_in_one_day():
+    # 122 incumbents at ranks 79..200 (the "122 down to 100" reset). Strict mode drops the 100 names ranked
+    # 101..200, adds the 78 names ranked 1..78, keeps 79..100, and the proposal still validates.
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, _prior_same(board), _incumbents(range(79, 201), tenure=0), config=cfg)
+    assert set(p.active) == {_rank_sym(r) for r in range(1, 101)}
+    assert len(p.drops) == 100 and len(p.adds) == 78
+    assert validate_proposal(p, _prior_stats(), _fresh(), cfg) == []
+
+
+def test_strict_daily_validation_still_rejects_an_add_ranked_outside_the_top_100():
+    board = _board(200)
+    prior = _prior_same(board)
+    del prior[_rank_sym(100)]
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, prior, _incumbents(range(1, 100), tenure=0), config=cfg)
+    tampered = dataclasses.replace(p, ranks={**p.ranks, _rank_sym(100): 150})
+    failures = validate_proposal(tampered, _prior_stats(), _fresh(), cfg)
+    assert any("outside entry band" in f.detail for f in failures)
+
+
+def test_strict_daily_still_refuses_an_add_with_no_rank_at_all():
+    board = _board(200)
+    cfg = UniverseConfig.strict_daily_top(100)
+    p = _select(board, _prior_same(board), _incumbents(range(1, 100), tenure=0), config=cfg)
+    ranks = {t: r for t, r in p.ranks.items() if t != _rank_sym(100)}
+    failures = validate_proposal(dataclasses.replace(p, ranks=ranks), _prior_stats(), _fresh(), cfg)
+    assert any("outside entry band" in f.detail for f in failures)

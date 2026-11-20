@@ -76,7 +76,7 @@ Stamps named in the merged-PR table above were current when those PRs merged. No
    - `python -m scripts.generate_perplexity_backup_prompts --check` (expect exit 0);
    - `python -m scripts.build_backup_planner --out backup_planner.pyz --check` (expect `UP_TO_DATE`);
    - `python3 backup_planner.pyz --build-info`: its `content_sha256` must begin with the 12 characters that
-     `grep -o "must equal [0-9a-f]\{12\}" claude/dca-executor-prompts/perplexity/0955ET-935-backup.txt` prints.
+     `grep -o "must equal [0-9a-f]\{12\}" claude/dca-executor-prompts/perplexity/1000ET-935-backup.txt` prints.
    If `main` moves after you paste, repeat the checks on the new commit; a prompt set pasted from an older commit may be
    stale. Never reuse a `backup_planner.pyz` from an older checkout. Two tests in
    `scripts/tests/test_build_backup_planner.py` fail CI if the committed file stops matching its sources or the prompts

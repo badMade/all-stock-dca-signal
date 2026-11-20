@@ -170,10 +170,13 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
   docs, or tests — `test_config_invariants.py` greps for it and fails. `conftest.py` assigns a
   synthetic `999000111` unconditionally so the suite is hermetic even on a machine that exports
   a real value.
-- **Config ↔ constant parity.** `near_close_dca.BUDGET_TIERS`, `ACTIVE_TICKERS`, and
-  `EXCLUDED_TICKERS` must agree with `config/budgets.json` and `config/tickers.json`. Some code
-  paths build a bare `StrategyConfig()` and never see the JSON, so a drift changes behavior on
-  some paths and not others. `test_config_invariants.py` is the enforcement.
+- **Config ↔ constant parity.** `near_close_dca.BUDGET_TIERS` and `EXCLUDED_TICKERS` must agree
+  with `config/budgets.json` and `config/tickers.json`. Some code paths build a bare
+  `StrategyConfig()` and never see the JSON, so a drift changes behavior on some paths and not
+  others. `test_config_invariants.py` is the enforcement. `ACTIVE_TICKERS` is no longer a copy: it
+  is derived from `config/tickers.json` at import (2026-11-19, `docs/adr-program-maintained-universe.md`)
+  and `import near_close_dca` raises if that file is missing or malformed, so never re-add a
+  hardcoded list (`tests/test_active_tickers_derivation.py`).
 - **No hard-coded absolute paths.** Artifact roots come from `dca_paths.stream_root(...)` /
   `cron_tracking_root()` (honouring `$DCA_CRON_TRACKING_ROOT`); ticker history from
   `dca_ticker_paths.configured_ticker_history_dir()`. Never write a literal `/home/user/...`.

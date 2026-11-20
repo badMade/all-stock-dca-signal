@@ -2853,7 +2853,7 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
 
     slots = policy["authorized_slots_et"]
     expected = {
-        "09:35": ("2ba19526", "4412c3c4", "09:55"),
+        "09:35": ("2ba19526", "4412c3c4", "10:00"),
         "10:30": ("42173154", "e028361e", "10:50"),
         "11:30": ("7be82b97", "e3590042", "11:50"),
         "12:30": ("a6239dae", "062605c6", "12:50"),

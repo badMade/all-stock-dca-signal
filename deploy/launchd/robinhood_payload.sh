@@ -242,7 +242,10 @@ run_chunk() {
 
 BUILD_STARTED="$(date +%s)"
 DEADLINE_EPOCH=""
-[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( BUILD_STARTED + BUILD_DEADLINE_SECONDS ))
+# The deadline counts from the FIRST attempt's start (2026-11-19): a whole-build retry used to restart its own clock, so a
+# build that ran to its 600 s deadline and was refused (2026-11-16, 14:30, 96/122) could be rebuilt for another 600 s and
+# land long after the executor stopped waiting. A first attempt has no DCA_BUILD_FIRST_STARTED, so it is unchanged.
+[ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && DEADLINE_EPOCH=$(( ${DCA_BUILD_FIRST_STARTED:-$BUILD_STARTED} + BUILD_DEADLINE_SECONDS ))
 if [ -n "$BUILD_DEADLINE_ET" ]; then
   # zoneinfo, not the Mac's own clock zone: the cutoff is ET even on a Mac that is not pinned to New York.
   CUTOFF_EPOCH="$("$PY" -c '
@@ -256,12 +259,18 @@ print(int(dt.datetime.combine(day, dt.time.fromisoformat(sys.argv[2]), ZoneInfo(
     && echo "robinhood_payload: deadline $BUILD_DEADLINE_ET ET had already passed when the build started; fetching nothing" >&2
 fi
 "$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json" >"$WORK/chunks.txt"
+# Sliding worker pool (2026-11-19). Chunks used to start in lock-step waves of PARALLEL with a `wait` after each wave, so
+# one chunk that ran to its 240 s timeout idled the other workers until it ended (the 2026-11-16 14:30 build, which then
+# ran into its deadline). Now a new chunk starts as soon as any worker finishes. No bash 4 `wait -n` (macOS ships bash
+# 3.2), so this polls the running-job count; 0.2 s against chunks that take tens of seconds costs nothing.
+wait_for_free_worker() {
+  while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$PARALLEL" ]; do sleep 0.2; done
+}
 idx=0
 while IFS= read -r tickers; do
+  wait_for_free_worker
   run_chunk "$idx" "$tickers" &
   idx=$((idx + 1))
-  # Bound concurrency without bash 4's wait -n (macOS ships bash 3.2).
-  if [ $((idx % PARALLEL)) -eq 0 ]; then wait; fi
 done <"$WORK/chunks.txt"
 wait
 
@@ -296,16 +305,14 @@ print(",".join(rescue_targets(reply, [t for t in sys.argv[2].split(",") if t])))
 ' "$WORK/chunk_$i.json" "$(sed -n "$((i + 1))p" "$WORK/chunks.txt")" || true)"
   if [ -n "$need" ]; then echo "$need" >"$WORK/need_$i.txt"; targets+=("$i"); fi
 done
-rescued=0
 for i in ${targets[@]+"${targets[@]}"}; do
   IFS=, read -r -a members <<<"$(cat "$WORK/need_$i.txt")"
   echo "robinhood_payload: rescue chunk=$i tickers=${#members[@]} size=$RESCUE_SIZE" >&2
   for ((k = 0; k * RESCUE_SIZE < ${#members[@]}; k++)); do
     group="$(IFS=,; echo "${members[*]:k*RESCUE_SIZE:RESCUE_SIZE}")"
     echo "$group" >"$WORK/rescue_$i.r$k.tickers"
+    wait_for_free_worker
     run_chunk "$i.r$k" "$group" &
-    rescued=$((rescued + 1))
-    if [ $((rescued % PARALLEL)) -eq 0 ]; then wait; fi
   done
 done
 wait
@@ -387,6 +394,10 @@ if [ "$MERGE_STATUS" -ne 0 ] && [ "$BUILD_ATTEMPT" -le "$BUILD_RETRIES" ] && [ !
   RETRY_FIRST="${DCA_BUILD_FIRST_STARTED:-$BUILD_STARTED}"
   if [ $(( RETRY_NOW + BUILD_RETRY_WAIT - RETRY_FIRST )) -ge "$BUILD_RETRY_BY" ]; then
     echo "robinhood_payload: not retrying: the first attempt began too long ago (limit ${BUILD_RETRY_BY}s)" >&2
+  elif [ "$BUILD_DEADLINE_SECONDS" -gt 0 ] && [ $(( RETRY_NOW + BUILD_RETRY_WAIT + MIN_ATTEMPT_SECONDS )) -ge $(( RETRY_FIRST + BUILD_DEADLINE_SECONDS )) ]; then
+    # The retry could not start a useful attempt before the shared deadline (the first attempt spent it), so a rebuild
+    # would only publish after the slot's window. Fail now and let Gate 5 name the refusal.
+    echo "robinhood_payload: not retrying: the build deadline (${BUILD_DEADLINE_SECONDS}s from the first attempt) would pass first" >&2
   elif [ -n "${CUTOFF_EPOCH:-}" ] && [ $(( RETRY_NOW + BUILD_RETRY_WAIT + MIN_ATTEMPT_SECONDS )) -ge "$CUTOFF_EPOCH" ]; then
     echo "robinhood_payload: not retrying: the ${BUILD_DEADLINE_ET} ET cutoff would pass first" >&2
   else
