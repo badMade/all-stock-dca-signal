@@ -1,6 +1,8 @@
 # ADR: How a daily-changing universe reaches the Perplexity backup planner
 
-- **Status:** Proposed (2026-11-20). Nothing in this ADR is implemented. It needs operator acceptance first.
+- **Status:** Accepted by the operator 2026-11-20 (option 1, as revised by the second read below). Implementation is
+  in progress, test-first, in separate small pieces. Piece 1 (the recommendation set can carry the list) has failing
+  tests and no code yet.
 - **Why now:** `docs/adr-program-maintained-universe.md` lets the program change the buy list every trading day.
   The backup planner was built for a list that changes by hand, rarely. This ADR is the open question 9 of that
   ADR (item "Mac checkout and the backup planner").
@@ -22,6 +24,15 @@ Consequence: with a list that changes daily, the bundled list is stale almost ev
 the live list's hash and are refused (fail closed, no backup that day). A plan the planner builds itself would
 use the stale bundled list and could buy a name that has left the top 100.
 
+## Second read (2026-11-20, before any code)
+
+The Mac already PUBLISHES the day's recommendations: `RecommendationSet` (`dca_rec_models.py`) carries ticker,
+amount and reference id per item plus `universe_hash`, and goes to the GitHub `recommendations` branch and Notion
+(`dca_rec_publish.py`, `docs/plan_first_recommendations.md`). The backup planner reads it as `published_rec`. So the
+day's hash is already published on a channel the backup trusts for amounts, and a separate slot-status hash adds
+little independence (the same Mac writes both). The change therefore reduces to letting the SET carry the list.
+`sizing_guard` is the precedent: an optional key, absent on older sets, so older payloads still parse.
+
 ## Options
 
 | # | Option | Effect |
@@ -32,21 +43,26 @@ use the stale bundled list and could buy a name that has left the top 100.
 
 ## Decision (proposed): option 1, with a published-hash trust anchor
 
-1. **The universe travels with the plan.** A plan-first document gains the sorted `universe` list. The planner
-   checks that `universe_hash` equals the hash of that list, instead of the bundled list.
-2. **The day's hash is published.** After the daily run applies a list, the Mac publishes that day's
-   `universe_hash` on the public slot-status signal the backup prompts already read. The planner refuses a plan
-   unless its `universe_hash` equals the published hash for the trading day. A missing or stale published hash
-   refuses the plan (fail closed). The backup is best effort, so a refused backup is acceptable.
+1. **The universe travels with the recommendation set, then the plan.** `RecommendationSet` gains an optional
+   sorted `universe` (at most 100 canonical symbols; it must hash to `universe_hash`; every recommended ticker must be
+   in it). The plan-first document gains the same list. The planner checks that `universe_hash` equals the hash of
+   that carried list, instead of the bundled list.
+2. **The published set is the anchor.** The recommendation set the Mac publishes for the day already carries the
+   hash. The planner refuses a plan whose `universe` or `universe_hash` differs from the published set it was built
+   from, and refuses a set with no carried list on a day the bundled list differs. A missing or stale set refuses the
+   plan (fail closed). The backup is best effort, so a refused backup is acceptable. Publishing the hash a second
+   time on the slot-status signal is optional hardening (open question 1).
 3. **Bounds the planner keeps on its own,** because it can no longer rely on a bundled list: at most 100 symbols;
    every symbol canonical; no symbol in the BUNDLED `excluded` list (still hand-held); every existing
    per-order, daily and weekly dollar cap unchanged. A wrong list can change WHICH names are bought, never how
    much.
 4. **The bundled `tickers.json` stays in the planner,** as the fallback for the hand-held lists and for a day with
    no published hash. A bundled-list plan is accepted only on a day with no list change.
-5. **What changes in code (each test-first, each its own PR):** the plan schema and validator
-   (`dca_order_plan.py`, `scripts/backup_planner.py`); the published status record; the Mac-built plan generator;
-   the six generated prompts; the planner rebuild.
+5. **What changes in code (each test-first):** (a) `dca_rec_models.RecommendationSet` carries the list (tests
+   written 2026-11-20, `tests/test_dca_rec_models.py`); (b) the recommender fills it and `dca_rec_publish`
+   publishes it; (c) the plan-first document and `scripts/backup_planner.py` validate against the carried list with
+   the bounds in item 3; (d) `dca_order_plan.validate_plan` for Mac plans; (e) the six generated prompts and the
+   planner rebuild, which is the one re-paste you do by hand.
 
 ## Risks and trade-offs
 
