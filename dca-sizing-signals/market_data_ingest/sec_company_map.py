@@ -1,8 +1,11 @@
 """Ticker-to-CIK map and SIC sector/industry reader for the daily universe ranking (feed step 2).
 
-Specified first by tests/test_sec_company_map.py (docs/fundamentals_feed_scope.md). Two SEC documents:
+Specified first by tests/test_sec_company_map.py and tests/test_sec_exchange_map.py
+(docs/fundamentals_feed_scope.md). Three SEC documents:
 
 * ``company_tickers.json``: ticker to CIK, the key every SEC fact is stored under.
+* ``company_tickers_exchange.json`` (feed step 2b): ticker to the exchange the SEC records, which the ranking's pool
+  filter reads as "listed on a US exchange". Its columns are found by NAME, so a reordering is harmless.
 * a company's ``submissions`` document: its SIC code. The ADR chose SIC for sector and industry because
   GICS is licensed. Industry is the four-digit SIC code and sector is its two-digit major group, so each
   industry belongs to exactly one sector.
@@ -28,6 +31,7 @@ from .edgar_fundamentals import _get_json, _normalize_cik
 
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+COMPANY_EXCHANGES_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 
 
 @dataclass(frozen=True)
@@ -134,3 +138,41 @@ def fetch_sic(cik: str, *, user_agent: str | None = None) -> SicInfo | None:
     except LookupError:
         return None
     return parse_submissions_sic(document)
+
+
+def parse_company_exchanges(document: Any) -> dict[str, str | None]:
+    """Map each ticker to the exchange the SEC records for it (``None`` when blank). ``ValueError`` if malformed.
+
+    The document is ``{"fields": [...column names...], "data": [[...row...], ...]}``. Tickers are normalized like
+    ``parse_company_tickers``. The same ticker on two different exchanges is refused rather than guessed.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("company_tickers_exchange document must be an object")
+    fields = document.get("fields")
+    if not isinstance(fields, list):
+        raise ValueError("company_tickers_exchange 'fields' must be a list")
+    try:
+        ticker_at, exchange_at = fields.index("ticker"), fields.index("exchange")
+    except ValueError:
+        raise ValueError("company_tickers_exchange 'fields' must name 'ticker' and 'exchange'") from None
+    rows = document.get("data")
+    if not isinstance(rows, list):
+        raise ValueError("company_tickers_exchange 'data' must be a list")
+    out: dict[str, str | None] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) != len(fields):
+            raise ValueError("company_tickers_exchange row does not match 'fields'")
+        symbol = _normalize_symbol(row[ticker_at])
+        raw = row[exchange_at]
+        if raw is not None and not isinstance(raw, str):
+            raise ValueError("company_tickers_exchange exchange must be a string")
+        exchange = raw.strip() or None if raw is not None else None
+        if symbol in out and out[symbol] != exchange:
+            raise ValueError(f"ticker {symbol} is listed on two different exchanges")
+        out[symbol] = exchange
+    return out
+
+
+def fetch_company_exchanges(*, user_agent: str | None = None) -> dict[str, str | None]:
+    """Download and parse the SEC exchange file. A 404 (``LookupError``) is not swallowed."""
+    return parse_company_exchanges(_get_json(COMPANY_EXCHANGES_URL, user_agent=user_agent))
