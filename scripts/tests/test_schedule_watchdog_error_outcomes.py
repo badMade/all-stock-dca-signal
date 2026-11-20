@@ -118,12 +118,18 @@ def test_cli_exits_1_and_lists_error_slots(tmp_path, capsys):
     assert schedule_watchdog.main(["--date", "2026-09-22", "--root", str(tmp_path), "--json"]) == 1
     printed = json.loads(capsys.readouterr().out)
     assert printed["error_slots"] == ["1330"]
+    # 2026-11-19 13:30 output_cap_exceeded had verified evidence but an error outcome.
+    assert printed["verify_schedule_ok"] is True
+    assert printed["ok"] is False
 
 
 def test_cli_stays_green_on_a_clean_day(tmp_path, capsys):
     write_complete_day(tmp_path)
     assert schedule_watchdog.main(["--date", "2026-09-22", "--root", str(tmp_path), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["error_slots"] == []
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["error_slots"] == []
+    assert printed["verify_schedule_ok"] is True
+    assert printed["ok"] is True
 
 
 def test_the_banner_names_slot_ids_and_never_quotes_run_state_values(tmp_path):

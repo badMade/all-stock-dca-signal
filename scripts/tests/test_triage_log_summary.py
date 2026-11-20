@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts import find_order_baseline as fob  # noqa: E402
 from scripts import triage_log_summary as tls  # noqa: E402
 from scripts.verify_schedule import SLOT_EVIDENCE_LAYOUT, slot_run_dir_relative  # noqa: E402
 
@@ -144,3 +145,74 @@ def test_cli_json_and_text(friday, capsys):
     assert tls.main(["--date", "2026-10-30", "--root", str(friday)]) == 1
     out = capsys.readouterr().out
     assert "ATTENTION: 0935, 1530" in out and "ABORT_GATE5_ALL_PROVIDER_ERRORS" in out
+
+
+def _cap_slot(root: Path, *, day_history_mode_marker=False):
+    slot_id = "1330"
+    run_dir = root / slot_run_dir_relative(slot_id, DAY)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {"error_class": "output_cap_exceeded", "status": "ABORT_GATE6_HISTORY_NOT_PERSISTABLE",
+             "order_submit_status": "not_submitted_error", "orders_submitted_count": 0}
+    if day_history_mode_marker:
+        state["day_history_mode"] = "full"
+    (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+    row = {"slot_id": slot_id, "time_et": "13:30", "stream": "intraday_dca", "status": "verified",
+           "run_dir": str(slot_run_dir_relative(slot_id, DAY)), "order_submit_status": "not_submitted_error",
+           "orders_submitted_count": 0, "failure_key": None}
+    return row
+
+
+def test_cap_abort_with_usable_baseline_is_flagged(tmp_path, monkeypatch):
+    account = "999000111"
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", account)
+    row = _cap_slot(tmp_path)
+    monkeypatch.setattr(fob, "find_baseline", lambda **kwargs: {"ok": True})
+    slot = tls.summarize_slot(row, tmp_path, DAY)
+    assert slot["baseline_unused"] is True and slot["baseline_check"] == "ok"
+    assert any(reason.startswith("baseline_available_not_used:") for reason in slot["attention_reasons"])
+    assert account not in json.dumps(slot)
+
+
+def test_cap_abort_without_baseline_uses_real_rejection_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
+    slot = tls.summarize_slot(_cap_slot(tmp_path), tmp_path, DAY)
+    assert slot["baseline_unused"] is False and slot["baseline_check"] == "ok"
+
+
+def test_cap_abort_missing_account_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    monkeypatch.setattr(fob, "find_baseline", lambda **kwargs: pytest.fail("must not call without account"))
+    slot = tls.summarize_slot(_cap_slot(tmp_path), tmp_path, DAY)
+    assert slot["baseline_unused"] is None and slot["baseline_check"] == "unavailable"
+
+
+def test_baseline_is_not_applicable_to_other_errors_or_recorded_day_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
+    monkeypatch.setattr(fob, "find_baseline", lambda **kwargs: pytest.fail("not applicable"))
+    row = _cap_slot(tmp_path)
+    state_path = tmp_path / row["run_dir"] / "run_state.json"
+    state = json.loads(state_path.read_text())
+    state["error_class"] = "different_error"
+    state_path.write_text(json.dumps(state))
+    slot = tls.summarize_slot(row, tmp_path, DAY)
+    assert slot["baseline_unused"] is None and slot["baseline_check"] == "not_applicable"
+    state["error_class"] = "output_cap_exceeded"
+    state["day_history_mode"] = "full"
+    state_path.write_text(json.dumps(state))
+    slot = tls.summarize_slot(row, tmp_path, DAY)
+    assert slot["baseline_unused"] is None and slot["baseline_check"] == "not_applicable"
+
+
+def test_baseline_lookup_uses_nominal_fire_time_and_summary_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "999000111")
+    seen = {}
+
+    def lookup(**kwargs):
+        seen.update(kwargs)
+        return {"ok": False, "reason": "no_valid_baseline"}
+
+    monkeypatch.setattr(fob, "find_baseline", lookup)
+    tls.summarize_slot(_cap_slot(tmp_path), tmp_path, DAY)
+    assert seen["now"] == datetime(2026, 10, 30, 13, 30, tzinfo=ET)
+    assert seen["root"] == tmp_path
+    assert seen["kind"] == "day" and seen["slot"] == "1330"

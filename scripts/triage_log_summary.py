@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from dca_paths import cron_tracking_root
+from scripts import find_order_baseline
 from scripts.verify_schedule import ET, OK_STATUSES, verify_day
 
 # order_submit_status values that are not failures (config/run_classification.json's
@@ -60,7 +61,8 @@ CLEAN_SUBMIT_STATUSES = frozenset({"submitted", "not_submitted_no_candidates", "
 SUMMARY_FIELDS = (
     "slot_id", "time_et", "stream", "run_dir", "evidence_status", "outcome", "order_submit_status",
     "orders_submitted_count", "error_class", "error_detail", "gate9_notes", "first_file_et",
-    "first_file_delay_min", "last_file_et", "finalized_at_et", "attention", "attention_reasons",
+    "first_file_delay_min", "last_file_et", "finalized_at_et", "baseline_unused", "baseline_check",
+    "attention", "attention_reasons",
 )
 
 # Same shape test_config_invariants.py treats as account-shaped: a bare 6-12 digit run.
@@ -149,6 +151,26 @@ def summarize_slot(row: Mapping[str, Any], base: Path, day: date) -> Dict[str, A
     hh, mm = int(row["slot_id"][:2]), int(row["slot_id"][2:])
     nominal = datetime(day.year, day.month, day.day, hh, mm, tzinfo=ET)
 
+    baseline_unused: Optional[bool] = None
+    baseline_check = "not_applicable"
+    if state.get("error_class") == "output_cap_exceeded" and "day_history_mode" not in state:
+        account = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "").strip()
+        if account:
+            try:
+                # The 2026-11-19 13:30 abort had no day history despite an earlier
+                # slot's proven envelope; use the shared validator at this slot's fire time.
+                result = find_order_baseline.find_baseline(
+                    kind="day", slot=row["slot_id"], trading_day=day.isoformat(), account=account,
+                    now=nominal, root=base,
+                )
+            except Exception:  # noqa: BLE001 - triage must still emit a redacted summary
+                baseline_check = "unavailable"
+            else:
+                baseline_check = "ok"
+                baseline_unused = bool(result.get("ok"))
+        else:
+            baseline_check = "unavailable"
+
     outcome = state.get("status")
     submit = state.get("order_submit_status", row.get("order_submit_status"))
     reasons: List[str] = []
@@ -163,6 +185,8 @@ def summarize_slot(row: Mapping[str, Any], base: Path, day: date) -> Dict[str, A
         reasons.append(f"outcome {outcome}")
     if row.get("failure_key"):
         reasons.append(f"failure_key {row['failure_key']}")
+    if baseline_unused is True:
+        reasons.append("baseline_available_not_used: live prompt may lack the baseline chain, diff it against live-mirror")
 
     summary = {
         "slot_id": row["slot_id"],
@@ -180,6 +204,8 @@ def summarize_slot(row: Mapping[str, Any], base: Path, day: date) -> Dict[str, A
         "first_file_delay_min": round((first - nominal).total_seconds() / 60) if first else None,
         "last_file_et": last.strftime("%H:%M") if last else None,
         "finalized_at_et": _et_clock(state.get("finalized_at")) if state.get("finalized_at") else None,
+        "baseline_unused": baseline_unused,
+        "baseline_check": baseline_check,
         "attention": bool(reasons),
         "attention_reasons": reasons,
     }
@@ -208,9 +234,10 @@ def _render(summary: Mapping[str, Any]) -> str:
     lines = [f"DCA run summary for {summary['date']} (checked {summary['checked_at_et']})"]
     for slot in summary["slots"]:
         late = f" first file {slot['first_file_et']} (+{slot['first_file_delay_min']}m)" if slot["first_file_et"] else ""
+        baseline = " baseline_unused=true" if slot.get("baseline_unused") is True else ""
         flag = "  <-- " + "; ".join(slot["attention_reasons"]) if slot["attention"] else ""
         lines.append(f"  {slot['time_et']}  {slot['stream']:<12} {slot['outcome'] or slot['evidence_status']:<36} "
-                     f"{slot['order_submit_status']} ({slot['orders_submitted_count']}){late}{flag}")
+                     f"{slot['order_submit_status']} ({slot['orders_submitted_count']}){late}{baseline}{flag}")
         for label in ("error_detail", "gate9_notes"):
             if slot[label]:
                 lines.append(f"         {label}: {slot[label]}")
