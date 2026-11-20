@@ -1561,3 +1561,72 @@ def test_cumulative_credit_edge_cases(tmp_path):
 def test_normalized_order_id_overflow():
     from dca_cumulative import _normalized_order_id
     assert _normalized_order_id(10**1000) is None
+
+
+@pytest.mark.parametrize(
+    "bad_val,expected_match",
+    [
+        (True, "credit amounts must be numeric"),
+        (False, "credit amounts must be numeric"),
+        (10**1000, "credit amounts must be finite"),
+    ],
+)
+def test_money_and_apply_cumulative_credit_reject_bool_and_overflow(bad_val, expected_match):
+    from dca_cumulative import _money
+
+    with pytest.raises(ValueError, match=expected_match):
+        _money(bad_val)
+    with pytest.raises(ValueError, match=expected_match):
+        apply_cumulative_credit(bad_val, 0.20)
+    with pytest.raises(ValueError, match=expected_match):
+        apply_cumulative_credit(0.20, bad_val)
+
+
+@pytest.mark.parametrize(
+    "raw_json,expected_match",
+    [
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {"XYZ": 0.90, "XYZ": 0.10}, "events": []}',
+            "could not read cumulative credit ledger",
+        ),
+        (
+            '{"version": true, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {"XYZ": true}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {"XYZ": NaN}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {"XYZ": -0.10}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "minimum_order_pending_usd_by_ticker": [], "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "minimum_order_pending_usd_by_ticker": {"XYZ": true}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": null, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+    ],
+)
+def test_read_state_fails_closed_on_duplicate_keys_bools_nonfinite_and_malformed_maps(
+    tmp_path, raw_json, expected_match
+):
+    day_dir = tmp_path / "2026-08-11"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    (day_dir / "ledger.json").write_text(raw_json, encoding="utf-8")
+    ledger = CumulativeCreditLedger(tmp_path)
+
+    with pytest.raises(ValueError, match=expected_match):
+        ledger.pending_usd("XYZ", "2026-08-11")
+

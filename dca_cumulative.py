@@ -1433,14 +1433,23 @@ class CumulativeCreditLedger:
                 "events": [],
             }
         try:
-            state = json.loads(path.read_bytes())
-        except (OSError, json.JSONDecodeError) as exc:
+            state = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        except (OSError, ValueError) as exc:
             raise ValueError(f"could not read cumulative credit ledger {path}") from exc
         if (
             not isinstance(state, dict)
+            or isinstance(state.get("version"), bool)
             or state.get("version") != 1
             or state.get("trading_day") != trading_day
-            or not isinstance(state.get("pending_usd_by_ticker"), dict)
+            or not _valid_pending_map(state.get("pending_usd_by_ticker"))
+            or (
+                "minimum_order_pending_usd_by_ticker" in state
+                and not _valid_pending_map(state.get("minimum_order_pending_usd_by_ticker"))
+            )
+            or (
+                "recorded_idempotency_keys" in state
+                and not isinstance(state.get("recorded_idempotency_keys"), dict)
+            )
             or not isinstance(state.get("events"), list)
         ):
             raise ValueError(f"invalid cumulative credit ledger {path}")
@@ -1476,12 +1485,39 @@ class CumulativeCreditLedger:
         return state
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _valid_pending_map(mapping: Any) -> bool:
+    if not isinstance(mapping, dict):
+        return False
+    for amount in mapping.values():
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            return False
+        try:
+            if not math.isfinite(amount) or amount < 0:
+                return False
+        except OverflowError:
+            return False
+    return True
+
+
 def _money(value: float | Decimal | int | str) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
+    if isinstance(value, bool):
+        raise ValueError("credit amounts must be numeric")
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("credit amounts must be numeric") from exc
+    except OverflowError as exc:
+        raise ValueError("credit amounts must be finite") from exc
     if not math.isfinite(numeric):
         raise ValueError("credit amounts must be finite")
     return max(Decimal("0"), Decimal(str(numeric))).quantize(CENT, rounding=ROUND_HALF_UP)
