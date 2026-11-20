@@ -594,3 +594,45 @@ def test_grade_command_reads_history_and_compare_csv(tmp_path, capsys):
     payload = json.loads((data / "grading" / "grade_latest.json").read_text())
     assert payload["composite_rank"]["20"]["mean_ic"] == pytest.approx(1.0)
     assert payload["inverted"]["20"]["mean_ic"] == pytest.approx(-1.0)
+
+
+def test_forward_returns_charge_a_delisting_loss_only_for_series_that_ended_early():
+    start = dt.date(2026, 9, 1)
+    live = cr.Series([(start + dt.timedelta(days=d), 100.0 + d) for d in range(-5, 90)])
+    dead = cr.Series([(start + dt.timedelta(days=d), 100.0) for d in range(-5, 3)])  # stops 3 days after start
+    series = {"LIVE": live, "DEAD": dead}
+    archive_end = live.last_date
+    plain = cr.forward_returns(series, ["LIVE", "DEAD"], start, 20)
+    assert set(plain) == {"LIVE"}  # the delisted name silently vanishes: survivorship bias
+    filled = cr.forward_returns(series, ["LIVE", "DEAD"], start, 20, delist_loss=0.30, archive_end=archive_end)
+    assert filled["DEAD"] == pytest.approx(-0.30) and filled["LIVE"] == plain["LIVE"]
+    stale_only = cr.Series([(start + dt.timedelta(days=d), 100.0) for d in range(-5, 60)])  # ended < 30d before the end
+    assert "STALE" not in cr.forward_returns({"STALE": stale_only}, ["STALE"], start, 90, 0.30, archive_end)
+
+
+def test_trading_days_drops_days_most_series_lack():
+    a = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 3, 4)])
+    b = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 4)])
+    c = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 4, 5)])
+    # Sep 3 has 1 of 3 bars and Sep 5 has 1 of 3: both below half, so only the shared days survive
+    assert cr.trading_days({"a": a, "b": b, "c": c}, dt.date(2026, 9, 1), dt.date(2026, 9, 5)) == [
+        dt.date(2026, 9, 1), dt.date(2026, 9, 2), dt.date(2026, 9, 4)]
+
+
+def test_backfill_history_writes_one_csv_and_leaves_live_history_alone(tmp_path):
+    data, archive = tmp_path / "data", tmp_path / "archive"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    (data / "inputs" / "sp500.json").write_text(json.dumps([[f"T{i}", f"T{i}", "X"] for i in range(6)]))
+    ext = {f"T{i}": [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+           for i, s in enumerate(make_series(0.0005 * (i + 1), wobble=0.001) for i in range(6))}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+    out = tmp_path / "bf.csv"
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "backfill-history",
+                    "--start", "2026-10-01", "--end", "2026-11-04", "--step-days", "14", "--out", str(out)])
+    assert code == 0 and not (data / "history.csv").exists()
+    rows = cr.read_history(out)
+    dates = sorted({r["date"] for r in rows})
+    assert len(dates) >= 2 and all((dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days >= 14
+                                   for a, b in zip(dates, dates[1:], strict=False))
+    assert rows[0].keys() == set(cr.HISTORY_FIELDS) and {r["eligible"] for r in rows} == {"1"}

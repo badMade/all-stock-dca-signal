@@ -574,13 +574,30 @@ def render_proposal_md(proposal):
     return "\n".join(lines)
 
 
-def forward_returns(series_by_ticker, tickers, start, horizon):
-    """{ticker: return from start to start+horizon days} for tickers with bars on both ends."""
+DELISTED_GAP_DAYS = 30  # a series that stopped this long before the archive's newest bar is treated as delisted
+
+
+def forward_returns(series_by_ticker, tickers, start, horizon, delist_loss=None, archive_end=None):
+    """{ticker: return from start to start+horizon days} for tickers with bars on both ends.
+
+    With ``delist_loss`` and ``archive_end`` a series whose last bar is more than DELISTED_GAP_DAYS older than the
+    archive's newest date, and that ended inside the window, is treated as delisted: its return is the last close over
+    the start close with ``delist_loss`` taken off (Shumway: about -30% for performance delistings). Without this,
+    names that vanished drop out of every forward pool and the grade is survivorship-biased upward. Cash acquisitions
+    look the same as failures here, so the fill is conservative for those.
+    """
     end = start + dt.timedelta(days=horizon)
     out = {}
     for t in tickers:
         s = series_by_ticker.get(t)
-        if not s or s.last_date < end:
+        if not s:
+            continue
+        if s.last_date < end:
+            delisted = (delist_loss is not None and archive_end is not None and s.last_date > start
+                        and (archive_end - s.last_date).days > DELISTED_GAP_DAYS)
+            a = s.value_at(start, max_gap=3) if delisted else None
+            if a:
+                out[t] = (s.last_value / a) * (1.0 - delist_loss) - 1.0
             continue
         a, b = s.value_at(start, max_gap=3), s.value_at(end, max_gap=3)
         if a and b:
@@ -630,7 +647,7 @@ def _top_set(scores, eligible, top_n):
 
 
 def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N, cost_bps=DEFAULT_COST_BPS,
-                 eligible_by_date=None, min_names=30):
+                 eligible_by_date=None, min_names=30, delist_loss=None):
     """Per-date grade of a ranking at one horizon: rank IC, quintile spread, top-N edge vs the eligible pool, and
     turnover against the list ``horizon`` days earlier (a rebalance cadence of one horizon, so costs are not charged
     once per overlapping daily sample). Equal-weighted; no market-cap data exists here for value weighting.
@@ -638,13 +655,15 @@ def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N,
     a forward return.
     """
     dates = sorted(scores_by_date)
+    archive_end = max((s.last_date for s in series_by_ticker.values() if s), default=None)
     top_sets = {d: _top_set(scores_by_date[d], (eligible_by_date or {}).get(d), top_n) for d in dates}
     rows = []
     for day in dates:
         scores = scores_by_date[day]
         pool_names = (eligible_by_date or {}).get(day)
         pool = [t for t in scores if pool_names is None or t in pool_names]
-        fwd = forward_returns(series_by_ticker, pool, dt.date.fromisoformat(day), horizon)
+        origin = dt.date.fromisoformat(day)
+        fwd = forward_returns(series_by_ticker, pool, origin, horizon, delist_loss, archive_end)
         if len(fwd) < min_names:
             continue
         pairs = sorted(((scores[t], fwd[t]) for t in fwd), key=lambda p: p[0])
@@ -660,7 +679,8 @@ def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N,
             base = top_sets[prior[-1]]
             turnover = 1.0 - len(base & top_sets[day]) / max(1, len(top_sets[day]))
         edge = top_mean - pool_mean
-        rows.append({"date": day, "n": len(pairs), "ic": spearman(pairs), "top_return": top_mean,
+        ended = sum(1 for t in fwd if series_by_ticker[t].last_date < origin + dt.timedelta(days=horizon))
+        rows.append({"date": day, "n": len(pairs), "delisted": ended, "ic": spearman(pairs), "top_return": top_mean,
                      "pool_return": pool_mean, "edge": edge,
                      "spread": statistics.fmean(y for _, y in pairs[-k:]) - statistics.fmean(y for _, y in pairs[:k]),
                      "turnover": turnover,
@@ -683,6 +703,7 @@ def summarize_grade(rows):
             out["ic_std"] = statistics.stdev(ics)
             if out["ic_std"] > 0:
                 out["ic_tstat"] = out["mean_ic"] / (out["ic_std"] / math.sqrt(len(ics)))
+    out["delisted_fills"] = sum(r.get("delisted", 0) for r in rows)
     for key in ("top_return", "pool_return", "edge", "spread", "turnover", "net_edge"):
         values = col(key)
         out[f"mean_{key}"] = statistics.fmean(values) if values else None
@@ -703,7 +724,9 @@ def render_grade(label, horizons_summary, top_n, cost_bps):
                      f"{f(sm['ic_tstat'], digits=1)} | {f(sm['mean_top_return'], True)} | "
                      f"{f(sm['mean_pool_return'], True)} | {f(sm['mean_edge'], True)} | {f(sm['mean_spread'], True)} | "
                      f"{turn} | {f(sm['mean_net_edge'], True)} |")
-    lines += ["", "*t ignores overlap between daily samples (overstated for horizons above 1 day).", ""]
+    fills = sum(sm.get("delisted_fills", 0) for sm in horizons_summary.values())
+    lines += ["", "*t ignores overlap between daily samples (overstated for horizons above 1 day).",
+              f"Delisting-loss fills used across all rows: {fills}.", ""]
     return "\n".join(lines)
 
 
@@ -1277,11 +1300,55 @@ def read_scores_csv(path):
     return scores_from_history(read_history(path))
 
 
+def trading_days(series_by_ticker, start, end, min_share=0.5):
+    """Dates in [start, end] on which at least ``min_share`` of the series have a bar (weekends/holidays drop out)."""
+    counts = {}
+    for s in series_by_ticker.values():
+        lo, hi = bisect.bisect_left(s.dates, start), bisect.bisect_right(s.dates, end)
+        for day in s.dates[lo:hi]:
+            counts[day] = counts.get(day, 0) + 1
+    floor = min_share * len(series_by_ticker)
+    return sorted(d for d, c in counts.items() if c >= floor)
+
+
+def cmd_backfill_history(args):
+    """Point-in-time score history for grading: score every ``--step-days`` trading day from ``--start`` to ``--end``
+    using only bars up to that day and the same liquidity pool, and write ONE CSV (not the live history.csv and none
+    of the per-run outputs). Holds no forward model. Universe = today's archive tickers, so names that left the archive
+    are absent (survivorship); grade with --delist-loss to charge ones whose series ended early."""
+    tickers, held, names, sectors, series = prepare(args)
+    params = load_params(getattr(args, "params", None))
+    days = trading_days(series, dt.date.fromisoformat(args.start), dt.date.fromisoformat(args.end))
+    chosen, last = [], None
+    for day in days:
+        if last is None or (day - last).days >= args.step_days:
+            chosen.append(day)
+            last = day
+    liquidity = params["liquidity"] if args.universe == "archive" else None
+    rows = []
+    for day in chosen:
+        records, _ = score_universe(series, day, params, None, liquidity)
+        size = len(records)
+        for ticker, rec in records.items():
+            rows.append({"date": day.isoformat(), "ticker": ticker, "score": f"{rec['score']:.3f}",
+                         "rank": str(rec["rank"]), "universe_size": str(size), "vol": f"{rec['vol']:.4f}",
+                         "max_dd": f"{rec['max_dd']:.4f}", "eligible": "1" if rec["eligible"] else "0"})
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(json.dumps({"dates": len(chosen), "rows": len(rows), "out": str(out), "params_version": params["version"]}))
+    return 0
+
+
 def cmd_grade(args):
     """Grade the composite score (history.csv) and optionally a second ranking at several horizons."""
     _, _, _, _, series = prepare(args)
     sources = []
-    scores, eligible = scores_from_history(read_history(Path(args.data_dir) / "history.csv"))
+    history_path = Path(args.history) if args.history else Path(args.data_dir) / "history.csv"
+    scores, eligible = scores_from_history(read_history(history_path))
     if scores:
         sources.append(("composite_rank", scores, eligible))
     for label_path in args.compare or []:
@@ -1297,7 +1364,8 @@ def cmd_grade(args):
     for label, sc, el in sources:
         summaries = {}
         for horizon in args.horizons:
-            rows = grade_scores(sc, series, horizon, args.top_n, args.cost_bps, el, args.min_names)
+            rows = grade_scores(sc, series, horizon, args.top_n, args.cost_bps, el, args.min_names,
+                               args.delist_loss)
             summaries[horizon] = summarize_grade(rows)
         payload[label] = {str(h): s for h, s in summaries.items()}
         report.append(render_grade(label, summaries, args.top_n, args.cost_bps))
@@ -1433,10 +1501,19 @@ def build_parser():
     eff = sub.add_parser("effectiveness", help="forward return of past trade lists vs the universe (tuning input)")
     eff.add_argument("--horizon", type=int, default=20, help="calendar days ahead (default 20)")
     eff.set_defaults(func=cmd_effectiveness)
+    bh = sub.add_parser("backfill-history", help="point-in-time score history to one CSV, for grading only")
+    bh.add_argument("--start", required=True)
+    bh.add_argument("--end", required=True)
+    bh.add_argument("--step-days", type=int, default=7, help="minimum calendar days between scored dates")
+    bh.add_argument("--out", required=True, help="output CSV (not history.csv)")
+    bh.set_defaults(func=cmd_backfill_history)
     gr = sub.add_parser("grade", help="rank IC, quintile spread, top-N edge, turnover and cost drag by horizon")
     gr.add_argument("--horizons", type=int, nargs="+", default=list(GRADE_HORIZONS), help="calendar days ahead")
     gr.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
     gr.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS, help="round-trip cost per replaced name")
+    gr.add_argument("--history", default="", help="score history CSV to grade (default: <data-dir>/history.csv)")
+    gr.add_argument("--delist-loss", type=float, default=None,
+                    help="treat series that ended early as delisted with this loss (e.g. 0.30); default: ignore them")
     gr.add_argument("--min-names", type=int, default=30, help="skip dates with fewer names with a forward return")
     gr.add_argument("--compare", action="append", metavar="LABEL=PATH",
                     help="also grade another ranking from a date,ticker,score[,eligible] CSV (repeatable)")
