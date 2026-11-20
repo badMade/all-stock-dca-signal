@@ -1,0 +1,9 @@
+# CLI hyperparameters for the octopus; one flag per line, edited by the loop.
+--window-len 128
+--online-steps 4
+--alpha 1.0
+--beta 0.3
+--gamma 0.1
+--horizon-weight 0.5
+--replay-capacity 50000
+--update-every 1
