@@ -1216,3 +1216,88 @@ def test_a_visible_prior_fill_without_average_price_is_not_missing_prior_price()
     assert d["reason"] in (ALREADY_MET_OR_OVERFILLED, NO_LOWER_PRICE)
     assert d["reference_price"] == pytest.approx(500.0)
     assert d["buy_usd"] == pytest.approx(0.0)
+
+
+# --- Sentinel: boolean, oversized-int, non-mapping candidate, and duplicate-key hardening ---
+
+
+def test_f_rejects_booleans_and_oversized_integers():
+    """Booleans and astronomically large JSON integers must not parse as finite floats or raise OverflowError."""
+    pages = [_page([_fill("o1", "TRIN", 1.00, 100.00, "2026-07-30T13:58:14Z")])]
+    r = _run(
+        pages,
+        [
+            {"ticker": "SPCX", "desired_usd": True, "current_price": True},
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 90.00,
+                "prior_logged_reference_price": True,
+                "prior_logged_reference_order_id": "o1",
+            },
+            {"ticker": "AAPL", "desired_usd": 10**400, "current_price": 10**400},
+        ],
+    )
+    assert r["verdict"] == "PROCEED"
+    by_t = _by_ticker(r)
+    assert by_t["SPCX"]["buy_usd"] == 0.0
+    assert by_t["SPCX"]["reason"] == MISSING_CURRENT_PRICE
+    assert by_t["TRIN"]["logged_reference_bound"] is False
+    assert by_t["TRIN"]["buy_usd"] == 0.0
+    assert by_t["TRIN"]["reason"] == UNLOGGED_REFERENCE_PRICE
+    assert by_t["AAPL"]["buy_usd"] == 0.0
+    assert by_t["AAPL"]["reason"] == MISSING_CURRENT_PRICE
+
+
+def test_evaluate_slot_validates_non_finite_and_oversized_minimum_order_usd():
+    """NaN, Infinity, non-numeric, and oversized integer minimum_order_usd must raise ValueError."""
+    pages = [_page([])]
+    cands = [{"ticker": "SPCX", "desired_usd": 1.00, "current_price": 112.10}]
+    for bad in (float("nan"), float("inf"), float("-inf"), "1.0", 10**400):
+        with pytest.raises(ValueError, match="minimum_order_usd must be a positive"):
+            _run(pages, cands, minimum_order_usd=bad)
+
+
+def test_cli_rejects_duplicate_json_keys_and_non_object_candidates(tmp_path, capsys):
+    """Duplicate JSON keys in --orders-pages or --candidates and non-dict candidate rows must abort fail-closed."""
+    dup_pages = tmp_path / "dup_pages.json"
+    dup_pages.write_text(
+        f'{{"account_number": "{ACCOUNT}", "trading_day": "{DAY}", '
+        f'"pages": [{{"data": {{"orders": [{{"id": "o1", "symbol": "TRIN", "side": "buy", "state": "filled", '
+        f'"cumulative_quantity": "1", "average_price": "10", "created_at": "{DAY}T13:58:14Z"}}]}}}}, '
+        f'"pages": [{{"data": {{"orders": []}}}}]}}',
+        encoding="utf-8",
+    )
+    clean_pages = _write_json(tmp_path / "clean_pages.json", _pinned_pages([_page([])]))
+    dup_cands = tmp_path / "dup_cands.json"
+    dup_cands.write_text(
+        '[{"ticker": "SPCX", "desired_usd": 1.0, "desired_usd": 15.0, "current_price": 100.0}]',
+        encoding="utf-8",
+    )
+    clean_cands = _write_json(
+        tmp_path / "clean_cands.json", [{"ticker": "SPCX", "desired_usd": 1.0, "current_price": 100.0}]
+    )
+    non_dict_cands = _write_json(tmp_path / "non_dict_cands.json", ["SPCX"])
+
+    for pages_arg, cands_arg in (
+        (str(dup_pages), clean_cands),
+        (clean_pages, str(dup_cands)),
+        (clean_pages, non_dict_cands),
+    ):
+        rc = gate.main(
+            [
+                "--account",
+                ACCOUNT,
+                "--trading-day",
+                DAY,
+                "--orders-pages",
+                pages_arg,
+                "--candidates",
+                cands_arg,
+            ]
+        )
+        assert rc == 2
+        out = json.loads(capsys.readouterr().out)
+        assert out["verdict"] == "ABORT"
+        assert out["reason"] == BROKER_HISTORY_INCOMPLETE
+

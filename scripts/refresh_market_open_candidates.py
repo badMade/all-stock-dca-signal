@@ -26,15 +26,14 @@ MAX_REFRESH_QUOTE_FUTURE_SKEW = timedelta(seconds=30)
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
-def _parse_finite_float(value: Any) -> float | None:
-    """Parse a finite float, rejecting booleans and oversized ints."""
+def _positive_finite_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return parsed if math.isfinite(parsed) else None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
 def refresh_market_open_candidates(
@@ -60,14 +59,12 @@ def refresh_market_open_candidates(
         if not ticker or not isinstance(quote, Mapping):
             dropped.append({"ticker": ticker, "reason": "missing_refresh_quote"})
             continue
-        price = _parse_finite_float(quote.get("price"))
-        as_of_raw = quote.get("as_of")
+        price = _positive_finite_float(quote.get("price"))
         try:
-            as_of = datetime.fromisoformat(str(as_of_raw).replace("Z", "+00:00"))
+            as_of = datetime.fromisoformat(str(quote.get("as_of")).replace("Z", "+00:00"))
         except (TypeError, ValueError):
-            dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
-            continue
-        if price is None or price <= 0 or as_of.tzinfo is None:
+            as_of = None
+        if price is None or as_of is None or as_of.tzinfo is None:
             dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
             continue
         as_of_market = as_of.astimezone(MARKET_TIMEZONE)
@@ -79,12 +76,10 @@ def refresh_market_open_candidates(
         ):
             dropped.append({"ticker": ticker, "reason": "stale_refresh_quote"})
             continue
-        prior_close = _parse_finite_float(candidate.get("prior_close"))
+        prior_close = _positive_finite_float(candidate.get("prior_close"))
         prior_low_raw = candidate.get("prior_low")
-        prior_low = None if prior_low_raw is None else _parse_finite_float(prior_low_raw)
-        if prior_close is None or prior_close <= 0 or (
-            prior_low_raw is not None and (prior_low is None or prior_low <= 0)
-        ):
+        prior_low = None if prior_low_raw is None else _positive_finite_float(prior_low_raw)
+        if prior_close is None or (prior_low_raw is not None and prior_low is None):
             dropped.append({"ticker": ticker, "reason": "invalid_price_reference"})
             continue
 
@@ -93,8 +88,8 @@ def refresh_market_open_candidates(
         base, _ = select_first_allocation_base_usd(
             price, prior_close, prior_low, executor.sizing_config, ticker
         )
-        authorized_base = _parse_finite_float(candidate.get("selected_base_amount_usd"))
-        if authorized_base is None or authorized_base <= 0:
+        authorized_base = _positive_finite_float(candidate.get("selected_base_amount_usd"))
+        if authorized_base is None:
             dropped.append({"ticker": ticker, "reason": "invalid_authorized_base"})
             continue
         if base < authorized_base:
@@ -104,8 +99,8 @@ def refresh_market_open_candidates(
         if desired <= 0:
             dropped.append({"ticker": ticker, "reason": "no_longer_ladder_eligible"})
             continue
-        authorized_desired = _parse_finite_float(candidate.get("desired_usd"))
-        if authorized_desired is None or authorized_desired <= 0:
+        authorized_desired = _positive_finite_float(candidate.get("desired_usd"))
+        if authorized_desired is None:
             dropped.append({"ticker": ticker, "reason": "invalid_authorized_amount"})
             continue
         if desired > authorized_desired:
@@ -137,7 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         candidates = json.loads(args.candidates.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
         quotes = json.loads(args.quotes.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
-    except (OSError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         parser.error(str(exc))
     if not isinstance(candidates, list) or not all(isinstance(candidate, Mapping) for candidate in candidates):
         parser.error("--candidates must contain a JSON list of objects")

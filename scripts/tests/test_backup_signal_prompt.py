@@ -367,3 +367,14 @@ def test_part_0_reuses_the_preflight_gates_instead_of_running_them_again(backup)
 def test_the_final_state_record_carries_preflight_at_et(backup):
     procedure = backup_procedure.render_procedure(backup, backup_procedure.common_values())
     assert "preflight_at_et" in procedure[procedure.index("STEP 8"):procedure.index("STEP 9")]
+
+
+# -- the Project Files sync runs first, unconditionally (operator report on the pasted path) ---------------------------
+
+
+@pytest.mark.parametrize("backup", backup_procedure.BACKUPS, ids=lambda b: b.task_id)
+def test_step_b_syncs_project_files_before_changing_folder(instructions, backup):
+    step_b = _step_b(instructions[backup.file])
+    assert "pplx project files sync" in step_b
+    assert step_b.index("pplx project files sync") < step_b.index("cd ${PPLX_PROJECT_FILES_DIR}")
+    assert "fail closed" in step_b.split("cd ${PPLX_PROJECT_FILES_DIR}", 1)[0]

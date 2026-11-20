@@ -787,7 +787,7 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 > `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
 
 > **PAUSED 2026-10-31 (operator, Perplexity credit plan step 5):** only three backup fires stay scheduled:
-> 9:55 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:40 PM (`f83b8d62`, moved from 3:45 PM on 2026-11-09, backs up
+> 10:00 AM (`4412c3c4`, backs up 9:35), 12:50 PM (`062605c6`, backs up 12:30) and 3:40 PM (`f83b8d62`, moved from 3:45 PM on 2026-11-09, backs up
 > 3:30). The 10:50 AM (`e028361e`) and 11:50 AM (`e3590042`) tasks and the 1:50/2:50 PM task (`54ab24d2`) are
 > paused, not retired: their prompts stay generated and re-enabling one is a status change in the config plus a
 > paste in Perplexity. A Claude failure at 10:30, 11:30, 1:30 or 2:30 now has no Perplexity backup. Source:
@@ -795,7 +795,7 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 
 | Canonical ET | Canonical task | Backup ET | Backup task | Trades | Status |
 |---|---|---|---|---|---|
-| 9:35 AM | `2ba19526` | 9:55 AM | `4412c3c4` | **backup only** | standing |
+| 9:35 AM | `2ba19526` | 10:00 AM | `4412c3c4` | **backup only** | standing |
 | 10:30 AM | `42173154` | 10:50 AM | `e028361e` | **backup only** | **PAUSED 2026-10-31** |
 | 11:30 AM | `7be82b97` (11:30 fire) | 11:50 AM | `e3590042` | **backup only** | **PAUSED 2026-10-31** |
 | 12:30 PM | `a6239dae` | 12:50 PM | `062605c6` | **backup only** | standing |
@@ -838,14 +838,7 @@ see the note at the top of this section for why that ordering is load-bearing.
 | 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 8 1-7 * 1-5` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 17 25-31 3-10 *` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 17 25-31 1,2,11,12 *` | no | active |
-| 7:31 AM | Goal snapshot: previous trading day close, read only (`claude/goal-snapshot/0731ET-goal-snapshot.md`) | TBD-task-id | Trading days (holidays skip via `dca_goal_snapshot.should_run`) | `31 7 * * 1-5` | no | pending |
-
-**Planned, not yet registered: 07:31 AM goal progress snapshot** (Phase 2 of
-`docs/adr-goals-and-loss-hedge-shadow.md`, approved 2026-11-14). Trading days only; records the
-previous trading day's close through Robinhood read tools (`dca_goal_snapshot.py`), places no
-orders, runs on the Mac ("Requires this computer"), 30-minute budget so it ends long before the
-3:40 PM chain. It has no task ID yet, so it is deliberately not a row in the table above; add the
-row when the task is created.
+| 7:31 AM | Goal snapshot: previous trading day close, read only (`claude/goal-snapshot/0731ET-goal-snapshot.md`) | `goal-snapshot-0731` | Trading days at 07:31 ET (holidays skip via `dca_goal_snapshot.should_run`) | `31 7 * * 1-5` | no | active |
 
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own

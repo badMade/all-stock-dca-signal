@@ -61,6 +61,7 @@ import os
 import re
 import secrets
 import statistics
+import sys
 import traceback
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -209,225 +210,188 @@ DAILY_COST_CONTROL_NOTES = (
     "Notion daily sync limited to the compact Latest Run section",
 )
 
-ACTIVE_TICKERS = [
-    "DFTX",
-    "TRIN",
-    "AAAU",
-    "SPCX",
-    "EVR",
-    "LUNR",
-    "IRDM",
-    "DXYZ",
-    "LITE",
-    "ASML",
-    "DRAM",
-    "STX",
-    "MSFT",
-    "AAPL",
-    "AMAT",
-    "AMD",
-    "CBRS",
-    "MRVL",
-    "BTX",
-    "STM",
-    "SNDK",
-    "WDC",
-    "TSM",
-    "AVGO",
-    "NVDA",
-    "QBTS",
-    "FLKR",
-    "INTC",
-    "GOOGL",
-    "GOOG",
-    "AMZN",
-    "GLW",
-    "MA",
-    "GS",
-    "MU",
-    "NFLX",
-    "XLG",
-    "TOPT",
-    "QTOP",
-    "SATA",
-    "RGTI",
-    "IBM",
-    "GFUZ",
-    "TXN",
-    "RKLB",
-    "GE",
-    "VRT",
-    "CAT",
-    "QQQ",
-    "QCOM",
-    "ABBV",
-    "JPM",
-    # AUG 4 2026 (user-requested): VT (Vanguard Total World Stock ETF). Broker
-    # instrument resolution was not run in-repo -- see config/tickers.json's
-    # data_source_notes.VT before the first live allocation.
-    "VT",
-    # AUG 16 2026 (user-requested): QBUT, RVII, RVI, and VCX. RVI and VCX
-    # reverse the exclusion confirmed 2026-08-05 -- see config/tickers.json's
-    # notes for the full history. RVII has since moved to WHOLE_SHARE_TICKERS
-    # (AUG 24 2026, user-requested): it is not purchasable fractionally, so it
-    # is still bought by the same ladder, just through the whole-share
-    # mechanism -- see that constant below. QBUT itself was excluded again on
-    # SEP 18 2026 (see EXCLUDED_TICKERS below): Robinhood returned not-found
-    # for it on every live run -- no confirmed buying mechanism at all.
-    "RVI",
-    "VCX",
-    # AUG 16 2026 (user-requested, later same day): TRLV. Reverses the
-    # remaining piece of the 2026-08-05 exclusion decision, leaving BYDDY as
-    # the only excluded symbol -- see config/tickers.json's notes.
-    "TRLV",
-    # SEP 5 2026 (user-requested): LLY (Eli Lilly and Company) and TSLA
-    # (Tesla, Inc.). No Robinhood instrument search was run in-repo for
-    # either (this session has no broker access) -- as with VT/QBUT/RVII/
-    # RVI/VCX/TRLV above, tradability, fractional tradability, and
-    # prior-close availability are unverified, and the run-time preflight
-    # and data-confidence gates admit or gate each out fail-closed if it
-    # does not resolve. See config/tickers.json's notes.
-    "LLY",
-    "TSLA",
-    # SEP 11 2026 (user-requested): VIAV (Viavi Solutions Inc.), CIEN (Ciena
-    # Corporation), ANET (Arista Networks, Inc.), CSCO (Cisco Systems, Inc.),
-    # FFIV (F5, Inc.), and COHR (Coherent Corp.). As with VT/QBUT/RVII/RVI/
-    # VCX/TRLV/LLY/TSLA above, no Robinhood instrument search was run in-repo
-    # for any of the six (this session has no broker access) -- tradability,
-    # fractional tradability, and prior-close availability are unverified,
-    # and the run-time preflight and data-confidence gates admit or gate
-    # each out fail-closed if it does not resolve. All six ARE already in
-    # tickers.txt (the history-fetch symbol list), but none has been
-    # through scripts/generate_per_ticker_sizing.py's calibration yet, so
-    # all six use the global fallback ladder (config/per_ticker_sizing.json's
-    # fallback_tickers) until that script is re-run against their archived
-    # history. See config/tickers.json's notes.
-    "VIAV",
-    "CIEN",
-    "ANET",
-    "CSCO",
-    "FFIV",
-    "COHR",
-    # SEP 24 2026 (user-confirmed symbol correction): QUBT (Quantum Computing
-    # Inc.) is the symbol QBUT was meant to be. Unlike QBUT, it was checked
-    # against Robinhood before being added (instrument search + quote: state
-    # active, prior close available); fractional tradability was NOT checked,
-    # so the is_tradable_for_fractional_buy gate still decides fail-closed.
-    # QBUT stays in EXCLUDED_TICKERS so a stale list carrying the misspelling
-    # is filtered out. See config/tickers.json's notes.
-    "QUBT",
-    # OCT 12 2026 (user-requested): APH (Amphenol Corporation) and TEL (TE
-    # Connectivity plc). No Robinhood instrument search was run in-repo for
-    # either (this session has no broker access) -- as with VT/QBUT/RVII/
-    # RVI/VCX/TRLV/LLY/TSLA/VIAV et al. above, tradability, fractional
-    # tradability, and prior-close availability are unverified, and the
-    # run-time preflight and data-confidence gates admit or gate each out
-    # fail-closed if it does not resolve. Both ARE already in tickers.txt
-    # (the history-fetch symbol list). config/per_ticker_sizing.json carries
-    # an uncalibrated global-fallback entry for each (listed in its
-    # fallback_tickers; the config loader requires an entry per active
-    # ticker), so both size off the global fallback ladder until
-    # scripts/generate_per_ticker_sizing.py is re-run against their archived
-    # history. See config/tickers.json's notes.
-    "APH",
-    "TEL",
-    # OCT 14 2026 (user-requested): GFS (GlobalFoundries Inc.). A read-only
-    # Robinhood quote lookup resolved GFS (state active, prior close $46.70 on
-    # 2026-10-13); the instrument search for the name surfaced only GFSG, a 2x
-    # leveraged ETF on GFS, which is NOT the intended symbol and is not added.
-    # Fractional tradability was NOT verified (that check needs the account
-    # number), so the run-time is_tradable_for_fractional_buy gate still admits
-    # or blocks GFS fail-closed. GFS is already in tickers.txt (the
-    # history-fetch symbol list); config/per_ticker_sizing.json carries an
-    # uncalibrated global-fallback entry for it (listed in fallback_tickers;
-    # the config loader requires an entry per active ticker) until
-    # scripts/generate_per_ticker_sizing.py is re-run against its archived
-    # history. See config/tickers.json's notes.
-    "GFS",
-    # OCT 19 2026 (user-requested): 23 free-cash-flow-yield names were requested
-    # (TSN, RPRX, CVS, SJM, KR, CAH, HCA, HRL, PFGC, SYY, KVUE, HSY, USFD, MRK,
-    # RMD, DGX, CHE, ABT, MDLZ, MCK, CHD, ABBV, CL). ABBV has been active since
-    # AUG 2 2026, so 22 are new, taking the active universe from 68 to 90. No
-    # Robinhood instrument search was run in-repo for any of the 22 (this session
-    # has no broker access) -- tradability, fractional tradability, and
-    # prior-close availability are unverified, and the run-time preflight and
-    # data-confidence gates admit or gate each out fail-closed if it does not
-    # resolve. All 22 ARE already in tickers.txt (the history-fetch symbol list)
-    # but none has a calibrated config/per_ticker_sizing.json entry yet, so each
-    # carries an uncalibrated global-fallback entry (listed in fallback_tickers;
-    # the config loader requires an entry per active ticker) until
-    # scripts/generate_per_ticker_sizing.py is re-run. See config/tickers.json's notes.
-    "TSN",
-    "RPRX",
-    "CVS",
-    "SJM",
-    "KR",
-    "CAH",
-    "HCA",
-    "HRL",
-    "PFGC",
-    "SYY",
-    "HSY",
-    "USFD",
-    "MRK",
-    "RMD",
-    "DGX",
-    "CHE",
-    "ABT",
-    "MDLZ",
-    "MCK",
-    "CHD",
-    "CL",
-    # OCT 23 2026 (user-requested): CCI (Crown Castle Inc.). A read-only Robinhood
-    # instrument search resolved CCI as Crown Castle Inc. (state active, prior
-    # close $78.83 on 2026-10-22). Fractional tradability was NOT verified (that
-    # check needs the account number), so the run-time is_tradable_for_fractional_buy
-    # gate admits or blocks CCI fail-closed. CCI is already in tickers.txt (the
-    # history-fetch symbol list) but has no calibrated config/per_ticker_sizing.json
-    # entry yet, so its sizing waits on scripts/generate_per_ticker_sizing.py
-    # being re-run against the ticker_data archive. See config/tickers.json's notes.
-    "CCI",
-    # NOV 5 2026 (user-requested): LULU (lululemon athletica inc.). A read-only
-    # Robinhood instrument search resolved LULU (state active, prior close $112.06
-    # on 2026-11-04). Fractional tradability was NOT verified, so the run-time
-    # is_tradable_for_fractional_buy gate admits or blocks LULU fail-closed.
-    # See config/tickers.json's notes.
-    "LULU",
-    # NOV 6 2026 (user-requested): 31 S&P 500 names above 80 on the daily composite
-    # rank (analysis/composite-rank). Fractional tradability verified read-only.
-    # See config/tickers.json notes and config/ticker_history.csv.
-    "GWW",
-    "KO",
-    "ED",
-    "HLT",
-    "TRV",
-    "ACGL",
-    "EG",
-    "BDX",
-    "MAR",
-    "RSG",
-    "KDP",
-    "MO",
-    "AIZ",
-    "CB",
-    "KIM",
-    "EXR",
-    "AWK",
-    "MRSH",
-    "MSI",
-    "EW",
-    "VLTO",
-    "WELL",
-    "LH",
-    "PSA",
-    "CTAS",
-    "SPG",
-    "REGN",
-    "DRI",
-    "EBAY",
-    "CPAY",
-    "CINF",
-]
+# ACTIVE_TICKERS is the active graded-DCA universe, and it is DERIVED from config/tickers.json's
+# "active" list at import (docs/adr-program-maintained-universe.md, decision item 1). It used to be
+# a hardcoded copy kept equal to the JSON by a parity test; that second copy is gone, so a program
+# that rewrites tickers.json (ticker-advisor/universe_apply.py) changes what every entry point
+# buys, with nothing else to edit. There is deliberately NO hardcoded fallback: a missing,
+# unreadable or malformed file refuses the import (fail closed, like dca_runner's own whitelist)
+# rather than trading a stale list. The dated notes below are the audit trail of the additions the
+# old literal carried, kept because they record WHY each name was added and what was unverified;
+# the names themselves now live only in config/tickers.json and its notes.
+# AUG 4 2026 (user-requested): VT (Vanguard Total World Stock ETF). Broker
+# instrument resolution was not run in-repo -- see config/tickers.json's
+# data_source_notes.VT before the first live allocation.
+# AUG 16 2026 (user-requested): QBUT, RVII, RVI, and VCX. RVI and VCX
+# reverse the exclusion confirmed 2026-08-05 -- see config/tickers.json's
+# notes for the full history. RVII has since moved to WHOLE_SHARE_TICKERS
+# (AUG 24 2026, user-requested): it is not purchasable fractionally, so it
+# is still bought by the same ladder, just through the whole-share
+# mechanism -- see that constant below. QBUT itself was excluded again on
+# SEP 18 2026 (see EXCLUDED_TICKERS below): Robinhood returned not-found
+# for it on every live run -- no confirmed buying mechanism at all.
+# AUG 16 2026 (user-requested, later same day): TRLV. Reverses the
+# remaining piece of the 2026-08-05 exclusion decision, leaving BYDDY as
+# the only excluded symbol -- see config/tickers.json's notes.
+# SEP 5 2026 (user-requested): LLY (Eli Lilly and Company) and TSLA
+# (Tesla, Inc.). No Robinhood instrument search was run in-repo for
+# either (this session has no broker access) -- as with VT/QBUT/RVII/
+# RVI/VCX/TRLV above, tradability, fractional tradability, and
+# prior-close availability are unverified, and the run-time preflight
+# and data-confidence gates admit or gate each out fail-closed if it
+# does not resolve. See config/tickers.json's notes.
+# SEP 11 2026 (user-requested): VIAV (Viavi Solutions Inc.), CIEN (Ciena
+# Corporation), ANET (Arista Networks, Inc.), CSCO (Cisco Systems, Inc.),
+# FFIV (F5, Inc.), and COHR (Coherent Corp.). As with VT/QBUT/RVII/RVI/
+# VCX/TRLV/LLY/TSLA above, no Robinhood instrument search was run in-repo
+# for any of the six (this session has no broker access) -- tradability,
+# fractional tradability, and prior-close availability are unverified,
+# and the run-time preflight and data-confidence gates admit or gate
+# each out fail-closed if it does not resolve. All six ARE already in
+# tickers.txt (the history-fetch symbol list), but none has been
+# through scripts/generate_per_ticker_sizing.py's calibration yet, so
+# all six use the global fallback ladder (config/per_ticker_sizing.json's
+# fallback_tickers) until that script is re-run against their archived
+# history. See config/tickers.json's notes.
+# SEP 24 2026 (user-confirmed symbol correction): QUBT (Quantum Computing
+# Inc.) is the symbol QBUT was meant to be. Unlike QBUT, it was checked
+# against Robinhood before being added (instrument search + quote: state
+# active, prior close available); fractional tradability was NOT checked,
+# so the is_tradable_for_fractional_buy gate still decides fail-closed.
+# QBUT stays in EXCLUDED_TICKERS so a stale list carrying the misspelling
+# is filtered out. See config/tickers.json's notes.
+# OCT 12 2026 (user-requested): APH (Amphenol Corporation) and TEL (TE
+# Connectivity plc). No Robinhood instrument search was run in-repo for
+# either (this session has no broker access) -- as with VT/QBUT/RVII/
+# RVI/VCX/TRLV/LLY/TSLA/VIAV et al. above, tradability, fractional
+# tradability, and prior-close availability are unverified, and the
+# run-time preflight and data-confidence gates admit or gate each out
+# fail-closed if it does not resolve. Both ARE already in tickers.txt
+# (the history-fetch symbol list). config/per_ticker_sizing.json carries
+# an uncalibrated global-fallback entry for each (listed in its
+# fallback_tickers; the config loader requires an entry per active
+# ticker), so both size off the global fallback ladder until
+# scripts/generate_per_ticker_sizing.py is re-run against their archived
+# history. See config/tickers.json's notes.
+# OCT 14 2026 (user-requested): GFS (GlobalFoundries Inc.). A read-only
+# Robinhood quote lookup resolved GFS (state active, prior close $46.70 on
+# 2026-10-13); the instrument search for the name surfaced only GFSG, a 2x
+# leveraged ETF on GFS, which is NOT the intended symbol and is not added.
+# Fractional tradability was NOT verified (that check needs the account
+# number), so the run-time is_tradable_for_fractional_buy gate still admits
+# or blocks GFS fail-closed. GFS is already in tickers.txt (the
+# history-fetch symbol list); config/per_ticker_sizing.json carries an
+# uncalibrated global-fallback entry for it (listed in fallback_tickers;
+# the config loader requires an entry per active ticker) until
+# scripts/generate_per_ticker_sizing.py is re-run against its archived
+# history. See config/tickers.json's notes.
+# OCT 19 2026 (user-requested): 23 free-cash-flow-yield names were requested
+# (TSN, RPRX, CVS, SJM, KR, CAH, HCA, HRL, PFGC, SYY, KVUE, HSY, USFD, MRK,
+# RMD, DGX, CHE, ABT, MDLZ, MCK, CHD, ABBV, CL). ABBV has been active since
+# AUG 2 2026, so 22 are new, taking the active universe from 68 to 90. No
+# Robinhood instrument search was run in-repo for any of the 22 (this session
+# has no broker access) -- tradability, fractional tradability, and
+# prior-close availability are unverified, and the run-time preflight and
+# data-confidence gates admit or gate each out fail-closed if it does not
+# resolve. All 22 ARE already in tickers.txt (the history-fetch symbol list)
+# but none has a calibrated config/per_ticker_sizing.json entry yet, so each
+# carries an uncalibrated global-fallback entry (listed in fallback_tickers;
+# the config loader requires an entry per active ticker) until
+# scripts/generate_per_ticker_sizing.py is re-run. See config/tickers.json's notes.
+# OCT 23 2026 (user-requested): CCI (Crown Castle Inc.). A read-only Robinhood
+# instrument search resolved CCI as Crown Castle Inc. (state active, prior
+# close $78.83 on 2026-10-22). Fractional tradability was NOT verified (that
+# check needs the account number), so the run-time is_tradable_for_fractional_buy
+# gate admits or blocks CCI fail-closed. CCI is already in tickers.txt (the
+# history-fetch symbol list) but has no calibrated config/per_ticker_sizing.json
+# entry yet, so its sizing waits on scripts/generate_per_ticker_sizing.py
+# being re-run against the ticker_data archive. See config/tickers.json's notes.
+# NOV 5 2026 (user-requested): LULU (lululemon athletica inc.). A read-only
+# Robinhood instrument search resolved LULU (state active, prior close $112.06
+# on 2026-11-04). Fractional tradability was NOT verified, so the run-time
+# is_tradable_for_fractional_buy gate admits or blocks LULU fail-closed.
+# See config/tickers.json's notes.
+# NOV 6 2026 (user-requested): 31 S&P 500 names above 80 on the daily composite
+# rank (analysis/composite-rank). Fractional tradability verified read-only.
+# See config/tickers.json notes and config/ticker_history.csv.
+
+# dca_config imports this module, so it cannot be imported here. This is therefore a copy of
+# dca_config.get_config_dir()'s resolution order ($DCA_CONFIG_DIR, then config/ beside the
+# modules, the installed wheel's share/ copy, ./config); tests/test_active_tickers_derivation.py
+# pins the two together so they cannot drift.
+def _universe_config_dir() -> Path:
+    env = os.environ.get("DCA_CONFIG_DIR")
+    if env:
+        return Path(env)
+    installed = Path(sys.prefix) / "share" / "all-stock-dca" / "config"
+    for candidate in (Path(__file__).resolve().parent / "config", installed, Path.cwd() / "config"):
+        if candidate.is_dir():
+            return candidate
+    return Path(__file__).resolve().parent / "config"
+
+
+# Same canonical symbol shape schemas/tickers.schema.json enforces for "active".
+_ACTIVE_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,6}$")
+
+
+def _reject_duplicate_keys(pairs: list) -> dict:
+    # Mirrors dca_config's loader: a second "active" key must not silently win over the first.
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _load_active_tickers(config_dir: Path) -> list[str]:
+    """Return ``config_dir/tickers.json``'s ``active`` list, in file order, or raise ``RuntimeError``.
+
+    Fails closed on every defect: a missing or unreadable file, invalid JSON, duplicate JSON keys, a
+    document that is not an object, an ``active`` value that is not a non-empty list, and any entry
+    that is not a canonical upper-case symbol or that repeats. The message always names
+    ``tickers.json`` and the path, so the operator can find the file at fault.
+    """
+    path = Path(config_dir) / "tickers.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"cannot load the active ticker universe from {path} (tickers.json): {exc}") from exc
+    active = document.get("active") if isinstance(document, dict) else None
+    if not isinstance(active, list) or not active:
+        raise RuntimeError(f"{path} (tickers.json) must be an object with a non-empty 'active' list")
+    bad = [t for t in active if not isinstance(t, str) or not _ACTIVE_SYMBOL_PATTERN.match(t)]
+    if bad:
+        raise RuntimeError(f"{path} (tickers.json) 'active' has non-canonical symbols: {bad!r}")
+    if len(set(active)) != len(active):
+        raise RuntimeError(f"{path} (tickers.json) 'active' repeats a symbol")
+    return list(active)
+
+
+_ACTIVE_TICKERS_CACHE: list[str] | None = None
+
+
+def _active_tickers() -> list[str]:
+    """The active list, read from tickers.json on FIRST USE and then reused.
+
+    Read lazily rather than at import on purpose: scripts/tests/test_generate_buy_candidates.py pins
+    that a plain ``--help``, or a run given a valid ``--config-dir``, must not crash on a stale or
+    missing ``$DCA_CONFIG_DIR`` (Codex review: "Defer dca_runner import until after config
+    selection"). Every path that actually needs the list reads it here and still fails closed.
+    """
+    global _ACTIVE_TICKERS_CACHE
+    if _ACTIVE_TICKERS_CACHE is None:
+        _ACTIVE_TICKERS_CACHE = _load_active_tickers(_universe_config_dir())
+    return _ACTIVE_TICKERS_CACHE
+
+
+def __getattr__(name: str):
+    # PEP 562: ``near_close_dca.ACTIVE_TICKERS`` and ``from near_close_dca import ACTIVE_TICKERS`` keep
+    # working for every existing caller, but the value is derived from config/tickers.json on first
+    # access instead of being a second hardcoded copy.
+    if name == "ACTIVE_TICKERS":
+        return _active_tickers()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it
 # at all). It was added 2026-08-16 without an in-repo Robinhood instrument
@@ -1096,7 +1060,7 @@ def select_budget_tier(planned_spend_usd: float, high_multiplier_signal_count: i
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    tickers: Sequence[str] = tuple(ACTIVE_TICKERS)
+    tickers: Sequence[str] = field(default_factory=lambda: tuple(_active_tickers()))
     excluded_tickers: frozenset[str] = frozenset(EXCLUDED_TICKERS)
     # See WHOLE_SHARE_TICKERS' own module-level comment and
     # docs/whole_share_accumulation.md. UNLIKE `tickers`/`excluded_tickers`,

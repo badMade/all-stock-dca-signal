@@ -17,6 +17,16 @@ What happened: the Robinhood payload job for the 0935 slot got 429 Too Many Requ
 First result: on 2026-11-11 all seven builds (09:35 through 15:30) validated 122 of 122, with
 no `.failures.jsonl` and no 429 in any chunk log. One clean day is encouraging, not proof.
 
+## Reopened 2026-11-16, retry vs deadline fix 2026-11-19
+
+The 14:30 build on 2026-11-16 was not a 429: chunk 3 timed out at 240 s and the last 26 tickers came back empty at about
+601 s, the `DCA_BUILD_DEADLINE_SECONDS=600` cutoff, so 96/122 was refused. The cause of the slow earlier chunks is still
+unknown (a lock-step wave stalled by one timed-out chunk is the working hypothesis; not changed here). What is fixed: the
+whole-build retry restarted its own 600 s deadline, so such a refusal could be rebuilt for up to another 600 s and land after
+the executor stopped waiting. The deadline now counts from the first attempt, and the retry is skipped
+(`not retrying: the build deadline ...`) when it cannot start a useful attempt before then. Fast refusals (the 11-10 429
+shape) still get their one rebuild.
+
 ## Decisions (2026-11-11)
 
 1. **Why the job hit rate limits at 09:36-09:40: treated as fixed by the mitigations above.**

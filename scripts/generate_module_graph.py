@@ -212,8 +212,9 @@ def render(root: Path = REPO_ROOT) -> str:
     for mod, path in modules.items():
         deps = sorted(forward[mod])
         shown = ", ".join(f"`{d}`" for d in deps[:8]) + (f", +{len(deps) - 8} more" if len(deps) > 8 else "")
+        shown_col = f" {shown} " if shown else " "
         lines.append(
-            f"| `{mod}` | {_line_count(path)} | {len(deps)} | {len(reverse[mod])} | {refs[mod]} | {shown} |"
+            f"| `{mod}` | {_line_count(path)} | {len(deps)} | {len(reverse[mod])} | {refs[mod]} |{shown_col}|"
         )
     return "\n".join(lines) + "\n"
 

@@ -39,7 +39,7 @@ MONDAY = "2026-10-19"
 @pytest.mark.parametrize(
     ("task", "hhmm", "slot", "latest"),
     [
-        (T_0935, "09:55", "0935", "10:25"),  # 2026-11-14: latest placement is the next slot's window OPEN (:25 / 15:20), not its nominal :30
+        (T_0935, "10:00", "0935", "10:25"),  # 2026-11-14: latest placement is the next slot's window OPEN (:25 / 15:20), not its nominal :30
         (T_1030, "10:50", "1030", "11:25"),
         (T_1130, "11:50", "1130", "12:25"),
         (T_1230, "12:50", "1230", "13:25"),
@@ -57,7 +57,7 @@ def test_a_single_fire_task_proceeds_at_its_fire_time(task, hhmm, slot, latest):
     [
         (T_0935, "09:46", "skipped_outside_window"),  # 2026-10-26: a manual 09:46 run placed 25 buys before its fire
         (T_0935, "09:54", "skipped_outside_window"),  # the fire time is the earliest start, so Claude's slot goes first
-        (T_0935, "09:55", "PROCEED"),
+        (T_0935, "10:00", "PROCEED"),
         (T_0935, "10:24", "PROCEED"),
         (T_0935, "10:25", "skipped_outside_window"),  # never at or after the latest placement time (the 10:30 slot's 10:25 open)
         (T_1530, "15:39", "skipped_outside_window"),
@@ -95,7 +95,7 @@ def test_the_two_fire_task_lets_the_clock_pick_the_slot(hhmm, expected, slot, la
 
 @pytest.mark.parametrize("day", ["2026-10-17", "2026-10-18"])  # Saturday, Sunday
 def test_weekends_are_market_closed(day):
-    assert gate(T_0935, day, "09:55")["status"] == "skipped_market_closed"
+    assert gate(T_0935, day, "10:00")["status"] == "skipped_market_closed"
 
 
 @pytest.mark.parametrize("day", CALENDAR["holidays_closed"][:6] + ["2026-11-26", "2027-12-24"])
@@ -109,18 +109,18 @@ def test_market_closed_wins_over_outside_window():
 
 def test_an_early_close_day_stops_a_fire_at_or_after_the_early_close_time():
     day = CALENDAR["early_close_1300"][0]
-    assert gate(T_0935, day, "09:55")["status"] == "PROCEED"
+    assert gate(T_0935, day, "10:00")["status"] == "PROCEED"
     assert gate(T_1230, day, "12:50")["status"] == "PROCEED"
     assert gate(T_TWO_FIRE, day, "13:50")["status"] == "skipped_market_closed"
     assert gate(T_1530, day, "15:40")["status"] == "skipped_market_closed"
 
 
 def test_the_clock_is_converted_to_eastern_time_across_the_dst_change():
-    # 2026-11-02 is the first Monday after clocks went back; 14:55 UTC is 09:55 EST, not EDT.
-    utc = datetime.fromisoformat("2026-11-02T14:55:00+00:00")
+    # 2026-11-02 is the first Monday after clocks went back; 15:00 UTC is 10:00 EST, not EDT.
+    utc = datetime.fromisoformat("2026-11-02T15:00:00+00:00")
     assert backup_gates.evaluate(T_0935, utc, CALENDAR)["status"] == "PROCEED"
-    # The same UTC clock reading in October (EDT) is 10:55 ET: outside the 0935 backup's window.
-    october = datetime.fromisoformat("2026-10-19T14:55:00+00:00")
+    # The same UTC clock reading in October (EDT) is 11:00 ET: outside the 0935 backup's window.
+    october = datetime.fromisoformat("2026-10-19T15:00:00+00:00")
     assert backup_gates.evaluate(T_0935, october, CALENDAR)["status"] == "skipped_outside_window"
 
 
@@ -131,13 +131,13 @@ def test_a_naive_clock_value_is_refused_not_guessed():
 
 def test_an_unknown_task_is_refused():
     with pytest.raises(KeyError):
-        backup_gates.evaluate("deadbeef", at(MONDAY, "09:55"), CALENDAR)
+        backup_gates.evaluate("deadbeef", at(MONDAY, "10:00"), CALENDAR)
 
 
 def test_a_date_past_the_calendar_coverage_fails_closed():
     # The calendar file says: extend it before 2029 or the executors abort rather than guess.
     with pytest.raises(ValueError, match="calendar"):
-        gate(T_0935, "2029-03-05", "09:55")
+        gate(T_0935, "2029-03-05", "10:00")
 
 
 def _run(*args):
@@ -146,15 +146,15 @@ def _run(*args):
 
 
 def test_gates_command_prints_one_json_status_and_exits_zero_for_a_normal_skip():
-    proceed = _run("gates", "--task", T_0935, "--now", "2026-10-19T09:55:00-04:00")
+    proceed = _run("gates", "--task", T_0935, "--now", "2026-10-19T10:00:00-04:00")
     assert proceed.returncode == 0 and json.loads(proceed.stdout)["status"] == "PROCEED"
-    skipped = _run("gates", "--task", T_0935, "--now", "2026-10-17T09:55:00-04:00")
+    skipped = _run("gates", "--task", T_0935, "--now", "2026-10-17T10:00:00-04:00")
     assert skipped.returncode == 0 and json.loads(skipped.stdout)["status"] == "skipped_market_closed"
 
 
 def test_gates_command_fails_closed_on_bad_input():
     for args in (("--task", "deadbeef"), ("--task", T_0935, "--now", "not-a-time"),
-                 ("--task", T_0935, "--now", "2026-10-19T09:55:00")):
+                 ("--task", T_0935, "--now", "2026-10-19T10:00:00")):
         done = _run("gates", *args)
         assert done.returncode == 2, args
         assert json.loads(done.stdout)["status"] == "FAILED"

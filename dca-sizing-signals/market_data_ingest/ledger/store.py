@@ -1023,10 +1023,23 @@ class LedgerStore:
         return value
 
     def ingest_portfolio_snapshots(
-        self, rows: Iterable[dict[str, Any]], *, source: str, run_id: str, as_of: datetime
+        self,
+        rows: Iterable[dict[str, Any]],
+        *,
+        source: str,
+        run_id: str,
+        as_of: datetime,
+        allow_restate: bool = False,
     ) -> int:
         """Read-only per-symbol holdings at a prior close. No account field of any kind: the
-        snapshot is of the one strategy account, and an account-named key is refused outright."""
+        snapshot is of the one strategy account, and an account-named key is refused outright.
+
+        A ``snapshot_day`` that already has rows is refused unless the batch adds nothing new
+        (an identical re-ingest stays a no-op) or ``allow_restate=True``. 2026-11-19: a rerun after
+        the positions changed landed 96 conflicting rows under 11/16, because content_hash dedupes
+        only byte-identical rows and the reader keeps the latest row per (day, symbol), so symbols
+        missing from the second set silently survived from the first. A deliberate correction must
+        say so."""
         self._aware_as_of(as_of, "portfolio_snapshots")
         problems: list[str] = []
         prepared = []
@@ -1060,7 +1073,23 @@ class LedgerStore:
             out["content_hash"] = _hash([out[k] for k in sorted(out)])
             prepared.append(out)
         _raise_if(problems, "portfolio_snapshots")
+        if not allow_restate:
+            self._refuse_restated_days(prepared)
         return self._insert("portfolio_snapshots", prepared, source=source, run_id=run_id, as_of=as_of)
+
+    def _refuse_restated_days(self, prepared: list[dict[str, Any]]) -> None:
+        """Refuse a batch that would add new rows to a snapshot_day the ledger already holds."""
+        for day in sorted({row["snapshot_day"] for row in prepared}):
+            known = {
+                h for (h,) in self.con.execute(
+                    "SELECT content_hash FROM portfolio_snapshots WHERE snapshot_day = ?", [day]
+                ).fetchall()
+            }
+            if known and any(r["content_hash"] not in known for r in prepared if r["snapshot_day"] == day):
+                raise LedgerValidationError(
+                    f"portfolio_snapshots: snapshot_day {day} already has rows and this batch differs; "
+                    "pass allow_restate=True to record a deliberate correction"
+                )
 
     def _no_holdings_row(self, r: _Row, *, batch_size: int) -> dict[str, Any]:
         """Validate the exact no-holdings marker. Anything short of it is refused: a row with no

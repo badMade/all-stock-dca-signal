@@ -76,6 +76,7 @@ from morning_dca import (
     _stable_broker_order_id,
     load_max_consecutive_placement_failures,
     load_max_orders_per_day,
+    load_max_per_order_usd,
     load_morning_config,
     nyse_holidays,
 )
@@ -9173,31 +9174,59 @@ def test_load_max_orders_per_day_rejects_non_positive_value(tmp_path):
         load_max_orders_per_day(tmp_path)
 
 
-def test_load_max_per_order_usd_rejects_bool_overflow_string_and_duplicates(tmp_path):
-    from morning_dca import load_max_per_order_usd
-
-    for bad_val in (True, False, "25", 10**1000):
-        (tmp_path / "budgets.json").write_text(
-            json.dumps({"circuit_breakers": {"max_per_order_usd": bad_val}}), encoding="utf-8"
-        )
-        with pytest.raises(ValueError, match="max_per_order_usd"):
-            load_max_per_order_usd(tmp_path)
-
-    (tmp_path / "budgets.json").write_text(
-        '{"circuit_breakers": {"max_per_order_usd": 10, "max_per_order_usd": 999}}',
-        encoding="utf-8",
-    )
-    with pytest.raises(RuntimeError, match="could not be read or parsed"):
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"circuit_breakers": {"max_per_order_usd": 10.0, "max_per_order_usd": 99999.0}}',
+        '{"circuit_breakers": {"max_per_order_usd": 10.0}, "circuit_breakers": {"max_per_order_usd": 99999.0}}',
+    ],
+)
+def test_load_max_per_order_usd_rejects_duplicate_keys(tmp_path, payload):
+    (tmp_path / "budgets.json").write_text(payload, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="duplicate"):
         load_max_per_order_usd(tmp_path)
 
 
-def test_load_max_orders_per_day_rejects_duplicate_keys(tmp_path):
+@pytest.mark.parametrize("bad_value", [True, False, "10.0", 10**400])
+def test_load_max_per_order_usd_rejects_booleans_strings_and_oversized_ints(tmp_path, bad_value):
     (tmp_path / "budgets.json").write_text(
-        '{"circuit_breakers": {"max_orders_per_day": 2, "max_orders_per_day": 999}}',
+        json.dumps({"circuit_breakers": {"max_per_order_usd": bad_value}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="max_per_order_usd"):
+        load_max_per_order_usd(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"circuit_breakers": {"max_orders_per_day": 4, "max_orders_per_day": 999}}',
+        '{"circuit_breakers": {"max_orders_per_day": 4}, "circuit_breakers": {"max_orders_per_day": 999}}',
+    ],
+)
+def test_load_max_orders_per_day_rejects_duplicate_keys(tmp_path, payload):
+    (tmp_path / "budgets.json").write_text(payload, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="duplicate"):
+        load_max_orders_per_day(tmp_path)
+
+
+def test_load_morning_config_fails_closed_on_duplicate_breaker_keys_and_bool_cap(tmp_path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
+    (cfg_dir / "budgets.json").write_text(
+        '{"circuit_breakers": {"max_per_order_usd": 10.0, "max_per_order_usd": 99999.0, '
+        '"max_consecutive_placement_failures": 3}}',
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="could not be read or parsed"):
-        load_max_orders_per_day(tmp_path)
+    with pytest.raises(RuntimeError, match="duplicate"):
+        load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
+
+    (cfg_dir / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": True, "max_consecutive_placement_failures": 3}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="max_per_order_usd"):
+        load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
 
 def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):

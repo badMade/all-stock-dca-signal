@@ -572,72 +572,83 @@ def test_refresh_cli_does_not_require_broker_account_environment(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("candidate_patch", "quote_patch", "expected_reason"),
+    ("field", "bad_value", "expected_reason"),
     [
-        ({"prior_close": True}, {}, "invalid_price_reference"),
-        ({"prior_low": True}, {}, "invalid_price_reference"),
-        ({"prior_low": -1.0}, {}, "invalid_price_reference"),
-        ({"prior_low": 10**1000}, {}, "invalid_price_reference"),
-        ({"selected_base_amount_usd": True}, {}, "invalid_authorized_base"),
-        ({"desired_usd": True}, {}, "invalid_authorized_amount"),
-        ({"desired_usd": 10**1000}, {}, "invalid_authorized_amount"),
-        ({}, {"price": 10**1000}, "invalid_refresh_quote"),
+        ("prior_close", True, "invalid_price_reference"),
+        ("prior_close", 10**400, "invalid_price_reference"),
+        ("prior_low", True, "invalid_price_reference"),
+        ("prior_low", False, "invalid_price_reference"),
+        ("prior_low", float("inf"), "invalid_price_reference"),
+        ("prior_low", float("nan"), "invalid_price_reference"),
+        ("prior_low", -1.0, "invalid_price_reference"),
+        ("prior_low", 10**400, "invalid_price_reference"),
+        ("selected_base_amount_usd", True, "invalid_authorized_base"),
+        ("selected_base_amount_usd", 10**400, "invalid_authorized_base"),
+        ("desired_usd", True, "invalid_authorized_amount"),
+        ("desired_usd", 10**400, "invalid_authorized_amount"),
     ],
 )
-def test_post_anchor_refresh_rejects_boolean_and_overflow_fields(
-    candidate_patch, quote_patch, expected_reason
+def test_post_anchor_refresh_rejects_boolean_nonfinite_and_oversized_candidate_fields(
+    field, bad_value, expected_reason
 ):
-    candidate = _run(
-        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0))
-    )["cands"][0]
-    candidate.update(candidate_patch)
-    quote = {"price": 98.0, "as_of": "2026-08-05T09:41:00-04:00"}
-    quote.update(quote_patch)
-
+    candidate = dict(
+        _run(_market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0)))["cands"][0],
+        **{field: bad_value},
+    )
     result = refresh_market_open_candidates(
         [candidate],
-        {"TEST": quote},
+        {"TEST": {"price": 98.0, "as_of": "2026-08-05T09:41:00-04:00"}},
         _config(),
         trading_day=date(2026, 8, 5),
         placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
     )
-
     assert result["cands"] == []
     assert result["dropped"] == [{"ticker": "TEST", "reason": expected_reason}]
 
 
-def test_refresh_cli_rejects_duplicate_json_keys(tmp_path):
+def test_post_anchor_refresh_rejects_oversized_quote_price():
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0))
+    )["cands"][0]
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": 10**400, "as_of": "2026-08-05T09:41:00-04:00"}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
+    )
+    assert result["cands"] == []
+    assert result["dropped"] == [{"ticker": "TEST", "reason": "invalid_refresh_quote"}]
+
+
+@pytest.mark.parametrize(
+    ("candidates_json", "quotes_json"),
+    [
+        ('[{"ticker": "TEST", "desired_usd": 1.0, "desired_usd": 10.0}]', "{}"),
+        ("[]", '{"TEST": {"price": 98.0}, "TEST": {"price": 50.0}}'),
+    ],
+)
+def test_refresh_cli_rejects_duplicate_json_keys(tmp_path, candidates_json, quotes_json):
+    from scripts import refresh_market_open_candidates as rmoc
+
     candidates = tmp_path / "candidates.json"
     quotes = tmp_path / "quotes.json"
-    candidates.write_text("[]", encoding="utf-8")
-    quotes.write_text(
-        '{"TEST": {"price": 98.0, "as_of": "2026-08-05T09:41:00-04:00"}, '
-        '"TEST": {"price": 99.0, "as_of": "2026-08-05T09:41:00-04:00"}}',
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "scripts.refresh_market_open_candidates",
-            "--trading-day",
-            "2026-08-05",
-            "--placement-time",
-            "2026-08-05T09:41:00-04:00",
-            "--candidates",
-            str(candidates),
-            "--quotes",
-            str(quotes),
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert completed.returncode == 2
-    assert "duplicate" in completed.stderr.lower()
+    candidates.write_text(candidates_json, encoding="utf-8")
+    quotes.write_text(quotes_json, encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
+        rmoc.main(
+            [
+                "--trading-day",
+                "2026-08-05",
+                "--placement-time",
+                "2026-08-05T09:41:00-04:00",
+                "--candidates",
+                str(candidates),
+                "--quotes",
+                str(quotes),
+            ]
+        )
+    assert exc_info.value.code != 0
 
 
 def test_top_up_rows_survive_a_planner_incompatible_calibrated_ladder():

@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -359,6 +360,53 @@ def test_run_consumes_octopus_sources_but_leaves_scores_unchanged_at_zero_weight
     assert (plain / "history.csv").read_text() == (shadowed / "history.csv").read_text()
     assert not (plain / "shadow_octopus_history.csv").exists()
     assert len(cr.read_history(shadowed / "shadow_octopus_history.csv")) == 3
+
+
+def test_run_survives_ml_tickers_that_octopus_did_not_forecast(tmp_path):
+    # Regression: a ticker present only in the ML history had no "octopus" key and raised KeyError in cmd_run.
+    data = tmp_path / "data"
+    (data / "inputs").mkdir(parents=True)
+    (data / "inputs" / "holdings.json").write_text(json.dumps({"symbols": []}))
+    members = [["AAA", "A", "T"], ["BBB", "B", "T"], ["CCC", "C", "T"]]
+    (data / "inputs" / "sp500.json").write_text(json.dumps(members))
+    ext = {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+           for t, s in {"AAA": make_series(0.001), "BBB": make_series(-0.0002), "CCC": make_series(0.0004)}.items()}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+    src = tmp_path / "oct"
+    src.mkdir()
+    _octopus_csv(src / "x_next_day_forecasts.csv",
+                 [("AAA", "octopus", "2026-11-04", 100, 101, 99, 102, "2026-11-05")])
+    (data / "inputs" / "octopus_sources.json").write_text(json.dumps([str(src)]))
+    ml_root = tmp_path / "sizing_suggestions"
+    (ml_root / "ml_forecaster").mkdir(parents=True)
+    (ml_root / "ml_forecaster" / "2026.jsonl").write_text(
+        _ml_line("2026-11-03", {"AAA": 1.0, "BBB": 1.2, "CCC": 0.8}) + "\n")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    assert cr.main(["--data-dir", str(data), "--archive-dir", str(empty), "--config-dir", str(cfg),
+                    "--ml-root", str(ml_root), "run", "--as-of", "2026-11-04"]) == 0
+    shadow = cr.read_history(data / "shadow_octopus_history.csv")
+    assert [r["ticker"] for r in shadow] == ["AAA"]
+    assert len(cr.read_history(data / "shadow_ml_history.csv")) == 3
+
+
+def test_archive_guard_refuses_while_the_daily_update_is_still_writing(tmp_path):
+    # Regression: a run that read the archive mid-update mixed old and new bars (TRV moved 92.0 -> 78.6).
+    archive = tmp_path / "arch"
+    archive.mkdir()
+    assert cr.archive_settling_mtime(archive, 30) is None  # empty archive is not settling
+    fresh = archive / "TRV.csv"
+    fresh.write_text("Date\n")
+    now = fresh.stat().st_mtime
+    assert cr.archive_settling_mtime(archive, 30, now=now + 60) is not None  # 1 minute after a write: refuse
+    assert cr.archive_settling_mtime(archive, 30, now=now + 31 * 60) is None  # quiet for 31 minutes: allowed
+    data = tmp_path / "data"
+    rc = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "run", "--as-of", "2026-11-04"])
+    assert rc == 3 and not (data / "history.csv").exists()  # refused before writing any output
+    os.utime(fresh, (now - 3600, now - 3600))  # an hour old: the guard no longer blocks
+    assert cr.archive_settling_mtime(archive, 30) is None
 
 
 def test_stale_origin_dates_in_an_octopus_export_are_not_logged(tmp_path):

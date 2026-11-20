@@ -125,11 +125,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from scripts.account_arg import add_account_argument, resolve_account
 from scripts.broker_reconciliation import (
@@ -167,11 +168,21 @@ def _resolve_minimum_order_usd(
     (falling back to $1.00 if absent or unreadable).
     """
     if minimum_order_usd is not None:
-        if isinstance(minimum_order_usd, bool) or minimum_order_usd <= 0:
+        if isinstance(minimum_order_usd, bool) or not isinstance(minimum_order_usd, (int, float)):
             raise ValueError(
                 f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
             )
-        return minimum_order_usd
+        try:
+            resolved = float(minimum_order_usd)
+        except OverflowError as exc:
+            raise ValueError(
+                f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
+            ) from exc
+        if not math.isfinite(resolved) or resolved <= 0:
+            raise ValueError(
+                f"minimum_order_usd must be a positive number, got {minimum_order_usd!r}"
+            )
+        return resolved
 
     try:
         from dca_config import DEFAULT_CONFIG_DIR, load_per_ticker_sizing
@@ -249,6 +260,15 @@ def _abort(reason: str, candidates: Sequence[Mapping[str, Any]], detail: Sequenc
     }
 
 
+def _reject_duplicate_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, val in pairs:
+        if key in out:
+            raise ValueError(f"Duplicate JSON key: {key!r}")
+        out[key] = val
+    return out
+
+
 def _f(value: Any) -> Optional[float]:
     """Best-effort float parse; None for missing/nonnumeric/non-finite.
 
@@ -258,13 +278,13 @@ def _f(value: Any) -> Optional[float]:
     can compare against, rather than being treated as absent (Codex review:
     "Reject first allocations without a current price").
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if result != result or result in (float("inf"), float("-inf")):  # NaN/inf
+    if not math.isfinite(result):
         return None
     return result
 
@@ -679,9 +699,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         with open(args.orders_pages, encoding="utf-8") as handle:
-            orders_payload = json.load(handle)
+            orders_payload = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
         with open(args.candidates, encoding="utf-8") as handle:
-            candidates = json.load(handle)
+            candidates = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         # Unreadable input is indistinguishable from missing input, and missing
         # input must never read as a clean slate.
@@ -693,7 +713,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    if not isinstance(candidates, list):
+    if not isinstance(candidates, list) or not all(isinstance(c, Mapping) for c in candidates):
         print(json.dumps(_abort(BROKER_HISTORY_INCOMPLETE, [], ["input_not_a_json_array"]), indent=2))
         return 2
 

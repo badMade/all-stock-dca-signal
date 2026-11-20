@@ -81,6 +81,10 @@ changing chunk size, concurrency or the sessions' 12-minute wait.
   spent its deadline on retries and rescues and refused at 15/84. The 15:30 and live plist templates set `DCA_CODEX_PARALLEL=8`
   (it was 6 until the 122-symbol universe of 2026-11-06 made 31 chunks, 6 waves at 6 workers; reload the plists on the Mac
   after a change), since 4-ticker chunks mean more worker calls.
+- Workers run as a sliding pool (2026-11-19): a new chunk starts as soon as any of the `DCA_CODEX_PARALLEL` workers
+  finishes, in both the first pass and the rescue pass. Before, chunks started in lock-step waves and each wave waited for
+  its slowest chunk, so one chunk that ran to its 240 s timeout idled the other workers. Where this file or the plist
+  comments say "waves", read the count as total chunks divided by workers; it is now an estimate, not a barrier.
 - A rate-limited attempt waits before it is retried (2026-11-10: the 09:35 and 10:30 builds refused at 60/122 and
   98/122 because whole chunks died in 3-4 s with `429 Too Many Requests`, and each retry and rescue fired at once into
   the same window). When an attempt returns no reply and its worker log names a 429, the launcher logs
