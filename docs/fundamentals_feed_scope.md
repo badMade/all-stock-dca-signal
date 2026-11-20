@@ -105,7 +105,8 @@ Steps 1 to 4 need no network in their tests (trimmed fixtures, as `test_edgar_fu
    VCX. **Foreign 20-F filers (3, presumed):** ASML, TSM, STM. Not pinned: TRIN (profile does not settle
    fund versus operating company), GFUZ (recent listing, filing form unknown), and the foreign-headquartered
    names that normally file 10-Ks (TEL, LULU, ACGL, EG, CB). If any of those has no us-gaap facts it
-   shows as `unscored`, and the engine holds an unscored incumbent rather than dropping it. The list is NOT
+   shows as `unscored`, and the engine holds an unscored incumbent rather than dropping it. The operator approved this list on
+   2026-11-20. It is NOT
    written to `config/tickers.json` yet: that file is bundled into the backup planner, so changing it
    forces another planner rebuild. It is added when the ranking job lands.
 2. **Fractional eligibility.** Check only the top 150 or so after ranking, through an agent session
