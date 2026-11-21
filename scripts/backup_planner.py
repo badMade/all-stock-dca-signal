@@ -57,6 +57,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
@@ -88,6 +89,7 @@ require_supported_python(sys.version_info)
 
 import dca_config  # noqa: E402  (every project import must follow the version guard)
 import dca_order_plan as dop  # noqa: E402
+import dca_runner  # noqa: E402
 from dca_number_check import plan_grounding_errors  # noqa: E402
 from dca_order_plan import PlanError, PlanResult  # noqa: E402
 from dca_paths import cron_tracking_root  # noqa: E402
@@ -990,6 +992,39 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     return _emit({"status": "VALID_PLAN", "plan": plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
 
 
+@contextlib.contextmanager
+def _carried_config_dir(directory: Path, carried: tuple[str, ...] | None, bundled: Any):
+    """The config directory the gated generators read, with the day's carried list in force.
+
+    No carried list yields ``directory`` untouched. Otherwise the list must sit inside the BUNDLED one: the live runner
+    freezes its own whitelist at import and per-ticker sizing must cover every name, so a carried name the bundled list
+    lacks is refused (``carried_name_unsupported``) instead of being planned. The generators read ``tickers.json`` from
+    disk and insist on ``dca_runner.CONFIG_DIR``, so a private copy with ``active`` narrowed to the carried list is
+    used, and ``dca_runner.CONFIG_DIR`` points at it for the length of the call. The copy holds the same bytes for
+    every other file, so calendar, ladder and calibration are unchanged.
+    """
+    if carried is None:
+        yield directory
+        return
+    outside = sorted(set(carried) - set(bundled.tickers))
+    if outside:
+        raise _Refused(*(PlanError("carried_name_unsupported", symbol) for symbol in outside))
+    previous = dca_runner.CONFIG_DIR
+    with tempfile.TemporaryDirectory(prefix="backup-day-config-") as scratch:
+        copy = Path(scratch) / "config"
+        shutil.copytree(directory, copy)
+        document = json.loads((copy / "tickers.json").read_bytes())
+        document["active"] = list(carried)
+        if "pinned" in document:
+            document["pinned"] = [t for t in document["pinned"] if t in set(carried)]
+        (copy / "tickers.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        dca_runner.CONFIG_DIR = copy
+        try:
+            yield copy
+        finally:
+            dca_runner.CONFIG_DIR = previous
+
+
 def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     """The safety gate: the primary's own Gate 5 decides what to buy, the plan only carries it out.
 
@@ -1007,7 +1042,17 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     history = _load_history(args.orders_pages, trading_day, week_last4)
     deployed = _parse_deployed(args.deployed_last_7d_usd, history, now)
     payload = _load_market_data(args.market_data)
-    directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
+    base = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
+    bundled = dca_config.load_strategy_config(base)
+    carried = _day_universe(args.published, args.slot, bundled)
+    with _carried_config_dir(base, carried, bundled) as directory:
+        return _gated_plan(args, trading_day, now, buying_power, week_last4, history, deployed, payload, directory, carried)
+
+
+def _gated_plan(args: argparse.Namespace, trading_day: date, now: datetime, buying_power: Any, week_last4: Any,
+                history: Any, deployed: float, payload: dict[str, Any], directory: Path,
+                carried: tuple[str, ...] | None) -> int:
+    """The gate's Gate 5 decisions wrapped in a capped plan, reading the (possibly day-narrowed) ``directory``."""
     extra: dict[str, Any] = {}
     if week_last4 is not None:
         # A week envelope cannot prove the days before Monday, so the kill switch is treated as engaged (module note
@@ -1038,7 +1083,8 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     )
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors), **extra}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": [],
+    plan = result.plan if carried is None else {**result.plan, "universe": list(carried)}
+    return _emit({"status": "VALID_PLAN", "plan": plan, "skipped": _skipped_dicts(result.skipped), "errors": [],
                   **extra}, 0)
 
 

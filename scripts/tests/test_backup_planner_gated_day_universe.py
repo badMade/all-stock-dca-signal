@@ -36,12 +36,15 @@ GATED = ["0935", "1030", "1130", "1230", "1330", "1430", "1530"]
 NOW = {**STREAM_NOW, "1530": NOW_1530}
 AS_OF = "2026-10-07T09:00:00-04:00"
 
-CARRIED = ("MSFT", "VT", "ZZZ")  # ZZZ is not in the bundled list; AAPL is, and is NOT carried
+CARRIED = ("AMD", "MSFT", "VT")  # all on the bundled list; AAPL is bundled too and is NOT carried
+# A carried name the bundled list lacks cannot be planned on the gated path: dca_runner freezes its whitelist at import
+# and per-ticker sizing must cover every name, so such a name is refused (``carried_name_unsupported``).
+OUTSIDE = ("MSFT", "VT", "ZZZ")
 # prior close -> last price. Every name drops enough to be a buy, so only the list decides who is planned.
 # The payload holds exactly the names its list names (the task fetches what ``universe`` prints), so the carried tape
-# has ZZZ and no AAPL, and the bundled tape has AAPL and no ZZZ: a name outside the governing list is not in the payload.
+# has AMD and no AAPL, and the bundled tape has AAPL and no AMD: a name outside the governing list is not in the payload.
 BUNDLED_TAPE = {"VT": (100.0, 97.0), "MSFT": (100.0, 98.5), "AAPL": (100.0, 98.0)}
-CARRIED_TAPE = {"VT": (100.0, 97.0), "MSFT": (100.0, 98.5), "ZZZ": (100.0, 97.5)}
+CARRIED_TAPE = {"VT": (100.0, 97.0), "MSFT": (100.0, 98.5), "AMD": (100.0, 97.5)}
 # A payload that ALSO holds a dropped name: it must never be planned (refusing the payload is acceptable).
 STRAY_TAPE = {**CARRIED_TAPE, "AAPL": (100.0, 98.0)}
 
@@ -117,11 +120,19 @@ def test_a_bundled_name_the_day_dropped_is_never_planned_even_if_the_payload_hol
 
 
 @pytest.mark.parametrize("slot", GATED)
-def test_a_carried_list_can_plan_a_name_the_bundled_list_lacks(tmp_path, capsys, slot, config):
+def test_a_carried_name_the_bundled_list_lacks_is_refused_not_planned(tmp_path, capsys, slot, config):
     assert "ZZZ" not in config.tickers
+    code, report = gated(tmp_path, capsys, slot, "--published", published(tmp_path, slot, a_set(slot, OUTSIDE)),
+                         tape=CARRIED_TAPE)
+    assert (code, report["status"], report["plan"]) == (2, "FAILED", None)
+    assert "carried_name_unsupported" in codes(report)
+
+
+@pytest.mark.parametrize("slot", GATED)
+def test_a_carried_subset_plans_the_names_it_holds(tmp_path, capsys, slot):
     _, report = gated(tmp_path, capsys, slot, "--published", published(tmp_path, slot, a_set(slot, CARRIED)),
                       tape=CARRIED_TAPE)
-    assert "ZZZ" in symbols(report)
+    assert {"AMD", "MSFT", "VT"} <= symbols(report)
 
 
 @pytest.mark.parametrize("slot", GATED)
