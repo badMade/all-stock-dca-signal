@@ -1,4 +1,4 @@
-## CapEx Scan Report (2026-11-14)
+## CapEx Scan Report (2026-11-21)
 
 | Ticker | Company | Period End | Tier | Current ($M) | Prior ($M) | Delta ($M) | Delta (%) | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -16,10 +16,10 @@
 | CBRS | Cerebras Systems Inc. | N/A | supplier | N/A | N/A | N/A | N/A | NOT_SCANNABLE | Private entity / S-1 filing status |
 | CIEN | Ciena Corporation | 2026-08-01 | supplier | $80.0M | $41.0M | +$38.9M | +94.8% | PASS | Breached 15.0% QoQ delta (+94.8%), but under $250M supplier addition |
 | COHR | Coherent Corp. | 2026-09-30 | supplier | $775.5M | $555.7M | +$219.9M | +39.6% | PASS | Breached 15.0% QoQ delta (+39.6%), but under $250M supplier addition |
-| CSCO | Cisco Systems, Inc. | 2026-07-25 | supplier | $390.0M | $414.0M | -$24.0M | -5.8% | PASS | Within normal thresholds |
+| CSCO | Cisco Systems, Inc. | 2026-10-24 | supplier | $502.0M | $390.0M | +$112.0M | +28.7% | PASS | Breached 15.0% QoQ delta (+28.7%), but under $250M supplier addition |
 | DFTX | Definium Therapeutics, Inc. | N/A | supplier | $0.0M | N/A | N/A | N/A | NOT_FOUND | Filer reports no capex XBRL tag (e.g. bank or pre-revenue biotech); needs a manual source |
 | EVR | Evercore, Inc. | 2026-09-30 | supplier | $18.9M | $10.7M | +$8.2M | +76.0% | PASS | Breached 15.0% QoQ delta (+76.0%), but under $250M supplier addition |
-| FFIV | F5, Inc. | 2026-06-30 | supplier | $35.6M | $18.4M | +$17.3M | +94.2% | PASS | Breached 15.0% QoQ delta (+94.2%), but under $250M supplier addition |
+| FFIV | F5, Inc. | 2026-09-30 | supplier | $26.8M | $35.6M | -$8.8M | -24.7% | PASS | Within normal thresholds |
 | GE | GE Aerospace | 2026-09-30 | supplier | $336.0M | $335.0M | +$1.0M | +0.3% | PASS | Within normal thresholds |
 | GFS | GlobalFoundries Inc. | N/A | supplier | $0.0M | N/A | N/A | N/A | NOT_FOUND | Filer reports no capex XBRL tag (e.g. bank or pre-revenue biotech); needs a manual source |
 | GFUZ | General Fusion Group Ltd. | 2026-06-30 | supplier | $0.4M | $0.4M | -$0.0M | -2.5% | PASS | Within normal thresholds |
@@ -39,7 +39,7 @@
 | MU | Micron Technology, Inc. | 2026-09-03 | hyperscaler | $11,110.0M | $7,826.0M | +$3,284.0M | +42.0% | FLAGGED | Breached both gates: +42.0% QoQ delta and $+3,284.0M hyperscaler addition |
 | NFLX | Netflix, Inc. | 2026-09-30 | supplier | $278.8M | $218.6M | +$60.1M | +27.5% | PASS | Breached 15.0% QoQ delta (+27.5%), but under $250M supplier addition |
 | NVDA | NVIDIA Corporation | 2026-07-26 | supplier | $2,677.0M | $1,757.0M | +$920.0M | +52.4% | FLAGGED | Breached both gates: +52.4% QoQ delta and $+920.0M supplier addition |
-| QBTS | D-Wave Quantum Inc. | 2026-06-30 | supplier | $4.4M | $1.1M | +$3.4M | +311.1% | PASS | Breached 15.0% QoQ delta (+311.1%), but under $250M supplier addition |
+| QBTS | D-Wave Quantum Inc. | 2026-09-30 | supplier | $7.4M | $4.4M | +$3.0M | +67.6% | PASS | Breached 15.0% QoQ delta (+67.6%), but under $250M supplier addition |
 | QCOM | Qualcomm Incorporated | 2026-09-27 | supplier | $916.0M | $496.0M | +$420.0M | +84.7% | FLAGGED | Breached both gates: +84.7% QoQ delta and $+420.0M supplier addition |
 | QUBT | Quantum Computing Inc. | 2026-09-30 | supplier | $9.4M | $2.7M | +$6.8M | +253.2% | PASS | Breached 15.0% QoQ delta (+253.2%), but under $250M supplier addition |
 | RGTI | Rigetti Computing, Inc. | 2026-09-30 | supplier | $26.2M | $12.0M | +$14.2M | +118.4% | PASS | Breached 15.0% QoQ delta (+118.4%), but under $250M supplier addition |
