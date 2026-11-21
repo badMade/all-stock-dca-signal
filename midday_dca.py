@@ -385,6 +385,8 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MiddayConfig(**kwargs)

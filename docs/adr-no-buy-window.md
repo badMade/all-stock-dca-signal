@@ -31,24 +31,35 @@ tracking, and has to be reverted by hand on the day buying resumes.
 3. `dca_config.no_buy_blocked_tickers(cfg, on)` is the one rule. It fails closed: a malformed block
    raises `ValueError` naming `no_buy`, and one bad entry fails the whole load. A symbol must be in
    `active` and not in the permanent `excluded` list.
-4. `dca_config.load_tickers` overlays the blocked set. Blocked symbols are added to `excluded_tickers`
-   and removed from the runtime `tickers` tuple (the resolved `StrategyConfig` requires those two to be
-   disjoint). `tickers.json`'s own `active` list is untouched, so the ticker stays in the history fetch,
-   sizing calibration and universe records, and returns to the runtime tuple on its own the day after
-   `until`. `load_strategy_config(now=...)` uses the run's own clock, so a replayed day sees that day's
-   windows.
-5. That one overlay reaches `near_close_dca` (the 3:30 PM path), `morning_dca` and its three subclasses,
-   and `scripts/generate_buy_candidates.py`. `dca_runner.py` reads `tickers.json` itself, so it checks the
-   block at call time in tier selection, `plan_orders` (refusal `no_buy_window`) and `execute_plan`.
+4. `dca_config.load_tickers` returns the blocked set as `no_buy_tickers` (present only when non-empty) and
+   leaves `tickers` and `excluded_tickers` alone. `StrategyConfig` and `MorningConfig` carry it as
+   `no_buy_tickers`. `load_strategy_config(now=...)` uses the run's own clock, so a replayed day sees that
+   day's windows.
+5. **The BUY is vetoed at buy time, not by shrinking the universe.** A first attempt folded blocked names
+   into `excluded_tickers` and removed them from the run-time ticker list. It broke 33 tests: the backup
+   planner's stamped universe hash and symbol count (122 became 115), the committed Perplexity prompts, and
+   anything else keyed to the universe. So the universe, its stamps and the signals do not change, and each
+   entry point withdraws the BUY itself:
+   - `near_close_dca._process_buy_candidate` returns a `skipped` outcome with `skip_reason: no_buy_window`
+     before any order, top-up or credit flush is built, so the blocked ticker still appears in the run's
+     candidate rows.
+   - `morning_dca.MorningDCAExecutor.evaluate_signal` (the four executors and `scripts/stream_candidates`)
+     scores the ticker, then returns NO_ACTION with a zero size and `no_buy_window` in the reason and
+     warnings. The row keeps the prices and the drop.
+   - `scripts/generate_buy_candidates.py` does the same on the reconciled decision.
+   - `dca_runner.py` reads `tickers.json` itself, so it checks the block at call time in tier selection,
+     `plan_orders` (refusal `no_buy_window`) and `execute_plan`.
+   - `dca_order_plan.py` and `scripts/backup_planner.py` refuse a blocked symbol like an excluded one when
+     they build or validate a plan, without touching the universe they stamp.
 6. Early release is `python -m scripts.no_buy_window release SYMBOL --reason "..." --accept-wash`. A
    release inside the window refuses without `--accept-wash`, always needs a reason, sets `released_on`
    (never deletes the entry), and changes only that entry's line. `status` lists every entry.
 
 ## Not covered (known gaps)
 
-- **Signals are not evaluated during the window.** A blocked ticker is in `excluded_tickers`, so the run
-  does not score it or write a signals row for it. "Tracking" today means the ticker stays in `active` and
-  in the data and sizing pipelines. A would-have-bought record in the run artifacts is a later slice.
+- **Tracking is partial.** A blocked ticker is still scored and keeps its signal row and prices, so the
+  signals show what the ladder wanted. There is no separate would-have-bought dollar record yet; the
+  3:30 PM path shows it as a skipped candidate with `no_buy_window`, the morning family as a NO_ACTION row.
 - **Bare `StrategyConfig()` constructions** never read `tickers.json` and so never see the block. Every
   live path found uses `load_strategy_config` or the stream loaders; a new code path that builds a bare
   config would bypass it.
@@ -61,6 +72,15 @@ tracking, and has to be reverted by hand on the day buying resumes.
   ticker in both `excluded` and `whole_share`. Its exposure is small, about one share per accumulator fire.
 - **No lookback.** The 30 days before a sale are not checked. That needs the cross-account lot ledger.
 
+## Operational note: planner and prompts
+
+`backup_planner.pyz` bundles the import closure of the backup planner, which includes `dca_config` and
+`near_close_dca`, and the Perplexity backup prompts stamp its build id. Any change to those sources, this
+one included, therefore means rebuilding the planner (`python -m scripts.build_backup_planner --out
+backup_planner.pyz`) and regenerating the prompts (`python -m scripts.generate_perplexity_backup_prompts
+--write`). The universe stamp itself is unchanged (122 symbols, same hash), so only the build stamp moves.
+The live Perplexity tasks hold the pasted prompt text and must be updated to the regenerated prompts.
+
 ## Later slices (each needs its own test first)
 
 1. A single guard at order submission plus a pre-sale lookback report.
@@ -70,8 +90,9 @@ tracking, and has to be reverted by hand on the day buying resumes.
 
 ## Rollback
 
-Delete the `no_buy` block from `config/tickers.json`. Nothing else holds state. Remove the overlay in
-`dca_config.load_tickers` and the three checks in `dca_runner.py` to remove the mechanism itself.
+Delete the `no_buy` block from `config/tickers.json`. Nothing else holds state. Removing the mechanism itself means
+removing the `no_buy_tickers` field and the veto in each entry point listed above, then rebuilding the planner
+and regenerating the prompts.
 
 ## Verification
 

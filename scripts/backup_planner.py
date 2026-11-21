@@ -673,7 +673,8 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
     orders = plan["orders"]
     if not isinstance(orders, list):
         return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
-    active, excluded, seen = set(config.tickers), set(config.excluded_tickers), set()
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol like an excluded one.
+    active, excluded, seen = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers), set()
     for order in orders:
         if not isinstance(order, dict) or set(order) != _PLAN_FIRST_ORDER_KEYS:
             errors.append(PlanError("schema_violation", "order must be an object with exactly the schema's fields"))

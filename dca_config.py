@@ -301,10 +301,10 @@ def load_tickers(config_dir: Path, today: Optional[date] = None) -> Dict[str, An
     tickers.json's ``"whole_share"`` array exactly like ``"active"``/
     ``"excluded"`` overlay ``tickers``/``excluded_tickers``.
 
-    ``today`` (default: today's date in US Eastern) decides which dated ``no_buy`` entries are in force; those
-    symbols are unioned into ``excluded_tickers`` so every entry point that already honors the excluded set
-    (near_close_dca, morning_dca and its subclasses, generate_buy_candidates) skips them for the window while
-    ``tickers`` still lists them. See ``no_buy_blocked_tickers``.
+    ``today`` (default: today's date in US Eastern) decides which dated ``no_buy`` entries are in force. Those
+    symbols come back as ``no_buy_tickers`` (present only when non-empty) and ``tickers``/``excluded_tickers``
+    are left alone, so the universe, its stamps and its signals are unchanged; each entry point vetoes the BUY
+    itself. See ``no_buy_blocked_tickers`` and ``docs/adr-no-buy-window.md``.
     """
     data = _read_json(config_dir / "tickers.json")
     if data is None:
@@ -396,19 +396,13 @@ def load_tickers(config_dir: Path, today: Optional[date] = None) -> Dict[str, An
             f"tickers.json's active/excluded/whole_share categories must be pairwise disjoint "
             f"(case-insensitive): {details}"
         )
+    # Dated no_buy pauses (wash-sale windows) are NOT folded into "tickers"/"excluded_tickers": doing so
+    # shrinks the universe every downstream tool derives from them (the backup planner's stamped universe hash
+    # and symbol count, the committed Perplexity prompts, the payload publisher's coverage) and stops the
+    # ticker being scored. The blocked set is surfaced on its own and vetoed at BUY time by each entry point.
     no_buy_now = no_buy_blocked_tickers(data, today if today is not None else _today_et())
     if no_buy_now:
-        if "excluded_tickers" not in out:
-            # Unioning into an absent set would REPLACE the StrategyConfig default excluded set (QBUT, KVUE)
-            # with only the blocked names, silently re-opening those. Fail closed instead.
-            raise ValueError("tickers.json no_buy is in force but the file has no 'excluded' list to extend")
-        out["excluded_tickers"] = out["excluded_tickers"] | no_buy_now
-        # The resolved StrategyConfig requires active/excluded to be disjoint (load_strategy_config's final
-        # check), so a blocked symbol leaves the RUNTIME tuple for the window. tickers.json's own "active"
-        # list is untouched, which is what keeps it in the history fetch, sizing calibration and universe
-        # records, and it returns to the runtime tuple by itself on the first day after `until`.
-        if "tickers" in out:
-            out["tickers"] = tuple(t for t in out["tickers"] if t not in no_buy_now)
+        out["no_buy_tickers"] = no_buy_now
     return out
 
 

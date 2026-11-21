@@ -644,7 +644,9 @@ def revalidate_for_placement(
         )
     except ValueError as exc:
         return _fail(PlanError("bad_scope", str(exc)))
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     keep: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
     for order in orders:
@@ -732,7 +734,9 @@ def compute_plan(
     Returns:
         ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.
     """
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     skipped: list[tuple[str, str]] = []
     chosen: dict[str, dict[str, Any]] = {}
     for row in quotes:
@@ -840,7 +844,9 @@ def plan_from_decisions(
     Returns:
         ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.
     """
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     skipped: list[tuple[str, str]] = []
     chosen: dict[str, dict[str, Any]] = {}
     for row in decisions:
@@ -1103,6 +1109,6 @@ def plan_from_survivors(
         slot=slot,
         ladder_version=ladder_version,
         active_tickers=config.tickers,
-        excluded_tickers=config.excluded_tickers,
+        excluded_tickers=set(config.excluded_tickers) | set(config.no_buy_tickers),
         max_per_order_usd=MAX_PER_ORDER_USD,
     )
