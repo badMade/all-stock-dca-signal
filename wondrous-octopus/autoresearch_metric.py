@@ -16,7 +16,10 @@ mae = {h: o[str(h)]["close"]["mae"] / p[str(h)]["close"]["mae"] for h in hs}
 pb = lambda r: sum(r["pinball"].values()) / len(r["pinball"])  # mean over p10/p50/p90
 pin = {h: pb(o[str(h)]["close"]) / pb(p[str(h)]["close"]) for h in hs}
 cov = {h: abs(o[str(h)]["close"]["coverage"] - 0.8) for h in hs}
-mean = lambda xs: sum(xs) / len(xs)
+def mean(xs):
+    return sum(xs) / len(xs)
+
+
 print(f"METRIC mae_ratio={mean(mae.values()):.6f}")
 print(f"METRIC pinball_ratio={mean(pin.values()):.6f}")
 print(f"METRIC max_cov_err={max(cov.values()):.4f}")
