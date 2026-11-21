@@ -727,6 +727,70 @@ def test_the_cli_accepts_a_git_sha_equal_to_the_pinned_release(tmp_path, monkeyp
 
     assert fre.main(cli_args(tmp_path, json.dumps(CODE_VERSION))) == 0
 
+
+def test_the_cli_refuses_omitted_code_version_when_pinned_release_is_set(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("DCA_PINNED_SHA", CODE_VERSION["git_sha"])
+    argv = [
+        "--slot", "1330", "--started-at", "2026-09-22T13:32:00-04:00",
+        "--outcome", "NO_ORDERS", "--order-submit-status", "no_orders_submitted",
+        "--root", str(tmp_path),
+    ]
+    assert fre.main(argv) == 2
+    assert "DCA_PINNED_SHA" in json.loads(capsys.readouterr().out)["refused"]
+    assert not (tmp_path / slot_run_dir_relative("1330", DAY)).exists()
+
+
+@pytest.mark.parametrize(
+    "flag, bad_body",
+    [
+        ("--orders-json", '[{"ticker": "MA", "order_id": "ord-1", "submitted_amount_usd": 2.5, "status": "rejected", "status": "filled"}]'),
+        ("--budget-json", '{"budget_tier": "normal", "daily_cap_usd": 1, "daily_cap_usd": 180, "weekly_cap_usd": 900}'),
+        ("--report-json", '{"outcome": "ABORT", "outcome": "ORDERS_PLACED"}'),
+        ("--signals-json", '[{"ticker": "MA", "ticker": "ANET"}]'),
+    ],
+)
+def test_the_cli_refuses_duplicate_json_keys_in_file_inputs(tmp_path, capsys, flag, bad_body):
+    payload_path = tmp_path / "payload.json"
+    payload_path.write_text(bad_body, encoding="utf-8")
+    root_dir = tmp_path / "root"
+    argv = [
+        "--slot", "1330", "--started-at", "2026-09-22T13:32:00-04:00",
+        "--outcome", "ORDERS_PLACED", "--order-submit-status", "submitted",
+        flag, str(payload_path), "--root", str(root_dir),
+    ]
+    if flag != "--orders-json":
+        orders_path = tmp_path / "orders.json"
+        orders_path.write_text(json.dumps([ORDER]), encoding="utf-8")
+        argv += ["--orders-json", str(orders_path)]
+    if flag != "--budget-json":
+        budget_path = tmp_path / "budget.json"
+        budget_path.write_text(json.dumps(BUDGET), encoding="utf-8")
+        argv += ["--budget-json", str(budget_path)]
+    assert fre.main(argv) == 2
+    assert "duplicate key" in json.loads(capsys.readouterr().out)["refused"]
+    assert not (root_dir / slot_run_dir_relative("1330", DAY)).exists()
+
+
+def test_duplicate_json_keys_in_existing_run_state_or_summary_are_refused(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text('{"finalized_by": "executor", "finalized_by": "scripts.finalize_run_evidence"}')
+    with pytest.raises(fre.FinalizeRefused, match="exists but is not a JSON object"):
+        run(tmp_path, "1330")
+
+
+@pytest.mark.parametrize(
+    "fn, payload",
+    [
+        (fre.validate_orders, [{**ORDER, "submitted_amount_usd": 10**400}]),
+        (fre.validate_budget, {**BUDGET, "daily_cap_usd": 10**400}),
+        (fre.validate_budget, {**BUDGET, "weekly_cap_usd": 10**400}),
+    ],
+)
+def test_oversized_int_in_orders_or_budget_raises_finalize_refused_not_overflow(fn, payload):
+    with pytest.raises(fre.FinalizeRefused):
+        fn(payload)
+
 def test_existing_state_oserror(tmp_path, monkeypatch):
     run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
     run_dir.mkdir(parents=True)
