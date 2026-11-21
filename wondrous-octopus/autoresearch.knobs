@@ -6,4 +6,4 @@
 --gamma 0.1
 --horizon-weight 0.5
 --replay-capacity 50000
---update-every 1
+--update-every 5

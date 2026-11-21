@@ -7,11 +7,14 @@ worst-case coverage error vs the 80% target, and per-horizon-bucket ratios (shor
 import json
 import sys
 
-d = json.load(open(sys.argv[1]))["horizons"]["by_horizon"]
-o, p = d["octopus"], d["persistence"]
+# Persistence is deterministic and independent of the octopus knobs, so it is run once (autoresearch.sh
+# caches it) and read from its own report; `--model octopus` reports contain no persistence column.
+o = json.load(open(sys.argv[1]))["horizons"]["by_horizon"]["octopus"]
+p = json.load(open(sys.argv[2]))["horizons"]["by_horizon"]["persistence"]
 hs = sorted(int(h) for h in o if h in p)
 mae = {h: o[str(h)]["close"]["mae"] / p[str(h)]["close"]["mae"] for h in hs}
-pin = {h: o[str(h)]["close"]["pinball"] / p[str(h)]["close"]["pinball"] for h in hs}
+pb = lambda r: sum(r["pinball"].values()) / len(r["pinball"])  # mean over p10/p50/p90
+pin = {h: pb(o[str(h)]["close"]) / pb(p[str(h)]["close"]) for h in hs}
 cov = {h: abs(o[str(h)]["close"]["coverage"] - 0.8) for h in hs}
 mean = lambda xs: sum(xs) / len(xs)
 print(f"METRIC mae_ratio={mean(mae.values()):.6f}")
