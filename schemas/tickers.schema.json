@@ -21,7 +21,7 @@
     },
     "no_buy": {
       "type": "object",
-      "description": "Dated buy pauses (wash-sale windows after a tax-loss sale; docs/adr-no-buy-window.md). Keys are tickers from `active`, which stay tracked; each is blocked from buying while blocked_on <= today <= until (both inclusive, US Eastern) unless released_on is set and reached. A release (scripts/no_buy_window.py) sets released_on and never deletes the entry. Distinct from the permanent `excluded` list. dca_config.no_buy_blocked_tickers enforces the stricter rules (symbol in `active`, not in `excluded`, until >= blocked_on, released_on >= blocked_on).",
+      "description": "Dated buy pauses (wash-sale windows after a tax-loss sale; docs/adr-no-buy-window.md). Keys are upper-case tickers (normally ones in `active`, which stay in the universe and keep being scored); each is blocked from buying while blocked_on <= today <= until (both inclusive, US Eastern) unless released_on is set and reached. A release (scripts/no_buy_window.py) sets released_on and never deletes the entry. Distinct from the permanent `excluded` list. dca_config.no_buy_blocked_tickers enforces the stricter rules (until >= blocked_on, released_on >= blocked_on, non-empty reason, no unknown fields).",
       "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
       "additionalProperties": {
         "type": "object",

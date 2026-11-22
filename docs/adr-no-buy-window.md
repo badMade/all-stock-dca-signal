@@ -29,8 +29,9 @@ tracking, and has to be reverted by hand on the day buying resumes.
    buffer. For the 2026-11-20 sales, the last blocked day is 2026-12-21 and buying resumes 2026-12-22. The
    statutory minimum would resume on 2026-12-21.
 3. `dca_config.no_buy_blocked_tickers(cfg, on)` is the one rule. It fails closed: a malformed block
-   raises `ValueError` naming `no_buy`, and one bad entry fails the whole load. A symbol must be in
-   `active` and not in the permanent `excluded` list.
+   raises `ValueError` naming `no_buy`, and one bad entry fails the whole load. The block is a plain dated
+   blocklist and is not cross-checked against `active` or `excluded`, so a config that rewrites `active` cannot
+   abort a run through it.
 4. `dca_config.load_tickers` returns the blocked set as `no_buy_tickers` (present only when non-empty) and
    leaves `tickers` and `excluded_tickers` alone. `StrategyConfig` and `MorningConfig` carry it as
    `no_buy_tickers`. `load_strategy_config(now=...)` uses the run's own clock, so a replayed day sees that

@@ -242,7 +242,7 @@ def no_buy_blocked_tickers(tickers_cfg: Mapping[str, Any], on: date) -> frozense
     Raises:
         ValueError: any malformed block or entry (not an object, bad or impossible date, ``until`` or
             ``released_on`` before ``blocked_on``, missing field, empty reason, unknown field, a symbol
-            that is not in ``active`` or is in the permanent ``excluded`` list). The message always names
+            symbol that is not upper-case). The message always names
             ``no_buy``. One bad entry fails the whole call.
     """
     block = tickers_cfg.get("no_buy")
@@ -250,16 +250,13 @@ def no_buy_blocked_tickers(tickers_cfg: Mapping[str, Any], on: date) -> frozense
         return frozenset()
     if not isinstance(block, dict):
         raise ValueError(f"tickers.json no_buy must be an object keyed by symbol, got {type(block).__name__}")
-    active = set(tickers_cfg.get("active") or ())
-    excluded = set(tickers_cfg.get("excluded") or ())
+    # No cross-check against "active"/"excluded": a no_buy entry is only a dated blocklist. A symbol in neither
+    # list is harmless (nothing buys it), and tying the block to the universe made a config that rewrites
+    # "active" (the planner and recommender tests do) abort every run instead of just dropping the entry.
     blocked = set()
     for symbol, entry in block.items():
         if not isinstance(symbol, str) or symbol != symbol.strip().upper() or not symbol:
             raise ValueError(f"tickers.json no_buy has a non-canonical symbol {symbol!r} (must be upper-case)")
-        if symbol not in active:
-            raise ValueError(f"tickers.json no_buy[{symbol!r}] must be listed in 'active' (it stays tracked)")
-        if symbol in excluded:
-            raise ValueError(f"tickers.json no_buy[{symbol!r}] is already in the permanent 'excluded' list")
         if not isinstance(entry, dict):
             raise ValueError(f"tickers.json no_buy[{symbol!r}] must be an object, got {type(entry).__name__}")
         missing = _NO_BUY_REQUIRED_KEYS - set(entry)

@@ -139,8 +139,6 @@ def test_empty_no_buy_block_blocks_nothing():
         ("until before blocked_on", {"AAA": _entry(blocked_on="2026-12-01", until="2026-11-01")}),
         ("released before blocked_on", {"AAA": _entry(released_on="2026-11-01")}),
         ("lowercase symbol", {"aaa": _entry()}),
-        ("symbol not in active", {"ZZZ": _entry()}),
-        ("symbol is permanently excluded", {"XXX": _entry()}),
     ],
 )
 def test_malformed_block_is_a_hard_error(label, no_buy):
@@ -185,3 +183,9 @@ def test_real_config_entries_start_unreleased_and_carry_a_reason():
         assert entry["released_on"] is None, f"{symbol} should start unreleased"
         assert entry["reason"].strip(), f"{symbol} needs a reason"
         assert entry["blocked_on"] == "2026-11-20"
+
+
+def test_a_symbol_outside_active_or_in_excluded_is_still_just_a_blocklist_entry():
+    # The block must not be tied to the universe: a config that rewrites "active" would otherwise abort the run.
+    cfg = _cfg(ZZZ=_entry(), XXX=_entry())
+    assert no_buy_blocked_tickers(cfg, date(2026, 12, 1)) == {"ZZZ", "XXX"}
