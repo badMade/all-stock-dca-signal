@@ -60,9 +60,15 @@ def _is_ticker(value: Any) -> bool:
 def _finite(value: Any, name: str, *, optional: bool = False) -> float | None:
     if value is None and optional:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
-    return float(value)
+    try:
+        numeric = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be a finite number")
+    return numeric
 
 
 def _json_copy(value: Any) -> Any:
@@ -114,12 +120,16 @@ class MarketSnapshot:
         if not isinstance(sides, dict):
             raise ValueError("quote_sides must be an object")
         for ticker, pair in sides.items():
-            if not _is_ticker(ticker) or (pair is not None and (
-                not isinstance(pair, list) or len(pair) != 2 or any(
-                    isinstance(side, bool) or not isinstance(side, (int, float)) or not math.isfinite(side)
-                    for side in pair
+            try:
+                bad_pair = pair is not None and (
+                    not isinstance(pair, list) or len(pair) != 2 or any(
+                        isinstance(side, bool) or not isinstance(side, (int, float)) or not math.isfinite(side)
+                        for side in pair
+                    )
                 )
-            )):
+            except OverflowError:
+                bad_pair = True
+            if not _is_ticker(ticker) or bad_pair:
                 raise ValueError("invalid quote_sides")
 
     def to_json(self) -> dict[str, Any]:
