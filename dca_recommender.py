@@ -14,6 +14,7 @@ import dca_risk
 import dca_runner
 from dca_market_sources import ET
 from dca_rec_models import (
+    MAX_CARRIED_UNIVERSE,
     SLOT_IDS,
     BrokerState,
     ExpectedPrice,
@@ -299,13 +300,20 @@ class RecommendationEngine:
             if planned_result.errors or planned_result.plan is None:
                 return EngineResult("ABORT", slot, None, None, tuple(error.code for error in planned_result.errors))
             orders_out = planned_result.plan["orders"]
+            sorted_tickers = tuple(sorted(set(config.tickers)))
+            carried_universe = sorted_tickers if len(sorted_tickers) <= MAX_CARRIED_UNIVERSE else None
             rec = RecommendationSet(day, instant, slot, snapshot.source, ladder,
                                    dca_order_plan.universe_hash(config.tickers),
                                    tuple(Recommendation(row["symbol"], row["notional_usd"], native_ref_id(slot, day.isoformat(), row["symbol"])) for row in orders_out),
                                    # Stamp the kill-switch state this set was sized under, so the backup can recheck
                                    # an above-1x set against spend that landed since (it cannot see multipliers).
                                    sizing_guard={"max_multiplier": max([1.0, *(float(row["multiplier"]) for row in orders_out)]),
-                                                 "deployed_7d_usd": float(deployed)})
+                                                 "deployed_7d_usd": float(deployed)},
+                                   # The day's buy list travels with the set (docs/adr-backup-planner-daily-universe.md)
+                                   # so the backup need not rely on a copy bundled at build time. Only when it fits the
+                                   # bound: a longer list (the live 122 until the daily run cuts it) leaves the set as it
+                                   # was, because a bound violation here would be a ValueError and abort the slot.
+                                   universe=carried_universe)
             expected = ExpectedPriceSet(day, instant, slot, deployed_source,
                                         tuple(ExpectedPrice(row["symbol"], row["decision_price"], row["prior_close"],
                                                             row["prior_low"], row["multiplier"], row["drop_pct"],

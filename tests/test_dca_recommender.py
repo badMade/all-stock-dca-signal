@@ -1,6 +1,7 @@
 """Recommendation parity for the primary's real signal and sizing chain."""
 
 import json
+import shutil
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
@@ -457,3 +458,75 @@ def test_order_bearing_artifact_without_deployment_amounts_falls_back_to_broker_
     assert engine._deployed([], now) == (0.0, "broker_history_fallback")
     assert not engine._orders_without_amounts({"orders_submitted_count": 0})
     assert not engine._orders_without_amounts({"orders_submitted_count": True})
+
+
+# --- the carried universe (docs/adr-backup-planner-daily-universe.md, piece 2) --------------------------------------
+# The set the Mac publishes carries the day's sorted buy list, so the backup planner need not rely on a copy bundled
+# at build time. It is carried only when the list fits the 100-name bound: the live list is 122 until the daily run
+# cuts it, and a list over the bound must leave the set exactly as before (never abort the recommendation).
+
+
+def _config_with_active_count(tmp_path, count, *, excluded=None):
+    """A copy of the real config whose tickers.json has ``count`` active names, the fixture tape's among them."""
+    source = dca_config.get_config_dir()
+    target = tmp_path / "config"
+    shutil.copytree(source, target)
+    document = json.loads((target / "tickers.json").read_text(encoding="utf-8"))
+    others = [t for t in document["active"] if t not in TAPE]
+    document["active"] = [*TAPE, *others[: count - len(TAPE)]]
+    if excluded is not None:
+        document["excluded"] = excluded
+    (target / "tickers.json").write_text(json.dumps(document), encoding="utf-8")
+    return target, sorted(document["active"])
+
+
+def _compute_1530(tmp_path, config_dir):
+    snapshot, now = _snapshot("1530")
+    result = RecommendationEngine(config_dir=config_dir, cron_root=tmp_path / "cron").compute(snapshot, _broker(), now)
+    assert result.status == "OK", result
+    return result.recommendations
+
+
+def test_a_list_within_the_bound_is_carried_sorted_and_matches_the_hash(tmp_path):
+    config_dir, active = _config_with_active_count(tmp_path, 60)
+    carried = _compute_1530(tmp_path, config_dir)
+    assert carried.universe == tuple(active)
+    assert carried.universe_hash == dca_order_plan.universe_hash(active)
+    assert all(item.ticker in carried.universe for item in carried.items)
+
+
+def test_exactly_100_names_is_carried_and_101_is_not(tmp_path):
+    at_bound, _ = _config_with_active_count(tmp_path / "a", 100)
+    over_bound, over_active = _config_with_active_count(tmp_path / "b", 101)
+    assert _compute_1530(tmp_path / "a", at_bound).universe is not None
+    over = _compute_1530(tmp_path / "b", over_bound)
+    assert over.universe is None  # not carried, and the recommendation still succeeds
+    assert over.universe_hash == dca_order_plan.universe_hash(over_active)  # the hash is unchanged behaviour
+
+
+def test_the_live_list_of_122_leaves_the_set_exactly_as_before(tmp_path):
+    carried = _compute_1530(tmp_path, dca_config.get_config_dir())
+    assert carried.universe is None and "universe" not in carried.to_json()
+
+
+def test_an_excluded_name_is_never_in_the_carried_universe(tmp_path):
+    config_dir, _ = _config_with_active_count(tmp_path, 60, excluded=["QBUT"])
+    assert "QBUT" not in _compute_1530(tmp_path, config_dir).universe
+
+
+def test_the_carried_list_follows_the_configuration_it_was_computed_under(tmp_path):
+    small, small_active = _config_with_active_count(tmp_path / "a", 40)
+    large, large_active = _config_with_active_count(tmp_path / "b", 70)
+    assert _compute_1530(tmp_path / "a", small).universe == tuple(small_active)
+    assert _compute_1530(tmp_path / "b", large).universe == tuple(large_active)
+
+
+def test_the_published_document_carries_the_list_and_still_parses(tmp_path):
+    from dca_rec_models import RecommendationSet
+    from dca_rec_publish import build_document
+
+    config_dir, active = _config_with_active_count(tmp_path, 60)
+    carried = _compute_1530(tmp_path, config_dir)
+    document = build_document({"1530": carried}, generated_at=carried.as_of)
+    assert document["slots"]["1530"]["universe"] == active
+    assert RecommendationSet.from_json(document["slots"]["1530"]) == carried

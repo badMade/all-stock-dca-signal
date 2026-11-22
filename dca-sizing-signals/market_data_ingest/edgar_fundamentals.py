@@ -35,6 +35,9 @@ _SOURCE = "SEC EDGAR companyfacts"
 # A fiscal quarter is 13 weeks (91 days), or 14 in a 53-week year; the 9-month YTD window
 # in the same 10-Q spans ~272 days, so this band cannot admit it.
 SINGLE_QUARTER_SPAN_DAYS = range(80, 101)
+# A fiscal year is 52 or 53 weeks (364 or 371 days) or a calendar year (365 or 366); the 9-month YTD window
+# (~273 days) and a quarter (~91) cannot fall in this band.
+ANNUAL_SPAN_DAYS = range(350, 381)
 
 
 @dataclass(frozen=True)
@@ -169,3 +172,39 @@ def fetch_point_in_time_facts(
 def select_single_quarter_facts(facts: list[PointInTimeFact]) -> list[PointInTimeFact]:
     """Keep only duration facts spanning one fiscal quarter, dropping YTD and annual windows."""
     return [f for f in facts if f.start is not None and (f.end - f.start).days in SINGLE_QUARTER_SPAN_DAYS]
+
+
+def select_annual_facts(facts: list[PointInTimeFact]) -> list[PointInTimeFact]:
+    """Keep only duration facts spanning a fiscal year, dropping quarters, YTD windows and instants."""
+    return [f for f in facts if f.start is not None and (f.end - f.start).days in ANNUAL_SPAN_DAYS]
+
+
+def first_filed_facts(facts: list[PointInTimeFact], *, as_of: date) -> list[PointInTimeFact]:
+    """One fact per reporting period: the value as FIRST reported, and only if public on ``as_of``.
+
+    A period is its ``(start, end)`` window (an instant has ``start=None``). EDGAR repeats a period in
+    every later filing that shows it as a comparative column, and again whenever it is restated, so a
+    company's facts hold many copies. Only copies with ``filed <= as_of`` count (inclusive: it was public
+    that day); of those the earliest ``filed`` wins, an original form beating an amendment (``10-K/A``)
+    filed the same day, then the lowest accession number, so input order never matters. A period first
+    filed after ``as_of`` is simply absent: no later copy may stand in for it, since that value was not
+    known yet (lookahead bias). Output is ordered by ``(end, start)``, oldest period first.
+    """
+    best: dict[tuple[date | None, date], PointInTimeFact] = {}
+    for fact in facts:
+        if fact.filed > as_of:
+            continue
+        key = (fact.start, fact.end)
+        current = best.get(key)
+        if current is None or _first_filed_rank(fact) < _first_filed_rank(current):
+            best[key] = fact
+    return sorted(best.values(), key=lambda f: (f.end, f.start or date.min))
+
+
+def _first_filed_rank(fact: PointInTimeFact) -> tuple[date, bool, str]:
+    return (fact.filed, fact.form.endswith("/A"), fact.accn)
+
+
+def latest_fact(facts: list[PointInTimeFact]) -> PointInTimeFact | None:
+    """The fact whose period ends last, or None for no facts."""
+    return max(facts, key=lambda f: f.end, default=None)
