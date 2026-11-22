@@ -59,6 +59,7 @@ MARKETS = ("open", "closed")
 # The signal's repository comes from config/slot_status.json "repository": a separate PUBLIC data-only repository,
 # because badMade/all-stock-dca is private and an unauthenticated raw read of it returns 404 (found 2026-10-31).
 _REPOSITORY = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+_BRANCH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 # The branch publisher force-pushes a one-file tree: sharing the recommendations branch would erase
 # recommendations.json. main and claude/** are refused by the publisher itself (they trigger CI).
 _RESERVED_BRANCHES = {"recommendations"}
@@ -77,8 +78,12 @@ def state_path() -> Path:
 
 def raw_url(branch: str, repository: str) -> str:
     """Where a cloud reader fetches the published document (the public signal repository, never the trading one)."""
-    if not _REPOSITORY.fullmatch(repository or "") or ".." in repository:
+    if (not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository)
+            or ".." in repository or repository.endswith("/.")):
         raise ValueError("repository must look like owner/name")
+    if (not isinstance(branch, str) or not _BRANCH.fullmatch(branch)
+            or ".." in branch or any(seg == "." for seg in branch.split("/"))):
+        raise ValueError("branch must be a plain ref name without traversal or URL metacharacters")
     return f"https://raw.githubusercontent.com/{repository}/{branch}/{FILENAME}"
 
 
@@ -100,7 +105,8 @@ def _empty(day: str) -> dict[str, Any]:
 def _load(day: str) -> dict[str, Any]:
     """Today's local document, or a fresh one. A corrupt or foreign file is replaced, never trusted."""
     try:
-        document = json.loads(state_path().read_text(encoding="utf-8"))
+        raw_text = state_path().read_text(encoding="utf-8")
+        document = json.loads(raw_text, object_pairs_hook=dca_config._reject_duplicate_keys)
     except (OSError, ValueError):
         return _empty(day)
     if (not isinstance(document, dict) or document.get("schema") != SCHEMA or document.get("trading_day") != day
@@ -217,7 +223,7 @@ def _local_document() -> tuple[dict[str, Any], str] | None:
     """The recorded document and its hash, or None when it is missing or not a valid slot-status document."""
     try:
         text = state_path().read_text(encoding="utf-8")
-        document = json.loads(text)
+        document = json.loads(text, object_pairs_hook=dca_config._reject_duplicate_keys)
     except (OSError, ValueError):
         return None
     if (not isinstance(document, dict) or document.get("schema") != SCHEMA
@@ -257,7 +263,7 @@ def publish_local(publisher: Any) -> tuple[int, dict[str, Any]]:
 
 def load_settings(config_dir: Path | None = None) -> dict[str, Any]:
     path = (config_dir or dca_config.get_config_dir()) / "slot_status.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=dca_config._reject_duplicate_keys)
 
 
 def publisher_from_settings(settings: Mapping[str, Any], *, repo_dir: str | Path) -> GitHubBranchPublisher | None:
