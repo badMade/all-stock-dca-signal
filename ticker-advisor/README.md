@@ -160,6 +160,51 @@ the number of names changed per day is unlimited (`UNLIMITED_SWAPS`). The input 
 90-name floor and 100-name cap are unchanged. The default `UniverseConfig()` keeps the quarterly
 behaviour exactly as before.
 
+### Price-derived inputs (`price_factors.py`)
+
+`price_factors.load_price_history` reads the daily price archive's CSV (the shape of the repo's sample
+`historical_stock_data.csv`) into ascending bars per ticker. Exact duplicate rows collapse and conflicting ones are
+refused. `price_factors.price_inputs(bars, as_of=...)` returns 6- and 12-month momentum that skips the latest month,
+one-year volatility, the 60-session median dollar volume, history length, last price and the count of trailing
+sessions below the minimum price, using only bars on or before `as_of`. A figure it cannot compute is `None` with a
+flag. A split-like one-day move blanks momentum and volatility (`possible_unadjusted_split`). Pure stdlib.
+
+### Ranking inputs (`universe_inputs.py`)
+
+`universe_inputs.load_snapshot` validates the fundamentals snapshot file (kind, schema version, content hash).
+`build_ranking_inputs(snapshot, price_inputs, pinned=..., exchange_by_symbol=...)` returns the engine's `Candidate`,
+`FactorInputs` and `TickerStatus` records plus a reason for every name left out. Profitability is gross profit over
+assets (revenue minus cost of revenue as a fallback); value is book-to-price (equity over shares times price).
+Pinned names are removed. Fractional eligibility is not checked: pair it with
+`PoolThresholds(require_fractional_eligible=False)`.
+
+### The daily ranking run (`daily_ranking.py`, propose-only)
+
+`daily_ranking.run_daily_ranking(snapshot=..., price_inputs=..., prior_active=..., pinned=..., ...)` ties the feed
+pieces to the engine and returns a proposal and a report (who enters and leaves, sector counts, who fails the pool
+floors, who could not be scored). `write_daily_outputs(directory, ranking)` writes `universe_proposal.json` and
+`ranking_report.json` atomically. It never writes `config/tickers.json`; `universe_apply` does that.
+
+Command line (propose-only, reads files, writes only into `--out-dir`):
+
+```bash
+python -m daily_ranking --snapshot snapshot.json --prices prices.csv --tickers-config config/tickers.json \
+    --exchanges exchanges.json --as-of 2026-11-20 --out-dir out/
+```
+
+Exit 0: the proposal passed the safeguards. Exit 1: it was rejected (files still written, the summary names the
+failures). Exit 2: bad input. The pool floors are options (`--min-price`, `--min-market-cap`, `--min-dollar-volume`,
+`--min-history`) with the ADR's values as defaults.
+
+### Pinned names
+
+`config/tickers.json`'s optional `pinned` array lists hand-held names (ETFs, funds, filers with no us-gaap
+facts) that cannot be scored. They stay in `active`, count toward the cap of 100, and are never ranked, added
+or dropped by the program. Run `select_universe` on the non-pinned pool with
+`UniverseConfig.strict_daily_top(100 - len(pinned))`, then `universe.apply_pinned(proposal, pinned)` BEFORE
+`apply_safeguards`. `dca_config.load_tickers` validates `pinned` (a subset of `active`, canonical symbols,
+no repeats, never excluded) and `universe_apply` refuses a proposal that drops a pinned name.
+
 ### Applying a proposal (`universe_apply.py`)
 
 `universe_apply.apply_proposal(proposal_path, tickers_path, history_path, approval_id=..., applied_on=...)`
