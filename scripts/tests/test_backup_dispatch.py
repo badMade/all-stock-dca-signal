@@ -353,3 +353,23 @@ def test_a_malformed_activity_time_falls_back_to_the_heartbeat_probe():
     probe = _probe("off", True)
     bd.decide(day=DAY, slot="0935", now=_at("09:51"), calendar=CALENDAR, probe=probe, already_sent=False)
     assert probe.calls == [(DAY, "0935")]
+
+
+def test_duplicate_keys_are_rejected_in_settings_and_local_slot_status(tmp_path):
+    (tmp_path / "backup_dispatch.json").write_text('{"mode": "shadow", "mode": "live"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key"):
+        bd.load_settings(tmp_path)
+
+    slot_status.state_dir().mkdir(parents=True, exist_ok=True)
+    slot_status.state_path().write_text(
+        f'{{"schema": "{slot_status.SCHEMA}", "trading_day": "{DAY}", '
+        f'"slots": {{"0935": {{"status": "succeeded"}}, "0935": {{"status": "failed"}}}}}}',
+        encoding="utf-8",
+    )
+    assert bd._local_entry(DAY, "0935") == {}
+
+
+def test_boolean_check_after_minutes_is_rejected_in_cli(monkeypatch, capsys):
+    monkeypatch.setattr(bd, "load_settings", lambda: {"mode": "shadow", "check_after_minutes": True})
+    assert bd.main(["run", "--now", "2026-10-29T09:51:00-04:00"]) == 2
+    assert json.loads(capsys.readouterr().out) == {"action": "error", "detail": "ValueError"}
