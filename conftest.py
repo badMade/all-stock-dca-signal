@@ -255,3 +255,19 @@ if TYPE_CHECKING:
     ) -> pd.DataFrame: ...
 
     def write_ticker_csv(history_dir: Path, ticker: str, frame: pd.DataFrame) -> Path: ...
+
+
+@pytest.fixture(autouse=True)
+def _pin_no_buy_clock_outside_every_window(monkeypatch):
+    """Pin dca_config's "today" past every dated ``no_buy`` window in config/tickers.json.
+
+    The shipped config pauses buys of tickers sold at a loss for a wash-sale window (docs/adr-no-buy-window.md).
+    Many tests build a config from the real universe and count its tickers or orders; without this they would
+    pass or fail depending on the host's date. Tests of the window itself pass explicit dates, or monkeypatch
+    ``dca_config._today_et`` again, which overrides this.
+    """
+    import datetime as _datetime
+
+    import dca_config
+
+    monkeypatch.setattr(dca_config, "_today_et", lambda: _datetime.date(2099, 1, 1))
