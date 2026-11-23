@@ -2,7 +2,7 @@
 
 Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; `--check` exits 1 when this copy is stale and `--impact <module>` lists everything that depends on a module. A workflow refreshes this file on every push to `main`.
 
-197 core modules, 618 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
+198 core modules, 620 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
 
 ## Most depended-on modules (change these with care)
 
@@ -10,7 +10,7 @@ Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; 
 | --- | ---: | --- |
 | `dca_paths` | 58 | `dca_alerts`, `dca_console`, `dca_console_alerts`, `dca_console_launch`, `dca_console_runs`, `dca_cumulative`, +52 more |
 | `dca_fileio` | 48 | `dca_alerts`, `dca_average_cost_snapshot`, `dca_console`, `dca_console_jobs`, `dca_console_launch`, `dca_cost_tracker`, +42 more |
-| `dca_config` | 44 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +38 more |
+| `dca_config` | 45 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +39 more |
 | `near_close_dca` | 32 | `dca_alerts`, `dca_config`, `dca_console_config`, `dca_console_jobs`, `dca_live_adapters`, `dca_market_graph`, +26 more |
 | `dca_runner` | 28 | `dca_console`, `dca_console_config`, `dca_console_data`, `dca_console_schedule`, `dca_console_state`, `dca_goal_progress`, +22 more |
 | `dca_console_reader` | 17 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_docs`, `dca_console_env`, `dca_console_launch`, +11 more |
@@ -71,6 +71,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.index_run_states_sqlite` | 204 | 0 |
 | `scripts.kill_switch_gap_proof` | 297 | 0 |
 | `scripts.local_ci_sweep` | 312 | 0 |
+| `scripts.no_buy_window` | 157 | 0 |
 | `scripts.order_refetch` | 68 | 0 |
 | `scripts.plan_first_slot` | 362 | 28 |
 | `scripts.planner_repaste_notice` | 238 | 2 |
@@ -115,7 +116,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_average_cost_snapshot` | 207 | 1 | 1 | 0 | `dca_fileio` |
 | `dca_bootstrap` | 220 | 0 | 2 | 0 | |
 | `dca_common` | 99 | 0 | 4 | 0 | |
-| `dca_config` | 1693 | 1 | 44 | 3 | `near_close_dca` |
+| `dca_config` | 1693 | 1 | 45 | 3 | `near_close_dca` |
 | `dca_console` | 1575 | 13 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_goals`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, +5 more |
 | `dca_console_alerts` | 650 | 12 | 1 | 0 | `dca_alerts`, `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_paths`, `dca_risk`, `scripts.alert_digest`, +4 more |
 | `dca_console_config` | 857 | 6 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_runner`, `near_close_dca` |
@@ -154,14 +155,14 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_market_graph` | 2233 | 7 | 1 | 0 | `dca_config`, `dca_fileio`, `dca_intraday_archive`, `dca_live_adapters`, `dca_paths`, `dca_ticker_paths`, `near_close_dca` |
 | `dca_market_history` | 296 | 7 | 3 | 0 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_market_sources`, `dca_rec_models`, `scripts.assemble_market_data`, `scripts.assemble_order_pages` |
 | `dca_market_sources` | 119 | 3 | 4 | 0 | `dca_config`, `dca_rec_models`, `scripts.assemble_market_data` |
-| `dca_net_utils` | 376 | 0 | 4 | 2 | |
+| `dca_net_utils` | 376 | 0 | 5 | 2 | |
 | `dca_notion_sync` | 103 | 1 | 2 | 0 | `dca_fileio` |
 | `dca_number_check` | 226 | 1 | 1 | 0 | `dca_order_plan` |
 | `dca_order_plan` | 1137 | 6 | 9 | 2 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_runner`, `near_close_dca`, `scripts.validate_native_placement` |
 | `dca_paths` | 219 | 1 | 58 | 1 | `dca_env` |
 | `dca_provenance` | 156 | 1 | 0 | 0 | `dca_fileio` |
 | `dca_rec_models` | 405 | 0 | 11 | 0 | |
-| `dca_rec_publish` | 265 | 1 | 3 | 0 | `dca_rec_models` |
+| `dca_rec_publish` | 265 | 2 | 3 | 0 | `dca_net_utils`, `dca_rec_models` |
 | `dca_rec_store` | 277 | 5 | 8 | 0 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_rec_models`, `scripts.validate_native_placement` |
 | `dca_recommender` | 323 | 16 | 2 | 0 | `dca_config`, `dca_market_sources`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_risk`, `dca_runner`, +8 more |
 | `dca_reporting` | 1259 | 6 | 2 | 2 | `dca_fileio`, `dca_paths`, `scripts.close_window_signal`, `scripts.foreground_primary`, `scripts.model_usage_log`, `scripts.run_classification` |
@@ -250,6 +251,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.local_heartbeat` | 331 | 5 | 1 | 1 | `dca_execution_router`, `dca_paths`, `scripts.file_lock`, `scripts.scheduler_lease`, `scripts.slot_status` |
 | `scripts.merge_order_pages` | 230 | 4 | 1 | 16 | `dca_config`, `dca_fileio`, `scripts.account_arg`, `scripts.assemble_order_pages` |
 | `scripts.model_usage_log` | 336 | 1 | 4 | 3 | `dca_paths` |
+| `scripts.no_buy_window` | 157 | 1 | 0 | 0 | `dca_config` |
 | `scripts.order_refetch` | 68 | 4 | 0 | 0 | `dca_runner`, `scripts.assemble_order_pages`, `scripts.backup_planner`, `scripts.broker_reconciliation` |
 | `scripts.plan_first_slot` | 362 | 8 | 0 | 28 | `dca_config`, `dca_market_history`, `dca_order_plan`, `dca_rec_models`, `dca_rec_store`, `dca_runner`, `scripts.assemble_order_pages`, `scripts.backup_planner` |
 | `scripts.planner_repaste_notice` | 238 | 2 | 0 | 2 | `scripts.planner_stamp_check`, `scripts.verify_perplexity_pair` |
