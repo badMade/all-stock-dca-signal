@@ -1080,11 +1080,6 @@ class StrategyConfig:
     # `excluded_tickers` are overlaid from "active"/"excluded" -- this is an
     # empty CLASS default only, not a statement that no ticker is enrolled.
     whole_share_tickers: frozenset[str] = frozenset()
-    # Dated wash-sale pauses in force for this run (config/tickers.json "no_buy", docs/adr-no-buy-window.md),
-    # overlaid by dca_config.load_tickers. Deliberately NOT folded into `tickers`/`excluded_tickers`: the
-    # universe, its stamped hash and its signals must not change. A listed ticker is still scored; only its
-    # BUY is vetoed, in _process_buy_candidate. Empty by default, so a bare StrategyConfig() blocks nothing.
-    no_buy_tickers: frozenset[str] = frozenset()
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
     decision_time_et: time = time(15, 30)  # matches the 3:30 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
@@ -9531,22 +9526,7 @@ def _write_csv(
         with atomic_open_w(path, newline="") as handle:
             csv.DictWriter(handle, fieldnames=list(empty_fieldnames)).writeheader()
         return
-    if fieldnames is not None:
-        resolved_fieldnames = list(fieldnames)
-    else:
-        # Row 0's keys first (stable column order), then any key a LATER row
-        # carries that row 0 lacks. A guarded same-day top-up run has the
-        # afternoon_*/prior_same_day_*/top_up_* keys only on rows whose guard
-        # ran, and row 0 is not always one of them (CI failure on PR #2395:
-        # test_cli_bare_defaults_to_demo ValueError). Rows missing a column
-        # get "" via DictWriter's default restval.
-        resolved_fieldnames = list(rows[0].keys())
-        seen = set(resolved_fieldnames)
-        for row in rows[1:]:
-            for key in row:
-                if key not in seen:
-                    seen.add(key)
-                    resolved_fieldnames.append(key)
+    resolved_fieldnames = list(fieldnames) if fieldnames is not None else list(rows[0].keys())
     with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=resolved_fieldnames)
         writer.writeheader()
@@ -22370,12 +22350,6 @@ def _process_buy_candidate(
     running_deployed_7d: float,
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
-    # Dated no_buy pause (wash-sale window after a tax-loss sale): the ladder still scored this ticker, so the
-    # signal row and the BUY decision are kept for tracking, but no order is built. Checked first so no later
-    # path (pending-credit flush, top-up, duplicate recovery) can place one either.
-    if ticker in ctx.config.no_buy_tickers:
-        logger.info("%s: inside a tickers.json no_buy window (wash-sale pause); no buy", ticker)
-        return ({"status": "skipped", "order_id": None, "skip_reason": "no_buy_window"}, None, running_deployed_7d, 0, 0)
     # A whole-share ticker (near_close_dca.WHOLE_SHARE_TICKERS) is never
     # bought through the normal dollar-amount pipeline below -- it always
     # blocks at the is_tradable_for_fractional_buy gate further down, and
