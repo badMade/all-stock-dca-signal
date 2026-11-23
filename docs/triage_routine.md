@@ -41,7 +41,7 @@ Anything that is not exactly `Approved` counts as not approved.
    finds a shell that can read them: a local checkout (the routine runs as a Mac task with the repo folder), else the
    `remote-devices` bridge at `$HOME/mnt/all-stock-dca`, as the live slot prompts do. There it runs
    `python -m scripts.triage_log_summary --json`, then `scripts.schedule_watchdog` and `scripts.alert_digest` (both
-   `--json`), and reads the newest `attempt_log` file. With neither shell the digest opens with `LOGS UNAVAILABLE in
+   `--json`), and reads the newest `attempt_log` file. It reads the watchdog's `error_slots` as well as `ok` (2026-11-19: the 13:30 slot ended `output_cap_exceeded` with complete evidence, so `verify_schedule_ok` stayed true), and the summary's `baseline_unused` flag (the slot aborted for unpersistable history although an earlier same-day baseline was usable, so the live routine prompt may lack the baseline chain). The digest runs `verify_schedule --orders-json` for order attribution. Executor slot tasks are cloud routines absent from the local scheduler, so `enabled` stays UNKNOWN and `lastRunAt` is evidence-derived (a lower bound). COMPLETE means STEPs 1-7 ran, the batch script counting for STEPs 2, 4 and 6; a missing order list or a batch error makes the run PARTIAL. With neither shell the digest opens with `LOGS UNAVAILABLE in
    this container` and carries on with GitHub and Notion only. That is not a clean bill of health.
    From the readable shell, the routine also gathers the resolved root using `dca_paths.cron_tracking_root()` and
    checks whether it is an existing directory and which stream subdirectories it contains. It passes those facts to
@@ -66,6 +66,11 @@ Anything that is not exactly `Approved` counts as not approved.
 7. **Digest.** The final message: counts, rows awaiting approval, Progress changes, approved rows, skipped items,
    the "Fix briefs" appendix, embedded instructions seen, and the closing line
    `No code, branches, PRs or comments were created by this run.`
+
+The batch also returns `unsupported_fixes`: the digest prints `unsupported_with_recorded_evidence` as
+“operator-recorded, not matched by text: confirm” and `unsupported_no_recorded_evidence` as
+“no PR, commit or issue recorded,” with Key, Status and Fix state. It also shows the other audit lists and
+`audit not run: <reason>` entries with counts taken from those lists, and never changes a row from this signal.
 
 ## Matching and Progress
 

@@ -57,6 +57,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
@@ -88,6 +89,7 @@ require_supported_python(sys.version_info)
 
 import dca_config  # noqa: E402  (every project import must follow the version guard)
 import dca_order_plan as dop  # noqa: E402
+import dca_runner  # noqa: E402
 from dca_number_check import plan_grounding_errors  # noqa: E402
 from dca_order_plan import PlanError, PlanResult  # noqa: E402
 from dca_paths import cron_tracking_root  # noqa: E402
@@ -704,6 +706,10 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
     if not isinstance(orders, list):
         return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
     seen: set[str] = set()
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses an ORDER for the symbol like an
+    # excluded one. Kept separate from `excluded` above, which also guards a carried universe: a blocked name stays
+    # in the universe (its hash and count do not change); only its BUY is refused.
+    order_refused = excluded | set(config.no_buy_tickers)
     for order in orders:
         if not isinstance(order, dict) or set(order) != _PLAN_FIRST_ORDER_KEYS:
             errors.append(PlanError("schema_violation", "order must be an object with exactly the schema's fields"))
@@ -712,7 +718,7 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
         if not isinstance(symbol, str) or not dop._SYMBOL_RE.match(symbol):
             errors.append(PlanError("schema_violation", "order symbol is not a ticker"))
             continue
-        if symbol in excluded:
+        if symbol in order_refused:
             errors.append(PlanError("excluded_symbol", symbol))
         elif symbol not in active:
             errors.append(PlanError("unknown_symbol", symbol))
@@ -991,48 +997,39 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
 
 
 @contextlib.contextmanager
-def _carried_universe_in_force(carried: tuple[str, ...] | None):
-    """Make the day's carried list the ticker universe for EVERY config reader the gated path reaches.
+def _carried_config_dir(directory: Path, carried: tuple[str, ...] | None, bundled: Any):
+    """The config directory the gated generators read, with the day's carried list in force.
 
-    Piece 4b of docs/adr-backup-planner-daily-universe.md. The 15:30 engine and the stream CLI reload the strategy config
-    themselves (through names they imported, so patching ``dca_config`` alone would miss them), and a reader that kept
-    the bundled list could plan a name the program dropped. Every loader the path uses is wrapped for the duration of the
-    call; ``None`` (the bundled list governs) leaves all of them untouched.
+    No carried list yields ``directory`` untouched. Otherwise the list must sit inside the BUNDLED one: the live runner
+    freezes its own whitelist at import and per-ticker sizing must cover every name, so a carried name the bundled list
+    lacks is refused (``carried_name_unsupported``) instead of being planned. The generators read ``tickers.json`` from
+    disk and insist on ``dca_runner.CONFIG_DIR``, so a private copy with ``active`` narrowed to the carried list is
+    used, and ``dca_runner.CONFIG_DIR`` points at it for the length of the call. The copy holds the same bytes for
+    every other file, so calendar, ladder and calibration are unchanged.
     """
     if carried is None:
-        yield
+        yield directory
         return
-    targets = [(dca_config, "load_strategy_config"), (gbc, "load_strategy_config"),
-               (stream_candidates, "load_strategy_config")]
-    originals = [(module, name, getattr(module, name)) for module, name in targets]
-    real = dca_config.load_strategy_config
-
-    def load_with_carried(*args: Any, **kwargs: Any) -> Any:
-        return dataclasses.replace(real(*args, **kwargs), tickers=carried)
-
-    try:
-        for module, name, _ in originals:
-            setattr(module, name, load_with_carried)
-        yield
-    finally:
-        for module, name, original in originals:
-            setattr(module, name, original)
+    outside = sorted(set(carried) - set(bundled.tickers))
+    if outside:
+        raise _Refused(*(PlanError("carried_name_unsupported", symbol) for symbol in outside))
+    previous = dca_runner.CONFIG_DIR
+    with tempfile.TemporaryDirectory(prefix="backup-day-config-") as scratch:
+        copy = Path(scratch) / "config"
+        shutil.copytree(directory, copy)
+        document = json.loads((copy / "tickers.json").read_bytes())
+        document["active"] = list(carried)
+        if "pinned" in document:
+            document["pinned"] = [t for t in document["pinned"] if t in set(carried)]
+        (copy / "tickers.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        dca_runner.CONFIG_DIR = copy
+        try:
+            yield copy
+        finally:
+            dca_runner.CONFIG_DIR = previous
 
 
 def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
-    """Run ``_compute_gated`` under the day's carried list (piece 4b), then stamp the list onto the plan."""
-    try:
-        base = dca_config.load_strategy_config(args.config_dir if args.config_dir is not None else dca_config.get_config_dir())
-        carried = _day_universe(args.published, args.slot, base)
-    except _Refused as refusal:
-        return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(refusal.errors)}, 2)
-    if carried is None:
-        return _compute_gated(args, trading_day, None)
-    with _carried_universe_in_force(carried):
-        return _compute_gated(args, trading_day, carried)
-
-
-def _compute_gated(args: argparse.Namespace, trading_day: date, carried: tuple[str, ...] | None) -> int:
     """The safety gate: the primary's own Gate 5 decides what to buy, the plan only carries it out.
 
     Nothing is sized here. The slot's own generator (the 15:30 engine, or the stream CLI path for the six
@@ -1049,7 +1046,17 @@ def _compute_gated(args: argparse.Namespace, trading_day: date, carried: tuple[s
     history = _load_history(args.orders_pages, trading_day, week_last4)
     deployed = _parse_deployed(args.deployed_last_7d_usd, history, now)
     payload = _load_market_data(args.market_data)
-    directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
+    base = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
+    bundled = dca_config.load_strategy_config(base)
+    carried = _day_universe(args.published, args.slot, bundled)
+    with _carried_config_dir(base, carried, bundled) as directory:
+        return _gated_plan(args, trading_day, now, buying_power, week_last4, history, deployed, payload, directory, carried)
+
+
+def _gated_plan(args: argparse.Namespace, trading_day: date, now: datetime, buying_power: Any, week_last4: Any,
+                history: Any, deployed: float, payload: dict[str, Any], directory: Path,
+                carried: tuple[str, ...] | None) -> int:
+    """The gate's Gate 5 decisions wrapped in a capped plan, reading the (possibly day-narrowed) ``directory``."""
     extra: dict[str, Any] = {}
     if week_last4 is not None:
         # A week envelope cannot prove the days before Monday, so the kill switch is treated as engaged (module note
@@ -1066,7 +1073,7 @@ def _compute_gated(args: argparse.Namespace, trading_day: date, carried: tuple[s
         if args.slot == "1530":
             decisions = _decisions_final_buy(payload, config, directory, trading_day, deployed, covered)
         else:
-            decisions = _decisions_stream(args.slot, payload, directory, trading_day, deployed, covered, carried)
+            decisions = _decisions_stream(args.slot, payload, directory, trading_day, deployed, covered)
     except ValueError as exc:
         # Type name only: the message can carry untrusted payload content (a source name, a path).
         raise _Refused(PlanError("market_data_invalid", type(exc).__name__)) from exc
@@ -1123,22 +1130,13 @@ def _decisions_final_buy(payload: dict[str, Any], config: Any, directory: Path, 
 
 
 def _decisions_stream(slot: str, payload: dict[str, Any], directory: Path, trading_day: date,
-                      deployed: float, covered: list[str], carried: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+                      deployed: float, covered: list[str]) -> list[dict[str, Any]]:
     """An executor-class slot: the primary's own stream CLI path, run on the payload, and its ``cands`` BUY rows.
 
     The empty ``finance`` placeholder the assembler writes is dropped (these slots score Robinhood); a non-empty one is
     left in so the stream CLI refuses it exactly as it refuses an unsupported source.
     """
     spec = backup_stream_specs.stream_spec(slot)
-    if carried is not None:
-        # The stream CLI loads its config through the spec's own loader (not a name patched above), so the day's list
-        # is put in force there: a name the program dropped must not stay scoreable on the bundled list.
-        base_loader = spec.config_loader
-
-        def loader_with_carried(*args: Any, **kwargs: Any) -> Any:
-            return dataclasses.replace(base_loader(*args, **kwargs), tickers=carried)
-
-        spec = dataclasses.replace(spec, config_loader=loader_with_carried)
     sources = {name: block for name, block in payload["sources"].items() if not (name == "finance" and block == {})}
     ticker_errors = {name: errs for name, errs in (payload.get("ticker_errors") or {}).items() if name == "robinhood" or errs}
     stream_payload = {"sources": sources, "source_errors": payload.get("source_errors", []), "ticker_errors": ticker_errors}
@@ -1544,7 +1542,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Trailing-7-day deployment for the kill switch, or 'auto' to derive it from --orders-pages. "
                               "Required with --market-data.")
     compute.add_argument("--published", type=Path, default=None,
-                         help="The published recommendations payload; its set gives the day's list.")
+                         help="Quotes path: the published recommendations payload; its set gives the day's list.")
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
