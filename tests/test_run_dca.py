@@ -8586,3 +8586,22 @@ def test_parse_raw_json_rejects_duplicate_keys(tmp_path):
     assert error is not None
     assert isinstance(error, ValueError)
     assert "duplicate key" in str(error).lower()
+
+
+def test_write_csv_unions_headers_when_later_row_has_extra_keys(tmp_path):
+    """Regression: row 0 lacking guard-only keys must not crash _write_csv.
+
+    A guarded same-day top-up run puts afternoon_*/top_up_* keys only on rows
+    whose guard ran; a header derived from row 0 alone raised ValueError.
+    """
+    import csv
+
+    from near_close_dca import _write_csv
+
+    path = tmp_path / "buy_candidates.csv"
+    _write_csv(path, [{"ticker": "A"}, {"ticker": "B", "top_up_skipped": True}])
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert list(rows[0].keys()) == ["ticker", "top_up_skipped"]
+    assert rows[0]["top_up_skipped"] == ""
+    assert rows[1]["top_up_skipped"] == "True"
