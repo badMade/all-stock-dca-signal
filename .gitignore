@@ -140,3 +140,7 @@ data/staging/
 # agent PR conflicted with main on it (PR #2033 hit it twice in one day; #1926 had to
 # remove a stray pr_description.txt). PR text belongs in the PR body, not the tree.
 /pr_description.*
+autoresearch.jsonl
+autoresearch.md
+autoresearch.ideas.md
+run.log

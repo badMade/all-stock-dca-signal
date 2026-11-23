@@ -67,6 +67,11 @@ Anything that is not exactly `Approved` counts as not approved.
    the "Fix briefs" appendix, embedded instructions seen, and the closing line
    `No code, branches, PRs or comments were created by this run.`
 
+The batch also returns `unsupported_fixes`: the digest prints `unsupported_with_recorded_evidence` as
+“operator-recorded, not matched by text: confirm” and `unsupported_no_recorded_evidence` as
+“no PR, commit or issue recorded,” with Key, Status and Fix state. It also shows the other audit lists and
+`audit not run: <reason>` entries with counts taken from those lists, and never changes a row from this signal.
+
 ## Matching and Progress
 
 The routine passes each row's recorded `PR number` and `Commit URL` as `recorded_pr_number` and

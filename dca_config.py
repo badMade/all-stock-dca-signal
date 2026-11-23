@@ -21,7 +21,8 @@ import re
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from near_close_dca import WHOLE_SHARE_TICKERS, StrategyConfig
 
@@ -202,7 +203,90 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return data
 
 
-def load_tickers(config_dir: Path) -> Dict[str, Any]:
+# --- dated no_buy window (tax-loss harvest / wash-sale pause) --------------------------------
+# A ticker sold at a realized loss must not be re-bought for the wash-sale window (docs/adr-tax-loss-sale.md,
+# docs/adr-no-buy-window.md). Unlike the permanent "excluded" list ("no buying mechanism at all"), a no_buy
+# entry is dated, stays in "active" (so history, sizing and the fetch universe keep covering it), and can be
+# released early. Fail closed: a malformed block raises instead of being skipped, because a skipped entry
+# silently re-opens buying a ticker the operator believes is blocked.
+_NO_BUY_REQUIRED_KEYS = frozenset({"blocked_on", "until", "reason"})
+_NO_BUY_OPTIONAL_KEYS = frozenset({"released_on", "release_reason"})
+_NO_BUY_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NO_BUY_ET = ZoneInfo("America/New_York")
+
+
+def _today_et() -> date:
+    """Today's date in US Eastern (the market's calendar); a seam so tests can pin the clock."""
+    return datetime.now(_NO_BUY_ET).date()
+
+
+def _no_buy_date(value: object, *, symbol: str, field: str) -> date:
+    """Parse one strict ``YYYY-MM-DD`` no_buy date, raising a ``no_buy``-tagged ``ValueError``."""
+    # Strict on purpose: date.fromisoformat also accepts compact digit-only forms on 3.11+, and a bare int is
+    # a typo for a date, not a date.
+    if not isinstance(value, str) or not _NO_BUY_DATE_PATTERN.match(value):
+        raise ValueError(f"tickers.json no_buy[{symbol!r}].{field} must be a YYYY-MM-DD string, got {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"tickers.json no_buy[{symbol!r}].{field} is not a real date: {value!r}") from exc
+
+
+def no_buy_blocked_tickers(tickers_cfg: Mapping[str, Any], on: date) -> frozenset:
+    """Return the tickers whose buys are blocked on ``on`` by tickers.json's ``no_buy`` block.
+
+    A symbol is blocked when ``blocked_on <= on <= until`` (both ends inclusive) and it has not been
+    released: ``released_on`` (set by ``scripts/no_buy_window.py release``) unblocks it from that date on.
+    The entry is never deleted by a release, so the history of what was blocked and when stays in the file.
+
+    Raises:
+        ValueError: any malformed block or entry (not an object, bad or impossible date, ``until`` or
+            ``released_on`` before ``blocked_on``, missing field, empty reason, unknown field, a symbol
+            symbol that is not upper-case). The message always names
+            ``no_buy``. One bad entry fails the whole call.
+    """
+    block = tickers_cfg.get("no_buy")
+    if block is None:
+        return frozenset()
+    if not isinstance(block, dict):
+        raise ValueError(f"tickers.json no_buy must be an object keyed by symbol, got {type(block).__name__}")
+    # No cross-check against "active"/"excluded": a no_buy entry is only a dated blocklist. A symbol in neither
+    # list is harmless (nothing buys it), and tying the block to the universe made a config that rewrites
+    # "active" (the planner and recommender tests do) abort every run instead of just dropping the entry.
+    blocked = set()
+    for symbol, entry in block.items():
+        if not isinstance(symbol, str) or symbol != symbol.strip().upper() or not symbol:
+            raise ValueError(f"tickers.json no_buy has a non-canonical symbol {symbol!r} (must be upper-case)")
+        if not isinstance(entry, dict):
+            raise ValueError(f"tickers.json no_buy[{symbol!r}] must be an object, got {type(entry).__name__}")
+        missing = _NO_BUY_REQUIRED_KEYS - set(entry)
+        unknown = set(entry) - _NO_BUY_REQUIRED_KEYS - _NO_BUY_OPTIONAL_KEYS
+        if missing or unknown:
+            raise ValueError(
+                f"tickers.json no_buy[{symbol!r}] has missing field(s) {sorted(missing)} "
+                f"and unknown field(s) {sorted(unknown)}"
+            )
+        reason = entry["reason"]
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"tickers.json no_buy[{symbol!r}].reason must be a non-empty string")
+        blocked_on = _no_buy_date(entry["blocked_on"], symbol=symbol, field="blocked_on")
+        until = _no_buy_date(entry["until"], symbol=symbol, field="until")
+        if until < blocked_on:
+            raise ValueError(f"tickers.json no_buy[{symbol!r}].until {until} is before blocked_on {blocked_on}")
+        released_raw = entry.get("released_on")
+        released_on = (
+            None if released_raw is None else _no_buy_date(released_raw, symbol=symbol, field="released_on")
+        )
+        if released_on is not None and released_on < blocked_on:
+            raise ValueError(
+                f"tickers.json no_buy[{symbol!r}].released_on {released_on} is before blocked_on {blocked_on}"
+            )
+        if blocked_on <= on <= until and (released_on is None or on < released_on):
+            blocked.add(symbol)
+    return frozenset(blocked)
+
+
+def load_tickers(config_dir: Path, today: Optional[date] = None) -> Dict[str, Any]:
     """Return ``{'tickers': (...), 'excluded_tickers': frozenset(...),
     'whole_share_tickers': frozenset(...)}`` from tickers.json.
 
@@ -213,6 +297,11 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
     whole-share order instead of the normal dollar-amount one. Overlaid from
     tickers.json's ``"whole_share"`` array exactly like ``"active"``/
     ``"excluded"`` overlay ``tickers``/``excluded_tickers``.
+
+    ``today`` (default: today's date in US Eastern) decides which dated ``no_buy`` entries are in force. Those
+    symbols come back as ``no_buy_tickers`` (present only when non-empty) and ``tickers``/``excluded_tickers``
+    are left alone, so the universe, its stamps and its signals are unchanged; each entry point vetoes the BUY
+    itself. See ``no_buy_blocked_tickers`` and ``docs/adr-no-buy-window.md``.
     """
     data = _read_json(config_dir / "tickers.json")
     if data is None:
@@ -248,6 +337,28 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
                 f"tickers.json's 'whole_share' field contains invalid ticker symbol(s): {invalid_whole_share!r}"
             )
         out["whole_share_tickers"] = frozenset(str(t) for t in whole_share)
+    pinned = data.get("pinned")
+    if pinned is not None:
+        # Hand-held names the daily ranking never adds, ranks or drops (docs/fundamentals_feed_scope.md).
+        # Rejected outright when malformed, like "whole_share" above: a quietly ignored pinned list would
+        # let the program drop a name the operator meant to keep. It is a SUBSET of active (so it adds no
+        # fourth category to the partition below) and can never be an excluded name.
+        if not isinstance(pinned, list):
+            raise ValueError(f"tickers.json's 'pinned' field must be a list, got {type(pinned).__name__}")
+        invalid_pinned = [
+            item for item in pinned if not isinstance(item, str) or not _WHOLE_SHARE_SYMBOL_PATTERN.match(item)
+        ]
+        if invalid_pinned:
+            raise ValueError(f"tickers.json's 'pinned' field contains invalid ticker symbol(s): {invalid_pinned!r}")
+        if len(set(pinned)) != len(pinned):
+            raise ValueError("tickers.json's 'pinned' field repeats a symbol")
+        active_set = set(out.get("tickers", ()))
+        not_active = sorted(set(pinned) - active_set)
+        if not_active:
+            raise ValueError(f"tickers.json's 'pinned' names are not in 'active': {not_active!r}")
+        pinned_and_excluded = sorted(set(pinned) & set(out.get("excluded_tickers", ())))
+        if pinned_and_excluded:
+            raise ValueError(f"tickers.json's 'pinned' names are also excluded: {pinned_and_excluded!r}")
     # active/excluded/whole_share are a THREE-WAY DISJOINT partition of the
     # universe (see docs/whole_share_accumulation.md) -- a symbol in more
     # than one category leaves near_close_dca._run_once_impl's ticker-list
@@ -304,6 +415,13 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
             f"tickers.json's active/excluded/whole_share categories must be pairwise disjoint "
             f"(case-insensitive): {details}"
         )
+    # Dated no_buy pauses (wash-sale windows) are NOT folded into "tickers"/"excluded_tickers": doing so
+    # shrinks the universe every downstream tool derives from them (the backup planner's stamped universe hash
+    # and symbol count, the committed Perplexity prompts, the payload publisher's coverage) and stops the
+    # ticker being scored. The blocked set is surfaced on its own and vetoed at BUY time by each entry point.
+    no_buy_now = no_buy_blocked_tickers(data, today if today is not None else _today_et())
+    if no_buy_now:
+        out["no_buy_tickers"] = no_buy_now
     return out
 
 
@@ -1256,7 +1374,10 @@ def load_strategy_config(
         )
 
     merged: Dict[str, Any] = {}
-    merged.update(load_tickers(config_dir))
+    # The run's own clock decides which no_buy entries are in force (a replayed or injected `now` must see the
+    # window as of THAT date, not the host's); naive datetimes are taken as already Eastern, matching the runs.
+    no_buy_today = None if now is None else (now.date() if now.tzinfo is None else now.astimezone(_NO_BUY_ET).date())
+    merged.update(load_tickers(config_dir, today=no_buy_today))
     merged.update(load_budgets(config_dir))
     merged.update(load_sizing_tiers(config_dir))
     merged.update(load_per_ticker_sizing(config_dir))

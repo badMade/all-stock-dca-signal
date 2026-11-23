@@ -1834,7 +1834,9 @@ def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     for fractional/notional buys either). "excluded" carries QBUT, excluded
     2026-09-18 after Robinhood returned not-found for it on every live run
     (see config/tickers.json's exclusion_reasons.QBUT)."""
-    loaded = load_tickers(get_config_dir())
+    # today pinned past every dated no_buy window: this test is about the PERMANENT excluded list, and the
+    # no_buy overlay (tests/test_no_buy_enforcement.py) would otherwise make it depend on the host clock.
+    loaded = load_tickers(get_config_dir(), today=date(2027, 1, 1))
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
     assert loaded["excluded_tickers"] == frozenset({"QBUT", "KVUE"})
     for whole_share in ("BYDDY", "RVII"):
@@ -2250,6 +2252,39 @@ def test_per_ticker_sizing_loader_exposes_linear_interpolation_flag(tmp_path):
     assert loaded["SMOOTH"]["interpolate"] is True
     assert loaded["STEPPED"]["interpolate"] is False
     assert loaded["ODD"]["interpolate"] is False  # anything but "linear" fails safe to the stepped lookup
+
+
+# --- pinned: the hand-held list of buy-list names the daily ranking never adds or removes ---------------
+# docs/fundamentals_feed_scope.md (operator-approved 2026-11-19): ETFs, funds and filers with no
+# us-gaap facts cannot be scored, so a hand-held `pinned` array keeps them in `active` outside the
+# ranking. `pinned` is a SUBSET of `active`, not a fourth category: it never overlaps excluded.
+
+
+def test_load_tickers_accepts_a_pinned_subset_of_active(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL", "QQQ"], "excluded": [], "pinned": ["QQQ"]})
+    assert load_tickers(tmp_path)["tickers"] == ("AAPL", "QQQ")
+
+
+def test_load_tickers_without_a_pinned_key_is_unchanged(tmp_path):
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": []})
+    assert load_tickers(tmp_path)["tickers"] == ("AAPL",)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"active": ["AAPL"], "pinned": "AAPL"}, id="not_a_list"),
+        pytest.param({"active": ["AAPL"], "pinned": ["aapl"]}, id="lowercase_symbol"),
+        pytest.param({"active": ["AAPL"], "pinned": [7]}, id="non_string_entry"),
+        pytest.param({"active": ["AAPL", "QQQ"], "pinned": ["QQQ", "QQQ"]}, id="duplicate_entry"),
+        pytest.param({"active": ["AAPL"], "pinned": ["QQQ"]}, id="pinned_name_not_in_active"),
+        pytest.param({"active": ["AAPL"], "excluded": ["QBUT"], "pinned": ["QBUT"]}, id="pinned_name_is_excluded"),
+    ],
+)
+def test_load_tickers_rejects_a_malformed_pinned_list(tmp_path, document):
+    _write(tmp_path, "tickers.json", document)
+    with pytest.raises(ValueError, match="pinned"):
+        load_tickers(tmp_path)
 
 
 @pytest.mark.parametrize("bad_value", [10**400, "10.0"])

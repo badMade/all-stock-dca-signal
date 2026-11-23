@@ -78,6 +78,16 @@ def test_steps(monkeypatch):
     assert len(called) >= 5
 
 
+def test_step_4_installs_pinned_requirements_dev(monkeypatch):
+    """Regression test for S:CI-02: step_4 must install from pinned requirements-dev.txt."""
+    called = []
+    monkeypatch.setattr(self_heal, "run_cmd", lambda cmd: called.append(cmd))
+
+    self_heal.step_4()
+
+    assert called == [[sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]]
+
+
 def test_main_success_on_step(monkeypatch):
     statuses = ["", "M file.py", "M file.py"]
     call_count = [0]

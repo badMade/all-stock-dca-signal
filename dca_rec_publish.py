@@ -26,6 +26,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
+from dca_net_utils import (
+    BlockedFileHandler,
+    BlockedFTPHandler,
+    PinnedHTTPHandler,
+    PinnedHTTPSHandler,
+    UnsafeDestinationError,
+    assert_safe_destination,
+)
 from dca_rec_models import SLOT_IDS, RecommendationSet
 
 NOTION_API = "https://api.notion.com/v1"
@@ -33,7 +41,9 @@ NOTION_VERSION = "2022-06-28"
 # Notion caps one rich-text object at 2,000 characters and a block at 100 of them.
 _NOTION_CHUNK = 2000
 _NOTION_MAX_CHUNKS = 100
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # Cap Notion API response reads against unbounded memory use.
 _KEYCHAIN_SERVICE = re.compile(r"^[A-Za-z0-9._-]+$")
+_BLOCK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # git's regular-file tree mode, written as an octal literal: the bare six-digit string trips the
 # account-number invariant (tests/test_config_invariants.py), which scans every tracked file.
 _REGULAR_FILE_MODE = f"{0o100644:o}"
@@ -89,17 +99,40 @@ def keychain_secret(service: str, account: str, *, runner: Callable[..., Any] = 
 Transport = Callable[[str, str, dict[str, str], bytes], tuple[int, bytes]]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects so Authorization headers cannot be forwarded or pivoted."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def urllib_transport(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, bytes]:
     if not isinstance(url, str) or not url.lower().startswith("https://"):
         raise OSError("transport failed (UnsafeURL)")
-    request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
+    # Validate destination IPs and pin connections against SSRF / DNS rebinding; refuse
+    # redirects so Notion Bearer tokens are never forwarded to another host.
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 - https scheme enforced above
-            return response.status, response.read()
+        assert_safe_destination(url)
+    except UnsafeDestinationError:
+        raise OSError("transport failed (UnsafeURL)") from None
+    request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
+    opener = urllib.request.build_opener(
+        _NoRedirectHandler,
+        PinnedHTTPHandler,
+        PinnedHTTPSHandler,
+        BlockedFileHandler,
+        BlockedFTPHandler,
+    )
+    try:
+        with opener.open(request, timeout=20) as response:  # noqa: S310 - https + assert_safe_destination enforced above
+            status, data = response.status, response.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         return exc.code, b""  # the body can echo the request; keep only the status
     except Exception as exc:  # noqa: BLE001 - any transport fault is one sanitized publish failure
         raise OSError(f"transport failed ({type(exc).__name__})") from None
+    if len(data) > _MAX_RESPONSE_BYTES:
+        raise OSError("transport failed (ResponseTooLarge)")
+    return status, data
 
 
 class NotionPublisher:
@@ -147,7 +180,10 @@ class NotionPublisher:
                 status, _ = self._call("PATCH", f"/blocks/{self.page_id}/children", token,
                                        {"children": [{"object": "block", "type": "code", "code": code}]})
             else:
-                status, _ = self._call("PATCH", f"/blocks/{block['id']}", token, {"code": code})
+                block_id = block.get("id")
+                if not isinstance(block_id, str) or not _BLOCK_ID.fullmatch(block_id):
+                    return PublishResult(self.channel, False, "list children returned invalid block id")
+                status, _ = self._call("PATCH", f"/blocks/{block_id}", token, {"code": code})
         except OSError as exc:
             return PublishResult(self.channel, False, str(exc))
         if status != 200:
