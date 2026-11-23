@@ -16,40 +16,22 @@ Owner rules: tests first, wait for approval before implementing; no em dashes; a
 and links back to the originating chat session.
 
 ## Done (committed on this branch)
-- `dca-sizing-signals/tests/ledger/test_budget_exhaustion_opportunity.py`, revision 2: 31 tests, the spec.
-  All fail only because `load_global_ladder` etc. do not exist yet (red on purpose).
-  Revision 1 (22 tests, approved 2026-11-23) priced every deep dip as a flat $4 "Tier B" buy.
-  The repo's ladder is a 1x-8x log-scaled ladder on drop vs prior close (config/sizing_ladder.json),
-  times a $2 base strictly below the prior low or a $1 base below the close only
-  (dca_ladder_core.select_base_usd), so revision 2 uses the ladder's own planned dollars.
-  It also folds in the owner's answers: count both dip kinds, run at all four caps.
-- `claude/markov-extensions.md`: the six Markov ideas split into two categories, with build order.
+- Spec revision 2 (31 tests), operator-approved 2026-11-23, and its implementation
+  `dca-sizing-signals/market_data_ingest/ledger/opportunity.py`: all 31 pass, full sibling suite
+  green (1420 passed). This is the GLOBAL-ladder estimate plus the point-in-time extract.
+- `docs/adr-budget-exhaustion-replay.md` (proposed): the faithful replay the operator asked for.
+  Per-ticker ladders, ML nudge, inverse-Martingale suppression, kill switch and the same-day top-up
+  guard are computed by calling `near_close_dca`'s own functions from `scripts/`, never copied.
+- `claude/markov-extensions.md`: the six Markov ideas in two categories, with build order.
 
-## Next step (only after the owner approves revision 2)
-Create `dca-sizing-signals/market_data_ingest/ledger/opportunity.py` with:
+## Decided (operator, 2026-11-23)
+- Run at all four daily caps; count both dip kinds; report is a CLI only.
+- No global-ladder-only shortcut for the final number: per-ticker ladders must be replayed.
 
-    load_global_ladder(config_dir) -> GlobalLadder        # .planned_usd(price, *, prior_close, prior_low)
-    load_daily_caps(config_dir) -> tuple[float, ...]       # budgets.json budget_tiers daily_cap_usd
-    budget_exhaustion_opportunity(ledger, *, known_at, daily_cap_usd, ladder) -> dict
-    budget_exhaustion_opportunity_all_caps(ledger, *, known_at, config_dir=None) -> list[dict]
-
-Contract the tests pin:
-- Ladder mirrors dca_ladder_core: largest `min_drop_pct` <= drop wins, raw float compare, no epsilon;
-  base $2 only when price < prior low (strict), $1 when below close only, nothing at or above close.
-  Global ladder only: per-ticker calibration, ML nudge and kill-switch cap are not replayed.
-- Reads `fills_known_at(known_at)` (scheduled only; drop any order id tagged manual in any visible
-  version, same rule as `scheduled_outcomes`), `intraday_quotes` with `as_of <= known_at`, and the
-  prior session's close and low from `bars_known_at(known_at)`.
-- `spent_before` = scheduled fill notional for that session with `filled_at` strictly before the
-  quote `ts`, summed across all tickers. Event when `daily_cap_usd - spent_before < planned_usd`.
-- No prior bar: skip and count. Bad cap (incl. bool) or naive `known_at`: `ValueError`.
-  Missing config file: `FileNotFoundError`. Never writes.
-- Report keys: `daily_cap_usd`, `known_at`, `ladder` ("global"), `sessions_observed`,
-  `quotes_considered`, `sessions_with_event`, `skipped_no_prior_bar`, `events`, and
-  `by_tier` -> {`below_low`, `below_close_only`} -> {`sessions_with_event`, `events`}.
-
-Then run `budget_exhaustion_opportunity_all_caps` on the real ledger DuckDB on the Mac and report
-`sessions_with_event / sessions_observed` per cap and per dip kind.
+## Next step
+1. Get the owner's answers to the six open questions in `docs/adr-budget-exhaustion-replay.md`.
+2. Then, test-first (tests wait for approval): the replay in `scripts/budget_exhaustion_replay.py`
+   and its CLI. Run it on the Mac (it needs the cron tracking artifact tree and the ledger DuckDB).
 
 ## Checks
     (cd dca-sizing-signals && python -m pytest tests/ledger/test_budget_exhaustion_opportunity.py -q)
@@ -58,8 +40,7 @@ Then run `budget_exhaustion_opportunity_all_caps` on the real ledger DuckDB on t
     scripts/local_ci.sh --changed
 
 ## Open questions for the owner
-1. Approve revision 2 (31 tests)? (Revision 1 approved; answers: all four caps, both dip kinds.)
-2. Where does the report live: CLI under `dca-sizing-signals`, a console page, or both?
+See section 7 of `docs/adr-budget-exhaustion-replay.md`.
 
 ## Known limits
 - The day's budget tier is not stored in the ledger, so the cap is a caller parameter.
