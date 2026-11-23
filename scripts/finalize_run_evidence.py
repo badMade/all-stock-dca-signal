@@ -252,12 +252,22 @@ def _load_json(path: Optional[str], kind: type, label: str) -> Any:
     if path is None:
         return None
     try:
-        value = json.loads(Path(path).read_bytes())
+        # Reject duplicate keys so parameter pollution cannot override order status or budget caps.
+        value = json.loads(Path(path).read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise FinalizeRefused(f"{label} {path!r} is not readable JSON: {exc}") from exc
     if not isinstance(value, kind) or (kind is list and not all(isinstance(row, dict) for row in value)):
         raise FinalizeRefused(f"{label} must be a JSON {'array of objects' if kind is list else 'object'}")
     return value
+
+
+def _is_finite_num(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _load_inline_or_file_json(value: Optional[str], label: str) -> Any:
@@ -313,7 +323,7 @@ def validate_orders(orders: Optional[List[Dict[str, Any]]]) -> None:
                 f"order row {index} ({ticker}) status {status!r} is not a placed or in-flight "
                 f"order; expected one of {sorted(ORDER_ATTEMPT_STATUSES)}"
             )
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+        if not _is_finite_num(amount) or amount <= 0:
             raise FinalizeRefused(
                 f"order row {index} ({ticker}) submitted_amount_usd {amount!r} is not a positive number"
             )
@@ -338,7 +348,7 @@ def validate_budget(budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         raise FinalizeRefused(f"--budget-json budget_tier {tier!r} is not one of {list(BUDGET_TIERS)}")
     for key in ("daily_cap_usd", "weekly_cap_usd"):
         value = budget.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        if not _is_finite_num(value) or value < 0:
             raise FinalizeRefused(f"--budget-json {key} {value!r} is not a non-negative number")
     return normalized
 
@@ -384,10 +394,10 @@ def check_code_version_pin(code_version: Optional[Dict[str, Any]], env: Mapping[
     environment, outside the repo (scripts/cloud_preflight.py). Where it is
     unset (a local or non-cloud run) there is nothing to bind to.
     """
-    pin = env.get(PINNED_SHA_ENV) or ""
-    if code_version is None or not pin or not isinstance(code_version, dict):
+    pin = (env.get(PINNED_SHA_ENV) or "").strip()
+    if not pin:
         return
-    if code_version.get("git_sha") != pin:
+    if not isinstance(code_version, dict) or code_version.get("git_sha") != pin:
         raise FinalizeRefused(f"--code-version-json git_sha is not the pinned release named by {PINNED_SHA_ENV}")
 
 
@@ -401,7 +411,7 @@ def _merge_code_version(run_dir: Path, state: Dict[str, Any], code_version: Dict
     summary_path = run_dir / "run_summary.json"
     if summary_path.is_file():
         try:
-            summary = json.loads(summary_path.read_bytes())
+            summary = json.loads(summary_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
         except (OSError, ValueError):
             summary = None
         if isinstance(summary, dict):
@@ -917,7 +927,7 @@ def _finalize_locked(
     existing = None
     if state_path.is_file():
         try:
-            loaded = json.loads(state_path.read_bytes())
+            loaded = json.loads(state_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
             existing = loaded if isinstance(loaded, dict) else None
         except (OSError, ValueError):
             existing = None
