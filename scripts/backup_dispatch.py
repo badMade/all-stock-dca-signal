@@ -38,9 +38,11 @@ from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import dca_config
+import dca_net_utils
 import dca_order_plan
 import dca_paths
 from dca_fileio import atomic_write_text
@@ -60,6 +62,14 @@ CLOUD_STALE_MINUTES = 20
 REPO = Path(__file__).resolve().parents[1]
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _SLOT = re.compile(r"\d{4}")
+_MAX_DOCUMENT_BYTES = 256 * 1024
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects so a remote signal host cannot redirect to internal targets."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 # -- slots, tasks and windows -----------------------------------------------------------------------------------------
@@ -177,7 +187,10 @@ def _local_entry(day: str, slot: str) -> dict[str, Any]:
     in_progress. An unreadable, foreign or older document gives {}, so the caller falls through to the probe.
     """
     try:
-        document = json.loads(slot_status.state_path().read_text(encoding="utf-8"))
+        document = json.loads(
+            slot_status.state_path().read_text(encoding="utf-8"),
+            object_pairs_hook=dca_config._reject_duplicate_keys,
+        )
     except (OSError, ValueError):
         return {}
     if not (isinstance(document, dict) and document.get("schema") == slot_status.SCHEMA
@@ -316,11 +329,14 @@ def dispatch(*, day: str, slot: str, now: datetime, mode: str, calendar: Mapping
 
 def load_settings(config_dir: Path | None = None) -> dict[str, Any]:
     path = (config_dir or dca_config.get_config_dir()) / "backup_dispatch.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=dca_config._reject_duplicate_keys)
 
 
 def _calendar() -> dict[str, Any]:
-    return json.loads((dca_config.get_config_dir() / "market_calendar.json").read_text(encoding="utf-8"))
+    return json.loads(
+        (dca_config.get_config_dir() / "market_calendar.json").read_text(encoding="utf-8"),
+        object_pairs_hook=dca_config._reject_duplicate_keys,
+    )
 
 
 def _probe(day: str, slot: str) -> dict:
@@ -339,10 +355,26 @@ def _notify(title: str, text: str) -> None:
 
 
 def _fetch_document(url: str) -> Any:
+    # Security: enforce HTTPS, block private/link-local SSRF & DNS rebinding, refuse redirects,
+    # cap response size, and reject duplicate JSON keys before parsing the signal payload.
     try:
-        with urllib.request.urlopen(url, timeout=20) as response:  # noqa: S310 - fixed https URL from config
-            return json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError):
+        if not isinstance(url, str) or urlsplit(url).scheme.lower() != "https":
+            return None
+        dca_net_utils.assert_safe_destination(url)
+        opener = urllib.request.build_opener(
+            _NoRedirectHandler,
+            dca_net_utils.PinnedHTTPHandler,
+            dca_net_utils.PinnedHTTPSHandler,
+            dca_net_utils.BlockedFileHandler,
+            dca_net_utils.BlockedFTPHandler,
+        )
+        request = urllib.request.Request(url, method="GET")
+        with opener.open(request, timeout=20) as response:  # noqa: S310 - HTTPS + assert_safe_destination enforced above
+            raw = response.read(_MAX_DOCUMENT_BYTES + 1)
+        if len(raw) > _MAX_DOCUMENT_BYTES:
+            return None
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=dca_config._reject_duplicate_keys)
+    except (OSError, ValueError, dca_net_utils.UnsafeDestinationError):
         return None
 
 
@@ -380,7 +412,13 @@ def main(argv: list[str] | None = None) -> int:
         mode = "shadow" if args.dry_run else settings["mode"]
         if mode not in MODES:
             raise ValueError("bad mode")
-        after = CLOUD_CHECK_AFTER_MINUTES if args.command == "cloud" else int(settings["check_after_minutes"])
+        if args.command == "cloud":
+            after = CLOUD_CHECK_AFTER_MINUTES
+        else:
+            raw_after = settings["check_after_minutes"]
+            if isinstance(raw_after, bool) or not isinstance(raw_after, int):
+                raise ValueError("bad check_after_minutes")
+            after = raw_after
         slot = due_slot(now, after)
         if slot is None:
             return _emit({"action": "skip", "reason": "no_slot_due", "slot": None}, 0)

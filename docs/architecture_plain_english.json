@@ -147,6 +147,7 @@
   "scripts.run_90day_prediction_experiment": "Runs a 90-trading-day forecasting experiment and scores it against what really happened.",
   "scripts.run_classification": "Keeps scheduled runs and manual runs apart so test or hand runs never count as live results.",
   "scripts.run_ledger": "One chronological record of scheduled runs, reruns, orders, fills and publishing.",
+  "scripts.no_buy_window": "Shows the dated list of tickers paused from buying after a tax-loss sale, and lets the owner release one early. A release inside the window must be confirmed and is recorded, never deleted.",
   "scripts.run_phase4_backtest": "A launcher for the Phase 4 backtest. It hands off to the all_stock_dca package.",
   "scripts.run_state_machine": "Tracks a run through its steps (pending, checked, decided, submitted, verified, published) and stops illegal jumps.",
   "scripts.run_ticker_maintenance": "Runs the two daily maintenance jobs: updating price history, then recalculating each ticker's triggers.",
