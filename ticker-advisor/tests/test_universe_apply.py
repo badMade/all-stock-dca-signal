@@ -255,3 +255,46 @@ def test_a_failed_write_leaves_the_original_and_no_temp_files(workspace, monkeyp
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
         ["tickers.json", "ticker_history.csv", "universe_proposal.json"]
     )
+
+
+# --- pinned names: hand-held buy-list names the program must never remove ----------------------------------
+
+
+def with_pinned(tickers: Path, pinned: list[str]) -> None:
+    document = json.loads(tickers.read_text(encoding="utf-8"))
+    document["pinned"] = pinned
+    tickers.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def test_refuses_a_proposal_that_drops_a_pinned_name(workspace):
+    tmp_path, tickers, history, prior = workspace
+    with_pinned(tickers, [prior[0]])
+    assert_refused_and_unchanged(
+        "drops_pinned_name", tmp_path, tickers, history, make_proposal(prior, prior[1:] + names(1, start=100)),
+    )
+
+
+def test_applies_a_proposal_that_keeps_every_pinned_name(workspace):
+    tmp_path, tickers, history, prior = workspace
+    with_pinned(tickers, [prior[0], prior[1]])
+    result = apply(tmp_path, tickers, history, make_proposal(prior, prior[:2] + prior[3:] + names(1, start=100)))
+    assert result.applied is True
+    document = json.loads(tickers.read_text(encoding="utf-8"))
+    assert document["pinned"] == [prior[0], prior[1]]  # the hand-held list is never rewritten
+    assert prior[0] in document["active"] and prior[1] in document["active"]
+
+
+def test_a_tickers_file_without_a_pinned_key_behaves_as_before(workspace):
+    tmp_path, tickers, history, prior = workspace
+    result = apply(tmp_path, tickers, history, make_proposal(prior, prior[1:] + names(1, start=100)))
+    assert result.applied is True
+
+
+def test_a_malformed_pinned_key_in_tickers_json_is_refused(workspace):
+    tmp_path, tickers, history, prior = workspace
+    document = json.loads(tickers.read_text(encoding="utf-8"))
+    document["pinned"] = "not a list"
+    tickers.write_text(json.dumps(document), encoding="utf-8")
+    assert_refused_and_unchanged(
+        "unreadable_tickers", tmp_path, tickers, history, make_proposal(prior, prior[1:] + names(1, start=100)),
+    )

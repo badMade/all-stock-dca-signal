@@ -51,7 +51,7 @@ HURDLE_BONUS = 5.0
 BAND_EDGES = (10, 25, 50, 100, 200)  # rank bands used by the movement summary
 
 # Deliberately no "held" column: the long-term log is pure market data. Holdings live in inputs/holdings.json only.
-HISTORY_FIELDS = ["date", "ticker", "score", "rank", "universe_size", "vol", "max_dd"]
+HISTORY_FIELDS = ["date", "ticker", "score", "rank", "universe_size", "vol", "max_dd", "eligible"]
 
 # The daily trade list: everything above the evaluate threshold, plus holdings above the held threshold.
 # The ``reason`` column carries the only trace of holdings (held names between the two thresholds).
@@ -70,6 +70,13 @@ DEFAULT_PARAMS = {
     # Share of the final score taken from each forward-looking model's percentile. ZERO = shadow mode: the signal is
     # logged and measured (shadow_octopus_history.csv) but cannot change the score or the list.
     "forward_weights": {"octopus": 0.0, "ml": 0.0},
+    # Liquidity hygiene, applied only with --universe archive. Everything is still ranked; names that fail are flagged
+    # ``eligible = 0`` and cannot enter the buy list (held names keep their held-floor rule). Percentiles are computed
+    # against the ELIGIBLE pool so thousands of illiquid names do not stretch the scale. Floors follow the pool in
+    # docs/adr-dynamic-universe.md (price > $5, 60-day MEDIAN dollar volume > $20M). That ADR also asks for market cap
+    # > $2B, fractional eligibility and 252 days of history; this tool has no market-cap or tradability feed, so those
+    # are not applied here (risk stats already need ~120 bars).
+    "liquidity": {"min_median_dollar_volume": 20_000_000.0, "min_price": 5.0, "window": 60},
 }
 SHADOW_FIELDS = ["origin_date", "ticker", "exp_ret", "p10_ret", "p90_ret", "expected_target_date", "fwd_pct", "model"]
 FORWARD_SIGNALS = ("octopus", "ml")
@@ -85,7 +92,7 @@ def load_params(path=None):
     if path.exists():
         raw = json.loads(path.read_text(encoding="utf-8"))
         for key, value in raw.items():
-            if key in ("period_weights", "blend", "forward_weights"):
+            if key in ("period_weights", "blend", "forward_weights", "liquidity"):
                 params[key].update(value)
             elif key in params:
                 params[key] = value
@@ -98,6 +105,9 @@ def load_params(path=None):
     if set(fw) != set(FORWARD_SIGNALS) or any(w < 0 for w in fw.values()) or sum(fw.values()) > 1.0:
         raise ValueError("forward_weights must cover " + ", ".join(FORWARD_SIGNALS)
                          + " with weights >= 0 summing to <= 1")
+    liq = params["liquidity"]
+    if liq["min_median_dollar_volume"] < 0 or liq["min_price"] < 0 or int(liq["window"]) < 1:
+        raise ValueError("liquidity floors must be >= 0 and window >= 1")
     if params["held_threshold"] > params["evaluate_threshold"]:
         raise ValueError("held_threshold must not exceed evaluate_threshold")
     return params
@@ -109,13 +119,21 @@ def load_params(path=None):
 class Series:
     """Sorted (date, adjusted close) pairs with bisect lookups."""
 
-    def __init__(self, points):
+    def __init__(self, points, liquidity=None):
         merged = {}
         for day, value in points:
             if value is not None and value > 0 and math.isfinite(value):
                 merged[day] = value
         self.dates = sorted(merged)
         self.values = [merged[d] for d in self.dates]
+        self.liquidity = liquidity or {}  # {date: (raw close, dollar volume)}; empty when the source has no volume
+
+    def liquidity_stats(self, window):
+        """(median dollar volume, last raw close) over the last ``window`` bars that carry volume, else None."""
+        bars = [self.liquidity[d] for d in self.dates[-window:] if d in self.liquidity]
+        if not bars:
+            return None
+        return statistics.median(dv for _, dv in bars), bars[-1][0]
 
     def __len__(self):
         return len(self.dates)
@@ -144,14 +162,16 @@ class Series:
         clipped = Series([])
         clipped.dates = self.dates[:idx]
         clipped.values = self.values[:idx]
+        clipped.liquidity = self.liquidity
         return clipped
 
 
 def _parse_day(text):
     try:
-        return dt.date.fromisoformat(str(text)[:10])
+        day = dt.date.fromisoformat(str(text)[:10])
     except ValueError:
         return None
+    return day if day.year >= 1900 else None  # a yearless "04-27" can parse as year 1 in some archive files
 
 
 def load_archive_series(archive_dir, ticker):
@@ -159,7 +179,7 @@ def load_archive_series(archive_dir, ticker):
     path = Path(archive_dir) / f"{ticker.replace('.', '-')}.csv"
     if not path.exists():
         return None
-    points = []
+    points, liquidity = [], {}
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             day = _parse_day(row.get("Date", ""))
@@ -169,7 +189,13 @@ def load_archive_series(archive_dir, ticker):
                 continue
             if day is not None:
                 points.append((day, value))
-    return Series(points) if points else None
+                try:  # raw close x share volume: adjusted closes would understate old dollar volume
+                    close, volume = float(row.get("Close", "")), float(row.get("Volume", ""))
+                    if close > 0 and volume >= 0 and math.isfinite(close * volume):
+                        liquidity[day] = (close, close * volume)
+                except (TypeError, ValueError):
+                    pass
+    return Series(points, liquidity) if points else None
 
 
 def load_ext_series(ext_prices, ticker):
@@ -217,14 +243,47 @@ def period_score(percentile, total_return, period, params=None):
     return share * percentile + (1.0 - share) * return_score(ann, p["return_score_cap"]) + bonus
 
 
-def percentiles(values):
-    """{key: 100 * (1 - (rank - 1) / (n - 1))} with rank 1 = largest value, ties share the best rank."""
-    n = len(values)
-    negated = sorted(-v for v in values.values())  # ascending, so bisect_left counts strictly larger values
+def percentiles(values, reference=None):
+    """{key: 100 * (1 - (rank - 1) / (n - 1))} with rank 1 = largest value, ties share the best rank.
+
+    With ``reference`` (a list of values) each key is ranked against that pool instead of ``values`` itself and the
+    result is clamped to 0..100; used to place ineligible names on the eligible pool's scale.
+    """
+    pool = list(values.values()) if reference is None else list(reference)
+    n = len(pool)
+    negated = sorted(-v for v in pool)  # ascending, so bisect_left counts strictly larger values
     out = {}
     for key, value in values.items():
         rank = bisect.bisect_left(negated, -value) + 1
-        out[key] = 100.0 if n == 1 else 100.0 * (1.0 - (rank - 1) / (n - 1))
+        pct = 100.0 if n <= 1 else 100.0 * (1.0 - (rank - 1) / (n - 1))
+        out[key] = min(max(pct, 0.0), 100.0)
+    return out
+
+
+def pooled_percentiles(values, eligible):
+    """Percentiles computed on the eligible names only; ineligible names are ranked against that pool."""
+    pool = {k: v for k, v in values.items() if eligible.get(k, True)}
+    rest = {k: v for k, v in values.items() if k not in pool}
+    if not pool or not rest:
+        return percentiles(values)
+    out = percentiles(pool)
+    out.update(percentiles(rest, reference=list(pool.values())))
+    return out
+
+
+def liquidity_flags(series_by_ticker, liquidity):
+    """{ticker: (eligible, median dollar volume or None)}. ``liquidity`` None disables the filter (all eligible).
+
+    A series with no volume data (e.g. external bars) cannot prove liquidity, so it is ineligible when the filter is on.
+    """
+    out = {}
+    for ticker, series in series_by_ticker.items():
+        stats = series.liquidity_stats(int(liquidity["window"])) if liquidity else None
+        if not liquidity:
+            out[ticker] = (True, stats[0] if stats else None)
+        else:
+            ok = bool(stats) and stats[0] >= liquidity["min_median_dollar_volume"] and stats[1] >= liquidity["min_price"]
+            out[ticker] = (ok, stats[0] if stats else None)
     return out
 
 
@@ -260,7 +319,7 @@ def apply_forward(historical, signals, weights):
     return (1.0 - sum(used.values())) * historical + sum(w * signals[k] for k, w in used.items())
 
 
-def score_universe(series_by_ticker, as_of, params=None, forward=None):
+def score_universe(series_by_ticker, as_of, params=None, forward=None, liquidity=None):
     """Return {ticker: record} for every ticker with a 1y return and risk stats."""
     params = params or DEFAULT_PARAMS
     weights, blend = params["period_weights"], params["blend"]
@@ -268,13 +327,15 @@ def score_universe(series_by_ticker, as_of, params=None, forward=None):
     fresh = {t: s for t, s in clipped.items() if len(s) and s.last_date >= as_of - dt.timedelta(days=STALE_DAYS)}
     returns = {t: period_returns(s, as_of) for t, s in fresh.items()}
     risk = {t: r for t, r in ((t, risk_stats(s, as_of)) for t, s in fresh.items()) if r}
+    flags = liquidity_flags(fresh, liquidity)
+    elig = {t: ok for t, (ok, _) in flags.items()}
 
     pct = {}
     for period in PERIOD_ORDER:
         pool = {t: r[period] for t, r in returns.items() if period in r}
-        pct[period] = percentiles(pool) if pool else {}
-    low_vol = percentiles({t: -r[0] for t, r in risk.items()}) if risk else {}
-    low_dd = percentiles({t: r[1] for t, r in risk.items()}) if risk else {}
+        pct[period] = pooled_percentiles(pool, elig) if pool else {}
+    low_vol = pooled_percentiles({t: -r[0] for t, r in risk.items()}, elig) if risk else {}
+    low_dd = pooled_percentiles({t: r[1] for t, r in risk.items()}, elig) if risk else {}
 
     records = {}
     for ticker, rets in returns.items():
@@ -299,10 +360,14 @@ def score_universe(series_by_ticker, as_of, params=None, forward=None):
             "max_dd": risk[ticker][1],
             "returns": rets,
             "periods": len(rets),
+            "eligible": elig[ticker],
+            "adv": flags[ticker][1],
         }
     ranked = sorted(records, key=lambda t: (-records[t]["score"], t))
     for position, ticker in enumerate(ranked, 1):
         records[ticker]["rank"] = position
+    for position, ticker in enumerate((t for t in ranked if records[t]["eligible"]), 1):
+        records[ticker]["elig_rank"] = position
     return records, sorted(set(series_by_ticker) - set(records))
 
 
@@ -334,6 +399,7 @@ def upsert_history(path, run_date, records):
                 "universe_size": str(size),
                 "vol": f"{rec['vol']:.4f}",
                 "max_dd": f"{rec['max_dd']:.4f}",
+                "eligible": "1" if rec.get("eligible", True) else "0",
             }
         )
     rows.sort(key=lambda r: (r["date"], int(r["rank"])))
@@ -455,6 +521,8 @@ def build_trade_list(records, held, params):
     out = []
     for ticker in sorted(records, key=lambda t: records[t]["rank"]):
         score = records[ticker]["score"]
+        if score > hi and not records[ticker].get("eligible", True) and ticker not in held:
+            continue  # illiquid names are ranked but never enter the buy list; a held name keeps the rules below
         if score > hi:
             out.append((ticker, "above_eval_held" if ticker in held else "above_eval"))
         elif ticker in held and score > lo:
@@ -506,13 +574,30 @@ def render_proposal_md(proposal):
     return "\n".join(lines)
 
 
-def forward_returns(series_by_ticker, tickers, start, horizon):
-    """{ticker: return from start to start+horizon days} for tickers with bars on both ends."""
+DELISTED_GAP_DAYS = 30  # a series that stopped this long before the archive's newest bar is treated as delisted
+
+
+def forward_returns(series_by_ticker, tickers, start, horizon, delist_loss=None, archive_end=None):
+    """{ticker: return from start to start+horizon days} for tickers with bars on both ends.
+
+    With ``delist_loss`` and ``archive_end`` a series whose last bar is more than DELISTED_GAP_DAYS older than the
+    archive's newest date, and that ended inside the window, is treated as delisted: its return is the last close over
+    the start close with ``delist_loss`` taken off (Shumway: about -30% for performance delistings). Without this,
+    names that vanished drop out of every forward pool and the grade is survivorship-biased upward. Cash acquisitions
+    look the same as failures here, so the fill is conservative for those.
+    """
     end = start + dt.timedelta(days=horizon)
     out = {}
     for t in tickers:
         s = series_by_ticker.get(t)
-        if not s or s.last_date < end:
+        if not s:
+            continue
+        if s.last_date < end:
+            delisted = (delist_loss is not None and archive_end is not None and s.last_date > start
+                        and (archive_end - s.last_date).days > DELISTED_GAP_DAYS)
+            a = s.value_at(start, max_gap=3) if delisted else None
+            if a:
+                out[t] = (s.last_value / a) * (1.0 - delist_loss) - 1.0
             continue
         a, b = s.value_at(start, max_gap=3), s.value_at(end, max_gap=3)
         if a and b:
@@ -536,6 +621,153 @@ def effectiveness(trade_rows, series_by_ticker, universe, horizon):
                         "universe_return": statistics.fmean(pool.values()),
                         "edge": statistics.fmean(listed.values()) - statistics.fmean(pool.values())})
     return results
+
+
+# ----------------------------------------------------------------------------------------------
+# Grading: does the ranking predict forward returns, and what does acting on it cost?
+# ----------------------------------------------------------------------------------------------
+GRADE_HORIZONS = (5, 20, 60)  # calendar days ahead
+DEFAULT_TOP_N = 100
+DEFAULT_COST_BPS = 20.0  # placeholder round-trip cost per replaced name; tune from real slippage, not evidence-backed
+
+
+def scores_from_history(rows):
+    """{date: {ticker: score}} and {date: {ticker, ...} eligible} from history.csv rows (blank eligible = eligible)."""
+    scores, eligible = {}, {}
+    for r in rows:
+        scores.setdefault(r["date"], {})[r["ticker"]] = float(r["score"])
+        if r.get("eligible", "") != "0":
+            eligible.setdefault(r["date"], set()).add(r["ticker"])
+    return scores, eligible
+
+
+def _top_set(scores, eligible, top_n, previous=None, hold_rank=None):
+    """The ``top_n`` best-scored eligible names. With ``hold_rank`` and a ``previous`` list, incumbents still ranked
+    within ``hold_rank`` stay and the best-ranked non-members fill the remaining slots (a buy/hold buffer in the style
+    of ``docs/adr-dynamic-universe.md``'s 75/150 rule; there is no separate entry rank because the list is always
+    refilled to ``top_n`` in rank order). A hold_rank of ``top_n`` or less is the plain top-N.
+    """
+    ranked = sorted((t for t in scores if eligible is None or t in eligible), key=lambda t: (-scores[t], t))
+    if not hold_rank or hold_rank <= top_n or not previous:
+        return set(ranked[:top_n])
+    keep = {t for t in ranked[:hold_rank] if t in previous}
+    chosen = set(keep)
+    for t in ranked:
+        if len(chosen) >= top_n:
+            break
+        chosen.add(t)
+    return chosen
+
+
+def _quintile_means(pairs):
+    """Mean forward return of each fifth of ``pairs`` (sorted ascending by score): Q1 = lowest score, Q5 = highest."""
+    n = len(pairs)
+    return [statistics.fmean(y for _, y in pairs[i * n // 5:(i + 1) * n // 5]) for i in range(5)]
+
+
+def grade_scores(scores_by_date, series_by_ticker, horizon, top_n=DEFAULT_TOP_N, cost_bps=DEFAULT_COST_BPS,
+                 eligible_by_date=None, min_names=30, delist_loss=None, hold_rank=None, non_overlap=False):
+    """Per-date grade of a ranking at one horizon: rank IC, quintile spread, top-N edge vs the eligible pool, and
+    turnover against the list ``horizon`` days earlier (a rebalance cadence of one horizon, so costs are not charged
+    once per overlapping daily sample). Equal-weighted; no market-cap data exists here for value weighting.
+    A date is graded only when its horizon has fully elapsed in the price data and at least ``min_names`` names have
+    a forward return.
+
+    ``non_overlap`` grades only dates at least one horizon after the previously graded one, so samples do not overlap
+    (the t-stat is then honest) and turnover is exactly the rebalance turnover. ``hold_rank`` applies the buy/hold
+    buffer of ``_top_set`` along that same date chain.
+    """
+    dates = sorted(scores_by_date)
+    if non_overlap:
+        picked = []
+        for d in dates:
+            if not picked or (dt.date.fromisoformat(d) - dt.date.fromisoformat(picked[-1])).days >= horizon:
+                picked.append(d)
+        dates = picked
+    archive_end = max((s.last_date for s in series_by_ticker.values() if s), default=None)
+    top_sets, previous = {}, None
+    for d in dates:
+        previous = top_sets[d] = _top_set(scores_by_date[d], (eligible_by_date or {}).get(d), top_n, previous, hold_rank)
+    rows = []
+    for day in dates:
+        scores = scores_by_date[day]
+        pool_names = (eligible_by_date or {}).get(day)
+        pool = [t for t in scores if pool_names is None or t in pool_names]
+        origin = dt.date.fromisoformat(day)
+        fwd = forward_returns(series_by_ticker, pool, origin, horizon, delist_loss, archive_end)
+        if len(fwd) < min_names:
+            continue
+        pairs = sorted(((scores[t], fwd[t]) for t in fwd), key=lambda p: p[0])
+        k = max(1, len(pairs) // 5)
+        top_names = [t for t in top_sets[day] if t in fwd]
+        if not top_names:
+            continue
+        pool_mean = statistics.fmean(fwd.values())
+        top_mean = statistics.fmean(fwd[t] for t in top_names)
+        prior = [d for d in dates if (dt.date.fromisoformat(day) - dt.date.fromisoformat(d)).days >= horizon]
+        turnover = None
+        if prior:
+            base = top_sets[prior[-1]]
+            turnover = 1.0 - len(base & top_sets[day]) / max(1, len(top_sets[day]))
+        edge = top_mean - pool_mean
+        ended = sum(1 for t in fwd if series_by_ticker[t].last_date < origin + dt.timedelta(days=horizon))
+        rows.append({"date": day, "n": len(pairs), "delisted": ended, "ic": spearman(pairs), "top_return": top_mean,
+                     "pool_return": pool_mean, "edge": edge,
+                     "spread": statistics.fmean(y for _, y in pairs[-k:]) - statistics.fmean(y for _, y in pairs[:k]),
+                     "quintiles": _quintile_means(pairs),
+                     "turnover": turnover,
+                     "net_edge": None if turnover is None else edge - turnover * cost_bps / 10000.0})
+    return rows
+
+
+def summarize_grade(rows):
+    """Mean / dispersion of the per-date grade. t-stats ignore overlap between daily samples, so they overstate
+    significance whenever the horizon exceeds one day; read them as a ranking aid, not a test."""
+    def col(key):
+        return [r[key] for r in rows if r[key] is not None]
+
+    ics = col("ic")
+    out = {"dates": len(rows), "mean_ic": None, "ic_std": None, "ic_positive_share": None, "ic_tstat": None}
+    if ics:
+        out["mean_ic"] = statistics.fmean(ics)
+        out["ic_positive_share"] = sum(1 for v in ics if v > 0) / len(ics)
+        if len(ics) > 1:
+            out["ic_std"] = statistics.stdev(ics)
+            if out["ic_std"] > 0:
+                out["ic_tstat"] = out["mean_ic"] / (out["ic_std"] / math.sqrt(len(ics)))
+    out["delisted_fills"] = sum(r.get("delisted", 0) for r in rows)
+    out["mean_quintiles"] = [statistics.fmean(r["quintiles"][i] for r in rows) for i in range(5)] if rows else None
+    for key in ("top_return", "pool_return", "edge", "spread", "turnover", "net_edge"):
+        values = col(key)
+        out[f"mean_{key}"] = statistics.fmean(values) if values else None
+    return out
+
+
+def render_grade(label, horizons_summary, top_n, cost_bps, hold_rank=None, non_overlap=False):
+    def f(v, pct=False, digits=3):
+        return "n/a" if v is None else (f"{v * 100:+.2f}%" if pct else f"{v:+.{digits}f}")
+
+    mode = (f", hold-rank {hold_rank}" if hold_rank else "") + (", non-overlapping dates" if non_overlap else "")
+    lines = [f"## {label}: top {top_n} eligible vs eligible pool (equal weight, cost {cost_bps:g} bps round trip{mode})", "",
+             "| Horizon | Dates | Mean IC | IC std | IC>0 | IC t* | Top-N | Pool | Edge | Q5-Q1 | Turnover | Net edge |",
+             "|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+    for horizon, sm in horizons_summary.items():
+        share = "n/a" if sm["ic_positive_share"] is None else f"{sm['ic_positive_share'] * 100:.0f}%"
+        turn = "n/a" if sm["mean_turnover"] is None else f"{sm['mean_turnover'] * 100:.0f}%"
+        lines.append(f"| {horizon}d | {sm['dates']} | {f(sm['mean_ic'])} | {f(sm['ic_std'])} | {share} | "
+                     f"{f(sm['ic_tstat'], digits=1)} | {f(sm['mean_top_return'], True)} | "
+                     f"{f(sm['mean_pool_return'], True)} | {f(sm['mean_edge'], True)} | {f(sm['mean_spread'], True)} | "
+                     f"{turn} | {f(sm['mean_net_edge'], True)} |")
+    fills = sum(sm.get("delisted_fills", 0) for sm in horizons_summary.values())
+    lines += ["", "Mean forward return by score quintile (Q1 = lowest score, Q5 = highest; whole eligible pool):", "",
+              "| Horizon | Q1 | Q2 | Q3 | Q4 | Q5 |", "|--:|--:|--:|--:|--:|--:|"]
+    for horizon, sm in horizons_summary.items():
+        qs = sm.get("mean_quintiles")
+        lines.append(f"| {horizon}d | " + (" | ".join(f(q, True) for q in qs) if qs else "n/a | n/a | n/a | n/a | n/a") + " |")
+    note = ("samples do not overlap (--non-overlap), so t is a fair guide." if non_overlap else
+            "t ignores overlap between daily samples (overstated for horizons above 1 day).")
+    lines += ["", f"*{note}", f"Delisting-loss fills used across all rows: {fills}.", ""]
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -808,7 +1040,7 @@ def render_evaluation_md(run_date, records, names, held, threshold, top, prev_da
 
 def write_ranked_csv(path, records, names, sectors, held):
     fields = ["rank", "ticker", "company", "sector", "held", "score", "base_score", "lowvol_pct", "lowdd_pct", "vol",
-              "max_dd"] + [f"ret_{p}" for p in PERIOD_ORDER]
+              "max_dd"] + [f"ret_{p}" for p in PERIOD_ORDER] + ["eligible", "elig_rank", "median_dollar_volume"]
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
@@ -819,6 +1051,8 @@ def write_ranked_csv(path, records, names, sectors, held):
                  f"{rec['score']:.3f}", f"{rec['base_score']:.3f}", f"{rec['lowvol_pct']:.1f}",
                  f"{rec['lowdd_pct']:.1f}", f"{rec['vol']:.4f}", f"{rec['max_dd']:.4f}"]
                 + [("" if p not in rec["returns"] else f"{rec['returns'][p]:.4f}") for p in PERIOD_ORDER]
+                + [int(rec.get("eligible", True)), rec.get("elig_rank", ""),
+                   "" if rec.get("adv") is None else f"{rec['adv']:.0f}"]
             )
 
 
@@ -863,10 +1097,10 @@ def _load_json(path, default):
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
 
-UNIVERSES = ("sp500", "all")
+UNIVERSES = ("sp500", "all", "archive")
 
 
-def build_universe(data_dir, mode="sp500"):
+def build_universe(data_dir, mode="sp500", archive_dir=None):
     """Tickers to score, the held set (flag only), and name / sector lookups.
 
     ``sp500`` (default, the current scope) scores only S&P 500 constituents; holdings that are not
@@ -884,7 +1118,12 @@ def build_universe(data_dir, mode="sp500"):
     sectors = {t: s for t, _, s in sp}
     names.update(holdings.get("names", {}))
     members = {t for t, _, _ in sp}
-    tickers = sorted(members if mode == "sp500" else members | held | watch)
+    if mode == "archive":
+        # every ticker with a price file; BRK-B style stems stay as stored, so held/S&P flags use the archive spelling
+        stems = {p.stem for p in Path(archive_dir).glob("*.csv")} if archive_dir else set()
+        tickers = sorted(stems | held | watch)
+    else:
+        tickers = sorted(members if mode == "sp500" else members | held | watch)
     return tickers, held, names, sectors
 
 
@@ -902,7 +1141,7 @@ def default_as_of(series):
 
 def prepare(args):
     data_dir = Path(args.data_dir)
-    tickers, held, names, sectors = build_universe(data_dir, args.universe)
+    tickers, held, names, sectors = build_universe(data_dir, args.universe, args.archive_dir)
     if not tickers:
         raise SystemExit("error: no universe; run ingest-sp500 first (inputs/sp500.json)")
     ext = _load_json(data_dir / "inputs" / "ext_prices.json", {})
@@ -928,7 +1167,8 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
     ml_runs = read_ml_runs(getattr(args, "ml_root", None) or default_ml_root())
     for ticker, pct in ml_percentiles(ml_runs, set(series), as_of).items():
         forward.setdefault(ticker, {})["ml"] = pct
-    records, unscored = score_universe(series, as_of, params, forward)
+    records, unscored = score_universe(series, as_of, params, forward,
+                                        params["liquidity"] if args.universe == "archive" else None)
     if not records:
         return None
     run_dir = data_dir / "runs" / as_of.isoformat()
@@ -968,10 +1208,11 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
                     "not_scored_or_stale": stale}, indent=2),
         encoding="utf-8",
     )
-    above = sum(1 for r in records.values() if r["score"] > args.threshold)
+    above = sum(1 for r in records.values() if r["score"] > args.threshold and r.get("eligible", True))
     summary = {"as_of": as_of.isoformat(), "universe": args.universe, "scored": len(records),
                "above_threshold": above, "threshold": args.threshold, "no_price_history": len(missing),
-               "not_scored_or_stale": len(stale), "trade_list": len(trade), "params_version": params["version"],
+               "not_scored_or_stale": len(stale), "eligible": sum(1 for r in records.values() if r.get("eligible", True)),
+               "trade_list": len(trade), "params_version": params["version"],
                "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"])}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # read by the console page
     return {**summary, "run_dir": str(run_dir)}
@@ -1093,6 +1334,90 @@ def cmd_effectiveness(args):
     return 0
 
 
+def read_scores_csv(path):
+    """{date: {ticker: score}} and eligibility from a generic ``date,ticker,score[,eligible]`` export (e.g. the
+    dynamic-universe scorer's ``universe_scores`` table)."""
+    return scores_from_history(read_history(path))
+
+
+def trading_days(series_by_ticker, start, end, min_share=0.5):
+    """Dates in [start, end] on which at least ``min_share`` of the series have a bar (weekends/holidays drop out)."""
+    counts = {}
+    for s in series_by_ticker.values():
+        lo, hi = bisect.bisect_left(s.dates, start), bisect.bisect_right(s.dates, end)
+        for day in s.dates[lo:hi]:
+            counts[day] = counts.get(day, 0) + 1
+    floor = min_share * len(series_by_ticker)
+    return sorted(d for d, c in counts.items() if c >= floor)
+
+
+def cmd_backfill_history(args):
+    """Point-in-time score history for grading: score every ``--step-days`` trading day from ``--start`` to ``--end``
+    using only bars up to that day and the same liquidity pool, and write ONE CSV (not the live history.csv and none
+    of the per-run outputs). Holds no forward model. Universe = today's archive tickers, so names that left the archive
+    are absent (survivorship); grade with --delist-loss to charge ones whose series ended early."""
+    tickers, held, names, sectors, series = prepare(args)
+    params = load_params(getattr(args, "params", None))
+    days = trading_days(series, dt.date.fromisoformat(args.start), dt.date.fromisoformat(args.end))
+    chosen, last = [], None
+    for day in days:
+        if last is None or (day - last).days >= args.step_days:
+            chosen.append(day)
+            last = day
+    liquidity = params["liquidity"] if args.universe == "archive" else None
+    rows = []
+    for day in chosen:
+        records, _ = score_universe(series, day, params, None, liquidity)
+        size = len(records)
+        for ticker, rec in records.items():
+            rows.append({"date": day.isoformat(), "ticker": ticker, "score": f"{rec['score']:.3f}",
+                         "rank": str(rec["rank"]), "universe_size": str(size), "vol": f"{rec['vol']:.4f}",
+                         "max_dd": f"{rec['max_dd']:.4f}", "eligible": "1" if rec["eligible"] else "0"})
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(json.dumps({"dates": len(chosen), "rows": len(rows), "out": str(out), "params_version": params["version"]}))
+    return 0
+
+
+def cmd_grade(args):
+    """Grade the composite score (history.csv) and optionally a second ranking at several horizons."""
+    _, _, _, _, series = prepare(args)
+    sources = []
+    history_path = Path(args.history) if args.history else Path(args.data_dir) / "history.csv"
+    scores, eligible = scores_from_history(read_history(history_path))
+    if scores:
+        sources.append(("composite_rank", scores, eligible))
+    for label_path in args.compare or []:
+        label, _, path = label_path.partition("=")
+        if not path:
+            raise SystemExit("error: --compare expects LABEL=PATH to a date,ticker,score[,eligible] CSV")
+        cmp_scores, cmp_elig = read_scores_csv(path)
+        sources.append((label, cmp_scores, cmp_elig))
+    if not sources:
+        print("no ranking history yet (history.csv is empty and no --compare given)")
+        return 0
+    report, payload = [], {}
+    for label, sc, el in sources:
+        summaries = {}
+        for horizon in args.horizons:
+            rows = grade_scores(sc, series, horizon, args.top_n, args.cost_bps, el, args.min_names,
+                               args.delist_loss, args.hold_rank, args.non_overlap)
+            summaries[horizon] = summarize_grade(rows)
+        payload[label] = {str(h): s for h, s in summaries.items()}
+        report.append(render_grade(label, summaries, args.top_n, args.cost_bps, args.hold_rank, args.non_overlap))
+    text = "# Ranking grade\n\n" + "\n".join(report)
+    out_dir = Path(args.data_dir) / "grading"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "grade_latest.md").write_text(text, encoding="utf-8")
+    (out_dir / "grade_latest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(text)
+    return 0
+
+
 def cmd_shadow_octopus(args):
     """Log Octopus next-day forecasts (zero weight) from CSV files or directories into shadow_octopus_history.csv."""
     forecasts = read_octopus_forecasts(find_octopus_files(args.sources))
@@ -1154,7 +1479,7 @@ def cmd_shadow_scorecard(args):
 
 
 def cmd_missing(args):
-    tickers, _, _, _ = build_universe(args.data_dir, args.universe)
+    tickers, _, _, _ = build_universe(args.data_dir, args.universe, args.archive_dir)
     ext = _load_json(Path(args.data_dir) / "inputs" / "ext_prices.json", {})
     print(json.dumps(find_missing(tickers, args.archive_dir, ext)))
     return 0
@@ -1189,7 +1514,8 @@ def build_parser():
     parser.add_argument("--config-dir", default=str(root / "config"),
                         help="read-only: config/tickers.json is compared with the trade list to build the proposal")
     parser.add_argument("--universe", choices=UNIVERSES, default="sp500",
-                        help="sp500 (current scope) or all (also holdings and the watchlist)")
+                        help="sp500 (current scope), all (also holdings and the watchlist) or archive (every archive ticker, "
+                         "liquidity-filtered buy list)")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="score, rank, write the evaluation list, update history and movement")
     run.add_argument("--threshold", type=float, default=None, help="default: params.json evaluate_threshold")
@@ -1215,6 +1541,27 @@ def build_parser():
     eff = sub.add_parser("effectiveness", help="forward return of past trade lists vs the universe (tuning input)")
     eff.add_argument("--horizon", type=int, default=20, help="calendar days ahead (default 20)")
     eff.set_defaults(func=cmd_effectiveness)
+    bh = sub.add_parser("backfill-history", help="point-in-time score history to one CSV, for grading only")
+    bh.add_argument("--start", required=True)
+    bh.add_argument("--end", required=True)
+    bh.add_argument("--step-days", type=int, default=7, help="minimum calendar days between scored dates")
+    bh.add_argument("--out", required=True, help="output CSV (not history.csv)")
+    bh.set_defaults(func=cmd_backfill_history)
+    gr = sub.add_parser("grade", help="rank IC, quintile spread, top-N edge, turnover and cost drag by horizon")
+    gr.add_argument("--horizons", type=int, nargs="+", default=list(GRADE_HORIZONS), help="calendar days ahead")
+    gr.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
+    gr.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS, help="round-trip cost per replaced name")
+    gr.add_argument("--history", default="", help="score history CSV to grade (default: <data-dir>/history.csv)")
+    gr.add_argument("--delist-loss", type=float, default=None,
+                    help="treat series that ended early as delisted with this loss (e.g. 0.30); default: ignore them")
+    gr.add_argument("--min-names", type=int, default=30, help="skip dates with fewer names with a forward return")
+    gr.add_argument("--hold-rank", type=int, default=None,
+                    help="buy/hold buffer: incumbents ranked within this rank stay on the list (e.g. 150 with --top-n 100)")
+    gr.add_argument("--non-overlap", action="store_true",
+                    help="grade only dates one horizon apart: non-overlapping samples, exact rebalance turnover")
+    gr.add_argument("--compare", action="append", metavar="LABEL=PATH",
+                    help="also grade another ranking from a date,ticker,score[,eligible] CSV (repeatable)")
+    gr.set_defaults(func=cmd_grade)
     so = sub.add_parser("shadow-octopus", help="log Octopus next-day forecasts at zero weight")
     so.add_argument("sources", nargs="+", help="Octopus *_next_day_forecasts.csv files or run directories")
     so.set_defaults(func=cmd_shadow_octopus)
