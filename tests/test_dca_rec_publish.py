@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import email.message
+import io
+import ipaddress
 import json
 import subprocess
+import urllib.response
 from datetime import date, datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_net_utils
 import dca_rec_publish as pub
 from dca_rec_models import Recommendation, RecommendationSet
 from scripts.validate_native_placement import native_ref_id
@@ -160,6 +165,15 @@ def test_notion_rejects_bad_page_id():
         pub.NotionPublisher("not-a-page")
 
 
+@pytest.mark.parametrize("bad_id", ["../pages/other", "blk/children", "blk?foo=1", "blk#frag", "", None, 123])
+def test_notion_rejects_unsafe_remote_block_id(bad_id):
+    child = {"type": "code"} if bad_id is None else {"id": bad_id, "type": "code"}
+    fake = FakeNotion(children=[child])
+    result = _notion(fake).publish(_doc())
+    assert (result.ok, result.detail) == (False, "list children returned invalid block id")
+    assert [call[0] for call in fake.calls] == ["GET"]
+
+
 def test_notion_default_token_reader_uses_keychain(monkeypatch):
     monkeypatch.setattr(pub, "keychain_secret", lambda service, account: f"{service}/{account}")
     assert pub.NotionPublisher(PAGE).token_reader() == "all-stock-dca.notion/integration"
@@ -171,7 +185,7 @@ def test_notion_default_token_reader_uses_keychain(monkeypatch):
 class _Resp:
     status = 200
 
-    def read(self):
+    def read(self, n=-1):
         return b"{}"
 
     def __enter__(self):
@@ -182,19 +196,32 @@ class _Resp:
 
 
 def test_urllib_transport_success_http_error_and_fault(monkeypatch):
-    monkeypatch.setattr(pub.urllib.request, "urlopen", lambda req, timeout: _Resp())
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("93.184.216.34")})
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=lambda req, timeout: _Resp()),
+    )
     assert pub.urllib_transport("GET", "https://x.test", {}, b"") == (200, b"{}")
 
     def http_error(req, timeout):
         raise pub.urllib.error.HTTPError("https://x.test", 403, "no", {}, None)
 
-    monkeypatch.setattr(pub.urllib.request, "urlopen", http_error)
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=http_error),
+    )
     assert pub.urllib_transport("GET", "https://x.test", {}, b"") == (403, b"")
 
     def boom(req, timeout):
         raise ConnectionResetError("Authorization: Bearer leaked")
 
-    monkeypatch.setattr(pub.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=boom),
+    )
     with pytest.raises(OSError) as info:
         pub.urllib_transport("GET", "https://x.test", {}, b"")
     assert "leaked" not in str(info.value)
@@ -202,6 +229,96 @@ def test_urllib_transport_success_http_error_and_fault(monkeypatch):
     for unsafe_url in ("file:///etc/passwd", "http://x.test/v1", "ftp://x.test/resource"):
         with pytest.raises(OSError, match="UnsafeURL"):
             pub.urllib_transport("GET", unsafe_url, {}, b"")
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "https://127.0.0.1/v1/blocks",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[::1]/v1/blocks",
+        "https://10.0.0.5/internal",
+        "https://100.64.0.1/cgnat",
+    ],
+)
+def test_urllib_transport_blocks_ssrf_private_literal_destinations(monkeypatch, unsafe_url):
+    opened = []
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=lambda req, timeout: opened.append(req)),
+    )
+    monkeypatch.setattr(pub.urllib.request, "urlopen", lambda req, timeout: opened.append(req))
+    with pytest.raises(OSError, match="UnsafeURL"):
+        pub.urllib_transport("GET", unsafe_url, {"Authorization": "Bearer tok"}, b"")
+    assert opened == []
+
+
+def test_urllib_transport_blocks_hostname_resolving_to_private_ip(monkeypatch):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("10.0.0.1")})
+    opened = []
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=lambda req, timeout: opened.append(req)),
+    )
+    monkeypatch.setattr(pub.urllib.request, "urlopen", lambda req, timeout: opened.append(req))
+    with pytest.raises(OSError, match="UnsafeURL"):
+        pub.urllib_transport("GET", "https://rebind.example/v1", {"Authorization": "Bearer tok"}, b"")
+    assert opened == []
+
+
+def test_urllib_transport_uses_pinned_no_redirect_opener_and_refuses_redirects(monkeypatch):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("93.184.216.34")})
+    seen_handlers = []
+    real_build_opener = pub.urllib.request.build_opener
+
+    class _RedirectHTTPS(pub.urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            buf = io.BytesIO(b"moved")
+            buf.msg = "Found"
+            hdrs = email.message.Message()
+            hdrs["Location"] = "https://attacker.example/steal"
+            return urllib.response.addinfourl(buf, hdrs, req.full_url, 302)
+
+    def spy_build_opener(*handlers):
+        seen_handlers.extend(handlers)
+        return real_build_opener(handlers[0], _RedirectHTTPS)
+
+    monkeypatch.setattr(pub.urllib.request, "build_opener", spy_build_opener)
+    status, body = pub.urllib_transport(
+        "GET", "https://api.notion.com/v1/blocks/x", {"Authorization": "Bearer secret"}, b""
+    )
+    assert (status, body) == (302, b"")
+    assert dca_net_utils.PinnedHTTPHandler in seen_handlers
+    assert dca_net_utils.PinnedHTTPSHandler in seen_handlers
+    assert dca_net_utils.BlockedFileHandler in seen_handlers
+    assert dca_net_utils.BlockedFTPHandler in seen_handlers
+
+
+def test_urllib_transport_rejects_oversized_response(monkeypatch):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("93.184.216.34")})
+    monkeypatch.setattr(pub, "_MAX_RESPONSE_BYTES", 8)
+
+    class _HugeResp:
+        status = 200
+
+        def read(self, n=-1):
+            return b"x" * 9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        pub.urllib.request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=lambda req, timeout: _HugeResp()),
+    )
+    with pytest.raises(OSError, match="ResponseTooLarge"):
+        pub.urllib_transport("GET", "https://api.notion.com/v1/blocks/x", {}, b"")
 
 
 
