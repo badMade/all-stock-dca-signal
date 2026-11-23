@@ -9531,7 +9531,22 @@ def _write_csv(
         with atomic_open_w(path, newline="") as handle:
             csv.DictWriter(handle, fieldnames=list(empty_fieldnames)).writeheader()
         return
-    resolved_fieldnames = list(fieldnames) if fieldnames is not None else list(rows[0].keys())
+    if fieldnames is not None:
+        resolved_fieldnames = list(fieldnames)
+    else:
+        # Row 0's keys first (stable column order), then any key a LATER row
+        # carries that row 0 lacks. A guarded same-day top-up run has the
+        # afternoon_*/prior_same_day_*/top_up_* keys only on rows whose guard
+        # ran, and row 0 is not always one of them (CI failure on PR #2395:
+        # test_cli_bare_defaults_to_demo ValueError). Rows missing a column
+        # get "" via DictWriter's default restval.
+        resolved_fieldnames = list(rows[0].keys())
+        seen = set(resolved_fieldnames)
+        for row in rows[1:]:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    resolved_fieldnames.append(key)
     with atomic_open_w(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=resolved_fieldnames)
         writer.writeheader()

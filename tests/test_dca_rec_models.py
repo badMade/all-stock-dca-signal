@@ -300,6 +300,19 @@ def test_from_json_refuses_a_universe_that_is_not_a_list_and_a_tampered_hash():
         RecommendationSet.from_json({**wire, "universe_hash": "tampered"})
 
 
+def test_oversized_integer_in_finite_and_quote_sides_raises_value_error_not_overflow():
+    huge = 10**400
+    with pytest.raises(ValueError, match="finite number"):
+        Recommendation("SPY", huge, UUID)
+    with pytest.raises(ValueError, match="finite number"):
+        BrokerState(DAY, STAMP, "acct", {}, huge)
+    with pytest.raises(ValueError, match="finite number"):
+        ExpectedPrice("SPY", huge, 101.0, None, 1.2, 0.99, 15.0)
+    with pytest.raises(ValueError, match="invalid quote_sides"):
+        MarketSnapshot(DAY, STAMP, "robinhood_agent_fetch", PAYLOAD, {"SPY": [huge, 100.0]})
+
+
+
 def test_from_json_still_refuses_any_other_unknown_key():
     wire = with_universe(("AAA", "SPY"), [rec()]).to_json()
     with pytest.raises(ValueError):

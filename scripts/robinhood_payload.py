@@ -142,7 +142,7 @@ def _num(value: Any, field: str, *, allow_zero: bool = False) -> float:
         raise PayloadError(f"{field} is not a number: {value!r}")
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise PayloadError(f"{field} is not a number: {value!r}") from exc
     if not math.isfinite(number) or number < 0 or (number == 0 and not allow_zero):
         raise PayloadError(f"{field} out of range: {value!r}")
@@ -521,14 +521,14 @@ def ingest(
     out = Path(plan["out"])
     day, slot = date.fromisoformat(plan["trading_day"]), plan["slot"]
     try:
-        meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
         generated = datetime.fromisoformat(meta["generated_at_et"])
         reply_at = datetime.fromtimestamp(Path(broker_reply).stat().st_mtime, ET)
         if now - generated > MAX_INGEST_AGE:
             raise PayloadError(f"payload built {generated:%H:%M:%S} ET is too old to ingest")
         if abs(now - reply_at) > MAX_INGEST_AGE:
             raise PayloadError(f"broker reply written {reply_at:%H:%M:%S} ET is not within {MAX_INGEST_AGE} of now")
-        payload = json.loads(out.read_text(encoding="utf-8"))
+        payload = json.loads(out.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
         account = _account_number()
         config_dir = config_dir or dca_config.get_config_dir()
         pages, portfolio = load_broker_reply(broker_reply)
@@ -851,7 +851,10 @@ def _refusal_note(plan: dict[str, Any]) -> str | None:
     a different slot's missing payload.
     """
     try:
-        marker = json.loads(_refusal_path(Path(plan["out"])).read_text(encoding="utf-8"))
+        marker = json.loads(
+            _refusal_path(Path(plan["out"])).read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
         if marker["slot"] != plan["slot"] or marker["trading_day"] != plan["trading_day"]:
             return None
         stale = ", ".join(f"{t} ({r})" for t, r in sorted(marker["failed"].items())) or "none listed"
@@ -943,7 +946,7 @@ def _freshness_problem(plan: dict[str, Any], out: Path, now: datetime, max_age_m
     """
     meta_path = out.with_suffix(".meta.json")
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = json.loads(meta_path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
         generated = datetime.fromisoformat(meta["generated_at_et"])
         digest = meta["payload_sha256"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -967,7 +970,7 @@ def _freshness_problem(plan: dict[str, Any], out: Path, now: datetime, max_age_m
 
 def _sidecar_quiet(out: Path) -> list[str]:
     """The quiet tickers ``publish`` recorded beside ``out`` (already bound to the payload by the checksum)."""
-    meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
     return list(meta.get("quiet", []))
 
 
@@ -993,7 +996,11 @@ def check(
     if problem:
         print(f"robinhood_payload: stale payload {out.name}: {problem}", file=sys.stderr)
         return EXIT_STALE
-    payload = json.loads(out.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(out.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as exc:
+        print(f"robinhood_payload: invalid payload {out.name}: {exc}", file=sys.stderr)
+        return 2
     # Already merged by `merge`, so chunk ownership is behind it: re-run only the per-ticker validation.
     rebuilt, _failed = _validate_entries(plan, payload["sources"]["robinhood"])
     invalid_present = {
@@ -1017,7 +1024,7 @@ def check(
 
 
 def _read_plan(path: str) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
 
 
 def main(argv: list[str] | None = None) -> int:
