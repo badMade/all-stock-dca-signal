@@ -172,7 +172,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_slot_guard` | 62 | 1 | 1 | 0 | `scripts.scheduler_lease` |
 | `dca_ticker_paths` | 33 | 0 | 10 | 0 | |
 | `dca_weekly_dashboard` | 6477 | 2 | 1 | 13 | `dca_common`, `dca_fileio` |
-| `dca_whole_share_accumulator` | 3827 | 4 | 1 | 3 | `dca_fileio`, `dca_paths`, `near_close_dca`, `scripts.file_lock` |
+| `dca_whole_share_accumulator` | 3865 | 4 | 1 | 3 | `dca_fileio`, `dca_paths`, `near_close_dca`, `scripts.file_lock` |
 | `find_issues` | 16 | 0 | 0 | 0 | |
 | `from` | 30 | 2 | 0 | 3 | `dca_bootstrap`, `dca_console` |
 | `guardrails` | 25 | 4 | 0 | 0 | `guardrails.engine`, `guardrails.input_guardrail`, `guardrails.output_guardrail`, `guardrails.retrieval_engine` |

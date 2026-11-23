@@ -95,12 +95,37 @@ class WholeShareClaimPersistenceError(RuntimeError):
         self.result = result
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Fail closed when persisted JSON repeats a key instead of resolving last-one-wins."""
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _valid_non_negative_number(value: Any) -> bool:
+    """Return True only for finite, non-negative JSON numbers (rejecting bools and oversized ints)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
 def _money(value: Any, *, field: str) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
+    # bool subclasses int in Python; True/False must not coerce to $1.00/$0.00.
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be numeric")
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} must be numeric") from exc
+    except OverflowError as exc:
+        raise ValueError(f"{field} must be finite") from exc
     if not math.isfinite(numeric):
         raise ValueError(f"{field} must be finite")
     if numeric < 0:
@@ -2806,9 +2831,12 @@ class WholeShareAccumulationLedger:
         symbol = ticker.strip().upper()
         if not symbol or not _SYMBOL_PATTERN.match(symbol):
             raise ValueError("ticker is required to settle a whole-share purchase")
+        # Guard bool before (int, float) so True/False cannot settle spurious shares.
+        if isinstance(shares_purchased, bool) or not isinstance(shares_purchased, (int, float)):
+            raise ValueError("shares_purchased must be a finite number")
         if shares_purchased < 0:
             raise ValueError("shares_purchased must not be negative")
-        if not math.isfinite(shares_purchased):
+        if not _valid_non_negative_number(shares_purchased):
             # NaN and +/-inf both fail the `< 0` guard above cleanly (every
             # comparison against NaN is False, and inf is not negative), so
             # a malformed broker result or a buggy caller can reach the
@@ -3327,15 +3355,17 @@ class WholeShareAccumulationLedger:
                 _WITHDRAWN_TOTAL_FIELD: 0.0,
             }
         try:
-            state = json.loads(path.read_bytes())
-        except (OSError, json.JSONDecodeError) as exc:
+            # Reject duplicate JSON keys and invalid UTF-8 at the boundary so
+            # persisted pending balances and claim maps cannot resolve last-one-wins.
+            state = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        except (OSError, ValueError) as exc:
             raise ValueError(f"could not read whole-share accumulation ledger {path}") from exc
         if (
             not isinstance(state, dict)
+            or isinstance(state.get("version"), bool)
             or state.get("version") != 1
             or state.get("ticker") != ticker
-            or isinstance(state.get("pending_usd"), bool)
-            or not isinstance(state.get("pending_usd"), (int, float))
+            or not _valid_non_negative_number(state.get("pending_usd"))
             or not isinstance(state.get("events"), list)
             # setdefault only fills this field in when it is ABSENT -- a
             # PRESENT but malformed value (null, a list, ...) survived
@@ -3358,6 +3388,14 @@ class WholeShareAccumulationLedger:
             or (
                 "recorded_idempotency_keys" in state
                 and not isinstance(state.get("recorded_idempotency_keys"), dict)
+            )
+            or (
+                "shares_purchased_total" in state
+                and not _valid_non_negative_number(state.get("shares_purchased_total"))
+            )
+            or (
+                "credited_claim_tokens" in state
+                and not isinstance(state.get("credited_claim_tokens"), list)
             )
         ):
             raise ValueError(f"invalid whole-share accumulation ledger {path}")
