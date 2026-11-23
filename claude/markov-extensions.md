@@ -17,11 +17,11 @@ Dependency: item 1 needs a calibrated item 2. Item 1 stays shadow-only until ite
 
 ### Gate before building either
 
-Opportunity sizing (read-only): count sessions where a later scheduled slot saw price <= prior low while the day's remaining budget could not fund a Tier B buy ($2 base x 2x = $4).
+Opportunity sizing (read-only): count sessions where a later scheduled slot saw a buyable dip while the day's remaining budget could not fund the buy the ladder would have made (global ladder from `config/sizing_ladder.json`: 1x to 8x on drop vs prior close, times $2 strictly below the prior low or $1 below the close only). Counted separately for both dip kinds, at all four daily caps.
 Spec: `dca-sizing-signals/tests/ledger/test_budget_exhaustion_opportunity.py` (test-first; implementation not started). Handoff: `HANDOFF_budget_exhaustion_opportunity.md`.
 If the count is near zero, both items drop down the roadmap.
 
-Known limits of the count: the daily cap is a parameter ($180/$240/$300/$360 by tier) because the day's tier is not stored in the ledger; Tier C is not reconstructed (needs the forecast); quotes come from `intraday_quotes`, so coverage starts when that table started filling.
+Known limits of the count: the day's budget tier is not stored in the ledger, so the report runs once per cap ($180/$240/$300/$360); per-ticker calibrated ladders, the ML nudge and the kill-switch cap are not replayed; quotes come from `intraday_quotes`, so coverage starts when that table started filling.
 
 ## Category 2: improves decisions made around the system
 
@@ -46,6 +46,7 @@ None of these changes the dollars bought on a given day.
 
 ## Open questions
 
-1. Which daily caps should the opportunity report run at: all four tiers, or only $180?
-2. Should the report also count Tier A misses (price < prior close, budget gone), or B-or-deeper only?
-3. Where does the report live: a CLI under `dca-sizing-signals`, a console page, or both?
+Decided 2026-11-23: run at all four caps; count both dip kinds.
+
+1. Where does the report live: a CLI under `dca-sizing-signals`, a console page, or both?
+2. Note: "Tier A/B/C" in category 1 is shorthand from the 2026-11-21 deep dive. The live ladder is the 1x-8x drop ladder; item 2's chain states must be redefined on it before that work starts.
