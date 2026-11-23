@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.universe-daily-ranking</string>
+  <!-- Daily universe job (ticker-advisor/daily_universe_job.py, docs/adr-program-maintained-universe.md): ranks the
+       pool from the fundamentals snapshot and the price archive, and when EVERY safeguard passes writes the new
+       buy list into this checkout's config/tickers.json and appends it to config/ticker_history.csv. It commits
+       nothing. It changes the buy list ONLY: a name that drops out simply stops being bought.
+       The job never sells anything. Reads files, makes no network call, never touches the broker.
+       Exit codes: 0 passed (applied, unchanged), 1 a safeguard rejected the proposal, 2 bad input, 3 the writer
+       refused a passing proposal. On 1, 2 and 3 the live files are untouched; read the log below.
+       FIRST RUN: delete the apply flag (the last argument below) and check universe_proposal.json in the out dir; add it back when
+       the proposal reads right. Without that flag the job is propose-only.
+       Replace REPLACE_WITH_REPO_PATH (the checkout), REPLACE_WITH_SNAPSHOT_FILE (the newest
+       fundamentals_snapshot JSON the fetch job wrote), REPLACE_WITH_PRICE_ARCHIVE_CSV (the price CSV the daily
+       archive refresh maintains), REPLACE_WITH_EXCHANGES_FILE (the exchange map the fetch job wrote) and
+       REPLACE_WITH_OUT_DIR (where universe_proposal.json and ranking_report.json go). Started through the
+       checkout's venv Python, like the other agents, because macOS privacy protection (TCC) grants ~/Documents
+       access per binary. The live 0935 run reads this checkout, so the list applied here is the list it trades. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>REPLACE_WITH_REPO_PATH/ticker-advisor/daily_universe_job.py</string>
+    <string>--snapshot</string>
+    <string>REPLACE_WITH_SNAPSHOT_FILE</string>
+    <string>--prices</string>
+    <string>REPLACE_WITH_PRICE_ARCHIVE_CSV</string>
+    <string>--tickers-config</string>
+    <string>REPLACE_WITH_REPO_PATH/config/tickers.json</string>
+    <string>--history</string>
+    <string>REPLACE_WITH_REPO_PATH/config/ticker_history.csv</string>
+    <string>--exchanges</string>
+    <string>REPLACE_WITH_EXCHANGES_FILE</string>
+    <string>--out-dir</string>
+    <string>REPLACE_WITH_OUT_DIR</string>
+    <string>--apply</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH/ticker-advisor</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- 19:30 Mon-Fri local time: after the archive refresh and the fundamentals snapshot jobs (18:30). Local Mac
+       time: pin the Mac to America/New_York or shift Hour. If the Mac is asleep launchd runs the job on wake. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/tmp/all-stock-dca-universe-daily-ranking.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/all-stock-dca-universe-daily-ranking.err.log</string>
+</dict>
+</plist>

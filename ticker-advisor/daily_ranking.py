@@ -295,7 +295,7 @@ def _parse_int(text: str | None, label: str, *, minimum: int) -> int | None:
     return value
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(*, as_of_required: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="daily_ranking",
         description="Rank the pool and write a universe proposal and report. Propose-only: never edits tickers.json.",
@@ -304,7 +304,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prices", required=True, help="price archive CSV (ticker,date,...,close,volume,...)")
     parser.add_argument("--tickers-config", required=True, help="config/tickers.json (active and optional pinned)")
     parser.add_argument("--exchanges", help="JSON object of ticker to exchange name (for the nms_listed flag)")
-    parser.add_argument("--as-of", required=True, help="ranking date, YYYY-MM-DD")
+    parser.add_argument("--as-of", required=as_of_required, help="ranking date, YYYY-MM-DD")
     parser.add_argument("--out-dir", required=True, help="directory for universe_proposal.json and ranking_report.json")
     parser.add_argument("--size", default=str(DEFAULT_SIZE), help="active list size, pinned names included")
     parser.add_argument("--prior-pool-size", help="the previous run's pool size (omit on the first run)")
