@@ -531,6 +531,9 @@ class MorningConfig:
 
     tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
     excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
+    # Dated wash-sale pauses in force (config/tickers.json "no_buy", docs/adr-no-buy-window.md); see
+    # StrategyConfig.no_buy_tickers. A listed ticker is still scored but its signal never becomes a BUY.
+    no_buy_tickers: frozenset[str] = frozenset()
     base_buy_amount_usd: float = 2.0
     # Reduced first-allocation base ($1) used when the price is below the prior
     # close but not below the prior regular-session low. See
@@ -1585,6 +1588,8 @@ def load_morning_config(
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MorningConfig(**kwargs)
@@ -1785,6 +1790,8 @@ def load_stream_config(
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return config_cls(**kwargs)
@@ -4168,6 +4175,28 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Evaluation ----------------------------------------------------------
     def evaluate_signal(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
+        """Score one ticker, then veto its BUY if it is inside a dated ``no_buy`` window.
+
+        The ladder runs unchanged so the row keeps its prices and drop for tracking; only the action is
+        withdrawn (NO_ACTION, zero multiplier and amount) and the would-be BUY recorded in ``reason`` and
+        ``warnings``. Every path that places or publishes morning-family orders goes through this method
+        (the four executors, ``scripts/stream_candidates``), so one veto here covers them all. See
+        ``docs/adr-no-buy-window.md``.
+        """
+        signal = self._evaluate_signal_unfiltered(ticker, now, data)
+        if signal.action != Action.BUY or ticker not in self.config.no_buy_tickers:
+            return signal
+        return replace(
+            signal,
+            action=Action.NO_ACTION,
+            reason=f"no_buy_window: wash-sale pause; ladder said BUY at {signal.multiplier:g}x ({signal.reason})",
+            multiplier=0.0,
+            hypothetical_amount_usd=0.0,
+            execution_status=None,
+            warnings=(*signal.warnings, "no_buy_window"),
+        )
+
+    def _evaluate_signal_unfiltered(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
         """Grade one ticker's morning weakness vs. yesterday's close.
 
         Uses the provider's previous-close bar and the latest completed intraday

@@ -1417,6 +1417,18 @@ def generate_candidates(
         else:
             robinhood_signal = None
         decision = reconcile_signals(ticker, finance_signal, robinhood_signal)
+        if ticker in config.no_buy_tickers and decision.action == Action.BUY:
+            # Dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md): the ladder still scored the
+            # ticker so its row and prices are published for tracking, but it must not reach the published
+            # BUY list the live executors read. Same shape as every other withdrawn BUY: NO_ACTION, no size.
+            decision = dataclasses.replace(
+                decision,
+                action=Action.NO_ACTION,
+                reason=f"no_buy_window: wash-sale pause; ladder said BUY ({decision.reason})",
+                buy_multiplier=0.0,
+                ladder_multiplier=0.0,
+                suggested_amount_usd=0.0,
+            )
         candidates.append(_decision_to_dict(ticker, decision))
     return candidates
 

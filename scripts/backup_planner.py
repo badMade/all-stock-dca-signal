@@ -706,6 +706,10 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
     if not isinstance(orders, list):
         return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
     seen: set[str] = set()
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses an ORDER for the symbol like an
+    # excluded one. Kept separate from `excluded` above, which also guards a carried universe: a blocked name stays
+    # in the universe (its hash and count do not change); only its BUY is refused.
+    order_refused = excluded | set(config.no_buy_tickers)
     for order in orders:
         if not isinstance(order, dict) or set(order) != _PLAN_FIRST_ORDER_KEYS:
             errors.append(PlanError("schema_violation", "order must be an object with exactly the schema's fields"))
@@ -714,7 +718,7 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
         if not isinstance(symbol, str) or not dop._SYMBOL_RE.match(symbol):
             errors.append(PlanError("schema_violation", "order symbol is not a ticker"))
             continue
-        if symbol in excluded:
+        if symbol in order_refused:
             errors.append(PlanError("excluded_symbol", symbol))
         elif symbol not in active:
             errors.append(PlanError("unknown_symbol", symbol))
