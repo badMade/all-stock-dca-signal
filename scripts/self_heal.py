@@ -90,11 +90,11 @@ def step_3() -> None:
     run_cmd(["pytest", "--snapshot-update"])
 
 def step_4() -> None:
-    """Step 4: Install type stubs."""
+    """Step 4: Install pinned dev and type-stub dependencies."""
     # Pinned, from the same file CI installs: this job holds write permissions
     # and an unpinned install here bypassed every pin in requirements-dev.txt
     # (2026-09-07 diagnostic, S:CI-02).
-    run_cmd([sys.executable, "-m", "pip", "install", "types-requests", "types-PyYAML", "types-beautifulsoup4", "types-Pillow"])
+    run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"])
 
 
 def step_5() -> None:
