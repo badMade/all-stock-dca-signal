@@ -488,3 +488,18 @@ def test_begin_refuses_a_set_the_current_config_would_refuse(tmp_path, monkeypat
     assert slot.main(["begin", "--slot", "1030", "--now", "2026-10-13T10:40:00-04:00", "--root", str(tmp_path)]) == 3
     assert json.loads(capsys.readouterr().out)["reason"].startswith("config_check_failed:")
     assert store.handed(rec.trading_day, "1030") is None
+
+
+def test_finish_rejects_duplicate_json_keys_in_handed_set(tmp_path, monkeypatch):
+    rec = _rec("2026-10-13T10:30:00-04:00")
+    day = tmp_path / "2026-10-13"
+    (day / "placements/1030").mkdir(parents=True)
+    # Duplicate key in handed_1030.json must be rejected by _strict_json / store.handed() rather than last-wins.
+    raw = json.dumps(rec.to_json())
+    tampered = raw[:-1] + ',"items":[]}'
+    (day / "handed_1030.json").write_text(tampered, encoding="utf-8")
+    monkeypatch.setitem(__import__("sys").modules, "scripts.finalize_run_evidence",
+                        SimpleNamespace(main=lambda args: pytest.fail("finalizer must not run on duplicate-keyed handed file")))
+    with pytest.raises(ValueError, match="duplicate key"):
+        slot._finish("1030", "2026-10-13T10:30:00-04:00", datetime.now(slot.ET), str(tmp_path), str(tmp_path / "evidence"))
+

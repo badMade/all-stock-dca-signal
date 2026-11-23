@@ -267,7 +267,7 @@ def _finish(slot: str, started_text: str, now: datetime, root: str | None, evide
     day = started.astimezone(ET).date()
     placement_dir = store.placements_dir(day, slot)
     handed_path = store.handed_path(day, slot)
-    handed = RecommendationSet.from_json(json.loads(handed_path.read_text(encoding="utf-8")))
+    handed = RecommendationSet.from_json(_strict_json(handed_path))
     orders = []
     refused = False
     for item in handed.items:
