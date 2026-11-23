@@ -292,7 +292,7 @@ class OctopusModel:
         batch_size: int = 256,
         lr_fit: float = 3e-4,
         lr_online: float = 3e-5,
-        fit_epochs: int = 2,
+        fit_epochs: int = 4,
         fit_sample_cap: int = 200_000,
         mask_fraction: float = 0.15,
         device: str = "auto",
