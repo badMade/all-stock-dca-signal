@@ -1617,6 +1617,46 @@ def test_money_and_apply_cumulative_credit_reject_bool_and_overflow(bad_val, exp
             '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": null, "events": []}',
             "invalid cumulative credit ledger",
         ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": "bad"}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": true, "pending_after_usd": 0.2, "settled_credit_usd": 0.0}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": NaN, "pending_after_usd": 0.2, "settled_credit_usd": 0.0}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": -0.2, "pending_after_usd": 0.2, "settled_credit_usd": 0.0}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": 0.2, "pending_after_usd": 0.2, "settled_credit_usd": 0.0, "sequence": true}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"preserve:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": 0.2, "pending_after_usd": 0.2, "settled_credit_usd": 0.0, "consumed_by_settlement": "false"}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"record:XYZ:slot-1": {"pending_before_usd": 0.0, "incremental_credit_usd": 0.2, "order_amount_usd": 0.0, "pending_after_usd": 0.2, "final_session": "no"}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "recorded_idempotency_keys": {"record:XYZ:slot-1": {"pending_before_usd": 0.0}}, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "next_sequence": true, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
+        (
+            '{"version": 1, "trading_day": "2026-08-11", "pending_usd_by_ticker": {}, "revision": -1, "events": []}',
+            "invalid cumulative credit ledger",
+        ),
     ],
 )
 def test_read_state_fails_closed_on_duplicate_keys_bools_nonfinite_and_malformed_maps(
@@ -1629,4 +1669,27 @@ def test_read_state_fails_closed_on_duplicate_keys_bools_nonfinite_and_malformed
 
     with pytest.raises(ValueError, match=expected_match):
         ledger.pending_usd("XYZ", "2026-08-11")
+
+
+@pytest.mark.parametrize("bad_amount", [True, False, float("nan"), float("inf"), -0.10, "0.20", 10**1000])
+def test_ledger_mutation_methods_reject_non_finite_bool_and_negative_inputs(tmp_path, bad_amount):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.30, idempotency_key="slot-1")
+
+    with pytest.raises(ValueError, match="credit amounts must be"):
+        ledger.preserve_pending("XYZ", "2026-08-11", bad_amount, idempotency_key="slot-2")
+    with pytest.raises(ValueError, match="credit amounts must be"):
+        ledger.settle("XYZ", "2026-08-11", bad_amount)
+    with pytest.raises(ValueError, match="credit amounts must be"):
+        ledger.settle("XYZ", "2026-08-11", 0.30, already_debited_usd=bad_amount)
+    with pytest.raises(ValueError, match="credit amounts must be"):
+        ledger.reconcile_preserved_credit(
+            "XYZ", "2026-08-11", "slot-1", bad_amount, expected_outstanding_credit_usd=0.30
+        )
+    with pytest.raises(ValueError, match="credit amounts must be"):
+        ledger.restore_minimum_order_pending("XYZ", "2026-08-11", bad_amount)
+    if bad_amount is not False:
+        with pytest.raises(ValueError, match="credit amounts must be"):
+            ledger.discard_minimum_order_pending("XYZ", "2026-08-11", observed_amount_usd=bad_amount)
+
 

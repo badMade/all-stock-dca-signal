@@ -140,7 +140,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_console_tickers` | 245 | 2 | 1 | 0 | `dca_console_reader`, `dca_ticker_paths` |
 | `dca_console_training` | 355 | 1 | 1 | 0 | `dca_console_reader` |
 | `dca_cost_tracker` | 416 | 3 | 2 | 0 | `dca_common`, `dca_fileio`, `scripts.run_classification` |
-| `dca_cumulative` | 1591 | 3 | 2 | 0 | `dca_fileio`, `dca_paths`, `scripts.file_lock` |
+| `dca_cumulative` | 1623 | 3 | 2 | 0 | `dca_fileio`, `dca_paths`, `scripts.file_lock` |
 | `dca_env` | 167 | 0 | 3 | 0 | |
 | `dca_execution_router` | 328 | 2 | 1 | 1 | `dca_order_plan`, `dca_paths` |
 | `dca_fileio` | 437 | 0 | 48 | 1 | |
