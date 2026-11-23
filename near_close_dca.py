@@ -9141,7 +9141,15 @@ def write_run_artifacts(
             return paths
 
         _write_csv(signals_path, artifacts["signal_rows"])
-        _write_csv(candidates_path, artifacts["buy_candidates"])
+        # Union the keys across rows (row 0's order first): only candidates the
+        # same-day top-up guard evaluated carry the guard columns, so a header
+        # derived from row 0 alone crashed the write when a later row had them
+        # (CI, test_cli_bare_defaults_to_demo, 2026-11-23).
+        _write_csv(
+            candidates_path,
+            artifacts["buy_candidates"],
+            fieldnames=_union_csv_fieldnames(artifacts["buy_candidates"]) or None,
+        )
 
         # Count only the CSVs this run just wrote. orders.csv (written afterwards on
         # the compact path) is folded in by _backfill_orders_csv_usage; a stale
@@ -9503,6 +9511,15 @@ def _backfill_orders_csv_usage_locked(run_state_path: Path) -> Optional[bytes]:
 # wrote a zero-byte file, which the artifact contract rejects for lacking a
 # header, failing the run and blocking the latest-pointer update (Codex review).
 _EMPTY_CSV_FIELDS = ("ticker",)
+
+
+def _union_csv_fieldnames(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    """Return every key seen across ``rows``, in first-seen order (row 0 first)."""
+    seen: Dict[str, None] = {}
+    for row in rows:
+        for key in row:
+            seen.setdefault(key, None)
+    return list(seen)
 
 
 def _write_csv(
