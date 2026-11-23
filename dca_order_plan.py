@@ -92,6 +92,11 @@ _PLAN_KEYS = frozenset(
     {"schema_version", "trading_day", "slot", "generated_at_et", "generator", "ladder_version",
      "universe_hash", "orders"}
 )
+# The one optional plan key: the day's carried universe (docs/adr-backup-planner-daily-universe.md, piece 3d). Absent =
+# the plan is validated against the reader's own list exactly as before.
+_PLAN_OPTIONAL_KEYS = frozenset({"universe"})
+# The validator keeps its own bound because a carried list cannot lean on the reader's list.
+MAX_CARRIED_UNIVERSE = 100
 _ORDER_KEYS = frozenset(
     {"symbol", "notional_usd", "multiplier", "drop_pct", "decision_price", "prior_close", "prior_low",
      "ref_id"}
@@ -324,7 +329,7 @@ def validate_plan(
     Returns:
         ``PlanResult`` with ``orders`` set and no errors, or empty ``orders`` and errors.
     """
-    if not isinstance(plan, dict) or set(plan) != _PLAN_KEYS:
+    if not isinstance(plan, dict) or (set(plan) - _PLAN_OPTIONAL_KEYS) != _PLAN_KEYS:
         return _fail(PlanError("schema_violation", "plan must be an object with exactly the schema's fields"))
     errors: list[PlanError] = []
     if slot not in SLOTS:
@@ -343,13 +348,31 @@ def validate_plan(
         errors.append(PlanError("schema_violation", "generated_at_et"))
     if plan["ladder_version"] != ladder_version:
         errors.append(PlanError("stale_ladder_version", f"expected {ladder_version}"))
-    if plan["universe_hash"] != universe_hash(active_tickers):
-        errors.append(PlanError("universe_hash_mismatch"))
+    excluded = set(excluded_tickers)
+    if "universe" in plan:
+        # A carried list replaces the reader's: the hash must be the carried list's, and the list itself is bounded
+        # here (size, canonical form, no excluded name) since no reader list vouches for it.
+        carried = plan["universe"]
+        if not (isinstance(carried, list) and carried
+                and all(isinstance(t, str) and _SYMBOL_RE.match(t) for t in carried)
+                and carried == sorted(set(carried))):
+            errors.append(PlanError("schema_violation", "universe must be sorted, unique tickers"))
+            active: set[str] = set()
+        else:
+            active = set(carried)
+            if len(carried) > MAX_CARRIED_UNIVERSE:
+                errors.append(PlanError("universe_too_large", f"at most {MAX_CARRIED_UNIVERSE}"))
+            if plan["universe_hash"] != universe_hash(carried):
+                errors.append(PlanError("universe_hash_mismatch"))
+            errors.extend(PlanError("excluded_in_universe", symbol) for symbol in carried if symbol in excluded)
+    else:
+        active = set(active_tickers)
+        if plan["universe_hash"] != universe_hash(active_tickers):
+            errors.append(PlanError("universe_hash_mismatch"))
     orders = plan["orders"]
     if not isinstance(orders, list):
         errors.append(PlanError("schema_violation", "orders must be a list"))
         return _fail(*errors)
-    active, excluded = set(active_tickers), set(excluded_tickers)
     seen: set[str] = set()
     for order in orders:
         errors.extend(
@@ -644,7 +667,9 @@ def revalidate_for_placement(
         )
     except ValueError as exc:
         return _fail(PlanError("bad_scope", str(exc)))
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     keep: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
     for order in orders:
@@ -732,7 +757,9 @@ def compute_plan(
     Returns:
         ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.
     """
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     skipped: list[tuple[str, str]] = []
     chosen: dict[str, dict[str, Any]] = {}
     for row in quotes:
@@ -840,7 +867,9 @@ def plan_from_decisions(
     Returns:
         ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.
     """
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
+    # A dated no_buy pause (wash-sale window, docs/adr-no-buy-window.md) refuses the symbol exactly like an excluded
+    # one HERE, without changing the universe the stamps and hashes are computed from.
+    active, excluded = set(config.tickers), set(config.excluded_tickers) | set(config.no_buy_tickers)
     skipped: list[tuple[str, str]] = []
     chosen: dict[str, dict[str, Any]] = {}
     for row in decisions:
@@ -1103,6 +1132,6 @@ def plan_from_survivors(
         slot=slot,
         ladder_version=ladder_version,
         active_tickers=config.tickers,
-        excluded_tickers=config.excluded_tickers,
+        excluded_tickers=set(config.excluded_tickers) | set(config.no_buy_tickers),
         max_per_order_usd=MAX_PER_ORDER_USD,
     )

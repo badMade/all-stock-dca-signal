@@ -203,6 +203,122 @@ def test_approved_groups_with_no_approved_rows_is_empty():
     assert _reconcile([{"Key": "cap_breach"}])["approved_groups"] == {"total": 0, "groups": []}
 
 
+def test_unsupported_approved_repaired_without_git_claim_is_reported():
+    report = _reconcile([{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired"}])
+    assert report["unsupported_fixes"]["unsupported_approved_fix"] == ["cap_breach"]
+
+
+def test_unsupported_fix_with_unmatched_recorded_pr_is_separated():
+    report = _reconcile([{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired", "PR number": 99}])
+    assert report["unsupported_fixes"]["unsupported_with_recorded_evidence"] == ["cap_breach"]
+    assert report["counts"]["unsupported_with_recorded_evidence"] == 1
+
+
+def test_unsupported_fix_with_recorded_commit_url_is_separated():
+    row = {
+        "Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired",
+        "Commit URL": f"{URL}/commit/{'a' * 40}",
+    }
+    report = _reconcile([row])
+    assert report["unsupported_fixes"]["unsupported_with_recorded_evidence"] == ["cap_breach"]
+    assert report["counts"]["unsupported_with_recorded_evidence"] == 1
+
+
+def test_unsupported_fix_without_recorded_pr_or_commit_is_separated():
+    report = _reconcile([{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired"}])
+    assert report["unsupported_fixes"]["unsupported_no_recorded_evidence"] == ["cap_breach"]
+    assert report["counts"]["unsupported_no_recorded_evidence"] == 1
+
+
+def test_unsupported_fix_recorded_evidence_lists_partition_union():
+    rows = [
+        {"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired", "PR number": "#99"},
+        {"Key": "low_confidence_tickers", "Approval": "Approved", "Fix state": "Repaired"},
+    ]
+    report = _reconcile(rows)
+    fixes = report["unsupported_fixes"]
+    split = fixes["unsupported_with_recorded_evidence"] + fixes["unsupported_no_recorded_evidence"]
+    assert sorted(split) == sorted(fixes["unsupported_approved_fix"])
+    assert len(split) == len(set(split))
+
+
+def test_matching_pr_supports_approved_repaired_row():
+    report = _reconcile(
+        [{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired", "PR number": 10}],
+        prs=[_gh_pr()],
+    )
+    assert report["unsupported_fixes"]["unsupported_approved_fix"] == []
+
+
+@pytest.mark.parametrize("pr_number", ["#10", f"{URL}/pull/10"])
+def test_audit_normalizes_notion_pr_number_forms(pr_number):
+    report = _reconcile([{"Key": "cap_breach", "PR number": pr_number}], prs=[_gh_pr()])
+    assert report["unsupported_fixes"]["recorded_pr_not_found"] == []
+
+
+def test_evidence_error_is_audit_not_run_not_unsupported():
+    report = _reconcile([{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired", "PR number": "bad"}])
+    assert report["unsupported_fixes"]["unsupported_approved_fix"] == []
+    assert report["unsupported_fixes"]["audit_not_run"] == [
+        {"key": "cap_breach", "reason": "row PR number 'bad' is not a number"}
+    ]
+
+
+def test_row_whose_evidence_match_raises_is_not_audited_as_unsupported(monkeypatch):
+    # An EvidenceError raised by match_git_evidence itself (not the PR-number parse) leaves no GitEvidence for the Key.
+    tr = _tr()
+    real = tr.match_git_evidence
+
+    def boom(key, **kwargs):
+        if key == "cap_breach":
+            raise tr.EvidenceError("simulated evidence refusal")
+        return real(key, **kwargs)
+
+    monkeypatch.setattr(tr, "match_git_evidence", boom)
+    rows = [{"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired"}]
+    report = _reconcile(rows)
+    assert report["unsupported_fixes"]["unsupported_approved_fix"] == []
+    assert report["unsupported_fixes"]["audit_not_run"] == [
+        {"key": "cap_breach", "reason": "simulated evidence refusal"}
+    ]
+
+
+def test_recorded_pr_unconfirmed_row_is_still_audited():
+    row = {"Key": "run_states_unclassifiable", "Approval": "Approved", "Fix state": "Repaired", "PR number": 1514}
+    pr = _gh_pr(number=1514, head="fix/daily-schedule-verification", title="Verify every live slot daily")
+    report = _reconcile([row], prs=[pr])
+    assert _decision(report, row["Key"])["action"] == "skip"
+    assert report["unsupported_fixes"]["unsupported_approved_fix"] == [row["Key"]]
+    assert report["unsupported_fixes"]["recorded_pr_not_found"] == [row["Key"]]
+
+
+def test_audit_does_not_mutate_caller_rows():
+    row = {"Key": "cap_breach", "Approval": "Approved", "Fix state": "Repaired", "PR number": "#10"}
+    before = dict(row)
+    _reconcile([row], prs=[_gh_pr()])
+    assert row == before
+
+
+def test_preexisting_report_contract_is_pinned():
+    # Captured from pre-audit reconcile() behavior for this fixed fixture. New audit keys are additive only.
+    report = _reconcile([{"Key": "cap_breach", "Progress": "PR open", "PR number": 10}], prs=[_gh_pr()])
+    legacy_counts = {
+        "rows_read": 1, "create": 0, "update": 1, "unchanged": 0, "skip": 0,
+        "progress_notes_kept": 0, "progress_regressions_blocked": 0,
+    }
+    assert {key: report["counts"][key] for key in legacy_counts} == legacy_counts
+    assert set(("counts", "decisions", "approved", "approved_groups")) <= report.keys()
+    assert report["decisions"] == [{
+            "key": "cap_breach", "action": "update", "progress": "Merged, checks green",
+            "evidence": {"branch": None, "pr": f"{URL}/pull/10", "pr_merged": True,
+                         "pr_checks": "green", "commit_url": None, "issue": None, "mentioned_in": None,
+                         "commit_status": None},
+            "updates": {"Progress": "Merged, checks green"}, "approved": False,
+        }]
+    assert report["approved"] == []
+    assert report["approved_groups"] == {"total": 0, "groups": []}
+
+
 # --- CLI over a collected work dir ---------------------------------------------------------------------------
 
 

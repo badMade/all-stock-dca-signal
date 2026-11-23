@@ -1080,6 +1080,11 @@ class StrategyConfig:
     # `excluded_tickers` are overlaid from "active"/"excluded" -- this is an
     # empty CLASS default only, not a statement that no ticker is enrolled.
     whole_share_tickers: frozenset[str] = frozenset()
+    # Dated wash-sale pauses in force for this run (config/tickers.json "no_buy", docs/adr-no-buy-window.md),
+    # overlaid by dca_config.load_tickers. Deliberately NOT folded into `tickers`/`excluded_tickers`: the
+    # universe, its stamped hash and its signals must not change. A listed ticker is still scored; only its
+    # BUY is vetoed, in _process_buy_candidate. Empty by default, so a bare StrategyConfig() blocks nothing.
+    no_buy_tickers: frozenset[str] = frozenset()
     approved_test_dates: frozenset[date] = frozenset(APPROVED_TEST_DATES)
     decision_time_et: time = time(15, 30)  # matches the 3:30 PM ET canonical live schedule
     trend_lookback_minutes: int = 60
@@ -22350,6 +22355,12 @@ def _process_buy_candidate(
     running_deployed_7d: float,
 ) -> tuple[Dict[str, Any], Optional[TopUpGuardOutcome], float, int, int]:
     ticker = decision.ticker
+    # Dated no_buy pause (wash-sale window after a tax-loss sale): the ladder still scored this ticker, so the
+    # signal row and the BUY decision are kept for tracking, but no order is built. Checked first so no later
+    # path (pending-credit flush, top-up, duplicate recovery) can place one either.
+    if ticker in ctx.config.no_buy_tickers:
+        logger.info("%s: inside a tickers.json no_buy window (wash-sale pause); no buy", ticker)
+        return ({"status": "skipped", "order_id": None, "skip_reason": "no_buy_window"}, None, running_deployed_7d, 0, 0)
     # A whole-share ticker (near_close_dca.WHOLE_SHARE_TICKERS) is never
     # bought through the normal dollar-amount pipeline below -- it always
     # blocks at the is_tradable_for_fractional_buy gate further down, and

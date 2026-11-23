@@ -53,7 +53,8 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from dca_config import get_config_dir
+import dca_config as _dca_config
+from dca_config import get_config_dir, no_buy_blocked_tickers
 from dca_fileio import atomic_open_w
 from dca_live_adapters import (
     _FILL_EVIDENCE_EXPLICIT_ZERO,
@@ -103,6 +104,7 @@ __all__ = [
     "REFUSED_INVALID_AMOUNT",
     "REFUSED_ALREADY_BOUGHT_TODAY",
     "REFUSED_NOT_ACTIVE_TICKER",
+    "REFUSED_NO_BUY_WINDOW",
     "REFUSED_INCONSISTENT_MULTIPLIER",
     "REFUSED_NON_CENT_AMOUNT",
     "REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE",
@@ -196,6 +198,9 @@ REFUSED_OVER_PER_ORDER_CAP = "over_per_order_cap"
 REFUSED_INVALID_AMOUNT = "invalid_amount"
 REFUSED_ALREADY_BOUGHT_TODAY = "already_bought_today"
 REFUSED_NOT_ACTIVE_TICKER = "not_active_ticker"
+# A ticker inside its dated tickers.json "no_buy" window (wash-sale pause after a tax-loss sale). Distinct from
+# not_active_ticker: the ticker IS active and tracked, only its BUY is paused. docs/adr-no-buy-window.md.
+REFUSED_NO_BUY_WINDOW = "no_buy_window"
 REFUSED_INCONSISTENT_MULTIPLIER = "inconsistent_multiplier_notional"
 REFUSED_NON_CENT_AMOUNT = "non_cent_amount"
 REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE = "below_broker_minimum_order_size"
@@ -646,6 +651,17 @@ def _validated_active_tickers() -> frozenset:
 # happened to name it (Codex review: "Enforce the active ticker whitelist
 # before planning").
 ACTIVE_TICKERS = _validated_active_tickers()
+
+
+def _no_buy_blocked(on: date | None = None) -> frozenset[str]:
+    """Tickers inside a dated ``no_buy`` window on ``on`` (default: today, US Eastern).
+
+    Read from ``tickers.json`` at call time, not frozen at import like ``ACTIVE_TICKERS``: a long-lived
+    process must see a window open or close on the right day, and an operator's early release
+    (``scripts/no_buy_window.py release``) must take effect on the next run. Fails closed: a malformed
+    block raises ``ValueError`` out of planning/execution, so nothing is placed, instead of being skipped.
+    """
+    return no_buy_blocked_tickers(_read_config("tickers.json"), on if on is not None else _dca_config._today_et())
 
 # The ladder's configured multiplier range. A candidate's self-reported
 # multiplier outside this range (or non-finite) is untrustworthy and must not
@@ -1967,9 +1983,12 @@ def _tier_selection_inputs(fresh_cands: list[Candidate]) -> tuple[list[Candidate
     """
     seen_tickers: set[str] = set()
     valid_cands = []
+    no_buy_blocked = _no_buy_blocked()
     for c in sorted(fresh_cands, key=_allocation_priority_key):
         if c.ticker in seen_tickers:
             continue
+        if c.ticker in no_buy_blocked:
+            continue  # paused for the wash-sale window: must not count toward tier spend either
         if not math.isfinite(c.amount_usd) or c.amount_usd <= 0:
             continue
         if c.amount_usd > MAX_PER_ORDER_USD:
@@ -2246,6 +2265,8 @@ def plan_orders(
     seen: set[str] = set()
     stop_reason: str | None = None
     effective_weekly_cap = tier.weekly_cap_usd if weekly_cap_usd is None else weekly_cap_usd
+    # Dated wash-sale pauses, as of the snapshot's own day so a replayed day sees that day's windows.
+    no_buy_blocked = _no_buy_blocked(snapshot.day)
 
     # Partitioned BEFORE sorting: a candidate whose fields can't even compute
     # a sort key (see _candidate_sortable_for_planning) would otherwise crash
@@ -2328,6 +2349,10 @@ def plan_orders(
             # (Codex review: "Enforce the active ticker whitelist before
             # planning").
             plan.refused.append((ticker, REFUSED_NOT_ACTIVE_TICKER))
+            continue
+
+        if ticker in no_buy_blocked:
+            plan.refused.append((ticker, REFUSED_NO_BUY_WINDOW))
             continue
 
         if isinstance(cand.amount_usd, bool) or not isinstance(cand.amount_usd, (int, float)):
@@ -5780,6 +5805,7 @@ def _validate_execute_plan(
     expected_pairs = {
         (_normalize_ticker(o.ticker), _cents(o.amount_usd)) for o in expected_plan.to_place
     }
+    no_buy_blocked_now = _no_buy_blocked()
     tickers_seen: set[str] = set()
     for order in plan.to_place:
         ticker = _normalize_ticker(order.ticker)
@@ -5796,6 +5822,11 @@ def _validate_execute_plan(
         if ticker not in ACTIVE_TICKERS:
             raise ValueError(
                 f"execute_plan refuses a plan containing a non-whitelisted ticker: {order.ticker!r}"
+            )
+        if ticker in no_buy_blocked_now:
+            raise ValueError(
+                f"execute_plan refuses a plan containing {order.ticker!r}: it is inside a tickers.json "
+                "no_buy window (wash-sale pause)"
             )
         if isinstance(order.amount_usd, bool) or not isinstance(order.amount_usd, (int, float)):
             # PlannedOrder is public and constructible independently of
