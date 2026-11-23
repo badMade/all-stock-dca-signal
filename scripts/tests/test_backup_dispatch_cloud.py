@@ -9,12 +9,15 @@ down). Any entry, ``failed`` included, means the Mac is alive and its own dispat
 
 from __future__ import annotations
 
+import io
+import ipaddress
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_net_utils
 from scripts import backup_dispatch as bd
 from scripts import slot_status
 
@@ -245,7 +248,7 @@ def test_fetch_document_uses_hardened_opener_and_enforces_size_and_duplicate_key
     assert redirect_handlers and redirect_handlers[0]().redirect_request(None, None, 302, "Found", {}, "https://x") is None
 
     # Oversized payload fails closed.
-    oversized = b'{"x":"' + (b"a" * (bd._MAX_STATUS_DOCUMENT_BYTES + 16)) + b'"}'
+    oversized = b'{"x":"' + (b"a" * (bd._MAX_DOCUMENT_BYTES + 16)) + b'"}'
     monkeypatch.setattr(bd.urllib.request, "build_opener", _make_opener(oversized))
     assert bd._fetch_document(url) is None
 
@@ -279,3 +282,76 @@ def test_main_rejects_boolean_check_after_minutes(monkeypatch, capsys):
     monkeypatch.setattr(bd, "load_settings", lambda: {"mode": "shadow", "check_after_minutes": True})
     assert bd.main(["run", "--now", "2026-10-29T09:51:00-04:00"]) == 2
     assert json.loads(capsys.readouterr().out) == {"action": "error", "detail": "ValueError"}
+
+
+# -- security: SSRF, redirect, size-limit, and duplicate-key hardening -----------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "http://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json",
+    "file:///etc/passwd",
+    "ftp://example.com/slot_status.json",
+    "https://127.0.0.1/slot_status.json",
+    "https://169.254.169.254/latest/meta-data/",
+    None,
+])
+def test_fetch_document_rejects_non_https_and_disallowed_destinations(monkeypatch, url):
+    monkeypatch.setattr(bd.urllib.request, "build_opener",
+                        lambda *a, **kw: pytest.fail("build_opener must not be called"))
+    assert bd._fetch_document(url) is None  # type: ignore[arg-type]
+
+
+class _FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_fetch_document_rejects_private_dns_resolution(monkeypatch):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("10.0.0.5")})
+    monkeypatch.setattr(bd.urllib.request, "build_opener",
+                        lambda *a, **kw: pytest.fail("build_opener must not be called"))
+    assert bd._fetch_document("https://example.com/slot_status.json") is None
+
+
+def test_fetch_document_uses_pinned_no_redirect_opener_and_bounds_reads(monkeypatch):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("93.184.216.34")})
+    seen_handlers = []
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            assert timeout == 20
+            return _FakeResponse(b'{"schema": "slot_status/1", "slots": {}}')
+
+    def _fake_build_opener(*handlers):
+        seen_handlers.extend(handlers)
+        return _FakeOpener()
+
+    monkeypatch.setattr(bd.urllib.request, "build_opener", _fake_build_opener)
+    doc = bd._fetch_document("https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json")
+    assert doc == {"schema": "slot_status/1", "slots": {}}
+    assert seen_handlers == [
+        bd._NoRedirectHandler,
+        dca_net_utils.PinnedHTTPHandler,
+        dca_net_utils.PinnedHTTPSHandler,
+        dca_net_utils.BlockedFileHandler,
+        dca_net_utils.BlockedFTPHandler,
+    ]
+    assert bd._NoRedirectHandler().redirect_request(None, None, 302, "Found", {}, "https://127.0.0.1/") is None
+
+
+@pytest.mark.parametrize("payload", [
+    b"x" * (bd._MAX_DOCUMENT_BYTES + 1),
+    b'{"schema": "slot_status/1", "schema": "other"}',
+])
+def test_fetch_document_fails_closed_on_oversized_or_duplicate_key_payload(monkeypatch, payload):
+    monkeypatch.setattr(dca_net_utils, "resolve_ips", lambda host: {ipaddress.ip_address("93.184.216.34")})
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResponse(payload)
+
+    monkeypatch.setattr(bd.urllib.request, "build_opener", lambda *a, **kw: _FakeOpener())
+    assert bd._fetch_document("https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json") is None

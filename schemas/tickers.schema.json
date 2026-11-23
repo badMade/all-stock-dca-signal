@@ -11,12 +11,30 @@
     "active": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true },
     "excluded": { "type": "array", "items": { "type": "string" }, "description": "Tickers with NO buying mechanism at all (e.g. a delisting/wind-down). Distinct from `whole_share` below." },
     "whole_share": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true, "description": "Tickers not tradable for fractional/notional buys, evaluated by the same graded ladder as `active` but bought via the whole-share accumulation path (dca_whole_share_accumulator.py, docs/whole_share_accumulation.md) instead of a normal dollar-amount order. Distinct from -- never overlapping with -- `active` and `excluded`. Canonical uppercase, same pattern as `active`: a lowercase entry would still normalize correctly in this repo's own comparisons, but the wired Robinhood tradability lookup compares against the broker's own (uppercase) response symbol case-insensitively as a defense, not a guarantee for every future consumer." },
+    "pinned": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true, "description": "Hand-held names kept in `active` outside the daily ranking (ETFs, funds and filers with no us-gaap facts, which cannot be scored). A subset of `active`, never overlapping `excluded`. The program never adds, ranks or drops them (docs/fundamentals_feed_scope.md)." },
     "symbol_corrections": { "type": "object", "additionalProperties": { "type": "string" } },
     "data_source_notes": {
       "type": "object",
       "description": "Per-ticker free-text notes about data-source availability/resolution quirks (e.g. a symbol resolved on Robinhood but unresolved/NOT_FOUND on the finance connector). Keys are tickers from `active`; values must be non-empty, non-placeholder text.",
       "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
       "additionalProperties": { "type": "string", "minLength": 1, "not": { "enum": ["", "TODO", "TBD", "N/A", "null"] } }
+    },
+    "no_buy": {
+      "type": "object",
+      "description": "Dated buy pauses (wash-sale windows after a tax-loss sale; docs/adr-no-buy-window.md). Keys are upper-case tickers (normally ones in `active`, which stay in the universe and keep being scored); each is blocked from buying while blocked_on <= today <= until (both inclusive, US Eastern) unless released_on is set and reached. A release (scripts/no_buy_window.py) sets released_on and never deletes the entry. Distinct from the permanent `excluded` list. dca_config.no_buy_blocked_tickers enforces the stricter rules (until >= blocked_on, released_on >= blocked_on, non-empty reason, no unknown fields).",
+      "propertyNames": { "pattern": "^[A-Z.]{1,6}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["blocked_on", "until", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "blocked_on": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "until": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "reason": { "type": "string", "minLength": 1 },
+          "released_on": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "release_reason": { "type": "string", "minLength": 1 }
+        }
+      }
     },
     "notes": { "type": "string" }
   }

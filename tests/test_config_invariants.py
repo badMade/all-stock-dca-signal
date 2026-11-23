@@ -5178,3 +5178,31 @@ def test_a_cve_id_suffix_is_not_an_account_but_a_nine_digit_one_still_is():
         match = _ACCOUNT_SHAPED.search(text)
         assert match is not None
         assert _is_cve_id_suffix(text, match) is expected, text
+
+
+# --- pinned (hand-held ETFs/funds/20-F filers kept in `active` outside the ranking) ---------------------
+
+
+def test_tickers_schema_accepts_a_pinned_list_of_canonical_symbols():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    document["pinned"] = [document["active"][0]]
+    jsonschema.validate(document, schema)
+
+
+@pytest.mark.parametrize("pinned", [["not-a-ticker"], ["AAPL", "AAPL"], "AAPL"])
+def test_tickers_schema_rejects_a_malformed_pinned_list(pinned):
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    document["pinned"] = pinned
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_pinned_names_are_active_and_never_excluded():
+    documented = _load("tickers.json")
+    pinned = set(documented.get("pinned", []))
+    assert pinned <= set(documented["active"]), "pinned must be a subset of active"
+    assert not pinned & set(documented.get("excluded", [])), "a pinned name cannot be excluded"
