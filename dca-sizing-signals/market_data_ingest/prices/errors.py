@@ -64,18 +64,5 @@ class AmbiguousActionsError(ValidationError):
         self.inserted = inserted
 
 
-class AnomalousBarsError(ValidationError):
-    """A batch held a close-to-close move no known split explains (backtest protocol item 6).
-
-    Like its parent, NOTHING from the batch reached ``daily_bars_raw``. Unlike its parent, the
-    anomalous rows WERE written to ``quarantined_bars`` with their reason before this was raised,
-    so a rejected batch leaves a queryable record. ``anomalies`` lists them.
-    """
-
-    def __init__(self, message: str, *, anomalies: tuple = ()) -> None:
-        super().__init__(message)
-        self.anomalies = anomalies
-
-
 class SpliceNotValidatedError(Exception):
     """Refused to join yahoo_legacy and vendor history without a passing reconciliation."""
