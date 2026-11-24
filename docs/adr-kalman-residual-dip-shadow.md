@@ -153,3 +153,14 @@ whose inputs are dated after its `as_of`.
 - `python -m pytest dca-sizing-signals/tests -q` and
   `ruff check --isolated --select=E,F,B --line-length=120 dca-sizing-signals`.
 - The boundary test fails if `kalman_signals` grows a sizing path or is imported from the live side.
+
+## Implementation status (2026-11-23)
+
+Phase 1 code is in `dca-sizing-signals/kalman_signals/` (`kalman_filter.py`, `residual_dip.py`,
+`shadow.py`, `backtest.py`, `backtest_cli.py`), with tests in `dca-sizing-signals/tests/kalman/` and
+boundary rules in `tests/test_architecture_boundaries.py`. Two deviations from the plan above:
+
+- The `trials` table is not written automatically: `kalman_signals` may not import
+  `market_data_ingest` (D3), so the report lists the q grid under `trials` for the operator to record.
+- The first walk-forward run used VT as the market factor, because the archive has no SPY. It failed
+  D7 (z variance 1.30). Results and next steps: `docs/research/2026-11-23-kalman-phase1-results.md`.
