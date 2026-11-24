@@ -45,7 +45,11 @@ def test_book_aggregates_are_dollar_weighted() -> None:
     assert book["uncovered"] == [{"ticker": "ZZZ", "usd": 50.0, "reason": "unmapped"}]
     assert book["portfolio_beta_market"] == pytest.approx(sum(w[k] * t[k].beta_market for k in w))
     assert book["sector_weights"] == pytest.approx({"XLK": 0.8, "market_only": 0.2})
-    assert book["sector_loadings"] == pytest.approx({"XLK": 0.6 * t["AAA"].beta_sector + 0.2 * t["BBB"].beta_sector})
+    # beta_sector is Optional (None for a market-only ticker like QQQ); AAA and BBB are
+    # XLK-mapped, so narrow them explicitly -- a None should fail here, not TypeError.
+    aaa_sector, bbb_sector = t["AAA"].beta_sector, t["BBB"].beta_sector
+    assert aaa_sector is not None and bbb_sector is not None
+    assert book["sector_loadings"] == pytest.approx({"XLK": 0.6 * aaa_sector + 0.2 * bbb_sector})
     assert book["mean_r_squared"] == pytest.approx(sum(w[k] * t[k].r_squared for k in w))
     assert book["effective_names"] == pytest.approx(1.0 / (0.36 + 0.04 + 0.04))
 
@@ -55,7 +59,10 @@ def test_variance_decomposition_matches_factor_model() -> None:
     book = exposure_report(model, {"h": {"AAA": 1.0, "QQQ": 1.0}})["books"]["h"]
     t = model.tickers
     x_m = 0.5 * t["AAA"].beta_market + 0.5 * t["QQQ"].beta_market
-    x_s = 0.5 * t["AAA"].beta_sector
+    # beta_sector is Optional (None for market-only QQQ); AAA is XLK-mapped, so narrow it.
+    aaa_sector = t["AAA"].beta_sector
+    assert aaa_sector is not None
+    x_s = 0.5 * aaa_sector
     f = model.factor_returns
     common = sorted(set(f["SPY"]) & set(f["XLK"]))
 

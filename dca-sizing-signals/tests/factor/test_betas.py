@@ -111,6 +111,9 @@ def test_blume_shrinkage_applied_to_both_betas() -> None:
     b = fit_factor_model(rows, as_of_after(rows), ["AAA"], _map()).tickers["AAA"]
     assert (BLUME_INTERCEPT, BLUME_SLOPE) == (0.23, 0.77)
     assert b.beta_market == pytest.approx(0.23 + 0.77 * b.beta_market_raw)
+    # beta_sector_raw is Optional (None for a market-only ticker); AAA is sector-mapped,
+    # so narrow it explicitly -- a None here should fail as an assertion, not a TypeError.
+    assert b.beta_sector_raw is not None
     assert b.beta_sector == pytest.approx(0.23 + 0.77 * b.beta_sector_raw)
 
 
