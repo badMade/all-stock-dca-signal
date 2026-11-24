@@ -43,8 +43,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # connector_signals/ and market_data_ingest/ ship inside THIS package, so they
 # resolve against the package root rather than the wider repo root.
 # overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
+# factor_signals/ joins them under docs/adr-factor-residual-dip-signals.md.
 _OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
-                 "inventory_signals", "mc_research"}
+                 "factor_signals", "inventory_signals", "mc_research"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
@@ -54,33 +55,45 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # (docs/adr-overnight-futures-tracker.md, D3) -- and unlike comovement_signals, not even
     # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
     "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
-                      "inventory_signals", "near_close_dca"},
+                      "factor_signals", "inventory_signals",
+                      "near_close_dca"},
     "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
-                         "inventory_signals", "near_close_dca"},
+                         "factor_signals", "inventory_signals",
+                         "near_close_dca"},
     "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
-                          "inventory_signals", "near_close_dca"},
+                          "factor_signals", "inventory_signals",
+                          "near_close_dca"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "overnight_futures", "inventory_signals", "near_close_dca"},
+                           "overnight_futures", "factor_signals", "inventory_signals",
+                           "near_close_dca"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                           "market_data_ingest", "overnight_futures", "inventory_signals", "near_close_dca"},
+                           "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
+                           "near_close_dca"},
     # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
     # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
     # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
     # any suggester. dca_shared_interfaces is the only sibling it may import.
     "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                          "market_data_ingest", "inventory_signals", "near_close_dca"},
+                          "market_data_ingest", "factor_signals", "inventory_signals", "near_close_dca"},
+    # Pure factor decomposition (docs/adr-factor-residual-dip-signals.md): rows arrive from
+    # the caller, as in comovement_signals, and the two-way rule applies. It may not import
+    # comovement_signals even to reuse its returns contract -- it carries its own copy.
+    "factor_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                       "market_data_ingest", "overnight_futures", "inventory_signals", "mc_research",
+                       "near_close_dca"},
     # Inventory reservation (docs/inventory_reservation_suggester.md): same two-way rule as
     # comovement_signals. Inputs arrive from the caller, so it needs no ingest layer and no
     # other suggester; only SizingAdjustmentReader may ever learn it exists.
     "inventory_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                          "market_data_ingest", "overnight_futures", "mc_research", "near_close_dca"},
+                          "market_data_ingest", "overnight_futures", "factor_signals", "mc_research",
+                          "near_close_dca"},
     # Research-only Monte Carlo harness (docs/mc_variance_reduction.md): paths are simulated
     # in-package and strategies take tiers as arguments, so it needs no suggester, no ingest
     # layer and no live module. Stdlib-only is pinned separately in tests/mc_research/.
     "mc_research": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                    "market_data_ingest", "overnight_futures", "inventory_signals", "near_close_dca",
+                    "market_data_ingest", "overnight_futures", "inventory_signals", "factor_signals", "near_close_dca",
                     "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters"},
 }
 
@@ -164,7 +177,8 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     shared = this_package_root / "dca_shared_interfaces"
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                 "market_data_ingest", "comovement_signals", "overnight_futures", "inventory_signals",
+                 "market_data_ingest", "comovement_signals", "overnight_futures", "factor_signals",
+                 "inventory_signals",
                  "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
@@ -242,6 +256,27 @@ def test_overnight_futures_is_packaged() -> None:
     packages.find works from a checkout and ImportErrors from an installed wheel."""
     pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
     assert f'"{_OVERNIGHT}*"' in pyproject, f'add "{_OVERNIGHT}*" to [tool.setuptools.packages.find] include'
+
+
+# --- factor_signals (docs/adr-factor-residual-dip-signals.md) --------------------------------
+#
+# Same reason as the overnight_futures block above: a registration that silently skips a
+# missing package proves nothing, so these make it bite.
+
+_FACTOR = "factor_signals"
+
+
+def test_factor_signals_package_exists() -> None:
+    package_dir = _resolve_package_dir(_FACTOR)
+    assert package_dir is not None, f"{_FACTOR}/ not found under {PACKAGE_ROOT}"
+    assert package_dir.parent == PACKAGE_ROOT
+    assert (package_dir / "__init__.py").is_file()
+
+
+def test_factor_signals_is_forbidden_to_every_other_package() -> None:
+    missing = sorted(pkg for pkg, forbidden in FORBIDDEN_IMPORTS.items()
+                     if pkg != _FACTOR and _FACTOR not in forbidden)
+    assert not missing, f"{_FACTOR} is not forbidden to: {missing}"
 
 
 # --- mc_research (docs/mc_variance_reduction.md) ----------------------------------------------
