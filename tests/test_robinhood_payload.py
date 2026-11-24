@@ -1681,3 +1681,24 @@ def test_a_healthy_build_writes_no_failure_file_and_never_retries(tmp_path):
 def test_retry_settings_must_be_whole_numbers(tmp_path):
     done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_RETRIES": "once"})
     assert done.returncode == 2 and "DCA_BUILD_RETRIES" in done.stderr
+
+
+def test_num_rejects_oversized_int_and_files_reject_duplicate_json_keys(tmp_path):
+    with pytest.raises(rp.PayloadError, match="out of range|not a number"):
+        rp._num(10**400, "quote.price")
+
+    plan = _published(tmp_path)
+    out = tmp_path / "out"
+    meta_path = out / "payload.meta.json"
+    good_meta = meta_path.read_text(encoding="utf-8")
+    # Duplicate key in sidecar must fail check() closed as EXIT_STALE.
+    meta_path.write_text(good_meta.rstrip()[:-1] + ',"slot":"1430"}', encoding="utf-8")
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=5)) == rp.EXIT_STALE
+    meta_path.write_text(good_meta, encoding="utf-8")
+
+    # Duplicate key in plan file must be rejected by _read_plan().
+    plan_file = tmp_path / "dup_plan.json"
+    plan_file.write_text('{"slot": "0935", "slot": "1430"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key"):
+        rp._read_plan(str(plan_file))
+
