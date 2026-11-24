@@ -959,6 +959,26 @@ def upsert_shadow_ml(path, runs):
     return len(rows)
 
 
+def upsert_shadow_adr_price(path, run_date, records):
+    """Merge one day's ``adr_price`` surrogate ranking into ``shadow_adr_price_history.csv`` (same columns as
+    ``backfill-history`` output, so ``grade`` reads it directly); returns the row count. Shadow only: the surrogate
+    is logged beside the composite and never touches the score, the trade list or the proposal."""
+    path = Path(path)
+    day = run_date.isoformat()
+    rows = [r for r in read_history(path) if r["date"] != day]
+    size = len(records)
+    for ticker, rec in sorted(records.items(), key=lambda kv: kv[1]["rank"]):
+        rows.append({"date": day, "ticker": ticker, "score": f"{rec['score']:.3f}", "rank": str(rec["rank"]),
+                     "universe_size": str(size), "vol": f"{rec['vol']:.4f}", "max_dd": f"{rec['max_dd']:.4f}",
+                     "eligible": "1" if rec["eligible"] else "0"})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def ml_scorecard(ml_rows, history_rows, series_by_ticker, horizon_days=ML_HORIZON_DAYS):
     """Per run date: rank correlation of ml-forecaster's tilt and of the composite score with the realised return over
     the next ``horizon_days`` calendar days (only dates whose horizon has fully elapsed in the price data)."""
@@ -1248,6 +1268,12 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
         upsert_shadow(data_dir / "shadow_octopus_history.csv", octopus, pcts)
     if ml_runs:
         upsert_shadow_ml(data_dir / "shadow_ml_history.csv", ml_runs)
+    summary_extra = {}
+    if args.universe == "archive":
+        # Shadow challenger: the price-only ADR surrogate, ranked over the same archive and logged for later grading.
+        adr_records, _ = score_universe_adr_price(series, as_of, params["liquidity"])
+        summary_extra["shadow_adr_price_rows"] = upsert_shadow_adr_price(
+            data_dir / "shadow_adr_price_history.csv", as_of, adr_records)
     trade = build_trade_list(records, held, params)
     write_trade_list(run_dir, data_dir / "trade_list_history.csv", as_of, records, trade, params)
     tickers_config = _load_json(Path(args.config_dir) / "tickers.json", {})
@@ -1269,7 +1295,7 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
                "above_threshold": above, "threshold": args.threshold, "no_price_history": len(missing),
                "not_scored_or_stale": len(stale), "eligible": sum(1 for r in records.values() if r.get("eligible", True)),
                "trade_list": len(trade), "params_version": params["version"],
-               "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"])}
+               "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"]), **summary_extra}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # read by the console page
     return {**summary, "run_dir": str(run_dir)}
 
