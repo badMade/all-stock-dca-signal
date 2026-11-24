@@ -1,6 +1,11 @@
 # ADR: Massive + Alpaca as the ongoing price source (Yahoo stays as `yahoo_legacy`)
 
 - **Status:** Proposed (2026-10-18). Not wired into any live path.
+- **Implementation status (2026-11-24 audit):** the whole Decision section is built and tested in
+  `dca-sizing-signals/market_data_ingest/prices/` (both providers, the router, the store and its
+  point-in-time macros, reconciliation, and the `daily_job` CLI). Still open: `daily_job` is not
+  scheduled, no bootstrap against the real `ticker_data/` archive is recorded, and accepting this
+  ADR remains the operator's decision.
 - **Scope:** `dca-sizing-signals/market_data_ingest/prices/` only. The stdlib-only core, the
   ladder, `config/`, and all three entry points (`run_dca.run_slot()`, the
   `MorningDCAExecutor` hierarchy, `dca_runner.py`) are untouched.
@@ -78,8 +83,9 @@ there is no `pyarrow`. Timestamps are stored as naive-UTC `TIMESTAMP`, because r
   collapse to the latest. Massive supplies ids, so this matters only for id-less rows.
 - The Yahoo daily updater keeps running and no consumer of `ticker_data/` is repointed.
   Cutover is a separate decision once reconciliation has run on the real archive.
-- CI: `dca-sizing-signals` has no job and AGENTS.md bars agents from editing
-  `.github/workflows/`. The job and the pip-audit manifest entry are proposed, not made.
+- CI: when this ADR was written `dca-sizing-signals` had no job. The job
+  (`Lint & test (dca-sizing-signals)`) and the pip-audit manifest entry now exist in
+  `.github/workflows/ci.yml`.
 
 ## Rollback
 

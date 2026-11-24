@@ -62,7 +62,7 @@ Facts that change the design:
    day and week notional. `scripts/primary_gates.py budget` is the slot's own scripted Gate 6 on top
    of both. So daily vs weekly attribution comes from live code for free.
 
-## 3) Decision (proposed)
+## 3) Decision
 
 A read-only CLI, `scripts/budget_exhaustion_count.py`, stdlib plus repo modules, that counts from the
 slots' own documents instead of replaying sizing.

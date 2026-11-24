@@ -2,8 +2,12 @@
 
 - **Status:** In progress, operator-directed 2026-11-19. Implemented so far: the gated writer
   (`ticker-advisor/universe_apply.py`), the derived `ACTIVE_TICKERS`, and the strict daily top-100
-  engine mode. Not built: the data feed for ranking, the `launchd` job on the Mac, and the call
-  sites. Nothing yet applies a proposal to the live list. Open question 9 is unanswered.
+  engine mode. Since built (2026-11-22, confirmed in the 2026-11-24 audit): the data feed for ranking
+  (`dca-sizing-signals/market_data_ingest/build_fundamentals_snapshot.py`,
+  `ticker-advisor/daily_ranking.py`), the daily job `ticker-advisor/daily_universe_job.py` and its
+  template `deploy/launchd/com.all-stock-dca.universe-daily-ranking.plist.template`, which is not
+  yet loaded on the Mac. Nothing yet applies a proposal to the live list. Open question 9 was
+  answered by `docs/adr-backup-planner-daily-universe.md` (option 1, accepted 2026-11-20).
 - **Supersedes:** item 8 ("Suggest-only boundary") of `docs/adr-dynamic-universe.md`. Every other
   item of that ADR stays in force unless this one says otherwise.
 - **Scope:** who writes `config/tickers.json`, how the executor reads it, how the 122 current names

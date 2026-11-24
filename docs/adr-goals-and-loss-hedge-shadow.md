@@ -5,8 +5,9 @@
   Phases 0 and 1, the console Goals panel and the hedge shadow pricing/scorecard functions are
   implemented; Phase 2 goal progress tables and snapshot capture are implemented (the
   `dca-sizing-signals/tests/ledger` and `tests/test_goal_snapshot_capture.py` suites pass, 379
-  and 12 tests on 2026-11-15). The daily hedge capture task and its DuckDB tables, the stale-goal
-  alert, the 07:31 ET task registration and Phase 4 stay open.
+  and 12 tests on 2026-11-15). The daily hedge capture task and its DuckDB tables, the 07:31 ET
+  task registration and Phase 4 stay open. (2026-11-24 audit: the stale-goal alert is implemented as
+  `dca_goal_progress.goal_config_alert`, tested in `tests/test_goal_progress_alerts.py`.)
 - **Scope:** goals as versioned data, a console page that proposes goal changes as pull
   requests, and a shadow-only loss hedge (options and crypto). **Nothing here changes a live
   dollar amount, places, previews or reviews an order, or edits a file under `config/` at
@@ -181,8 +182,9 @@ goal-attainment metrics to `sizing_suggestion_compare.py` and the ledger `trials
 | 11 | A shadow crypto price is the last quote at or before 4:00 PM ET (real fixture `rh_crypto_quotes_2026-11-13.json`) | `dca-sizing-signals/tests/ledger/test_hedge_shadow_pit.py` |
 | 12 | The scorecard reports hedge performance on equity down days, not only full-period correlation | `dca-sizing-signals/tests/ledger/test_hedge_shadow_scorecard.py` |
 
-Not yet written (follow in Phase 1 and 2): the bitemporal `goal_versions` point-in-time test,
-TWR/MWR golden values from real fills, and the stale-goal alert.
+Written since (2026-11-24 audit): the bitemporal `goal_versions` point-in-time test
+(`dca-sizing-signals/tests/ledger/test_goal_versions_pit.py`), TWR/MWR golden values from real fills
+(`tests/test_goal_progress_golden.py`) and the stale-goal alert (`tests/test_goal_progress_alerts.py`).
 
 ## Open questions
 
