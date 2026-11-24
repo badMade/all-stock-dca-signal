@@ -99,7 +99,8 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
                     "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters",
                     "residual_reversal", "cost_basis_backtest"},
     # Sector-ETF residual reversal (docs/adr-residual-reversal-suggester.md): rows arrive
-    # from the caller, so the same two-way rule as comovement_signals applies.
+    # from the caller, so the same two-way rule as comovement_signals applies. It carries its
+    # own OLS/OU math rather than reusing factor_signals' betas.
     "residual_reversal": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                           "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
                           "mc_research", "cost_basis_backtest", "near_close_dca"},
