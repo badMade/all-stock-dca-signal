@@ -493,3 +493,80 @@ def test_sync_workflow_cron_fallback_no_ruamel(monkeypatch, tmp_path):
     changed = compute_schedule.sync_workflow_cron(str(workflow_file), "0 3 * * 1")
     assert changed is True
     assert "cron: '0 3 * * 1'" in workflow_file.read_text()
+
+
+@pytest.mark.parametrize(
+    "bad_cron",
+    [
+        "0 3 * * 1\n",
+        "0 3 * * 1'\n    run: evil",
+        "0 3 * * 1 # injected",
+        "0 3 * *",
+        "not a valid cron expr",
+        "",
+    ],
+)
+def test_sync_workflow_cron_and_update_reject_malformed_or_injected_cron(tmp_path, bad_cron):
+    workflow_file = tmp_path / "self-heal.yml"
+    original = "on:\n  schedule:\n    - cron: '0 1 * * 1' # AUTO-UPDATED\n"
+    workflow_file.write_text(original)
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+
+    with pytest.raises(ValueError, match="Invalid 5-field cron schedule"):
+        compute_schedule.sync_workflow_cron(str(workflow_file), bad_cron)
+    assert workflow_file.read_text() == original
+
+    with pytest.raises(ValueError, match="Invalid 5-field cron schedule"):
+        compute_schedule.update_schedule_file(bad_cron, "Bad cron.", str(schedule_file))
+    assert not schedule_file.exists()
+
+
+def test_old_update_schedule_file_escapes_quotes_and_newlines_in_rationale(tmp_path):
+    import yaml
+
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    compute_schedule._old_update_schedule_file(
+        "0 3 * * 1",
+        "Operator's pin\noverride: false",
+        str(schedule_file),
+        override=True,
+    )
+
+    loaded = yaml.safe_load(schedule_file.read_text())
+    assert loaded == {
+        "schedule": "0 3 * * 1",
+        "rationale": "Operator's pin override: false",
+        "override": True,
+    }
+
+
+def test_update_schedule_file_cleans_up_temp_file_on_yaml_failure(monkeypatch, tmp_path):
+    class FailingYAML:
+        def __init__(self):
+            self.preserve_quotes = False
+            self.calls = 0
+
+        def load(self, f):
+            self.calls += 1
+            if self.calls == 1:
+                return {}
+            raise RuntimeError("corrupt dump")
+
+        def dump(self, data, f):
+            f.write("schedule: '0 3 * * *'\n")
+
+    import types
+
+    fake_mod = types.ModuleType("ruamel.yaml")
+    fake_mod.YAML = FailingYAML  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ruamel", fake_mod)
+    monkeypatch.setitem(sys.modules, "ruamel.yaml", fake_mod)
+
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    schedule_file.write_text("schedule: '0 1 * * 1'\n")
+
+    with pytest.raises(RuntimeError, match="corrupt dump"):
+        compute_schedule.update_schedule_file("0 3 * * *", "Test.", str(schedule_file))
+
+    assert [p.name for p in tmp_path.iterdir()] == ["self-heal-schedule.yml"]
+    assert schedule_file.read_text() == "schedule: '0 1 * * 1'\n"

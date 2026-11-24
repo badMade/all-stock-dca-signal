@@ -21,6 +21,28 @@ import sys
 from collections.abc import Sequence
 from typing import Callable, Optional, Tuple
 
+_CRON_EXPR_RE = re.compile(
+    r"\A[0-9*,/-]+ +[0-9*,/-]+ +[0-9*,/-]+ +[0-9A-Za-z*,/-]+ +[0-9A-Za-z*,/-]+\Z",
+    re.ASCII,
+)
+
+
+def _validate_cron_schedule(schedule: str) -> str:
+    """Validate that a schedule string is a single-line 5-field POSIX cron expression.
+
+    Args:
+        schedule (str): Candidate cron expression.
+
+    Returns:
+        str: The validated cron expression.
+
+    Raises:
+        ValueError: If ``schedule`` is not a single-line 5-field cron expression.
+    """
+    if not isinstance(schedule, str) or not _CRON_EXPR_RE.fullmatch(schedule):
+        raise ValueError(f"Invalid 5-field cron schedule: {schedule!r}")
+    return schedule
+
 
 def run_cmd(cmd: Sequence[str]) -> Optional[str]:
     """Executes a command and returns its standard output."""
@@ -179,7 +201,7 @@ def update_schedule_file(schedule: str, rationale: str, file_path: str, *, overr
         file_path (str): The path to the schedule file.
         override (bool, optional): Whether this is a manual override. Defaults to False.
     """
-    import os
+    _validate_cron_schedule(schedule)
     try:
         from ruamel.yaml import YAML
         yaml = YAML()
@@ -195,23 +217,28 @@ def update_schedule_file(schedule: str, rationale: str, file_path: str, *, overr
         data['override'] = override
 
         import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
-            yaml.dump(data, tf)
-            temp_name = tf.name
+        target_dir = os.path.dirname(os.path.abspath(file_path)) or "."
+        temp_name: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=target_dir, delete=False) as tf:
+                yaml.dump(data, tf)
+                temp_name = tf.name
 
-        # Validate parseability
-        with open(temp_name, "r") as tf:
-            yaml.load(tf)
+            with open(temp_name, "r") as f:
+                file_content = f.read()
+            if "# AUTO-UPDATED" not in file_content:
+                with open(temp_name, "a") as f:
+                    f.write("\n# AUTO-UPDATED\n")
 
-        import shutil
-        shutil.move(temp_name, file_path)
+            # Validate parseability before replacing the target file
+            with open(temp_name, "r") as tf:
+                yaml.load(tf)
 
-        # Ensure AUTO-UPDATED marker
-        with open(file_path, "r") as f:
-            file_content = f.read()
-        if "# AUTO-UPDATED" not in file_content:
-            with open(file_path, "a") as f:
-                f.write("\n# AUTO-UPDATED\n")
+            os.replace(temp_name, file_path)
+            temp_name = None
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
     except ImportError:
         _old_update_schedule_file(schedule, rationale, file_path, override=override)
 
@@ -225,9 +252,12 @@ def _old_update_schedule_file(schedule: str, rationale: str, file_path: str, *, 
         file_path (str): The path to the schedule file.
         override (bool, optional): Whether this is a manual override. Defaults to False.
     """
+    _validate_cron_schedule(schedule)
+    # Collapse newlines and escape single quotes so rationale cannot break out of the YAML scalar.
+    safe_rationale = " ".join(rationale.splitlines()).replace("'", "''")
     new_lines = [
         f"schedule: '{schedule}'\n",
-        f"rationale: '{rationale}'\n",
+        f"rationale: '{safe_rationale}'\n",
         f"override: {'true' if override else 'false'}\n",
         "# AUTO-UPDATED\n",
     ]
@@ -275,6 +305,7 @@ def sync_workflow_cron(workflow_file: str, schedule: str) -> bool:
     Returns:
         bool: True if the file was modified, False otherwise.
     """
+    _validate_cron_schedule(schedule)
     if not os.path.exists(workflow_file):
         return False
 
