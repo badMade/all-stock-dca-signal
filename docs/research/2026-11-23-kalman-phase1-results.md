@@ -1,7 +1,8 @@
 # Kalman residual-dip signal: first Phase 1 walk-forward run
 
-Status: research output only. Not a decision; the D7 gate failed, so nothing moves past Phase 1.
-Date: 2026-11-23
+Status: research output only. Not a decision. The D7 gate failed in both rounds (2026-11-23 and
+2026-11-24), so nothing moves past Phase 1.
+Date: 2026-11-23, second round 2026-11-24 (below)
 ADR: [`docs/adr-kalman-residual-dip-shadow.md`](../adr-kalman-residual-dip-shadow.md), Phase 1.
 Code: `dca-sizing-signals/kalman_signals/` at the commit that added this file.
 
@@ -72,4 +73,75 @@ Labels: 64,089 `none`, 5,295 `market_selloff`, 1,125 `idiosyncratic_dip`.
 5. If variance stays high, consider a time-varying R (e.g. scaled by trailing market vol);
    each such change is another trial.
 
-Phase 2 (live shadow logging) stays blocked until D7 passes on SPY.
+
+## Second round (2026-11-24): SPY, clusters, earnings
+
+Worktree: `.claude/worktrees/resolve-merge-conflicts-3d8a6a`, branch
+`badMade/kalman-filters-stock-dca-02d0fc`. Scripts: `analysis/2026-11-24-kalman-phase1/`.
+
+Next steps 1 to 4 above were done. Code changes: `--market-file` (SPY lives outside the managed
+archive), `--earnings`/`--earnings-pad`, forward returns by label, and the gate now also checks
+calibration **within each volatility regime**, as D7.1 says; round 1's gate checked only the pooled
+figure. All four runs below were re-run under the tightened gate.
+
+| Run | Market | Clusters | Earnings excluded | Events | Var (pooled / high vol / low vol) | Beyond ±1.96 | Failed checks |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| r1 | VT | no | no | 70,509 | 1.297 / 1.399 / 1.233 | 6.1% | variance, variance by regime, monotonic |
+| r2 | SPY | no | no | 69,826 | 1.300 / 1.377 / 1.255 | 6.2% | variance, variance by regime, monotonic |
+| r3 | SPY | yes | no | 69,826 | 1.300 / 1.377 / 1.255 | 6.2% | variance, variance by regime, monotonic |
+| r4 | SPY | yes | ±1 session | 66,353 | **1.046** / 1.143 / 0.990 | 5.2% | variance by regime, monotonic, events per bucket |
+
+r4 forward 5-session SPY-adjusted log return by intraday z (date-clustered SE):
+
+| Bucket | Events | Mean | SE |
+| --- | --- | --- | --- |
+| z ≤ -2 | 1,107 | +0.59% | 0.25% |
+| -2 < z ≤ -1 | 5,762 | +0.30% | 0.08% |
+| -1 < z ≤ 0 | 25,783 | +0.12% | 0.04% |
+| 0 < z ≤ 1 | 26,121 | +0.09% | 0.04% |
+| z > 1 | 7,194 | +0.11% | 0.08% |
+
+r4 by label (descriptive, not a D7 check): `cluster_selloff` 2,826 events +0.41% (SE 0.13%),
+`idiosyncratic_dip` 557 events +0.44% (SE 0.33%), `market_selloff` 4,774 events on only 62 dates
++0.23% (SE 0.13%), `none` +0.12% (SE 0.03%).
+
+### Reading it
+
+- **VT was not the problem.** SPY gives the same 1.30 variance.
+- **Earnings days were.** Removing the ±1-session window around each announcement (3,473 events,
+  5%) brings the pooled variance from 1.30 to 1.05 and the tail share from 6.2% to 5.2%. The
+  remaining miss is the high-volatility regime at 1.14: a constant R still understates noise when
+  the market is turbulent, which is what next step 5 (time-varying R) targets.
+- **Clusters change labels, not scores.** Calibration and buckets are market-factor quantities, so
+  r2 and r3 are identical there; with clusters, 2,996 events become `cluster_selloff`, and the
+  `idiosyncratic_dip` set shrinks from 1,147 to 714.
+- **Monotonicity misses on the top bucket only**: z > 1 is 0.02 points above 0 < z ≤ 1, well inside
+  their SEs. The four lower buckets are ordered, and z ≤ -2 is +0.59% at about 2.4 SEs. The gate is
+  not loosened to pass on this: that would be a post-hoc change to the bar.
+- **The z ≤ -2 bucket fell below 1,300 events** (1,107) once earnings days were removed, since
+  many deep dips are earnings reactions.
+- **D7 items not yet evaluated:** cluster-adjusted forward returns (D7.2 asks for market- and
+  cluster-adjusted; only market-adjusted is computed), survival against the trial count (D7.4,
+  deflated Sharpe), and budget-matched terminal value (D7.5).
+
+### Caveats
+
+- Clusters are fixed at 2023-12-29 for all 35 months: no lookahead, but stale by the end.
+- Earnings dates are yfinance's `get_earnings_dates`; DRAM, BTX, SATA, RVI and VCX returned none,
+  so their earnings days are still in. Not cross-checked against EDGAR.
+- The non-equity list is still hand-written.
+- Four configurations count as trials so far: these four runs, each with the same 3-value q grid.
+  The trial rows are built (`record_trials.py rows`) and verified against a scratch ledger, but
+  **not yet written to the live ledger** at `cron_tracking/goal_snapshot/ledger.duckdb`, which is
+  operator-owned run output.
+
+### Next steps
+
+1. Write the four trial rows to the live ledger (operator's call).
+2. Time-varying R scaled by trailing market volatility, as one new trial, to address the
+   high-vol regime.
+3. Cluster-adjusted forward returns, the D7.4 deflated-Sharpe check, and the D7.5 terminal-value
+   comparison, so the full gate can be read.
+4. A longer history (start before 2024) to lift the z ≤ -2 bucket past 1,300 events.
+
+Phase 2 (live shadow logging) stays blocked until every D7 check passes.

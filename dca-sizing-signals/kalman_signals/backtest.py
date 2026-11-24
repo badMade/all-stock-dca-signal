@@ -19,12 +19,20 @@ Diagnostics (ADR D7):
   3. event counts per bucket and the number of calendar months covered;
   4. the trial count (the q grid size) and how often each q was chosen.
 
-Earnings dates are not available offline, so the earnings gate is NOT applied here; the
-report says so. Pure: rows in, a dict out.
+Earnings (ADR D6): the caller may pass past announcement dates per ticker. Each scored session
+within ``earnings_pad`` sessions of the first session on or after an announcement date is
+flagged ``earnings_window`` -- a pad of 1 covers the session before, the announcement session
+(a before-the-open report) and the session after (an after-the-close report). Flagged
+sessions are still scored and the filter still steps through them, exactly as the live
+shadow function would skip the ticker for the day but keep its history; the caller decides
+which set the D7 gate is read on. Announcement dates are schedule facts published ahead of
+time, not outcomes. Without them nothing is flagged and the report says so. Pure: rows in,
+a dict out.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 import statistics
 from collections import Counter, defaultdict
@@ -66,6 +74,7 @@ class Event:
     q: float
     forward_adjusted: float | None
     high_vol: bool | None
+    earnings_window: bool = False
 
 
 def bucket_of(z: float) -> str:
@@ -92,6 +101,8 @@ def walk_forward(
     cluster_members: Mapping[str, Sequence[str]] | None = None,
     non_equity: frozenset[str] = frozenset(),
     horizon: int = 5,
+    earnings_dates: Mapping[str, Sequence[date]] | None = None,
+    earnings_pad: int = 1,
 ) -> list[Event]:
     """Score every eligible (ticker, session) in [start, end]. Rows must be final closes."""
     config = config or ResidualDipConfig()
@@ -109,6 +120,7 @@ def walk_forward(
                  and m not in non_equity and m in all_moves]
         if peers:
             clusters[t] = cluster_moves([all_moves[m] for m in peers])
+    flagged = _earnings_sessions(calendar, earnings_dates or {}, earnings_pad)
     vol = _trailing_vol(market)
     vol_median = statistics.median([v for v in vol if v is not None]) if any(v is not None for v in vol) else None
 
@@ -138,12 +150,26 @@ def walk_forward(
                 fwd = _forward_adjusted(all_moves[t], market, mi, horizon, event[1].beta)
                 high = None if vol[mi] is None or vol_median is None else vol[mi] > vol_median
                 events.append(Event(t, session, event[0], event[1].z_total, event[1].z_intraday, event[1].q, fwd,
-                                    high))
+                                    high, (t, session) in flagged))
             for factor_name, factor_moves in ((FACTOR_MARKET, market), (FACTOR_CLUSTER, clusters.get(t))):
                 key = (t, factor_name)
                 if models.get(key) is not None and factor_moves is not None:
                     models[key] = _advance(models[key], stock_today, factor_moves[mi])  # type: ignore[arg-type]
     return events
+
+
+def _earnings_sessions(calendar: Sequence[date], earnings_dates: Mapping[str, Sequence[date]],
+                       pad: int) -> set[tuple[str, date]]:
+    """(ticker, session) pairs within ``pad`` sessions of each announcement's first session."""
+    if pad < 0:
+        raise ValueError("earnings_pad must be >= 0")
+    out: set[tuple[str, date]] = set()
+    for ticker, dates in earnings_dates.items():
+        for d in dates:
+            k = bisect.bisect_left(calendar, d)
+            for j in range(max(0, k - pad), min(len(calendar), k + pad + 1)):
+                out.add((ticker, calendar[j]))
+    return out
 
 
 def _try_model(stock, factor, fit_through, config) -> FactorModel | None:
@@ -220,22 +246,42 @@ def calibration(events: Sequence[Event]) -> dict[str, object]:
     }
 
 
-def forward_by_bucket(events: Sequence[Event]) -> dict[str, dict[str, object]]:
-    per_date: dict[str, dict[date, list[float]]] = {name: defaultdict(list) for name in BUCKET_NAMES}
+def _clustered(groups: Sequence[str], keyed: Sequence[tuple[str, Event]]) -> dict[str, dict[str, object]]:
+    """Per group: date-clustered mean and SE of forward_adjusted (per-date mean first)."""
+    per_date: dict[str, dict[date, list[float]]] = {name: defaultdict(list) for name in groups}
     counts: Counter[str] = Counter()
-    for e in events:
-        if e.z_intraday is None or e.forward_adjusted is None:
+    for name, e in keyed:
+        if e.forward_adjusted is None:
             continue
-        name = bucket_of(e.z_intraday)
         per_date[name][e.session].append(e.forward_adjusted)
         counts[name] += 1
     out: dict[str, dict[str, object]] = {}
-    for name in BUCKET_NAMES:
+    for name in groups:
         date_means = [statistics.fmean(v) for v in per_date[name].values()]
         mean = statistics.fmean(date_means) if date_means else None
         se = statistics.stdev(date_means) / math.sqrt(len(date_means)) if len(date_means) > 1 else None
         out[name] = {"events": counts[name], "dates": len(date_means), "mean": mean, "se_date_clustered": se}
     return out
+
+
+def forward_by_bucket(events: Sequence[Event]) -> dict[str, dict[str, object]]:
+    return _clustered(BUCKET_NAMES, [(bucket_of(e.z_intraday), e) for e in events if e.z_intraday is not None])
+
+
+def forward_by_label(events: Sequence[Event]) -> dict[str, dict[str, object]]:
+    """Descriptive only, not a D7 check: forward adjusted return per dip label."""
+    keyed = [(e.label or "unlabeled", e) for e in events]
+    return _clustered(sorted({name for name, _ in keyed}), keyed)
+
+
+def _calibrated_variance(cal: Mapping[str, object]) -> bool:
+    v = cal.get("variance")
+    return isinstance(v, float) and 0.9 <= v <= 1.1
+
+
+def _calibrated_tails(cal: Mapping[str, object]) -> bool:
+    s = cal.get("share_beyond_1_96")
+    return isinstance(s, float) and 0.03 <= s <= 0.07
 
 
 def report(events: Sequence[Event], q_grid: Sequence[float], horizon: int = 5) -> dict[str, object]:
@@ -250,12 +296,13 @@ def report(events: Sequence[Event], q_grid: Sequence[float], horizon: int = 5) -
     monotonic = all(m is not None for m in means) and all(
         a >= b for a, b in zip(means, means[1:], strict=False))  # type: ignore[operator]
     months = sorted({(e.session.year, e.session.month) for e in events})
-    variance = overall.get("variance")
-    share = overall.get("share_beyond_1_96")
     min_events = min((buckets[name]["events"] for name in BUCKET_NAMES), default=0)
     gate = {
-        "variance_0_9_to_1_1": variance is not None and 0.9 <= variance <= 1.1,  # type: ignore[operator]
-        "share_beyond_1_96_3_to_7_pct": share is not None and 0.03 <= share <= 0.07,  # type: ignore[operator]
+        "variance_0_9_to_1_1": _calibrated_variance(overall),
+        "share_beyond_1_96_3_to_7_pct": _calibrated_tails(overall),
+        # ADR D7.1 also asks for both checks "by volatility regime": each regime on its own.
+        "variance_0_9_to_1_1_each_vol_regime": all(_calibrated_variance(c) for c in regimes.values()),
+        "share_beyond_1_96_3_to_7_pct_each_vol_regime": all(_calibrated_tails(c) for c in regimes.values()),
         "forward_returns_monotonic": monotonic,
         "at_least_1300_events_per_bucket": min_events >= 1300,
         "at_least_6_months": len(months) >= 6,
@@ -269,13 +316,16 @@ def report(events: Sequence[Event], q_grid: Sequence[float], horizon: int = 5) -
         "calibration": overall,
         "calibration_by_regime": regimes,
         "forward_adjusted_by_intraday_z": buckets,
+        "forward_adjusted_by_label": forward_by_label(events),
         "labels": dict(Counter(e.label or "unlabeled" for e in events)),
         "trials": {"q_grid": list(q_grid), "count": len(q_grid),
                    "q_chosen": {f"{q:g}": n for q, n in sorted(Counter(e.q for e in events).items())}},
         "gate": gate,
         "gate_passed": all(gate.values()),
+        "earnings_window_events": sum(1 for e in events if e.earnings_window),
         "notes": [
-            "Earnings gate not applied offline: no point-in-time earnings dates in this run.",
+            "Earnings windows are only flagged when the caller passes announcement dates; see"
+            " earnings_window_events and the caller's own filtering.",
             "Statistical significance of the bucket ordering is not tested here; read the date-clustered SEs.",
             "Record the q grid in the Phase 0 ledger's trials table before acting on any result.",
         ],

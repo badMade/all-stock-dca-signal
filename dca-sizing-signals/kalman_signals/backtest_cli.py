@@ -12,8 +12,11 @@ rows (an out-of-range or yearless date, an empty or zero price); those rows are 
 counted per file in the report rather than failing the run, because this loader is the
 research boundary -- the pure functions behind it still reject anything malformed.
 
-The market ticker must have its own CSV. SPY is not in the archive as of 2026-11-23; pass
-``--market VT`` (or another proxy that is) and the report records which one was used.
+The market ticker must have its own CSV. SPY is not in the archive as of 2026-11-23: either
+pass ``--market-file`` pointing at a SPY CSV in the same layout kept OUTSIDE the managed
+archive (the archive is the daily updater's universe, so research files are not added to
+it), or pass ``--market VT`` (or another proxy that is in it). The report records the ticker
+and the file that were used.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from collections.abc import Sequence
 from datetime import date, timedelta
 from pathlib import Path
 
-from kalman_signals.backtest import BUCKET_NAMES, report, walk_forward
+from kalman_signals.backtest import BUCKET_NAMES, calibration, forward_by_bucket, report, walk_forward
 from kalman_signals.residual_dip import ResidualDipConfig
 
 #: Calendar days of history loaded before --start: one 504-session window plus slack.
@@ -69,6 +72,15 @@ def load_csv(path: Path, ticker: str, first: date, last: date) -> tuple[list[dic
     return rows, skipped
 
 
+def load_earnings(path: Path) -> dict[str, list[date]]:
+    """{ticker: [announcement dates]} from JSON: that mapping itself, or under a "dates" key."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data = data.get("dates", data) if isinstance(data, dict) else data
+    if not isinstance(data, dict):
+        raise ValueError("earnings file must map ticker -> list of ISO dates")
+    return {str(t): sorted({date.fromisoformat(str(d)[:10]) for d in ds}) for t, ds in data.items()}
+
+
 def _universe(args: argparse.Namespace) -> list[str]:
     if args.tickers:
         return [t.strip() for t in args.tickers.split(",") if t.strip()]
@@ -103,6 +115,20 @@ def markdown(result: dict[str, object], market: str) -> str:
     for name in BUCKET_NAMES:
         b = buckets[name]  # type: ignore[index]
         lines.append(f"| {name} | {b['events']} | {b['dates']} | {_fmt(b['mean'])} | {_fmt(b['se_date_clustered'])} |")
+    lines += ["", "## Forward market-adjusted log return by label (descriptive, not a D7 check)", "",
+              "| Label | Events | Dates | Mean | SE (date-clustered) |", "| --- | --- | --- | --- | --- |"]
+    for name, b in result["forward_adjusted_by_label"].items():  # type: ignore[union-attr]
+        lines.append(f"| {name} | {b['events']} | {b['dates']} | {_fmt(b['mean'])} | {_fmt(b['se_date_clustered'])} |")
+    earn = result.get("earnings")
+    if earn:
+        cal_all = earn["calibration_including_earnings"]  # type: ignore[index]
+        lines += ["", f"## Earnings windows (pad {earn['pad_sessions']} sessions)", "",  # type: ignore[index]
+                  f"Gate read on events OUTSIDE earnings windows; {earn['excluded_events']} events excluded"  # type: ignore[index]
+                  f" ({earn['tickers_with_dates']} tickers with dates).",  # type: ignore[index]
+                  f"Including them: variance={_fmt(cal_all.get('variance'))},"
+                  f" beyond 1.96={_fmt(cal_all.get('share_beyond_1_96'))}."]
+    else:
+        lines += ["", "Earnings: no announcement dates passed; earnings days are included."]
     lines += ["", f"Labels: {result['labels']}", f"Trials: {result['trials']}", "", "Notes:"]
     lines += [f"- {n}" for n in result["notes"]]  # type: ignore[union-attr]
     return "\n".join(lines) + "\n"
@@ -116,26 +142,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--history-dir", required=True, type=Path)
     parser.add_argument("--market", default="SPY")
+    parser.add_argument("--market-file", type=Path,
+                        help="CSV for the market ticker; default <history-dir>/<market>.csv")
     parser.add_argument("--tickers", help="comma list; default: config/tickers.json active via --universe")
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--non-equity", default="", help="comma list of ETFs/funds to exclude")
     parser.add_argument("--clusters", type=Path, help="JSON {ticker: [cluster members]} from comovement_signals")
     parser.add_argument("--start", required=True, type=date.fromisoformat)
     parser.add_argument("--end", required=True, type=date.fromisoformat)
+    parser.add_argument("--earnings", type=Path,
+                        help='JSON {ticker: [announcement dates]} (or under "dates"); excludes their windows')
+    parser.add_argument("--earnings-pad", type=int, default=1, help="sessions either side of each announcement")
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--out-md", type=Path)
     args = parser.parse_args(argv)
 
     first = args.start - timedelta(days=HISTORY_LOOKBACK_DAYS)
-    market_file = args.history_dir / f"{args.market}.csv"
+    market_file = args.market_file or args.history_dir / f"{args.market}.csv"
     if not market_file.is_file():
         print(f"market ticker file not found: {market_file}", file=sys.stderr)
         return 2
     rows: list[dict[str, object]] = []
     load_report: dict[str, object] = {}
     for ticker in dict.fromkeys([args.market, *_universe(args)]):
-        path = args.history_dir / f"{ticker}.csv"
+        path = market_file if ticker == args.market else args.history_dir / f"{ticker}.csv"
         if not path.is_file():
             load_report[ticker] = "missing_file"
             continue
@@ -146,9 +177,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     clusters = json.loads(args.clusters.read_text(encoding="utf-8")) if args.clusters else {}
     non_equity = frozenset(t.strip() for t in args.non_equity.split(",") if t.strip())
     config = ResidualDipConfig(market_ticker=args.market)
-    events = walk_forward(rows, args.start, args.end, config, clusters, non_equity, horizon=args.horizon)
-    result = report(events, config.q_grid, horizon=args.horizon)
+    earnings = load_earnings(args.earnings) if args.earnings else None
+    events = walk_forward(rows, args.start, args.end, config, clusters, non_equity, horizon=args.horizon,
+                          earnings_dates=earnings, earnings_pad=args.earnings_pad)
+    kept = [e for e in events if not e.earnings_window]
+    result = report(kept, config.q_grid, horizon=args.horizon)
+    if earnings is not None:
+        result["earnings"] = {
+            "pad_sessions": args.earnings_pad,
+            "tickers_with_dates": sum(1 for ds in earnings.values() if ds),
+            "excluded_events": len(events) - len(kept),
+            "calibration_including_earnings": calibration(events),
+            "forward_including_earnings": forward_by_bucket(events),
+        }
     result["market_ticker"] = args.market
+    result["market_file"] = market_file.name
     result["load"] = load_report
     result["non_equity"] = sorted(non_equity)
     args.out_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

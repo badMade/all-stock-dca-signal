@@ -115,6 +115,29 @@ result = pair_breakdown_shadow(close_rows, as_of)
 write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
 ```
 
+## Kalman residual-dip signal (shadow only, Phase 1)
+
+`kalman_signals/` implements Phase 1 of `docs/adr-kalman-residual-dip-shadow.md`. Research
+basis: `docs/research/2026-11-23-kalman-filters.md`.
+
+| Piece | What it does |
+|---|---|
+| `kalman_filter.py` | 2-state (alpha, beta) random-walk regression on plain floats; prior innovation; predict-only step for missing sessions; q picked from a 3-value grid by one-step predictive log-likelihood; `steady_state_gain()` pins the research's EMA-equivalence table |
+| `residual_dip.py` | `residual_dip_shadow(inputs, as_of)`: fits and filters through the prior session, scores the as-of session, splits z into overnight and intraday, labels `idiosyncratic_dip` / `cluster_selloff` / `market_selloff` / `none`. Fails closed with a reason per skipped ticker |
+| `shadow.py` | `ShadowWriter`: appends only `kalman_residual_dip_shadow.jsonl`, refuses a `config/` directory, dedupes by content hash, `live_effect: "none"` |
+| `backtest.py`, `backtest_cli.py` | Monthly-refit walk-forward and the ADR D7 report (calibration pooled and per volatility regime, date-clustered forward returns by intraday-z bucket and by label, earnings-window flags, trials) |
+
+```bash
+python -m kalman_signals.backtest_cli --history-dir ../ticker_data --market SPY --market-file <dir>/SPY.csv \
+    --clusters <members.json> --earnings <earnings_dates.json> \
+    --non-equity QQQ,VT,XLG,AAAU --start 2024-01-02 --end 2026-11-20 --out-json /tmp/k.json --out-md /tmp/k.md
+python -m pytest tests/kalman -q
+```
+
+The managed archive has no SPY, so `--market-file` points at a SPY CSV kept outside it. `--clusters`
+and `--earnings` inputs are built by the scripts in `analysis/2026-11-24-kalman-phase1/`. Results of
+both rounds: `docs/research/2026-11-23-kalman-phase1-results.md`.
+
 ## Price source (Massive + Alpaca)
 
 `market_data_ingest/prices/` replaces Yahoo Finance as the ongoing source of daily prices.

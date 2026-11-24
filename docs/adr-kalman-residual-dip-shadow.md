@@ -164,3 +164,9 @@ boundary rules in `tests/test_architecture_boundaries.py`. Two deviations from t
   `market_data_ingest` (D3), so the report lists the q grid under `trials` for the operator to record.
 - The first walk-forward run used VT as the market factor, because the archive has no SPY. It failed
   D7 (z variance 1.30). Results and next steps: `docs/research/2026-11-23-kalman-phase1-results.md`.
+- Second round (2026-11-24): SPY via `--market-file`, point-in-time clusters, and earnings windows
+  via `--earnings`. The gate in `backtest.report` now also checks calibration within each volatility
+  regime (D7.1); round 1 checked only the pooled figure. With earnings days excluded the pooled
+  variance is 1.05, but the high-volatility regime (1.14), strict monotonicity and the
+  1,300-event floor still fail, and D7.2's cluster-adjusted returns, D7.4 and D7.5 are not yet computed.
+  Trial rows for `market_data_ingest`'s ledger are built by `analysis/2026-11-24-kalman-phase1/record_trials.py`.
