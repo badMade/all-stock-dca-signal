@@ -131,17 +131,16 @@ r4 by label (descriptive, not a D7 check): `cluster_selloff` 2,826 events +0.41%
   so their earnings days are still in. Not cross-checked against EDGAR.
 - The non-equity list is still hand-written.
 - Four configurations count as trials so far: these four runs, each with the same 3-value q grid.
-  The trial rows are built (`record_trials.py rows`) and verified against a scratch ledger, but
-  **not yet written to the live ledger** at `cron_tracking/goal_snapshot/ledger.duckdb`, which is
-  operator-owned run output.
+  The four trial rows were written to the Phase 0 ledger
+  (`cron_tracking/goal_snapshot/ledger.duckdb`, experiment `kalman_residual_dip_phase1`) on
+  2026-11-24 with the operator's approval; they are the ledger's first `trials` rows.
 
 ### Next steps
 
-1. Write the four trial rows to the live ledger (operator's call).
-2. Time-varying R scaled by trailing market volatility, as one new trial, to address the
+1. Time-varying R scaled by trailing market volatility, as one new trial, to address the
    high-vol regime.
-3. Cluster-adjusted forward returns, the D7.4 deflated-Sharpe check, and the D7.5 terminal-value
+2. Cluster-adjusted forward returns, the D7.4 deflated-Sharpe check, and the D7.5 terminal-value
    comparison, so the full gate can be read.
-4. A longer history (start before 2024) to lift the z ≤ -2 bucket past 1,300 events.
+3. A longer history (start before 2024) to lift the z ≤ -2 bucket past 1,300 events.
 
 Phase 2 (live shadow logging) stays blocked until every D7 check passes.
