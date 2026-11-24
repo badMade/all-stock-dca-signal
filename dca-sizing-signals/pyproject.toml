@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["dca_shared_interfaces*", "connector_signals*", "market_data_ingest*", "comovement_signals*",
-           "overnight_futures*"]
+           "overnight_futures*", "residual_reversal*"]
 
 [tool.pytest.ini_options]
 markers = [

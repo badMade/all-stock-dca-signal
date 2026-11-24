@@ -8,7 +8,7 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Four packages that only depend on each other in one direction, enforced by both the
+Five packages that only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
@@ -16,6 +16,7 @@ type system and a CI test, not by convention alone:
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
 | `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
+| `residual_reversal/` | Research-only, budget-neutral sector-ETF residual-reversal suggester (`docs/adr-residual-reversal-suggester.md`): OLS beta on a caller-mapped ETF, OU s-score of the cumulated residual, a bounded [0.75, 1.25] tilt renormalised so the day's dollars are unchanged, and a fail-closed relationship-break guard. Publishes only `residual_reversal_suggestions.json`. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -109,6 +110,38 @@ and a SHA-256 `content_hash`; an identical line is not appended twice.
 from comovement_signals import ShadowWriter, pair_breakdown_shadow, write_shadow_result
 result = pair_breakdown_shadow(close_rows, as_of)
 write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
+```
+
+## Residual reversal (research only)
+
+`residual_reversal/` implements `docs/adr-residual-reversal-suggester.md`. It is the long-only,
+budget-neutral version of sector-relative stat-arb. It never shorts and never changes the day's
+total, and it only moves the marginal dollar from residually rich names to residually cheap ones.
+
+| Step | Default |
+|---|---|
+| Beta of ticker on its sector ETF (OLS with intercept) | last 90 aligned daily log returns |
+| OU fit of the cumulated residual (AR(1)) | newest 60 residuals; tradable only when `b < exp(-1/30)` |
+| s-score `(X_now - m) / sigma_eq` | no cross-sectional centring |
+| Raw tilt | 1.0 while `abs(s) < 1.25`, else `clip(1 - 0.1 s, 0.75, 1.25)` |
+| Budget neutrality | one common shift across unguarded tickers; the publisher re-checks it |
+
+A ticker trips the break guard on any of: short or stale history, no ETF, R² < 0.25, no mean
+reversion, half-life > 3x its trailing 20-day median, or a point-in-time 8-K 1.01/2.01/5.01 or
+earnings event. A guarded ticker gets **no** suggestion, so the reader keeps its base tier.
+Inputs come from `load_inputs(asof)` (`ResidualReversalInputs`: close rows, proposed buys,
+`benchmark_by_ticker`, optional `CorporateEvent`s). Anything malformed fails the whole run
+closed. The suggestions are unscored (`eval_metric_mae = +inf`; the file records `"mae": null`)
+until the Phase 0 ledger scores them against the graded baseline.
+
+```python
+from residual_reversal import ResidualReversalSuggester, publish_outcome, residual_reversal_publisher
+outcome = ResidualReversalSuggester(load_inputs).evaluate(asof)
+publish_outcome(outcome, residual_reversal_publisher(Path("research/suggestions")))  # failed/all-guarded: writes nothing
+```
+
+```bash
+python -m pytest tests/residual_reversal -q
 ```
 
 ## Price source (Massive + Alpaca)
