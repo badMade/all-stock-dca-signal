@@ -156,7 +156,11 @@ def test_crn_and_flat_dca_control_shrink_the_difference_variance():
     report = compare(outcomes, variant="graded_1x2x3x", baseline="flat", baseline_mean=flat_mean)
     assert report.crn.mean == pytest.approx(report.independent.mean)
     assert report.crn_variance_reduction() > 10.0  # pilot: ~25x
-    assert report.crn_cv_variance_reduction() > report.crn_variance_reduction()  # pilot: ~104x
+    # crn_cv_variance_reduction() is Optional (None without a baseline_mean); narrow it
+    # explicitly so the comparison is typed and a None fails loudly rather than TypeErrors.
+    crn_cv_reduction = report.crn_cv_variance_reduction()
+    assert crn_cv_reduction is not None
+    assert crn_cv_reduction > report.crn_variance_reduction()  # pilot: ~104x
     assert report.crn_cv.method == "crn_paired+control_variate"
     assert compare(outcomes, variant="graded_1x2x3x", baseline="flat").crn_cv is None
 

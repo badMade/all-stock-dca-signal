@@ -69,7 +69,7 @@ file under `dca-sizing-signals/` changes (plus the weekday scheduled run). It in
 (operator decision 2026-11-01: pairs and co-movement as signals, not a pairs strategy).
 
 | Step | Function | Default |
-|---|---|---|
+| --- | --- | --- |
 | Returns | `returns_matrix(close_rows, as_of)`: daily log returns. Rows after `as_of`, rows on `as_of` not marked `final: True` (a forming intraday bar), and `interpolated` rows are ignored; a date counts as a session only when half the listed tickers have a close on it | 252-session window; fewer than 120 returns = singleton |
 | Clusters | `build_clusters(matrix)`: average linkage on 1 - correlation, ties broken by ticker | cut 0.5; pairs need 120 shared sessions |
 | Signal 1 | `cluster_cap_suggestions(...)`: scale an over-cap cluster (2+ members) to the cap | 35% of the day's budget; multiplier floor 0.25 |
@@ -102,7 +102,7 @@ its `as_of`. Each line has `as_of`, `inputs_known_at`, `signal`, `payload`, `liv
 and a SHA-256 `content_hash`; an identical line is not appended twice.
 
 | Signal | Function | Default | Shadow file |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 3 Pair breakdown | `pair_breakdown_shadow(close_rows, as_of)`: pairs with 2-year correlation >= 0.70; flag when the 60-session rolling correlation is strictly below the pair's 2-year 10th percentile (of the earlier rolling values) for 5 sessions; suggests `hold_1x` for both | 504-session lookback, 252 shared returns, 100 reference values | `comovement_pair_breakdown_shadow.jsonl` |
 | 4 Cheaper-leg tilt (speculative) | `cheaper_leg_tilt_shadow(close_rows, as_of, pairs=None, pair_dollars=None)`: pairs with formation correlation >= 0.75; OLS of log A on log B over the 252 closes before the evaluation close only; weight A = clip(0.5 - 0.15 z, 0.2, 0.8) | leg A = alphabetically first | `comovement_tilt_shadow.jsonl` |
 | 5 Rotation log | `rotation_log_shadow(close_rows, as_of, staples, semis)`: mean log return of the caller's staples group minus the semis group, plus its 20-session rolling mean | every group member must have a return | `comovement_rotation_log.jsonl` |
@@ -122,7 +122,7 @@ end-of-day failover and the intraday last-trade source. The Yahoo history alread
 `docs/adr-price-source-massive-alpaca.md`. It is suggestion-only: nothing in the live DCA
 paths imports it, and the ladder and sizing logic are unchanged.
 
-### Install
+### Install (price source)
 
 ```bash
 cd dca-sizing-signals
@@ -137,7 +137,7 @@ stdlib-only core.
 ### Environment variables
 
 | Variable | Needed for | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `MASSIVE_API_KEY` | daily job, PoC | Sent as an `Authorization: Bearer` header, never in a URL |
 | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY` | daily job (calendar, failover), intraday, PoC | Sent as `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers. The calendar uses the paper trading API |
 | `DCA_PRICE_DB` | optional | DuckDB path. Default `<repo>/data/backfill.duckdb` (gitignored, as is `data/staging/`) |
@@ -179,7 +179,7 @@ works too: `SELECT * FROM adjusted_bars(DATE '2024-06-01', TIMESTAMP '9999-12-31
 ### Troubleshooting
 
 | Symptom (run record `error_class` / `code`) | Meaning and fix |
-|---|---|
+| --- | --- |
 | `IncompleteBatchError` / `no_baseline` | Fewer than 20 stored Massive sessions. Run oldest-first with `--bootstrap` until 20 exist |
 | `IncompleteBatchError` / `below_median` | Massive returned under 90% of the usual row count. The fallback was tried; rerun later. The job re-pulls T-1..T-5 every night |
 | `IncompleteBatchError` / `empty_open_session` | No bars on a day the calendar says was open. Usually the job ran too early; rerun after 20:00 ET |
@@ -199,7 +199,7 @@ store. It is not wired into live sizing, makes no network or broker calls, and n
 live DCA paths imports it. Callers pass already-fetched plain dicts to `LedgerStore.ingest_*`.
 
 | Table | Holds |
-|---|---|
+| --- | --- |
 | `market_sessions` | The trading calendar that horizons count in |
 | `fills`, `baseline_fills` | Live fills (`run_kind` = `scheduled` / `manual`) and the 1x counterfactual per slot decision |
 | `outcomes` | Price at t+N sessions per fill and baseline row, `scored` or `unscored` (never zero) |
@@ -250,7 +250,7 @@ append-only tables (`csp_shadow_entries`, `csp_shadow_settlements`) via
 `ensure_csp_schema(con)`, under the same rules as the ledger.
 
 | Function | Does |
-|---|---|
+| --- | --- |
 | `select_candidates(...)` | At most one put per active ticker per session: 25-45 days, delta -0.30 to -0.15, spread <= 10% of mid, strike <= ladder buy price, collateral <= 10% of the account per contract and <= 25% in total, none in a sector above 30%, none in a tax-loss pause. Stale, future or non-finite data drops the row with a reason |
 | `record_shadow_entries(con, ...)` | Entries at the **bid** (`entry_price = bid` is also a schema check) |
 | `settle(...)` | OTM expires (premium kept); ITM assigned at strike (cost = strike - premium); early close at the **ask**; unknown price = `unscored`; ex-dividend and deep-ITM flags |
