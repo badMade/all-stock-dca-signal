@@ -27,7 +27,9 @@ values with no prompt discipline.
 The loader's contract is deliberately narrow:
 
 * **Allowlist.** Only `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`, `DCA_ALERT_EMAIL_ADDRESS` and
-  `DCA_CRON_TRACKING_ROOT` are read. Other lines are ignored and never exported.
+  `DCA_CRON_TRACKING_ROOT` are read. Other lines are ignored and never exported. (2026-11-24 audit: the list
+  has since grown to 27 names in `dca_env.ALLOWED_KEYS`, including SMTP, Notion and webhook
+  secrets. The module is the source of truth.)
 * **Never overrides.** A variable already set and non-empty wins, so a real export (cloud
   clone, CI, a developer shell) always beats the file. Cloud-clone runs are unaffected.
 * **Fail closed on a bad file.** The file must be a regular, non-symlink file owned by the
@@ -58,7 +60,9 @@ real `.env` stays gitignored.
   it to alerts, artifacts or messages is unchanged.
 * The executor prompts need two small edits (a Gate 2 environment check and the Gate 7 pin
   command). They are drafted in `claude/dca-executor-prompts/dotenv-loader.draft.md` and
-  not applied.
+  not applied. (2026-11-24 audit: all seven `claude/dca-executor-prompts/live-mirror/` prompts now carry
+  the ENVIRONMENT CHECK. Whether the live scheduled tasks match is checked on the Mac with
+  `scripts/check_live_prompt_drift.py`.)
 
 ## Alternatives rejected
 

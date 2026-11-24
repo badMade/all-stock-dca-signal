@@ -85,4 +85,5 @@ little independence (the same Mac writes both). The change therefore reduces to 
 
 1. Is the public slot-status signal the right channel, and who publishes it (the `slot-status-publish` job)?
 2. May a bundled-list plan still be accepted on a day with no list change, or must every plan carry the list?
+   (Answered yes 2026-11-21; see Status.)
 3. Who approves this change: it alters the backup's independent check, so it needs the operator.

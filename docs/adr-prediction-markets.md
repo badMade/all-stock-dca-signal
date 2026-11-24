@@ -2,6 +2,7 @@
 
 Status: proposed (permissions pending for some sources; build and test everything now; no implementation until tests approved)
 Date: 2026-11-12 (D1-D13; voice-call decisions added: composite score, Polymarket US in scope, build without waiting for permissions; Polymarket terms reviewed)
+Implementation status (2026-11-24 audit): Phase 5a (the Polymarket Intl and US adapters, the store and the composite) is built in `dca-sizing-signals/market_data_ingest/prediction_markets/` after the tests were approved (section 13). D11 says every adapter is built now, but the Kalshi, CME, Cboe and Metaculus adapters do not exist yet.
 Source of truth while drafting: claude.ai Project "all-stock-dca", `claude/prediction-markets-adr.md`. This repo copy supersedes it once merged.
 
 ## 1) Problem
