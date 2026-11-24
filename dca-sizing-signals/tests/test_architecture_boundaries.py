@@ -44,8 +44,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # resolve against the package root rather than the wider repo root.
 # overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
 # factor_signals/ joins them under docs/adr-factor-residual-dip-signals.md.
-_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
-                 "kalman_signals", "factor_signals", "inventory_signals", "mc_research"}
+_OWN_PACKAGES = {"kalman_signals", "connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
+                 "factor_signals", "inventory_signals", "mc_research", "residual_reversal",
+                 "cost_basis_backtest"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
@@ -55,54 +56,68 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # (docs/adr-overnight-futures-tracker.md, D3) -- and unlike comovement_signals, not even
     # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
     "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
-                      "factor_signals", "inventory_signals",
-                      "kalman_signals", "near_close_dca"},
+                      "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
+                      "near_close_dca", "kalman_signals"},
     "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
-                         "factor_signals", "inventory_signals",
-                         "kalman_signals", "near_close_dca"},
+                         "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
+                         "near_close_dca", "kalman_signals"},
     "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
-                          "factor_signals", "inventory_signals",
-                          "kalman_signals", "near_close_dca"},
+                          "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
+                          "near_close_dca", "kalman_signals"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "overnight_futures", "factor_signals", "inventory_signals",
-                           "kalman_signals", "near_close_dca"},
+                           "overnight_futures", "factor_signals", "inventory_signals", "residual_reversal",
+                           "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
                            "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
-                           "kalman_signals", "near_close_dca"},
+                           "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
     # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
     # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
     # any suggester. dca_shared_interfaces is the only sibling it may import.
     "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                          "market_data_ingest", "factor_signals", "inventory_signals", "kalman_signals",
-                          "near_close_dca"},
+                          "market_data_ingest", "factor_signals", "inventory_signals", "residual_reversal",
+                          "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure factor decomposition (docs/adr-factor-residual-dip-signals.md): rows arrive from
     # the caller, as in comovement_signals, and the two-way rule applies. It may not import
     # comovement_signals even to reuse its returns contract -- it carries its own copy.
     "factor_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                        "market_data_ingest", "overnight_futures", "inventory_signals", "mc_research",
-                       "kalman_signals", "near_close_dca"},
+                       "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Inventory reservation (docs/inventory_reservation_suggester.md): same two-way rule as
     # comovement_signals. Inputs arrive from the caller, so it needs no ingest layer and no
     # other suggester; only SizingAdjustmentReader may ever learn it exists.
     "inventory_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                           "market_data_ingest", "overnight_futures", "factor_signals", "mc_research",
-                          "kalman_signals", "near_close_dca"},
+                          "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Research-only Monte Carlo harness (docs/mc_variance_reduction.md): paths are simulated
     # in-package and strategies take tiers as arguments, so it needs no suggester, no ingest
     # layer and no live module. Stdlib-only is pinned separately in tests/mc_research/.
     "mc_research": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                    "market_data_ingest", "overnight_futures", "inventory_signals", "factor_signals", "kalman_signals",
-                    "near_close_dca",
-                    "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters"},
+                    "market_data_ingest", "overnight_futures", "inventory_signals", "factor_signals",
+                    "near_close_dca", "kalman_signals",
+                    "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters",
+                    "residual_reversal", "cost_basis_backtest"},
+    # Sector-ETF residual reversal (docs/adr-residual-reversal-suggester.md): rows arrive
+    # from the caller, so the same two-way rule as comovement_signals applies. It carries its
+    # own OLS/OU math rather than reusing factor_signals' betas.
+    "residual_reversal": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                          "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
+                          "mc_research", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
+    # Offline cost-basis backtest harness (docs/adr-cost-basis-backtest-harness.md): it replays
+    # a candidate through duck typing and a caller-supplied factory, so it imports no
+    # suggester, and it reads the Phase 0 ledger only as plain dict rows, so it does not
+    # import market_data_ingest either. Two-way: no other package may import it.
+    "cost_basis_backtest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                            "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
+                            "mc_research", "residual_reversal", "near_close_dca", "kalman_signals"},
     # Shadow-only residual-dip signal (docs/adr-kalman-residual-dip-shadow.md, D3): rows arrive
     # from the caller, cluster members included, so it needs no other signal package and not
     # the ingest layer. dca_shared_interfaces is the only sibling it may import.
-    "kalman_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                       "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
-                       "mc_research", "near_close_dca"},
+    "kalman_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "market_data_ingest",
+                       "comovement_signals", "overnight_futures", "factor_signals", "inventory_signals",
+                       "mc_research", "residual_reversal", "cost_basis_backtest", "near_close_dca"},
 }
 
 
@@ -186,8 +201,8 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
                  "market_data_ingest", "comovement_signals", "overnight_futures", "factor_signals",
-                 "inventory_signals", "kalman_signals",
-                 "near_close_dca"}
+                 "inventory_signals", "residual_reversal", "cost_basis_backtest",
+                 "kalman_signals", "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden
