@@ -1,0 +1,31 @@
+{
+ "broker": "robinhood",
+ "counts": {
+  "submitted": 7
+ },
+ "dry_run": false,
+ "generated_at": "2026-11-20T20:44:06Z",
+ "order_submit_status": "submitted",
+ "orders_submitted_count": 7,
+ "run_classification": {
+  "cron_id": "10ce362c",
+  "manual_run": false,
+  "run_id": "scheduled_20261120_1530ET",
+  "run_origin": "scheduled",
+  "run_type": "scheduled_live_test",
+  "same_day_required": true,
+  "scheduled_for_et": "15:30",
+  "scheduled_window_end_et": "15:35",
+  "scheduled_window_start_et": "15:20",
+  "state_schema_version": "run-classification-v1",
+  "stream": "afternoon",
+  "supersedes_cron_id": "ce16ba6b",
+  "trading_day": "2026-11-20",
+  "triggered_at_utc": "2026-11-20T20:32:26Z",
+  "valid_afternoon_scheduled_evidence": true,
+  "valid_scheduled_evidence": true
+ },
+ "run_id": "scheduled_20261120_1530ET",
+ "status": "ORDERS_PLACED",
+ "trading_day": "2026-11-20"
+}
