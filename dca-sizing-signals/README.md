@@ -241,6 +241,17 @@ with LedgerStore("data/backfill.duckdb") as ledger:
 
 Tests: `python -m pytest tests/ledger` (offline, synthetic hand-computed fixtures).
 
+**Loading fills from run artifacts** (`market_data_ingest/ledger/run_ingest.py`). Reads a
+cron-tracking tree (never writes it) and appends `fills` and flat-1x `baseline_fills`. It joins
+each run directory's order list and candidates (attribution) with broker order rows pooled from
+every `orders_pages*.json` in the tree, because a run's own pages are pulled before it places and
+can miss its own orders. Orders it cannot prove are skipped with a reason, never stored as zero:
+
+```bash
+python -m market_data_ingest.ledger.run_ingest --root "$DCA_CRON_TRACKING_ROOT" \
+    --db data/backfill.duckdb [--orders-file later_full_pull.json] --json
+```
+
 ### Cash-secured put shadow log (research only, never trades)
 
 `market_data_ingest/ledger/csp_shadow.py` implements the **proposed** ADR
