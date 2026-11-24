@@ -78,6 +78,10 @@ The routine passes each row's recorded `PR number` and `Commit URL` as `recorded
 `recorded_commit_url`. A recorded PR or commit that cites the Key only in its body keeps counting; any other
 body-only citation does not. When a row records a PR that the evidence neither matched nor found citing the Key,
 `GitEvidence.recorded_pr_unconfirmed` is set and the routine skips the row instead of lowering it to "No work".
+A merged fix whose title, head ref and body never name its Key can be pinned with `selfheal.triage_reconcile.OPERATOR_CONFIRMED_PRS`
+(`Key -> PR number`, empty by default). It applies only when nothing else matched, the row's own `PR number` equals
+the entry, and that PR is in the fetched list; a text match always wins. Prefer naming the Key in the PR body or title
+(2026-11-23: #2052 and #2221 were fixed that way); use the mapping only when the PR cannot be edited.
 Tracking columns (`GitHub issue`, `Branch`, `Commit URL`, `PR number`) are only ever replaced, never cleared, so a
 deleted `selfheal/<key>` branch leaves its recorded value in place.
 

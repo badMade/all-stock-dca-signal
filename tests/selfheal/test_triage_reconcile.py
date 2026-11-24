@@ -259,6 +259,46 @@ def test_recorded_pr_that_never_cites_the_key_is_flagged_not_lowered() -> None:
     assert ev.pr is None and ev.recorded_pr_unconfirmed is True
 
 
+def test_operator_confirmed_pr_counts_when_row_records_the_same_pr() -> None:
+    # 2026-11-23: a merged fix whose title, head ref and body never name the Key was skipped every run.
+    unrelated = _pr(1514, head_ref="feat/x", title="Unrelated", body="", state="closed", merged=True)
+    ev = _match(prs=[unrelated], recorded_pr_number=1514, confirmed_pr_number=1514)
+    assert ev.pr is not None and ev.pr.number == 1514
+    assert ev.recorded_pr_unconfirmed is False
+
+
+def test_operator_confirmation_needs_the_row_to_record_the_same_pr() -> None:
+    unrelated = _pr(1514, head_ref="feat/x", title="Unrelated", body="", state="closed", merged=True)
+    for recorded in (None, 99):
+        ev = _match(prs=[unrelated], recorded_pr_number=recorded, confirmed_pr_number=1514)
+        assert ev.pr is None
+        assert ev.recorded_pr_unconfirmed is (recorded is not None)
+
+
+def test_operator_confirmation_needs_the_pr_in_the_fetched_list() -> None:
+    ev = _match(prs=[], recorded_pr_number=1514, confirmed_pr_number=1514)
+    assert ev.pr is None and ev.recorded_pr_unconfirmed is True
+
+
+def test_operator_confirmation_never_displaces_a_text_match() -> None:
+    about = _pr(200)
+    unrelated = _pr(1514, head_ref="feat/x", title="Unrelated", body="", state="closed", merged=True)
+    ev = _match(prs=[about, unrelated], recorded_pr_number=1514, confirmed_pr_number=1514)
+    assert ev.pr is not None and ev.pr.number == 200
+
+
+def test_operator_confirmed_pr_must_be_an_integer() -> None:
+    with pytest.raises(tr.EvidenceError):
+        _match(prs=[_pr(1514, head_ref="feat/x", title="Unrelated")], recorded_pr_number=1514, confirmed_pr_number=True)
+    with pytest.raises(tr.EvidenceError):
+        _match(confirmed_pr_number="1514")
+
+
+def test_operator_confirmed_prs_ships_empty() -> None:
+    # An entry is a reviewed code change; the shipped mapping must not silently confirm any row.
+    assert tr.OPERATOR_CONFIRMED_PRS == {}
+
+
 def test_recorded_pr_flag_is_clear_when_evidence_is_found_or_nothing_was_recorded() -> None:
     assert _match(prs=[_pr(101)], recorded_pr_number=99).recorded_pr_unconfirmed is False
     assert _match().recorded_pr_unconfirmed is False
