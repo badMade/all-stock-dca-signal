@@ -9229,6 +9229,30 @@ def test_load_morning_config_fails_closed_on_duplicate_breaker_keys_and_bool_cap
         load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
 
+@pytest.mark.parametrize(
+    ("raw_text", "match"),
+    [
+        ('{"live_execution_enabled": false, "live_execution_enabled": true}', "duplicate"),
+        ('{"budget_ledger": {"morning_daily_cap_usd": Infinity}}', "finite"),
+        ('{"budget_ledger": {"morning_weekly_cap_usd": NaN}}', "finite"),
+        (f'{{"budget_ledger": {{"morning_daily_cap_usd": {10**400}}}}}', "finite"),
+        ('{"budget_ledger": {"morning_daily_cap_usd": true}}', "boolean"),
+        ('{"budget_ledger": {"morning_daily_cap_usd": -10.0}}', "non-negative"),
+        ('{"sizing_ladder": {"base_amount_usd": true}}', "boolean"),
+        ('{"sizing_ladder": {"no_buy_below_pct": NaN}}', "finite"),
+        ('{"sizing_ladder": {"tiers": [{"min_drop_pct": 1.0, "multiplier": Infinity}]}}', "finite"),
+        ('{"trend_min_bars": true}', "non-negative integer"),
+        ("[]", "JSON object"),
+    ],
+)
+def test_load_morning_config_rejects_malformed_stream_config_values(tmp_path, raw_text, match):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(raw_text, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE, allow_unpinned_account=True)
+
+
 def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     # Codex review (PR #42): setting prior_allocation_roots=[] disables the per-ticker
     # guard but must NOT skip cap seeding. A morning manual fill of $85 recorded in

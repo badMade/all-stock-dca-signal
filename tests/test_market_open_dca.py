@@ -512,3 +512,20 @@ def test_market_open_default_config_tolerates_an_unresolvable_account_and_fails_
     ex = MarketOpenDCAExecutor(config_dir=str(tmp_path))
     assert ex.config.target_account_number is None
     assert ex.config.live_execution_enabled is False  # ships disabled, and a missing key must not flip it
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "match"),
+    [
+        ('{"live_execution_enabled": false, "live_execution_enabled": true}', "duplicate"),
+        ('{"budget_ledger": {"market_open_daily_cap_usd": Infinity}}', "finite"),
+        (f'{{"budget_ledger": {{"market_open_weekly_cap_usd": {10**400}}}}}', "finite"),
+        ('{"budget_ledger": {"market_open_daily_cap_usd": true}}', "boolean"),
+        ('{"sizing_ladder": {"base_amount_usd": NaN}}', "finite"),
+        ('{"trend_min_bars": true}', "non-negative integer"),
+    ],
+)
+def test_load_stream_config_rejects_malformed_stream_config_values(tmp_path, raw_text, match):
+    (tmp_path / "market_open_dca.json").write_text(raw_text, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_market_open_config(config_dir=str(tmp_path), allow_unpinned_account=True)
