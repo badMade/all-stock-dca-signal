@@ -677,3 +677,63 @@ def test_backfill_history_writes_one_csv_and_leaves_live_history_alone(tmp_path)
     assert len(dates) >= 2 and all((dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days >= 14
                                    for a, b in zip(dates, dates[1:], strict=False))
     assert rows[0].keys() == set(cr.HISTORY_FIELDS) and {r["eligible"] for r in rows} == {"1"}
+
+
+# ----------------------------------------------------------------------------------------------
+# Price-only surrogate of the dynamic-universe ADR's factors
+# ----------------------------------------------------------------------------------------------
+def _drift_series(daily, vol_amp=0.0, days=420, end=dt.date(2026, 9, 1)):
+    """Daily bars compounding at ``daily`` with an alternating +/- ``vol_amp`` wobble."""
+    pts, value = [], 100.0
+    for i in range(days):
+        value *= 1.0 + daily + (vol_amp if i % 2 else -vol_amp)
+        pts.append((end - dt.timedelta(days=days - 1 - i), value))
+    return cr.Series(pts)
+
+
+def test_adr_price_zscores_are_winsorized_and_use_the_reference_pool():
+    z = cr._zscores({"a": 0.0, "b": 1.0, "c": 100.0}, {"a": 0.0, "b": 1.0})
+    assert z["c"] == cr.ADR_WINSOR and z["a"] < 0 < z["b"]
+    assert cr._zscores({"a": 1.0, "b": 1.0}) == {"a": 0.0, "b": 0.0}  # no dispersion: no signal
+
+
+def test_adr_price_ranks_strong_steady_names_above_weak_noisy_ones():
+    end = dt.date(2026, 9, 1)
+    series = {"UP": _drift_series(0.002, 0.001), "FLAT": _drift_series(0.0, 0.001),
+              "NOISY": _drift_series(0.0, 0.03), "DOWN": _drift_series(-0.002, 0.001)}
+    records, unscored = cr.score_universe_adr_price(series, end)
+    assert unscored == [] and records["UP"]["rank"] == 1 and records["DOWN"]["rank"] > records["FLAT"]["rank"]
+    assert records["NOISY"]["rank"] > records["FLAT"]["rank"]  # same drift, higher vol: lower score
+    assert all(r["eligible"] for r in records.values())  # filter off
+
+
+def test_adr_price_skips_latest_month_and_needs_both_momentum_legs():
+    end = dt.date(2026, 9, 1)
+    base = _drift_series(0.001, 0.001)
+    # A last-30-days spike must not change the score: momentum skips the latest month.
+    spiked = cr.Series(list(zip(base.dates, base.values, strict=False))[:-10]
+                       + [(d, v * 3.0) for d, v in list(zip(base.dates, base.values, strict=False))[-10:]])
+    a, _ = cr.score_universe_adr_price({"X": base, "Y": _drift_series(0.0, 0.001)}, end)
+    b, _ = cr.score_universe_adr_price({"X": spiked, "Y": _drift_series(0.0, 0.001)}, end)
+    assert a["X"]["mom_z"] == pytest.approx(b["X"]["mom_z"])
+    short = _drift_series(0.001, 0.001, days=200)  # under 12 months of bars
+    records, unscored = cr.score_universe_adr_price({"X": base, "Y": _drift_series(0.0, 0.001), "S": short}, end)
+    assert "S" not in records and "S" in unscored
+
+
+def test_backfill_history_adr_price_model_writes_a_gradable_csv(tmp_path, capsys):
+    data, archive = tmp_path / "data", tmp_path / "archive"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    series = {f"T{i:02d}": _drift_series(0.002 * (i - 5) / 5, 0.001 + 0.0005 * (i % 3)) for i in range(12)}
+    (data / "inputs" / "sp500.json").write_text(json.dumps([[t, t, "X"] for t in series]))
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(
+        {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)] for t, s in series.items()}))
+    out = tmp_path / "adr.csv"
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "backfill-history", "--start",
+                    "2026-08-25", "--end", "2026-09-01", "--step-days", "7", "--score-model", "adr_price",
+                    "--out", str(out)])
+    assert code == 0 and '"score_model": "adr_price"' in capsys.readouterr().out
+    scores, eligible = cr.read_scores_csv(out)
+    assert scores and len(next(iter(scores.values()))) == 12
+    assert not (data / "history.csv").exists()  # the live history is never touched

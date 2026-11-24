@@ -6185,3 +6185,104 @@ def test_read_state_rejects_boolean_pending_usd_as_corrupt(tmp_path):
 
     with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
         ledger._read_state(state_path, "BYDDY")
+
+
+def test_read_state_rejects_duplicate_json_keys(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+
+    state_path.write_text(
+        '{"version": 1, "ticker": "BYDDY", "pending_usd": 1.0, "pending_usd": 999.0, "events": []}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="could not read whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+    state_path.write_text(
+        '{"version": 1, "ticker": "BYDDY", "pending_usd": 1.0, "events": [], '
+        '"recorded_idempotency_keys": {"k": {"resolved": true}, "k": {"resolved": false}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="could not read whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+
+def test_read_state_rejects_invalid_utf8_as_ledger_read_error(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+    state_path.write_bytes(b"\x80\x81")
+
+    with pytest.raises(ValueError, match="could not read whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+
+def test_read_state_rejects_boolean_version(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"version": true, "ticker": "BYDDY", "pending_usd": 1.0, "events": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+
+@pytest.mark.parametrize("raw_pending", ["NaN", "Infinity", "-Infinity", "-1.0", str(10**400)])
+def test_read_state_rejects_non_finite_negative_and_overflow_pending_usd(tmp_path, raw_pending):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        f'{{"version": 1, "ticker": "BYDDY", "pending_usd": {raw_pending}, "events": []}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+
+@pytest.mark.parametrize("raw_shares", ["true", "false", "-1", "NaN", "Infinity", str(10**400), '"bad"', "null"])
+def test_read_state_rejects_malformed_shares_purchased_total(tmp_path, raw_shares):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        f'{{"version": 1, "ticker": "BYDDY", "pending_usd": 1.0, "events": [], "shares_purchased_total": {raw_shares}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
+        ledger.shares_purchased_total("BYDDY")
+
+
+@pytest.mark.parametrize("raw_tokens", ["null", "{}", '"tok"', "123"])
+def test_read_state_rejects_malformed_credited_claim_tokens(tmp_path, raw_tokens):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        f'{{"version": 1, "ticker": "BYDDY", "pending_usd": 1.0, "events": [], "credited_claim_tokens": {raw_tokens}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid whole-share accumulation ledger"):
+        ledger.pending_usd("BYDDY")
+
+
+def test_apply_contribution_rejects_booleans_and_oversized_ints():
+    with pytest.raises(ValueError, match="must be numeric"):
+        apply_contribution(cast(Any, True), 2.0, 10.0)
+    with pytest.raises(ValueError, match="must be numeric"):
+        apply_contribution(0.0, cast(Any, False), 10.0)
+    with pytest.raises(ValueError, match="must be finite"):
+        apply_contribution(0.0, cast(Any, 10**400), 10.0)
+
+
+@pytest.mark.parametrize("bad_quantity", [True, False, 10**400])
+def test_settle_rejects_boolean_and_overflow_share_quantities(tmp_path, bad_quantity):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0)
+
+    with pytest.raises(ValueError, match="shares_purchased must be a finite number"):
+        ledger.settle("BYDDY", "2026-08-16", cast(Any, bad_quantity), 10.0, stream="morning")

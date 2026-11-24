@@ -371,6 +371,62 @@ def score_universe(series_by_ticker, as_of, params=None, forward=None, liquidity
     return records, sorted(set(series_by_ticker) - set(records))
 
 
+SCORE_MODELS = ("composite", "adr_price")
+ADR_WINSOR = 3.0  # docs/adr-dynamic-universe.md: factors are winsorized at plus or minus 3
+ADR_MOMENTUM_WINDOWS = (182, 365)  # 6- and 12-month lookbacks, each ending one month before ``as_of`` (skip-month)
+ADR_SKIP_DAYS = 30
+
+
+def _zscores(values, reference=None):
+    """{key: z} against the mean/stdev of ``reference`` (default: all values), winsorized at +/- ADR_WINSOR."""
+    ref = list((reference if reference is not None else values).values())
+    if len(ref) < 2:
+        return {k: 0.0 for k in values}
+    mean, sd = statistics.fmean(ref), statistics.pstdev(ref)
+    if sd <= 0:
+        return {k: 0.0 for k in values}
+    return {k: max(-ADR_WINSOR, min(ADR_WINSOR, (v - mean) / sd)) for k, v in values.items()}
+
+
+def score_universe_adr_price(series_by_ticker, as_of, liquidity=None):
+    """PRICE-ONLY SURROGATE of the dynamic-universe ADR's composite -- NOT the ADR's ranker.
+
+    Keeps the ADR's two price-derived factors: momentum (average of the 6- and 12-month return, each ending one
+    month before ``as_of``) and low volatility (negative 1-year daily volatility), each z-scored and winsorized at
+    +/- 3, equal weight. Left out for lack of data here: gross profitability and value (EDGAR), sector neutralisation
+    (no SIC codes in the archive) and the market-cap / fractional-eligibility / 252-day-history filters. z-scores are
+    taken over the liquidity-eligible pool, so ineligible names are scored on the same scale but never move it.
+    Returns the same ``(records, unscored)`` shape as ``score_universe`` so grading and backfill reuse it unchanged.
+    """
+    clipped = {t: s.truncate(as_of) for t, s in series_by_ticker.items() if s}
+    fresh = {t: s for t, s in clipped.items() if len(s) and s.last_date >= as_of - dt.timedelta(days=STALE_DAYS)}
+    flags = liquidity_flags(fresh, liquidity)
+    skip_day = as_of - dt.timedelta(days=ADR_SKIP_DAYS)
+    momentum, lowvol, risk = {}, {}, {}
+    for ticker, series in fresh.items():
+        recent = series.value_at(skip_day)
+        stats = risk_stats(series, as_of)
+        if not recent or not stats:
+            continue
+        legs = [recent / start - 1.0 for start in (series.value_at(as_of - dt.timedelta(days=d))
+                                                    for d in ADR_MOMENTUM_WINDOWS) if start]
+        if len(legs) != len(ADR_MOMENTUM_WINDOWS):
+            continue  # the ADR scores a name only when its factors exist; here both momentum legs are required
+        momentum[ticker], lowvol[ticker], risk[ticker] = statistics.fmean(legs), -stats[0], stats
+    pool = {t for t in momentum if flags[t][0]} or set(momentum)
+    z_mom = _zscores(momentum, {t: momentum[t] for t in pool})
+    z_vol = _zscores(lowvol, {t: lowvol[t] for t in pool})
+    records = {}
+    for ticker in momentum:
+        records[ticker] = {"score": 50.0 + 15.0 * (z_mom[ticker] + z_vol[ticker]) / 2.0, "vol": risk[ticker][0],
+                           "max_dd": risk[ticker][1], "eligible": flags[ticker][0], "mom_z": z_mom[ticker],
+                           "lowvol_z": z_vol[ticker]}
+    ranked = sorted(records, key=lambda t: (-records[t]["score"], t))
+    for position, ticker in enumerate(ranked, 1):
+        records[ticker]["rank"] = position
+    return records, sorted(set(series_by_ticker) - set(records))
+
+
 # ----------------------------------------------------------------------------------------------
 # History and movement tracking
 # ----------------------------------------------------------------------------------------------
@@ -1367,7 +1423,10 @@ def cmd_backfill_history(args):
     liquidity = params["liquidity"] if args.universe == "archive" else None
     rows = []
     for day in chosen:
-        records, _ = score_universe(series, day, params, None, liquidity)
+        if getattr(args, "score_model", "composite") == "adr_price":
+            records, _ = score_universe_adr_price(series, day, liquidity)
+        else:
+            records, _ = score_universe(series, day, params, None, liquidity)
         size = len(records)
         for ticker, rec in records.items():
             rows.append({"date": day.isoformat(), "ticker": ticker, "score": f"{rec['score']:.3f}",
@@ -1379,7 +1438,8 @@ def cmd_backfill_history(args):
         writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
-    print(json.dumps({"dates": len(chosen), "rows": len(rows), "out": str(out), "params_version": params["version"]}))
+    print(json.dumps({"dates": len(chosen), "rows": len(rows), "out": str(out), "params_version": params["version"],
+                      "score_model": getattr(args, "score_model", "composite")}))
     return 0
 
 
@@ -1546,6 +1606,9 @@ def build_parser():
     bh.add_argument("--end", required=True)
     bh.add_argument("--step-days", type=int, default=7, help="minimum calendar days between scored dates")
     bh.add_argument("--out", required=True, help="output CSV (not history.csv)")
+    bh.add_argument("--score-model", choices=SCORE_MODELS, default="composite",
+                    help="composite (default) or adr_price: a price-only surrogate of the dynamic-universe ADR's "
+                         "momentum + low-vol factors, for side-by-side grading only")
     bh.set_defaults(func=cmd_backfill_history)
     gr = sub.add_parser("grade", help="rank IC, quintile spread, top-N edge, turnover and cost drag by horizon")
     gr.add_argument("--horizons", type=int, nargs="+", default=list(GRADE_HORIZONS), help="calendar days ahead")
