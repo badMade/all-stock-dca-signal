@@ -1,0 +1,11 @@
+{
+ "dropped": {
+  "daily_cap": 49,
+  "price_recovered": 0,
+  "spread_over_1pct": 0
+ },
+ "eligible_count": 49,
+ "notes": "Gate 6: today history (67 filled agentic orders from earlier slots 10:11-11:51 ET, none in this slot window) totals 195.89 USD vs 180 normal daily cap; zero headroom. WARNING history completeness unproven: 67 orders, oldest 2026-11-10T15:11:19Z, no cursor returned. Earlier-slot/backup orders are expected redundancy. Weekly and buying-power checks not needed.",
+ "outcome": "NO_ORDERS_DAILY_CAP_EXHAUSTED",
+ "slot": "1330ET"
+}
