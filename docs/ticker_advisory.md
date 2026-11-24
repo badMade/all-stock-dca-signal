@@ -98,8 +98,15 @@ function's docstring for the exact fail-closed contract.
 Publish gate (2026-11-11, operator decision): a model must beat the naive MAE baselines **or** pass the
 rank-IC path -- every walk-forward fold's Spearman rank IC > 0, at least 3 folds, mean >= 0.02
 (`ml-forecaster/publish.py`, `MIN_RANK_IC_FOLDS` / `MIN_MEAN_RANK_IC`). Sizing only needs the model to order dip
-days, and the 2026-11 retrain had rank IC +0.04 in all five folds while MAE trailed the baseline. The
-incumbent comparison is unchanged.
+days, and the 2026-11 retrain had rank IC +0.04 in all five folds while MAE trailed the baseline.
+
+Incumbent comparison (2026-11-24): a candidate admitted only through the rank-IC path is compared with the
+incumbent on mean rank IC (strictly higher than the recorded `eval_metric.model_rank_ic`, when one exists), not
+on the incumbent's MAE skill ratio -- but only when the incumbent itself failed the MAE baseline. Before this,
+the 2026-11-12 incumbent (skill ratio 1.0055) set an MAE floor no later rank-IC model could clear, and 12 of 13
+retrains were `blocked_regression`. An incumbent that beat the MAE baseline keeps the full MAE comparison.
+Publishing records the mean rank IC as `eval_metric.model_rank_ic` for the next retrain. The output is still
+shadow-only: `config/ml_sizing_adjustment.json` stays `inactive`.
 
 This is a distinct mechanism from the ticker-advisory composite score above (different model,
 different config file, different consumption point), built to the same design principles this

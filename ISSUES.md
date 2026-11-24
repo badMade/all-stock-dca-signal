@@ -12,3 +12,8 @@ Ranked by impact. Digest claims are unverified against Notion; repo checks are n
 8. [impact: low] Policy gap: 10 rows have operator-written Progress notes, and the derived "Merged, docs only" label is never written over them. Decide whether `triage_reconcile` should append instead.
 
 Note: PLAN.md and VTO.md already exist in this checkout and were not created by this run. I will ask before reusing or overwriting them.
+
+## 2026-11-23 (11:30 ET intraday slot): order history cannot be saved as script-built pages [impact: high, NOT a blocker]
+- 11:30 slot aborted at Gate 6.5 (`output_cap_exceeded`) because `get_equity_orders` returned inline only and the prompt forbids hand transcription, so `assemble_order_pages` had no file to read. Cause unknown.
+- Operator direction (2026-11-23): this must never block a run. Treat as email plus triage; fix later. Proposed fix: the executor should save tool output to the bridge shell directly, or the prompt should downgrade this to log-and-continue like the 2026-10-22 history-completeness rule.
+- Evidence: cron_tracking/intraday_dca/20261123_1130ET, alert file 2026-11-23-1130-gate6_5.txt.

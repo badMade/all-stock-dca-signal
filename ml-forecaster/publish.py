@@ -191,6 +191,21 @@ def _rank_ic_passes(eval_summary: dict[str, Any]) -> bool:
     return sum(ics) / len(ics) >= MIN_MEAN_RANK_IC
 
 
+def _mean_rank_ic(eval_summary: dict[str, Any]) -> float | None:
+    """Mean walk-forward rank IC, or None unless EVERY fold carries a finite one.
+
+    Persisted as ``eval_metric.model_rank_ic`` so the next retrain can compare rank IC with the incumbent's
+    (see the rank-IC incumbent comparison in ``blocking_reasons``).
+    """
+    folds = eval_summary.get("folds")
+    if not isinstance(folds, list) or not folds:
+        return None
+    ics = [f.get("model_rank_ic") if isinstance(f, dict) else None for f in folds]
+    if not all(_is_finite_number(v) for v in ics):
+        return None
+    return sum(ics) / len(ics)
+
+
 def _baseline_mae(eval_summary: dict[str, Any]) -> float:
     """The better (lower) of this run's two naive walk-forward baseline MAEs.
 
@@ -377,6 +392,36 @@ def blocking_reasons(
         previous_horizon = current.get("horizon_trading_days")
         previous_artifact_path = current.get("model_artifact_path")
 
+        # Rank-IC incumbent comparison (2026-11-24): a candidate that only qualifies through the rank-IC pass
+        # path (its MAE does not beat the naive baseline, see the bottom of this function) must not then be
+        # held to the incumbent's MAE skill ratio -- it was never admitted on MAE, and an incumbent that
+        # itself failed the MAE baseline sets a floor that no later rank-IC model can clear, so every
+        # retrain stayed blocked_regression (2026-11-13 .. 11-23, 12 of 13 runs). Such a candidate is compared
+        # on rank IC instead: strictly higher than the incumbent's recorded mean when it has one. An
+        # incumbent that DID beat the MAE baseline keeps the full MAE comparison, so a weaker rank-IC-only
+        # model can never displace a model that was admitted on error.
+        new_rank_ic = _mean_rank_ic(eval_summary)
+        previous_baseline_for_ic = _incumbent_baseline_mae(eval_metric) if isinstance(eval_metric, dict) else None
+        incumbent_no_mae_skill = bool(
+            _is_finite_number(previous_mae)
+            and previous_baseline_for_ic is not None
+            and float(previous_mae) >= previous_baseline_for_ic
+        )
+        compared_on_rank_ic = bool(
+            baseline_mae is not None
+            and new_mae >= baseline_mae
+            and _rank_ic_passes(eval_summary)
+            and previous_horizon == new_horizon_trading_days
+            and incumbent_no_mae_skill
+        )
+        if compared_on_rank_ic:
+            previous_rank_ic = eval_metric.get("model_rank_ic") if isinstance(eval_metric, dict) else None
+            if _is_finite_number(previous_rank_ic) and new_rank_ic is not None and new_rank_ic <= previous_rank_ic:
+                reasons.append(
+                    f"new model's mean rank IC {new_rank_ic:.6f} is not strictly better than the "
+                    f"currently-published model's recorded mean rank IC {float(previous_rank_ic):.6f}"
+                )
+
         # The most rigorous comparison available: the CURRENTLY-PUBLISHED
         # model's own real, persisted coefficients (not merely its recorded
         # summary MAE) re-scored directly against the SAME genuinely
@@ -404,6 +449,7 @@ def blocking_reasons(
             and isinstance(previous_artifact_path, str)
             and previous_artifact_path
             and previous_horizon == new_horizon_trading_days
+            and not compared_on_rank_ic
         )
         if rescoring_required:
             try:
@@ -437,6 +483,9 @@ def blocking_reasons(
                 "out-of-sample holdout; refusing to replace the incumbent until enough post-cutoff "
                 "history is available and both models can be scored"
             )
+        elif compared_on_rank_ic:
+            # Compared on rank IC above; the MAE comparisons below do not apply to this candidate.
+            pass
         else:
             # A currently-published model trained on a DIFFERENT forward-return
             # horizon has an MAE on an incomparable scale -- a 1-day-return model
@@ -895,6 +944,8 @@ def guarded_publish(
                 "hit_rate": overall.get("model_hit_rate"),
                 "baseline_zero_mae": overall.get("baseline_zero_mae"),
                 "baseline_mean_mae": overall.get("baseline_mean_mae"),
+                # Mean walk-forward rank IC, read back by the NEXT retrain's rank-IC incumbent comparison.
+                "model_rank_ic": _mean_rank_ic(eval_summary),
                 # Read back by blocking_reasons() above on the NEXT retrain --
                 # None (evaluation_universe not passed) round-trips through
                 # JSON as null, which fails `isinstance(previous_universe,
