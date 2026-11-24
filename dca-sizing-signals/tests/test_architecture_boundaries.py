@@ -43,7 +43,8 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # connector_signals/ and market_data_ingest/ ship inside THIS package, so they
 # resolve against the package root rather than the wider repo root.
 # overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
-_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures"}
+_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
+                 "inventory_signals"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
@@ -53,23 +54,28 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # (docs/adr-overnight-futures-tracker.md, D3) -- and unlike comovement_signals, not even
     # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
     "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
-                      "near_close_dca"},
+                      "inventory_signals", "near_close_dca"},
     "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
-                         "near_close_dca"},
+                         "inventory_signals", "near_close_dca"},
     "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
-                          "near_close_dca"},
+                          "inventory_signals", "near_close_dca"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "overnight_futures", "near_close_dca"},
+                           "overnight_futures", "inventory_signals", "near_close_dca"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                           "market_data_ingest", "overnight_futures", "near_close_dca"},
+                           "market_data_ingest", "overnight_futures", "inventory_signals", "near_close_dca"},
     # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
     # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
     # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
     # any suggester. dca_shared_interfaces is the only sibling it may import.
     "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                          "market_data_ingest", "near_close_dca"},
+                          "market_data_ingest", "inventory_signals", "near_close_dca"},
+    # Inventory reservation (docs/inventory_reservation_suggester.md): same two-way rule as
+    # comovement_signals. Inputs arrive from the caller, so it needs no ingest layer and no
+    # other suggester; only SizingAdjustmentReader may ever learn it exists.
+    "inventory_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                          "market_data_ingest", "overnight_futures", "near_close_dca"},
 }
 
 
@@ -152,7 +158,8 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     shared = this_package_root / "dca_shared_interfaces"
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                 "market_data_ingest", "comovement_signals", "overnight_futures", "near_close_dca"}
+                 "market_data_ingest", "comovement_signals", "overnight_futures", "inventory_signals",
+                 "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden
