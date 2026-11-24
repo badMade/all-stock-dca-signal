@@ -57,7 +57,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.check_slot_fills` | 120 | 7 |
 | `scripts.claude_liveness` | 139 | 0 |
 | `scripts.cloud_preflight` | 280 | 0 |
-| `scripts.compute_schedule` | 397 | 1 |
+| `scripts.compute_schedule` | 428 | 1 |
 | `scripts.emit_order_plan` | 147 | 7 |
 | `scripts.evaluate_deferral_params` | 502 | 0 |
 | `scripts.evidence_publish` | 626 | 0 |
@@ -185,7 +185,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `market_open_quote_shadow` | 167 | 1 | 0 | 2 | `dca_paths` |
 | `midday_dca` | 527 | 4 | 4 | 9 | `dca_config`, `dca_paths`, `morning_dca`, `near_close_dca` |
 | `morning_dca` | 9863 | 16 | 8 | 44 | `dca_alerts`, `dca_common`, `dca_config`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_paths`, `dca_risk`, +8 more |
-| `near_close_dca` | 41743 | 17 | 32 | 25 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
+| `near_close_dca` | 41760 | 17 | 32 | 25 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
 | `run_dca` | 4722 | 17 | 1 | 29 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
 | `run_market_open_signals` | 110 | 2 | 0 | 0 | `market_open_dca`, `near_close_dca` |
 | `scripts` | 0 | 0 | 0 | 258 | |
@@ -217,7 +217,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.claude_liveness` | 139 | 4 | 0 | 0 | `dca_fileio`, `dca_paths`, `scripts.alert_digest`, `scripts.schedule_watchdog` |
 | `scripts.close_window_signal` | 401 | 0 | 2 | 4 | |
 | `scripts.cloud_preflight` | 280 | 3 | 0 | 0 | `dca_config`, `dca_paths`, `scripts.verify_schedule` |
-| `scripts.compute_schedule` | 397 | 0 | 0 | 1 | |
+| `scripts.compute_schedule` | 428 | 0 | 0 | 1 | |
 | `scripts.correlation` | 85 | 0 | 1 | 0 | |
 | `scripts.daily_per_ticker_calibration` | 146 | 4 | 1 | 0 | `dca_fileio`, `dca_paths`, `dca_ticker_paths`, `scripts.generate_per_ticker_sizing` |
 | `scripts.drift_detection` | 1332 | 2 | 5 | 42 | `dca_fileio`, `dca_net_utils` |
