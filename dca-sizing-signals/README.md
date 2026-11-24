@@ -17,6 +17,7 @@ type system and a CI test, not by convention alone:
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
 | `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
 | `kalman_signals/` | Shadow-only Kalman residual-dip signal from `docs/adr-kalman-residual-dip-shadow.md` (accepted 2026-11-23, Phase 1 offline). Time-varying (alpha, beta) vs the market and the ticker's co-movement cluster; logs a standardized intraday residual and a dip label to its own JSONL file. Not a `SizingSuggester`; nothing on the live side imports it. |
+| `factor_signals/` | Research-only factor (APT) decomposition from `docs/adr-factor-residual-dip-signals.md`. F1: point-in-time, Blume-shrunk market and orthogonalized-sector betas over caller-supplied close rows. F2: a read-only factor exposure report (portfolio beta, sector weights and loadings, factor variance share) for caller-named books. Not a suggester yet; not wired into any live path. |
 | `inventory_signals/` | Research-only, shrink-only `InventoryReservationSuggester` (`docs/inventory_reservation_suggester.md`): an overweight name (cost basis over target) gets a smaller multiplier in [0.25, 1.0] and a deeper top-up discount (`max_buy_price`), scaled by the forecast variance left in the day. Inputs from an injected loader; fails closed; publishes only `inventory_reservation_suggestions.json`. Shadow mode: nothing live reads it. |
 | `mc_research/` | Research-only Monte Carlo harness with variance reduction (`docs/mc_variance_reduction.md`): named seeded streams, path-first GBM generator, estimators that always return mean/SE/CI/n/n_eff (plain, antithetic, control variate, CRN paired difference, importance sampling with a fail-closed ESS floor), and flat-vs-graded DCA runners scored on terminal wealth. Stdlib only; imports nothing else here and nothing live imports it. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
@@ -113,26 +114,6 @@ from comovement_signals import ShadowWriter, pair_breakdown_shadow, write_shadow
 result = pair_breakdown_shadow(close_rows, as_of)
 write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
 ```
-
-## Kalman residual-dip signal (shadow only, Phase 1)
-
-`kalman_signals/` implements Phase 1 of `docs/adr-kalman-residual-dip-shadow.md`. Research
-basis: `docs/research/2026-11-23-kalman-filters.md`.
-
-| Piece | What it does |
-|---|---|
-| `kalman_filter.py` | 2-state (alpha, beta) random-walk regression on plain floats; prior innovation; predict-only step for missing sessions; q picked from a 3-value grid by one-step predictive log-likelihood; `steady_state_gain()` pins the research's EMA-equivalence table |
-| `residual_dip.py` | `residual_dip_shadow(inputs, as_of)`: fits and filters through the prior session, scores the as-of session, splits z into overnight and intraday, labels `idiosyncratic_dip` / `cluster_selloff` / `market_selloff` / `none`. Fails closed with a reason per skipped ticker |
-| `shadow.py` | `ShadowWriter`: appends only `kalman_residual_dip_shadow.jsonl`, refuses a `config/` directory, dedupes by content hash, `live_effect: "none"` |
-| `backtest.py`, `backtest_cli.py` | Monthly-refit walk-forward and the ADR D7 report (calibration by regime, date-clustered forward returns by intraday-z bucket, trials) |
-
-```bash
-python -m kalman_signals.backtest_cli --history-dir ../ticker_data --market SPY \
-    --non-equity QQQ,VT,XLG,AAAU --start 2024-01-02 --end 2026-11-20 --out-json /tmp/k.json --out-md /tmp/k.md
-python -m pytest tests/kalman -q
-```
-
-The archive has no SPY yet; the first run used VT as a proxy (`docs/research/2026-11-23-kalman-phase1-results.md`).
 
 ## Price source (Massive + Alpaca)
 
