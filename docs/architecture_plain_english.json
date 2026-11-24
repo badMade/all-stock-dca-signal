@@ -77,6 +77,7 @@
   "scripts.auto_resume_walkforward": "Watches a long forecasting run and restarts it automatically if it crashes or stalls.",
   "scripts.backfill_afternoon_evidence": "A one-off repair tool. When the 2:30 and 3:30 PM runs died before saving their evidence, the 12:30 buy refused to run for a week. This writes the missing evidence records the honest way, through the normal finalizer.",
   "scripts.backfill_intraday_archive": "Fills the intraday price archive from run files already on disk, so history before the archive existed is not lost.",
+  "scripts.budget_exhaustion_count": "Counts how often a slot had a buy the live system sized but the day's or week's remaining budget could not pay for. It reads each slot's own saved files, changes nothing, and decides whether the cash-pacing research is worth building.",
   "scripts.backup_gates": "The first step of the backup procedure as code. It reads a real clock and decides which slot this is, whether the market is open, and whether we are inside the buying window, so the backup agent does not guess.",
   "scripts.backup_planner": "The tool the Perplexity backup uses to read a buy plan, compute one, or finalize one. It prints one answer and the backup places nothing if the answer is not usable.",
   "scripts.backup_procedure": "Holds the backup executor's step-by-step procedure and serves it on demand. Perplexity cuts pasted instructions at 20,000 characters, which used to chop the order step off, so the long text lives here instead.",

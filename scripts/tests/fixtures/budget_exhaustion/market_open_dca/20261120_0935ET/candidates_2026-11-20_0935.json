@@ -1,0 +1,1175 @@
+{
+ "already_covered_tickers": [],
+ "buy_count": 60,
+ "cands": [
+  {
+   "current_price": 335.635,
+   "desired_usd": 8.3,
+   "drop_pct": 4.67352097475077,
+   "multiplier": 8.3025,
+   "prior_close": 352.09,
+   "prior_low": 351.1362,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 4.73,
+   "sizing_min_drop_pct": 4.577,
+   "ticker": "TSM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 129.66,
+   "desired_usd": 8.19,
+   "drop_pct": 6.335331936718927,
+   "multiplier": 8.1866,
+   "prior_close": 138.43,
+   "prior_low": 135.5,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.7606,
+   "sizing_min_drop_pct": 6.2988,
+   "ticker": "SPCX",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 35.17,
+   "desired_usd": 8.11,
+   "drop_pct": 2.4410540915395162,
+   "multiplier": 8.1147,
+   "prior_close": 36.05,
+   "prior_low": 36.035,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.5541,
+   "sizing_min_drop_pct": 2.2064,
+   "ticker": "AAAU",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 177.13,
+   "desired_usd": 7.82,
+   "drop_pct": 6.572076586317848,
+   "multiplier": 7.8217,
+   "prior_close": 189.59,
+   "prior_low": 189.56,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.6856,
+   "sizing_min_drop_pct": 6.4182,
+   "ticker": "ANET",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 15.3205,
+   "desired_usd": 7.65,
+   "drop_pct": 12.404230989136646,
+   "multiplier": 7.6481,
+   "prior_close": 17.49,
+   "prior_low": 16.78,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 14.4841,
+   "sizing_min_drop_pct": 12.0017,
+   "ticker": "VCX",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 455.125,
+   "desired_usd": 7.5,
+   "drop_pct": 6.963551994112717,
+   "multiplier": 7.4989,
+   "prior_close": 489.19,
+   "prior_low": 470.56,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.992,
+   "sizing_min_drop_pct": 6.8657,
+   "ticker": "AMD",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 140.653,
+   "desired_usd": 7.07,
+   "drop_pct": 3.6491300178106583,
+   "multiplier": 7.071,
+   "prior_close": 145.98,
+   "prior_low": 145.71,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.7282,
+   "sizing_min_drop_pct": 3.5637,
+   "ticker": "NVDA",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 819.8825,
+   "desired_usd": 6.92,
+   "drop_pct": 3.262126414404201,
+   "multiplier": 6.9161,
+   "prior_close": 847.53,
+   "prior_low": 843.885,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.3734,
+   "sizing_min_drop_pct": 3.2599,
+   "ticker": "GS",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 87.68,
+   "desired_usd": 6.62,
+   "drop_pct": 0.7808079665044672,
+   "multiplier": 6.6243,
+   "prior_close": 88.37,
+   "prior_low": 88.28,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.7844,
+   "sizing_min_drop_pct": 0.6278,
+   "ticker": "SATA",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 7.2,
+   "desired_usd": 6.27,
+   "drop_pct": 2.702702702702705,
+   "multiplier": 6.2697,
+   "prior_close": 7.4,
+   "prior_low": 7.36,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.7978,
+   "sizing_min_drop_pct": 2.6082,
+   "ticker": "BTX",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 1308.49,
+   "desired_usd": 6.1,
+   "drop_pct": 3.5179177112520303,
+   "multiplier": 6.0993,
+   "prior_close": 1356.2,
+   "prior_low": 1354.3,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.5443,
+   "sizing_min_drop_pct": 3.453,
+   "ticker": "ASML",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 18.81,
+   "desired_usd": 5.94,
+   "drop_pct": 4.1772796739684175,
+   "multiplier": 5.9399,
+   "prior_close": 19.63,
+   "prior_low": 19.53,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 4.1863,
+   "sizing_min_drop_pct": 4.0162,
+   "ticker": "RVI",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 41.56,
+   "desired_usd": 5.93,
+   "drop_pct": 5.070808588396526,
+   "multiplier": 5.9313,
+   "prior_close": 43.78,
+   "prior_low": 43.59,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 5.1284,
+   "sizing_min_drop_pct": 4.5431,
+   "ticker": "STM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 86.695,
+   "desired_usd": 5.86,
+   "drop_pct": 8.157211716722287,
+   "multiplier": 5.8559,
+   "prior_close": 94.395,
+   "prior_low": 94.15875,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 8.4598,
+   "sizing_min_drop_pct": 7.8487,
+   "ticker": "SNDK",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 645.0,
+   "desired_usd": 5.81,
+   "drop_pct": 6.581310468686643,
+   "multiplier": 5.8107,
+   "prior_close": 690.44,
+   "prior_low": 689.279,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.8733,
+   "sizing_min_drop_pct": 6.4751,
+   "ticker": "MU",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 321.01,
+   "desired_usd": 5.46,
+   "drop_pct": 5.2872274510961015,
+   "multiplier": 5.4634,
+   "prior_close": 338.93,
+   "prior_low": 337.88,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 5.462,
+   "sizing_min_drop_pct": 5.2071,
+   "ticker": "AMAT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 174.53,
+   "desired_usd": 5.35,
+   "drop_pct": 5.654359695118659,
+   "multiplier": 5.3486,
+   "prior_close": 184.99,
+   "prior_low": 183.8101,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 5.8198,
+   "sizing_min_drop_pct": 5.3887,
+   "ticker": "VRT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 32.7,
+   "desired_usd": 5.35,
+   "drop_pct": 1.7427884615384563,
+   "multiplier": 5.3462,
+   "prior_close": 33.28,
+   "prior_low": 33.25,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.7575,
+   "sizing_min_drop_pct": 1.7206,
+   "ticker": "QTOP",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 4.3,
+   "desired_usd": 5.25,
+   "drop_pct": 7.526881720430119,
+   "multiplier": 5.2544,
+   "prior_close": 4.65,
+   "prior_low": 4.6,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 7.7587,
+   "sizing_min_drop_pct": 7.5204,
+   "ticker": "GFUZ",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 73.09,
+   "desired_usd": 5.25,
+   "drop_pct": 3.332892474540399,
+   "multiplier": 5.2464,
+   "prior_close": 75.61,
+   "prior_low": 75.23,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.3379,
+   "sizing_min_drop_pct": 3.1429,
+   "ticker": "APH",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 494.875,
+   "desired_usd": 5.0,
+   "drop_pct": 7.525927310099968,
+   "multiplier": 4.9958,
+   "prior_close": 535.15,
+   "prior_low": 531.01,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 8.0114,
+   "sizing_min_drop_pct": 7.4165,
+   "ticker": "LITE",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 100.25,
+   "desired_usd": 4.98,
+   "drop_pct": 5.397754081343775,
+   "multiplier": 4.9769,
+   "prior_close": 105.97,
+   "prior_low": 105.83,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 5.5769,
+   "sizing_min_drop_pct": 5.3885,
+   "ticker": "GLW",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 245.67,
+   "desired_usd": 4.89,
+   "drop_pct": 6.457754255035604,
+   "multiplier": 4.8896,
+   "prior_close": 262.63,
+   "prior_low": 262.05,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.7673,
+   "sizing_min_drop_pct": 6.2666,
+   "ticker": "CIEN",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 27.4,
+   "desired_usd": 4.8,
+   "drop_pct": 6.707524685052784,
+   "multiplier": 4.7956,
+   "prior_close": 29.37,
+   "prior_low": 29.07,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.7902,
+   "sizing_min_drop_pct": 6.5482,
+   "ticker": "VIAV",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 31.4399,
+   "desired_usd": 4.78,
+   "drop_pct": 1.0390305319483728,
+   "multiplier": 4.7848,
+   "prior_close": 31.77,
+   "prior_low": 31.76,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.0494,
+   "sizing_min_drop_pct": 1.025,
+   "ticker": "TOPT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 129.885,
+   "desired_usd": 4.66,
+   "drop_pct": 6.19989889506753,
+   "multiplier": 4.656,
+   "prior_close": 138.47,
+   "prior_low": 138.35,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.2929,
+   "sizing_min_drop_pct": 6.0863,
+   "ticker": "MRVL",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 337.115,
+   "desired_usd": 4.49,
+   "drop_pct": 2.7506130102408677,
+   "multiplier": 4.4937,
+   "prior_close": 346.65,
+   "prior_low": 345.0,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.8837,
+   "sizing_min_drop_pct": 2.7317,
+   "ticker": "AVGO",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 636.8362,
+   "desired_usd": 4.49,
+   "drop_pct": 1.2718281036834926,
+   "multiplier": 4.487,
+   "prior_close": 645.04,
+   "prior_low": 644.34,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.3177,
+   "sizing_min_drop_pct": 1.2687,
+   "ticker": "QQQ",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 279.0,
+   "desired_usd": 4.41,
+   "drop_pct": 2.3622047244094486,
+   "multiplier": 4.4115,
+   "prior_close": 285.75,
+   "prior_low": 282.985,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.4117,
+   "sizing_min_drop_pct": 2.3322,
+   "ticker": "TXN",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 37.4,
+   "desired_usd": 4.36,
+   "drop_pct": 3.954802259887004,
+   "multiplier": 4.3575,
+   "prior_close": 38.94,
+   "prior_low": 38.91,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.9608,
+   "sizing_min_drop_pct": 3.913,
+   "ticker": "GFS",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 487.7993,
+   "desired_usd": 4.31,
+   "drop_pct": 6.442528625405161,
+   "multiplier": 4.313,
+   "prior_close": 521.39,
+   "prior_low": 521.07,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.976,
+   "sizing_min_drop_pct": 6.0404,
+   "ticker": "STX",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 278.3,
+   "desired_usd": 4.26,
+   "drop_pct": 6.226834692364703,
+   "multiplier": 4.2603,
+   "prior_close": 296.78,
+   "prior_low": 291.82,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.2642,
+   "sizing_min_drop_pct": 5.8809,
+   "ticker": "WDC",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 36.4395,
+   "desired_usd": 4.21,
+   "drop_pct": 5.17954722872755,
+   "multiplier": 4.2108,
+   "prior_close": 38.43,
+   "prior_low": 38.395,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 5.2085,
+   "sizing_min_drop_pct": 5.1596,
+   "ticker": "DRAM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 202.09,
+   "desired_usd": 3.86,
+   "drop_pct": 5.978412580254952,
+   "multiplier": 3.8611,
+   "prior_close": 214.94,
+   "prior_low": 211.2,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 6.0274,
+   "sizing_min_drop_pct": 5.8751,
+   "ticker": "COHR",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 526.685,
+   "desired_usd": 3.65,
+   "drop_pct": 1.9883878891639017,
+   "multiplier": 3.6527,
+   "prior_close": 537.37,
+   "prior_low": 535.53,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.0757,
+   "sizing_min_drop_pct": 1.9719,
+   "ticker": "CAT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 146.2296,
+   "desired_usd": 3.59,
+   "drop_pct": 0.6389889243731621,
+   "multiplier": 3.5889,
+   "prior_close": 147.17,
+   "prior_low": 147.1,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.6616,
+   "sizing_min_drop_pct": 0.6262,
+   "ticker": "VT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 207.69,
+   "desired_usd": 3.59,
+   "drop_pct": 1.6665877562615454,
+   "multiplier": 3.5862,
+   "prior_close": 211.21,
+   "prior_low": 209.91,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.7065,
+   "sizing_min_drop_pct": 1.6471,
+   "ticker": "TEL",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 53.82,
+   "desired_usd": 3.22,
+   "drop_pct": 3.409906676238332,
+   "multiplier": 3.22,
+   "prior_close": 55.72,
+   "prior_low": 54.85,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.4868,
+   "sizing_min_drop_pct": 3.3792,
+   "ticker": "INTC",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 43.34,
+   "desired_usd": 3.16,
+   "drop_pct": 2.4752475247524623,
+   "multiplier": 3.1632,
+   "prior_close": 44.44,
+   "prior_low": 44.44,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.5862,
+   "sizing_min_drop_pct": 2.4052,
+   "ticker": "FLKR",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 57.31,
+   "desired_usd": 3.12,
+   "drop_pct": 0.6070065903572569,
+   "multiplier": 3.1177,
+   "prior_close": 57.66,
+   "prior_low": 57.66,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.6109,
+   "sizing_min_drop_pct": 0.5987,
+   "ticker": "XLG",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 7.05,
+   "desired_usd": 3.08,
+   "drop_pct": 3.5567715458276306,
+   "multiplier": 3.0802,
+   "prior_close": 7.31,
+   "prior_low": 7.26,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.6049,
+   "sizing_min_drop_pct": 3.5486,
+   "ticker": "QBTS",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 7.7808,
+   "desired_usd": 3.02,
+   "drop_pct": 3.4640198511166296,
+   "multiplier": 3.0249,
+   "prior_close": 8.06,
+   "prior_low": 8.03,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.6413,
+   "sizing_min_drop_pct": 3.4054,
+   "ticker": "RGTI",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 49.315,
+   "desired_usd": 2.86,
+   "drop_pct": 3.2849578348695903,
+   "multiplier": 2.861,
+   "prior_close": 50.99,
+   "prior_low": 50.45,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.3583,
+   "sizing_min_drop_pct": 3.2064,
+   "ticker": "RKLB",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 368.4001,
+   "desired_usd": 2.7,
+   "drop_pct": 1.6051654603242476,
+   "multiplier": 2.7014,
+   "prior_close": 374.41,
+   "prior_low": 370.81,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.6195,
+   "sizing_min_drop_pct": 1.5732,
+   "ticker": "TSLA",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 4.7598,
+   "desired_usd": 2.68,
+   "drop_pct": 2.4631147540983536,
+   "multiplier": 2.6751,
+   "prior_close": 4.88,
+   "prior_low": 4.86,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.5174,
+   "sizing_min_drop_pct": 2.4449,
+   "ticker": "QUBT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 1412.52,
+   "desired_usd": 2.52,
+   "drop_pct": 0.7978200410147012,
+   "multiplier": 2.5152,
+   "prior_close": 1423.88,
+   "prior_low": 1412.88,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.8264,
+   "sizing_min_drop_pct": 0.7945,
+   "ticker": "GWW",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 28.86,
+   "desired_usd": 2.4,
+   "drop_pct": 2.103120759837181,
+   "multiplier": 2.4028,
+   "prior_close": 29.48,
+   "prior_low": 28.23,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 2.1071,
+   "sizing_min_drop_pct": 2.0794,
+   "ticker": "DFTX",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 9.46,
+   "desired_usd": 2.36,
+   "drop_pct": 3.2719836400817846,
+   "multiplier": 2.3605,
+   "prior_close": 9.78,
+   "prior_low": 9.5,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.3796,
+   "sizing_min_drop_pct": 3.2709,
+   "ticker": "LUNR",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 314.69,
+   "desired_usd": 2.32,
+   "drop_pct": 1.0688798767644307,
+   "multiplier": 2.316,
+   "prior_close": 318.09,
+   "prior_low": 316.23,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.1163,
+   "sizing_min_drop_pct": 1.0624,
+   "ticker": "FFIV",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 254.96,
+   "desired_usd": 2.13,
+   "drop_pct": 0.9363950732408581,
+   "multiplier": 2.1325,
+   "prior_close": 257.37,
+   "prior_low": 256.75,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.9703,
+   "sizing_min_drop_pct": 0.9346,
+   "ticker": "AMZN",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 496.555,
+   "desired_usd": 2.0,
+   "drop_pct": 0.3501906482038941,
+   "multiplier": 1.9974,
+   "prior_close": 498.3,
+   "prior_low": 498.16,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.371,
+   "sizing_min_drop_pct": 0.3048,
+   "ticker": "MSFT",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 84.175,
+   "desired_usd": 1.88,
+   "drop_pct": 3.2026218951241914,
+   "multiplier": 1.8763,
+   "prior_close": 86.96,
+   "prior_low": 86.28,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 3.2315,
+   "sizing_min_drop_pct": 3.1469,
+   "ticker": "CBRS",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 282.0475,
+   "desired_usd": 1.84,
+   "drop_pct": 1.219661681784737,
+   "multiplier": 1.8403,
+   "prior_close": 285.53,
+   "prior_low": 282.26,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.2306,
+   "sizing_min_drop_pct": 1.1854,
+   "ticker": "EVR",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 94.18,
+   "desired_usd": 1.74,
+   "drop_pct": 0.5491024287222767,
+   "multiplier": 1.7375,
+   "prior_close": 94.7,
+   "prior_low": 94.38,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.5908,
+   "sizing_min_drop_pct": 0.5395,
+   "ticker": "CSCO",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 43.38,
+   "desired_usd": 1.74,
+   "drop_pct": 0.6640714449278661,
+   "multiplier": 1.7357,
+   "prior_close": 43.67,
+   "prior_low": 43.61,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.7021,
+   "sizing_min_drop_pct": 0.6578,
+   "ticker": "IRDM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 24.495,
+   "desired_usd": 1.47,
+   "drop_pct": 1.1899959661153616,
+   "multiplier": 1.4704,
+   "prior_close": 24.79,
+   "prior_low": 23.59,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 1.2427,
+   "sizing_min_drop_pct": 1.1354,
+   "ticker": "DXYZ",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 161.36,
+   "desired_usd": 1.31,
+   "drop_pct": 0.4012098018640685,
+   "multiplier": 1.3089,
+   "prior_close": 162.01,
+   "prior_low": 160.39,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.4178,
+   "sizing_min_drop_pct": 0.373,
+   "ticker": "QCOM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 319.6122,
+   "desired_usd": 1.29,
+   "drop_pct": 0.18980700768223543,
+   "multiplier": 1.2918,
+   "prior_close": 320.22,
+   "prior_low": 317.43,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.2054,
+   "sizing_min_drop_pct": 0.1888,
+   "ticker": "JPM",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 16.865,
+   "desired_usd": 1.24,
+   "drop_pct": 0.2661147250147942,
+   "multiplier": 1.2429,
+   "prior_close": 16.91,
+   "prior_low": 16.81,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.2777,
+   "sizing_min_drop_pct": 0.2574,
+   "ticker": "TRIN",
+   "unknown_prior_low": false
+  },
+  {
+   "current_price": 9.275,
+   "desired_usd": 1.0,
+   "drop_pct": 0.8021390374331475,
+   "multiplier": 1.0,
+   "prior_close": 9.35,
+   "prior_low": 9.23,
+   "selected_base_amount_usd": 1.0,
+   "sizing_base_usd": 1.0,
+   "sizing_max_drop_pct": 0.9697,
+   "sizing_min_drop_pct": 0.5841,
+   "ticker": "TRLV",
+   "unknown_prior_low": false
+  }
+ ],
+ "cron_id": "2ba19526",
+ "decision_time_et": "09:50",
+ "deployed_last_7d_usd": null,
+ "evaluated_count": 122,
+ "evaluation_time_et": "09:50",
+ "kill_switch_engaged": false,
+ "kill_switch_evaluated": false,
+ "live_execution_enabled": true,
+ "manual_review_count": 0,
+ "manual_review_tickers": [],
+ "no_data_count": 0,
+ "no_data_tickers": [],
+ "planner_config_mismatch": false,
+ "planner_incompatible_tickers": [],
+ "provider_error_count": 0,
+ "provider_error_tickers": [],
+ "runner_slot_id": "0935",
+ "same_day_top_up_candidates": [
+  {
+   "current_price": 335.635,
+   "desired_usd": 8.3,
+   "ticker": "TSM"
+  },
+  {
+   "current_price": 129.66,
+   "desired_usd": 8.19,
+   "ticker": "SPCX"
+  },
+  {
+   "current_price": 35.17,
+   "desired_usd": 8.11,
+   "ticker": "AAAU"
+  },
+  {
+   "current_price": 177.13,
+   "desired_usd": 7.82,
+   "ticker": "ANET"
+  },
+  {
+   "current_price": 15.3205,
+   "desired_usd": 7.65,
+   "ticker": "VCX"
+  },
+  {
+   "current_price": 455.125,
+   "desired_usd": 7.5,
+   "ticker": "AMD"
+  },
+  {
+   "current_price": 140.653,
+   "desired_usd": 7.07,
+   "ticker": "NVDA"
+  },
+  {
+   "current_price": 819.8825,
+   "desired_usd": 6.92,
+   "ticker": "GS"
+  },
+  {
+   "current_price": 87.68,
+   "desired_usd": 6.62,
+   "ticker": "SATA"
+  },
+  {
+   "current_price": 7.2,
+   "desired_usd": 6.27,
+   "ticker": "BTX"
+  },
+  {
+   "current_price": 1308.49,
+   "desired_usd": 6.1,
+   "ticker": "ASML"
+  },
+  {
+   "current_price": 18.81,
+   "desired_usd": 5.94,
+   "ticker": "RVI"
+  },
+  {
+   "current_price": 41.56,
+   "desired_usd": 5.93,
+   "ticker": "STM"
+  },
+  {
+   "current_price": 86.695,
+   "desired_usd": 5.86,
+   "ticker": "SNDK"
+  },
+  {
+   "current_price": 645.0,
+   "desired_usd": 5.81,
+   "ticker": "MU"
+  },
+  {
+   "current_price": 321.01,
+   "desired_usd": 5.46,
+   "ticker": "AMAT"
+  },
+  {
+   "current_price": 174.53,
+   "desired_usd": 5.35,
+   "ticker": "VRT"
+  },
+  {
+   "current_price": 32.7,
+   "desired_usd": 5.35,
+   "ticker": "QTOP"
+  },
+  {
+   "current_price": 4.3,
+   "desired_usd": 5.25,
+   "ticker": "GFUZ"
+  },
+  {
+   "current_price": 73.09,
+   "desired_usd": 5.25,
+   "ticker": "APH"
+  },
+  {
+   "current_price": 494.875,
+   "desired_usd": 5.0,
+   "ticker": "LITE"
+  },
+  {
+   "current_price": 100.25,
+   "desired_usd": 4.98,
+   "ticker": "GLW"
+  },
+  {
+   "current_price": 245.67,
+   "desired_usd": 4.89,
+   "ticker": "CIEN"
+  },
+  {
+   "current_price": 27.4,
+   "desired_usd": 4.8,
+   "ticker": "VIAV"
+  },
+  {
+   "current_price": 31.4399,
+   "desired_usd": 4.78,
+   "ticker": "TOPT"
+  },
+  {
+   "current_price": 129.885,
+   "desired_usd": 4.66,
+   "ticker": "MRVL"
+  },
+  {
+   "current_price": 337.115,
+   "desired_usd": 4.49,
+   "ticker": "AVGO"
+  },
+  {
+   "current_price": 636.8362,
+   "desired_usd": 4.49,
+   "ticker": "QQQ"
+  },
+  {
+   "current_price": 279.0,
+   "desired_usd": 4.41,
+   "ticker": "TXN"
+  },
+  {
+   "current_price": 37.4,
+   "desired_usd": 4.36,
+   "ticker": "GFS"
+  },
+  {
+   "current_price": 487.7993,
+   "desired_usd": 4.31,
+   "ticker": "STX"
+  },
+  {
+   "current_price": 278.3,
+   "desired_usd": 4.26,
+   "ticker": "WDC"
+  },
+  {
+   "current_price": 36.4395,
+   "desired_usd": 4.21,
+   "ticker": "DRAM"
+  },
+  {
+   "current_price": 202.09,
+   "desired_usd": 3.86,
+   "ticker": "COHR"
+  },
+  {
+   "current_price": 526.685,
+   "desired_usd": 3.65,
+   "ticker": "CAT"
+  },
+  {
+   "current_price": 146.2296,
+   "desired_usd": 3.59,
+   "ticker": "VT"
+  },
+  {
+   "current_price": 207.69,
+   "desired_usd": 3.59,
+   "ticker": "TEL"
+  },
+  {
+   "current_price": 53.82,
+   "desired_usd": 3.22,
+   "ticker": "INTC"
+  },
+  {
+   "current_price": 43.34,
+   "desired_usd": 3.16,
+   "ticker": "FLKR"
+  },
+  {
+   "current_price": 57.31,
+   "desired_usd": 3.12,
+   "ticker": "XLG"
+  },
+  {
+   "current_price": 7.05,
+   "desired_usd": 3.08,
+   "ticker": "QBTS"
+  },
+  {
+   "current_price": 7.7808,
+   "desired_usd": 3.02,
+   "ticker": "RGTI"
+  },
+  {
+   "current_price": 49.315,
+   "desired_usd": 2.86,
+   "ticker": "RKLB"
+  },
+  {
+   "current_price": 368.4001,
+   "desired_usd": 2.7,
+   "ticker": "TSLA"
+  },
+  {
+   "current_price": 4.7598,
+   "desired_usd": 2.68,
+   "ticker": "QUBT"
+  },
+  {
+   "current_price": 1412.52,
+   "desired_usd": 2.52,
+   "ticker": "GWW"
+  },
+  {
+   "current_price": 28.86,
+   "desired_usd": 2.4,
+   "ticker": "DFTX"
+  },
+  {
+   "current_price": 9.46,
+   "desired_usd": 2.36,
+   "ticker": "LUNR"
+  },
+  {
+   "current_price": 314.69,
+   "desired_usd": 2.32,
+   "ticker": "FFIV"
+  },
+  {
+   "current_price": 254.96,
+   "desired_usd": 2.13,
+   "ticker": "AMZN"
+  },
+  {
+   "current_price": 496.555,
+   "desired_usd": 2.0,
+   "ticker": "MSFT"
+  },
+  {
+   "current_price": 84.175,
+   "desired_usd": 1.88,
+   "ticker": "CBRS"
+  },
+  {
+   "current_price": 282.0475,
+   "desired_usd": 1.84,
+   "ticker": "EVR"
+  },
+  {
+   "current_price": 94.18,
+   "desired_usd": 1.74,
+   "ticker": "CSCO"
+  },
+  {
+   "current_price": 43.38,
+   "desired_usd": 1.74,
+   "ticker": "IRDM"
+  },
+  {
+   "current_price": 24.495,
+   "desired_usd": 1.47,
+   "ticker": "DXYZ"
+  },
+  {
+   "current_price": 161.36,
+   "desired_usd": 1.31,
+   "ticker": "QCOM"
+  },
+  {
+   "current_price": 319.6122,
+   "desired_usd": 1.29,
+   "ticker": "JPM"
+  },
+  {
+   "current_price": 16.865,
+   "desired_usd": 1.24,
+   "ticker": "TRIN"
+  },
+  {
+   "current_price": 9.275,
+   "desired_usd": 1.0,
+   "ticker": "TRLV"
+  }
+ ],
+ "slot": "0935ET",
+ "source": "robinhood",
+ "stream": "market_open",
+ "ticker_source_overrides_applied": {},
+ "trading_day": "2026-11-20",
+ "trend_validation_exempt": true,
+ "validation_context_source_errors": [],
+ "validation_context_sources_present": [],
+ "withheld_contradictory_base_tickers": [],
+ "withheld_incomplete_trend_window_tickers": []
+}
