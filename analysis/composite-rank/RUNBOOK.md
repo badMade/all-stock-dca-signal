@@ -92,6 +92,7 @@ Nothing adjusts weights automatically.
 | `trade_list_history.csv`, `runs/<date>/trade_list.csv`, `latest_trade_list.csv` | The daily list (score above 80, or held above 50) with the reason and the params version. |
 | `runs/<date>/tickers_proposal.{md,json}`, `latest_tickers_proposal.md` | Review-first diff of the list against `config/tickers.json`. Never applied automatically. |
 | `shadow_octopus_history.csv`, `shadow_ml_history.csv` | Octopus and ml-forecaster signals logged at zero weight (see above). |
+| `shadow_adr_price_history.csv` | `--universe archive` runs only: the price-only ADR surrogate (skip-month momentum + low volatility) ranked over the same archive, columns match `backfill-history` so `grade --compare adr=<file>` reads it. Never touches the score, trade list or proposal. |
 | `history.csv` | One row per ticker per run: rank, score, volatility, drawdown. No holdings column. The basis for movement tracking. Read it with the `history` command, not by loading the file. |
 | `movement_summary.md` | How far names typically move by starting rank, and per-ticker rank behaviour. |
 | `latest_evaluation_list.md`, `latest_ranked_all.csv` | Copies of the most recent run. |

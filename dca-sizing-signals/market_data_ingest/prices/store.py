@@ -30,6 +30,16 @@ Read rules: adjusted values are never stored. ``bars_known_at``, ``actions_known
 logic is available from the DuckDB CLI. A corporate action applies to a bar only when
 ``bar.session < ex_date <= as_of_date``; ``known_at`` hides any row whose ``as_of`` is later.
 
+Quarantine is read-side (backtest protocol item 6, operator decision 2026-11-24). Ingest stores
+every validated bar as delivered, because a split may be learned after the bars crossing it.
+``bar_anomalies_known_at`` lists each raw close-to-close move beyond the bound that no split-type
+action known at ``known_at`` explains (the SQL twin of ``validate.bar_anomalies``), and
+``checked_bars`` is ``adjusted_bars`` with every session of a symbol from its first such anomaly
+onward removed: those sessions cannot be put on one basis with the earlier ones, so they give no
+price rather than an interpolated or mis-adjusted one. Once the split is known (a later
+``known_at``) the anomaly is explained and the sessions come back. ``adjusted_bars`` itself is
+unchanged; a backtest or a decision reads ``checked_bars``.
+
 Timestamps are stored as naive UTC ``TIMESTAMP`` (reading ``TIMESTAMPTZ`` back into Python
 would need ``pytz``) and converted to aware UTC at this module's boundary.
 """
@@ -57,7 +67,7 @@ from .models import (
     action_version_key,
 )
 from .errors import AmbiguousActionsError
-from .validate import split_ambiguous_actions, validate_actions, validate_bars
+from .validate import MAX_ABS_MOVE, BarAnomaly, split_ambiguous_actions, validate_actions, validate_bars
 
 FAR_FUTURE = datetime(9999, 12, 31)
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
@@ -178,6 +188,28 @@ CREATE OR REPLACE MACRO adjusted_bars(as_of_date, known_at) AS TABLE
         b.volume AS volume_raw,
         b.volume / coalesce(s.price_factor, 1.0) AS volume_split_adjusted
     FROM b LEFT JOIN splits AS s USING (symbol, session) LEFT JOIN div_factors AS f USING (symbol, session);
+
+CREATE OR REPLACE MACRO bar_anomalies_known_at(as_of_date, known_at, max_abs_move) AS TABLE
+    WITH b AS (
+        SELECT symbol, session, source, close, run_id,
+            lag(session) OVER w AS prior_session, lag(close) OVER w AS prior_close
+        FROM bars_known_at(known_at) WHERE session <= as_of_date
+        WINDOW w AS (PARTITION BY symbol ORDER BY session)),
+    f AS (
+        SELECT b.*, (
+            SELECT coalesce(product(a.split_from / a.split_to), 1.0) FROM actions_known_at(known_at) AS a
+            WHERE a.symbol = b.symbol AND a.ex_date > b.prior_session AND a.ex_date <= b.session
+                AND a.action_type IN ('forward_split', 'reverse_split', 'stock_dividend')) AS factor
+        FROM b WHERE b.prior_session IS NOT NULL)
+    SELECT symbol, session, source, run_id, prior_close, close, close / (prior_close * factor) - 1 AS move
+    FROM f WHERE abs(close / (prior_close * factor) - 1) > max_abs_move;
+
+CREATE OR REPLACE MACRO checked_bars(as_of_date, known_at, max_abs_move) AS TABLE
+    WITH q AS (
+        SELECT symbol, min(session) AS first_bad
+        FROM bar_anomalies_known_at(as_of_date, known_at, max_abs_move) GROUP BY symbol)
+    SELECT ab.* FROM adjusted_bars(as_of_date, known_at) AS ab LEFT JOIN q USING (symbol)
+    WHERE q.first_bad IS NULL OR ab.session < q.first_bad;
 """
 
 _TABLES = frozenset(
@@ -477,6 +509,44 @@ class PriceStore:
             "SELECT * FROM adjusted_bars(?, ?) WHERE symbol = ? ORDER BY session", [as_of_date, known, symbol]
         )
         return [AdjustedBar(**r) for r in rows]
+
+    def checked_bars(
+        self, symbol: str, *, as_of_date: date, known_at: datetime | None = None, max_abs_move: float = MAX_ABS_MOVE
+    ) -> list[AdjustedBar]:
+        """``adjusted_bars`` without any session at or after the symbol's first unexplained jump (item 6).
+
+        The view a backtest or a decision reads. A session missing here has no price: callers must
+        not fall back to a neighbour's (``decision.NoSuggestion``).
+        """
+        known = FAR_FUTURE if known_at is None else to_utc_naive(known_at)
+        rows = self._rows(
+            "SELECT * FROM checked_bars(?, ?, ?) WHERE symbol = ? ORDER BY session",
+            [as_of_date, known, max_abs_move, symbol],
+        )
+        return [AdjustedBar(**r) for r in rows]
+
+    def bar_anomalies(
+        self,
+        *,
+        as_of_date: date,
+        known_at: datetime | None = None,
+        symbol: str | None = None,
+        max_abs_move: float = MAX_ABS_MOVE,
+    ) -> list[dict[str, Any]]:
+        """The quarantine record: each unexplained jump seen from ``known_at``, with its batch's run_id.
+
+        Rows carry symbol, session, source, run_id, prior_close, close, move and a readable reason.
+        """
+        known = FAR_FUTURE if known_at is None else to_utc_naive(known_at)
+        sql = "SELECT * FROM bar_anomalies_known_at(?, ?, ?)"
+        params: list[Any] = [as_of_date, known, max_abs_move]
+        if symbol is not None:
+            sql += " WHERE symbol = ?"
+            params.append(symbol)
+        rows = self._rows(sql + " ORDER BY symbol, session", params)
+        for r in rows:
+            r["reason"] = BarAnomaly(r["symbol"], r["session"], r["prior_close"], r["close"], r["move"]).reason
+        return rows
 
     def split_price_factor(self, symbol: str, *, after: date, through: date, known_at: datetime | None = None) -> float:
         """Product of split price ratios with ``after < ex_date <= through`` (1.0 if none)."""

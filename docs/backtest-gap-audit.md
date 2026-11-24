@@ -66,6 +66,35 @@ Evidence paths starting `prices/` or `ledger/` are under `dca-sizing-signals/mar
 - The data layer (items 1 to 6) is mostly built in `dca-sizing-signals/` and needs guards and a few
   columns. The harness and statistics layer (items 7 to 17) is mostly missing; the ADR covers it.
 
+## Phase A progress (2026-11-24)
+
+The table above is the audit as found on 2026-11-23 and is left as it was. Since then, on this branch:
+
+- **Item 4:** `dca-sizing-signals/market_data_ingest/exchange_calendar.py` provides `ExchangeCalendar`
+  (loads `config/market_calendar.json`) and `actionable_at`. Every test in `tests/test_actionable_at.py`
+  passes. A year the file does not cover raises `CalendarCoverageError`, so any acceptance before 2026
+  stays unusable until the calendar file is extended backwards.
+- **Item 3:** `market_data_ingest/edgar_acceptance.py` provides `parse_edgar_accepted`,
+  `POINT_IN_TIME_FORMS` and `actionable_facts`. Every test in `tests/test_edgar_actionable_facts.py`
+  passes. Nothing fetches acceptance times yet; callers pass the mapping in.
+- **Item 6, pure check:** `prices/validate.py` `bar_anomalies` returns each raw close-to-close move
+  beyond 50% that no split-type action explains.
+- **Item 6, store: read-time quarantine (operator decision 2026-11-24).** Ingest is unchanged, because the
+  store's contract lets a split be learned after the bars that cross it
+  (`tests/prices/test_store_point_in_time.py`, e.g. `test_known_at_hides_a_split_we_learned_about_later`).
+  An ingest-time reject was tried first and broke 24 existing tests. Two new DuckDB macros carry the
+  guard. `bar_anomalies_known_at(as_of_date, known_at, max_abs_move)` is the queryable record, with each
+  anomalous bar's run_id, and `PriceStore.bar_anomalies` adds a reason. `checked_bars(...)` is
+  `adjusted_bars` minus every session of a symbol from its first unexplained jump onward: those
+  sessions give no price. Learning the split later clears the quarantine for that later `known_at`.
+  `adjusted_bars` is unchanged; the backtest harness must read `checked_bars`. All 12 tests in
+  `tests/prices/test_bar_quarantine.py` pass, including SQL-versus-Python parity.
+- **Open on item 6:** a genuine one-day move beyond 50% (a failed drug trial, say) quarantines the
+  symbol from that day on, with no way yet to clear it. A clearance record is a follow-up. The
+  staleness bound is not covered yet.py`
+  stay `xfail(strict=True)` until the operator picks between an ingest-time reject and a read-time
+  quarantine.
+
 ## Conflicts and notes for the operator
 
 1. **Input files missing.** `claude/architecture.md` does not exist; `docs/codebase_roadmap.md` and
