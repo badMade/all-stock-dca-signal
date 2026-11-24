@@ -8,7 +8,7 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Five packages that only depend on each other in one direction, enforced by both the
+Six packages that only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
@@ -17,6 +17,7 @@ type system and a CI test, not by convention alone:
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
 | `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
 | `residual_reversal/` | Research-only, budget-neutral sector-ETF residual-reversal suggester (`docs/adr-residual-reversal-suggester.md`): OLS beta on a caller-mapped ETF, OU s-score of the cumulated residual, a bounded [0.75, 1.25] tilt renormalised so the day's dollars are unchanged, and a fail-closed relationship-break guard. Publishes only `residual_reversal_suggestions.json`. Not wired into any live path. |
+| `cost_basis_backtest/` | Research-only, offline walk-forward harness (`docs/adr-cost-basis-backtest-harness.md`): replays the graded baseline and a candidate suggester on the same cash flows and scores paired per-ticker cost-basis improvement, with lookahead rejection, an out-of-sample score-bucket promotion test, deflated Sharpe and PBO. Stdlib only, imports no suggester, writes nothing. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -142,6 +143,48 @@ publish_outcome(outcome, residual_reversal_publisher(Path("research/suggestions"
 
 ```bash
 python -m pytest tests/residual_reversal -q
+```
+
+## Cost-basis backtest harness (research only)
+
+`cost_basis_backtest/` implements `docs/adr-cost-basis-backtest-harness.md`. It replays the
+graded baseline and a candidate side by side on the same cash flows, and asks one question:
+does the candidate lower the price paid per share? It is stdlib only, writes nothing, and
+imports no suggester. A candidate is adapted by duck typing.
+
+- **Point in time.** The decision for session t sees closes before t and events with
+  `known_at` before t. An 8-K enters on its filed date. Both arms fill at the t close and pay
+  the same one-way buy cost.
+- **Rejected, not scored.** A candidate that asks the view for t or later is rejected, even if
+  it catches the error, and so is one that returns a malformed decision. A candidate that peeks
+  around the view trips an IC canary and cannot promote.
+- **Metrics.** The primary metric is paired per-ticker cost-basis improvement in bp. The others:
+  terminal wealth per dollar, forward return of the tilt dollars at 5, 10 and 20 sessions and
+  to the end, hit rate, worst rolling 63-session underperformance, turnover, and forward
+  residual returns by score bucket. The promotion test is strict out-of-sample monotonicity of
+  those buckets.
+- **Overfitting.** `compare_variants` gives the deflated Sharpe ratio, counting every trial
+  (pass the ledger's `trial_count`), and the CSCV PBO.
+- **Ledger seams.** `baseline_from_ledger_fills(store.fills())` reads scheduled fills only.
+  `trial_row(result, ...)` goes to `store.ingest_trials`.
+
+```python
+from cost_basis_backtest import BacktestConfig, SuggesterCandidate, run_backtest
+from residual_reversal import ResidualReversalInputs, ResidualReversalSuggester
+
+def build(view, buys):  # the view is the only data the suggester may close over
+    tickers = sorted(set(buys) | {benchmarks[t] for t in buys})
+    return ResidualReversalSuggester(lambda asof: ResidualReversalInputs(
+        view.close_rows(tickers, lookback_sessions=125), dict(buys), benchmarks,
+        view.events_by_ticker(sorted(buys))))
+
+result = run_backtest(SuggesterCandidate("residual_reversal", build), close_rows, baseline_buys,
+                      events_by_ticker=events, config=BacktestConfig(oos_start=oos, buy_cost_bps=3.0))
+result.summary()["metrics"]["periods"]["out_of_sample"]["cost_basis"]["aggregate"]
+```
+
+```bash
+python -m pytest tests/cost_basis_backtest -q
 ```
 
 ## Price source (Massive + Alpaca)
