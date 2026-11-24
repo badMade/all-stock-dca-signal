@@ -1,6 +1,8 @@
 # ADR: Budget-exhaustion count from live Gate 5 documents (gate for the Markov category-1 ideas)
 
-Status: proposed, revision 3. Section 8 answered 2026-11-23 (operator); tests written, awaiting approval.
+Status: accepted, revision 3. Section 8 answered 2026-11-23 (operator); tests approved; implemented as
+`python -m scripts.budget_exhaustion_count [--root <cron-tracking root>] [--json] [--slots]`
+(tests: `scripts/tests/test_budget_exhaustion_count.py`, real scrubbed fixtures beside it).
 Decided 2026-11-23 (operator): report location is a CLI only, no console page for now.
 Date: 2026-11-23
 Related: `claude/markov-extensions.md`, `HANDOFF_budget_exhaustion_opportunity.md`, draft PR #2403.
