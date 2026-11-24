@@ -365,7 +365,6 @@ def residual_dip_shadow(inputs: ResidualDipInputs, as_of: date,
     market_today = market_moves[-1]
     records: list[ShadowRecord] = []
     skipped: dict[str, str] = {}
-    market_models: dict[str, FactorModel] = {}
 
     for ticker in sorted(bars):
         if ticker == config.market_ticker:
@@ -378,7 +377,6 @@ def residual_dip_shadow(inputs: ResidualDipInputs, as_of: date,
         stock_today = stock_moves[-1]
         try:
             model = build_factor_model(observations(stock_moves[:-1], market_moves[:-1]), fit_through, config)
-            market_models[ticker] = model
             market_score = score_session(model, stock_today, market_today, config)  # type: ignore[arg-type]
         except FactorUnavailable as exc:
             skipped[ticker] = exc.reason
