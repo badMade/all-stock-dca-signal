@@ -1,7 +1,8 @@
 # ADR: Factor-residual dip signals (APT decomposition as suggest-only signals)
 
-- **Status:** Proposed (2026-11-23). Nothing here is built. Open questions carry proposed
-  defaults; they are not operator decisions.
+- **Status:** Accepted (2026-11-23, operator "Accept, build F1+F2"; open questions take their
+  proposed defaults). F1 and F2 are built in `dca-sizing-signals/factor_signals/`; F3 to F6 are
+  not built yet.
 - **Scope:** research-only, suggest-only components in `dca-sizing-signals/`, publishing through
   the existing `SizingSuggester` / `SuggestionPublisher` boundary like `comovement_signals/`.
   `config/`, the live prompts, `near_close_dca.py` and all three entry points are untouched.
@@ -56,8 +57,8 @@ market-driven escalations), secondarily a few bp per incremental dollar.
 
 | # | Component | Interface | Status |
 |---|---|---|---|
-| F1 | **Factor betas** (`factor_signals/betas.py`): per ticker, daily OLS of returns on SPY and the sector ETF's return orthogonalized to SPY, trailing 252 sessions through the prior close, Blume-shrunk (`0.23 + 0.77 * beta`), plus residual daily volatility and R-squared | Pure stdlib function over caller-supplied close rows, same row contract as `comovement_signals.returns_matrix` (final, non-interpolated, dated on or before `as_of`) | Build first |
-| F2 | **Factor exposure report**: dollar-weighted portfolio beta, sector weights, mean R-squared, and the same for the hypothetical "every eligible slot hits 2x/3x" spend | Read-only JSON report, not a suggester | Build with F1 |
+| F1 | **Factor betas** (`factor_signals/betas.py`, built): per ticker, daily OLS of returns on SPY and the sector ETF's return orthogonalized to SPY, trailing 252 sessions through the prior close, Blume-shrunk (`0.23 + 0.77 * beta`), plus residual daily volatility and R-squared | Pure stdlib function over caller-supplied close rows, same row contract as `comovement_signals.returns_matrix` (final, non-interpolated, dated on or before `as_of`) | Build first |
+| F2 | **Factor exposure report** (`factor_signals/exposure.py`, built): dollar-weighted portfolio beta, sector weights, mean R-squared, and the same for the hypothetical "every eligible slot hits 2x/3x" spend | Read-only JSON report, not a suggester | Build with F1 |
 | F3 | **Factor-share dampener** (`FactorShareDampenerSuggester`): at a slot, `factor_move = b_m * SPY move + b_s * orthogonal sector move` since prior close; if more than the threshold share of a ticker's dip is factor-driven, suggest removing the escalation above 1x | `SizingSuggester`; publishes only `factor_share_dampener_suggestions.json` | Shadow experiment |
 | F4 | **Event flag** (`event_flags.py`): earnings date or a fresh 8-K (EDGAR filing timestamp, point-in-time) in the prior or current session | Flag function consumed by F3/F5; it never publishes a suggestion of its own | Shadow experiment |
 | F5 | **Residual dip z-score** (`ResidualDipSuggester`): `z = residual / (sigma_idio * sqrt(elapsed session fraction))`; suggests keeping an upgrade only when the raw tier already qualifies **and** z clears the tier's cutoff and F4 is clear | `SizingSuggester`; publishes only `residual_dip_suggestions.json` | Shadow experiment, lowest confidence |
@@ -102,6 +103,31 @@ open question 6 here, not part of this ADR's build.
 | 6 | Reader combine rule | Separate ADR: for multipliers above 1x, the lowest suggested multiplier wins | See the reader gap above |
 | 7 | Shadow period | At least 6 months, and the Phase 0 promotion bar | Report and Phase 0 agree |
 | 8 | Small-cap applicability | Score large and small names separately; do not assume the large-cap reversal magnitude transfers | Strongest daily evidence is the 100 largest stocks |
+
+## Implementation notes (F1 and F2, 2026-11-23)
+
+Choices made while building, frozen per rule 6 (changing one is a new trial):
+
+- **Session calendar** is the market symbol's own close dates; a return exists only between two
+  adjacent market sessions on which the series has closes.
+- **Sector orthogonalization** is fit once per sector ETF over the window, so every ticker in a
+  sector shares one `e_s` series; each ticker then gets a full two-regressor OLS on (r_m, e_s)
+  over its own available sessions.
+- **Shrinkage** applies the Blume form (`0.23 + 0.77 * beta`) to the sector beta too, toward 1,
+  since a cap-weighted sector ETF's members load about 1 on it on average.
+- **Sector map value `None`** means market-only by design (a broad ETF); a ticker absent from the
+  map is skipped as `unmapped`, never silently fit market-only.
+- **Whole-run failures** (market series missing, stale beyond 4 days, or under 120 returns) raise;
+  per-ticker problems are skipped with a reason (`unmapped`, `no_prices`, `stale`,
+  `sector_unavailable`, `insufficient_history`, `degenerate`).
+- **Effective bets:** stdlib has no eigen solver, so F2 reports the dollar-Herfindahl
+  `effective_names` plus `factor_variance_share` from the factor model instead of the report's PCA
+  measure.
+- **Not built yet:** the committed, versioned ticker-to-sector-ETF table (rule 4). F1 takes a
+  caller-supplied `SectorMap(version, etf_by_ticker)`; the table itself needs a reviewed mapping
+  of the active universe, since SIC major groups do not map cleanly onto SPDR sectors. The
+  hypothetical all-escalate book is also caller-computed, because this package cannot import the
+  ladder.
 
 ## Not in scope
 

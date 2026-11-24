@@ -8,7 +8,7 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Four packages that only depend on each other in one direction, enforced by both the
+Five packages that only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
@@ -16,6 +16,7 @@ type system and a CI test, not by convention alone:
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
 | `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
+| `factor_signals/` | Research-only factor (APT) decomposition from `docs/adr-factor-residual-dip-signals.md`. F1: point-in-time, Blume-shrunk market and orthogonalized-sector betas over caller-supplied close rows. F2: a read-only factor exposure report (portfolio beta, sector weights and loadings, factor variance share) for caller-named books. Not a suggester yet; not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
