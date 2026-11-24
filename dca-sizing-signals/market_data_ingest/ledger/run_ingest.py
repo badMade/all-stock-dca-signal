@@ -5,8 +5,8 @@ tables. Spec: tests/ledger/test_run_ingest.py (operator-approved 2026-11-24, wit
 pinned assumptions). Read-only on the artifact tree; the only writes go through
 ``LedgerStore.ingest_fills`` / ``ingest_baseline_fills``.
 
-Why a join and not "read each run directory": a run's own ``orders_pages_*.json`` is the order
-history it pulled BEFORE placing, so it can miss that run's own orders (on the real scrubbed
+Why a join and not "read each run directory": a run's own ``orders_pages_*.json`` is an order-history
+snapshot taken during the run, which can predate some of that run's own orders (on the real scrubbed
 fixtures in scripts/tests/fixtures/budget_exhaustion/ the 2026-11-20 09:35 run sees 1 of its 2
 orders, the 15:30 run 6 of 7). So:
 

@@ -4,7 +4,7 @@ Spec for ``market_data_ingest.ledger.run_ingest`` (docs/adr-outcome-ledger-pit-h
 Decisions 2, 3, 4 and 7). Written BEFORE the implementation; awaiting operator approval.
 
 Why two inputs and a join, not "read the run directory": a run's own ``orders_pages_*.json`` is
-the order history it pulled BEFORE placing, so it can miss that run's own orders. On the real
+an order-history snapshot taken during the run, which can predate some of that run's own orders. On the real
 scrubbed fixtures in scripts/tests/fixtures/budget_exhaustion/, the 2026-11-20 09:35 run finds 1
 of its 2 submitted orders in its own pages and the 15:30 run finds 6 of 7. So:
 
