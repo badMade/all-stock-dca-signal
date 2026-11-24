@@ -1,0 +1,14 @@
+{
+ "abort": "Gate 6 week history output_cap_exceeded: 135,748-char page, per-state filled page equally oversized, files cloud-side; no orders placed",
+ "dropped": {
+  "daily_cap": 0,
+  "price_recovered": 0,
+  "spread_over_1pct": 0
+ },
+ "eligible_count": 70,
+ "manual_review_tickers": [
+  "CHE",
+  "MSFT",
+  "TRLV"
+ ]
+}

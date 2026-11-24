@@ -215,6 +215,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Count live-sized buys the daily or weekly budget could not fund (Markov category-1 gate)",
+        command="python -m scripts.budget_exhaustion_count [--root <cron-tracking root>] [--json] [--slots]",
+        exists_path="scripts/budget_exhaustion_count.py",
+        doc_ref="docs/adr-budget-exhaustion-replay.md",
+        symbols=("main", "count_slot", "allocate", "summarize"),
+        notes=(
+            "Read-only. Reads each slot's own Gate 5 document and week orders_pages envelope; sizing is not "
+            "recomputed. Headline is direct evidence only; slots without their own week envelope are unresolved "
+            "and also reported separately as 'derived'. Non-budget Gate 6 aborts are their own bucket."
+        ),
+    ),
+    EntryPoint(
         need="Check whether every live slot left verifiable scheduled evidence today",
         command="python -m scripts.verify_schedule [--date YYYY-MM-DD] [--root <cron-tracking root>] [--json]",
         exists_path="scripts/verify_schedule.py",

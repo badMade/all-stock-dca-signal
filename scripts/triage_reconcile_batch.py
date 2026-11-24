@@ -165,6 +165,7 @@ def _decide(
             issues=issues,
             recorded_pr_number=recorded_pr,
             recorded_commit_url=recorded_commit,
+            confirmed_pr_number=tr.OPERATOR_CONFIRMED_PRS.get(key),
             shallow=shallow,
             commit_present=commit_present,
         )

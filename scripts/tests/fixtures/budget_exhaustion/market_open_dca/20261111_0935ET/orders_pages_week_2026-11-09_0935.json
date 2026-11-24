@@ -1,0 +1,1577 @@
+{
+ "account_number": "999000111",
+ "ingest": {
+  "base_order_count": 96,
+  "base_payload_sha256": "a24394a690b0a46d036d099052162f2ca0606853f583c1f1eafd2fda6d06bdb2",
+  "created_at_gte": "2026-11-11T14:43:24Z",
+  "increment_order_count": 3,
+  "increment_payload_sha256": "6c559b5cac84790fd1a0b6dc9f5ae9439750c728b8440eaefc7cbdd3d124ac01",
+  "merged": true,
+  "order_count": 97,
+  "overlap_seconds": 120,
+  "payload_sha256": "a330fb903906e28582f649728edee5110e070961b06719fc200961c6f5851e0f",
+  "provenance": "merged_increment",
+  "tool": "scripts.merge_order_pages",
+  "total_usd": 299.73
+ },
+ "pages": [
+  {
+   "orders": [
+    {
+     "average_price": "276.719900",
+     "created_at": "2026-11-11T14:45:52.933308Z",
+     "cumulative_quantity": "0.004914",
+     "dollar_based_amount": {
+      "amount": "1.360000",
+      "currency_code": "USD"
+     },
+     "id": "6af47fa0-75a0-4f79-b7f1-0466ee6075f1",
+     "placed_agent": "agentic",
+     "price": "276.350000",
+     "quantity": "0.004914",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CAH"
+    },
+    {
+     "average_price": "77.489900",
+     "created_at": "2026-11-11T14:45:14.822147Z",
+     "cumulative_quantity": "0.021422",
+     "dollar_based_amount": {
+      "amount": "1.660000",
+      "currency_code": "USD"
+     },
+     "id": "6af47f7a-1281-468f-bb50-9a8b1029e104",
+     "placed_agent": "agentic",
+     "price": "77.470000",
+     "quantity": "0.021422",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SYY"
+    },
+    {
+     "average_price": "39.578700",
+     "created_at": "2026-11-11T14:44:14.430018Z",
+     "cumulative_quantity": "0.049268",
+     "dollar_based_amount": {
+      "amount": "1.950000",
+      "currency_code": "USD"
+     },
+     "id": "6af47f3e-a569-4e4c-9268-79415682e576",
+     "placed_agent": "agentic",
+     "price": "39.580000",
+     "quantity": "0.049268",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "AAAU"
+    },
+    {
+     "average_price": "504.648900",
+     "created_at": "2026-11-10T20:41:12.276777Z",
+     "cumulative_quantity": "0.002576",
+     "dollar_based_amount": {
+      "amount": "1.300000",
+      "currency_code": "USD"
+     },
+     "id": "6af38168-cc3d-4b85-8faa-ff4e51b29836",
+     "placed_agent": "agentic",
+     "price": "504.740000",
+     "quantity": "0.002576",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "HCA"
+    },
+    {
+     "average_price": "349.359900",
+     "created_at": "2026-11-10T20:40:49.309529Z",
+     "cumulative_quantity": "0.006383",
+     "dollar_based_amount": {
+      "amount": "2.230000",
+      "currency_code": "USD"
+     },
+     "id": "6af38151-fb6e-465b-9919-18c2349adfec",
+     "placed_agent": "agentic",
+     "price": "349.350000",
+     "quantity": "0.006383",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "AAPL"
+    },
+    {
+     "average_price": "293.922600",
+     "created_at": "2026-11-10T20:40:25.965716Z",
+     "cumulative_quantity": "0.003912",
+     "dollar_based_amount": {
+      "amount": "1.150000",
+      "currency_code": "USD"
+     },
+     "id": "6af38139-9c90-4ccd-bb19-ae9d1be3fb41",
+     "placed_agent": "agentic",
+     "price": "293.930000",
+     "quantity": "0.003912",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "EVR"
+    },
+    {
+     "average_price": "17.967500",
+     "created_at": "2026-11-10T20:40:00.801404Z",
+     "cumulative_quantity": "0.059551",
+     "dollar_based_amount": {
+      "amount": "1.070000",
+      "currency_code": "USD"
+     },
+     "id": "6af38120-c7b3-44c2-8c57-c58ad59dcc3d",
+     "placed_agent": "agentic",
+     "price": "17.960000",
+     "quantity": "0.059551",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TRIN"
+    },
+    {
+     "average_price": "34.399900",
+     "created_at": "2026-11-10T20:39:33.636532Z",
+     "cumulative_quantity": "0.088081",
+     "dollar_based_amount": {
+      "amount": "3.030000",
+      "currency_code": "USD"
+     },
+     "id": "6af38105-5975-4c0f-b0a1-51d8aea25a6b",
+     "placed_agent": "agentic",
+     "price": "34.380000",
+     "quantity": "0.088081",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "DFTX"
+    },
+    {
+     "average_price": "40.507400",
+     "created_at": "2026-11-10T19:52:10.722821Z",
+     "cumulative_quantity": "0.123434",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375ea-5773-444d-b2ea-346c8e5f0769",
+     "placed_agent": "agentic",
+     "price": "40.500000",
+     "quantity": "0.123434",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GFS"
+    },
+    {
+     "average_price": "141.389900",
+     "created_at": "2026-11-10T19:52:09.258757Z",
+     "cumulative_quantity": "0.035363",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e9-0b4b-47ff-8593-2015bdbab08f",
+     "placed_agent": "agentic",
+     "price": "141.410000",
+     "quantity": "0.035363",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SPCX"
+    },
+    {
+     "average_price": "371.059900",
+     "created_at": "2026-11-10T19:52:07.529823Z",
+     "cumulative_quantity": "0.013474",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e7-9423-4fa3-9922-3487cae9bbbb",
+     "placed_agent": "agentic",
+     "price": "370.920000",
+     "quantity": "0.013474",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "AMAT"
+    },
+    {
+     "average_price": "274.249900",
+     "created_at": "2026-11-10T19:52:05.758052Z",
+     "cumulative_quantity": "0.018231",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e5-198e-4932-99b2-0a1e5baec052",
+     "placed_agent": "agentic",
+     "price": "274.120000",
+     "quantity": "0.018231",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CIEN"
+    },
+    {
+     "average_price": "287.344700",
+     "created_at": "2026-11-10T19:52:03.898456Z",
+     "cumulative_quantity": "0.017400",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e3-5355-49ff-b4ac-1b332c35f255",
+     "placed_agent": "agentic",
+     "price": "287.340000",
+     "quantity": "0.017400",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GOOGL"
+    },
+    {
+     "average_price": "318.600000",
+     "created_at": "2026-11-10T19:52:02.107436Z",
+     "cumulative_quantity": "0.015693",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e2-cb95-4817-938c-f67a8165df0c",
+     "placed_agent": "agentic",
+     "price": "318.650000",
+     "quantity": "0.015693",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "FFIV"
+    },
+    {
+     "average_price": "185.989900",
+     "created_at": "2026-11-10T19:52:00.277455Z",
+     "cumulative_quantity": "0.026883",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375e0-f588-4aab-98e3-dd60c9580d85",
+     "placed_agent": "agentic",
+     "price": "185.900000",
+     "quantity": "0.026883",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ANET"
+    },
+    {
+     "average_price": "20.185700",
+     "created_at": "2026-11-10T19:51:58.695653Z",
+     "cumulative_quantity": "0.247700",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375de-d784-4723-bf2a-927b62c7ba06",
+     "placed_agent": "agentic",
+     "price": "20.200000",
+     "quantity": "0.247700",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "VCX"
+    },
+    {
+     "average_price": "44.687900",
+     "created_at": "2026-11-10T19:51:56.615286Z",
+     "cumulative_quantity": "0.111887",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375dc-0a56-4992-9ffd-8b74c46d3b44",
+     "placed_agent": "agentic",
+     "price": "44.690000",
+     "quantity": "0.111887",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "STM"
+    },
+    {
+     "average_price": "1508.709900",
+     "created_at": "2026-11-10T19:51:55.04084Z",
+     "cumulative_quantity": "0.003314",
+     "dollar_based_amount": {
+      "amount": "5.000000",
+      "currency_code": "USD"
+     },
+     "id": "6af375da-b6f9-47dd-b2ec-6409a4fa0d9e",
+     "placed_agent": "agentic",
+     "price": "1507.980000",
+     "quantity": "0.003314",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ASML"
+    },
+    {
+     "average_price": "900.610000",
+     "created_at": "2026-11-10T16:51:12.030775Z",
+     "cumulative_quantity": "0.001276",
+     "dollar_based_amount": {
+      "amount": "1.150000",
+      "currency_code": "USD"
+     },
+     "id": "6af34b7f-c45c-477c-9e09-fc3025d12fd0",
+     "placed_agent": "agentic",
+     "price": "900.300000",
+     "quantity": "0.001276",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GS"
+    },
+    {
+     "average_price": "151.489400",
+     "created_at": "2026-11-10T16:50:32.090083Z",
+     "cumulative_quantity": "0.009901",
+     "dollar_based_amount": {
+      "amount": "1.500000",
+      "currency_code": "USD"
+     },
+     "id": "6af34b58-8d60-40a0-ba39-64d764ba70fd",
+     "placed_agent": "agentic",
+     "price": "151.400000",
+     "quantity": "0.009901",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MRVL"
+    },
+    {
+     "average_price": "284.809900",
+     "created_at": "2026-11-10T16:49:47.904655Z",
+     "cumulative_quantity": "0.005688",
+     "dollar_based_amount": {
+      "amount": "1.620000",
+      "currency_code": "USD"
+     },
+     "id": "6af34b2b-db10-490f-9969-b4f19f8003f5",
+     "placed_agent": "agentic",
+     "price": "284.770000",
+     "quantity": "0.005688",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GOOG"
+    },
+    {
+     "average_price": "92.720000",
+     "created_at": "2026-11-10T16:49:03.370624Z",
+     "cumulative_quantity": "0.019521",
+     "dollar_based_amount": {
+      "amount": "1.810000",
+      "currency_code": "USD"
+     },
+     "id": "6af34aff-8ea8-4a37-9c2a-dd43983d00db",
+     "placed_agent": "agentic",
+     "price": "92.650000",
+     "quantity": "0.019521",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CBRS"
+    },
+    {
+     "average_price": "168.671100",
+     "created_at": "2026-11-10T16:48:23.282041Z",
+     "cumulative_quantity": "0.011086",
+     "dollar_based_amount": {
+      "amount": "1.870000",
+      "currency_code": "USD"
+     },
+     "id": "6af34ad7-577e-4e33-9762-a9b8a1150288",
+     "placed_agent": "agentic",
+     "price": "168.660000",
+     "quantity": "0.011086",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "QCOM"
+    },
+    {
+     "average_price": "57.508300",
+     "created_at": "2026-11-10T16:47:43.960857Z",
+     "cumulative_quantity": "0.035820",
+     "dollar_based_amount": {
+      "amount": "2.060000",
+      "currency_code": "USD"
+     },
+     "id": "6af34aaf-6564-4848-954e-1b6de810a396",
+     "placed_agent": "agentic",
+     "price": "57.510000",
+     "quantity": "0.035820",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "INTC"
+    },
+    {
+     "average_price": "282.159900",
+     "created_at": "2026-11-10T16:46:57.634192Z",
+     "cumulative_quantity": "0.007513",
+     "dollar_based_amount": {
+      "amount": "2.120000",
+      "currency_code": "USD"
+     },
+     "id": "6af34a81-5cba-4355-88eb-c86dea46fab5",
+     "placed_agent": "agentic",
+     "price": "281.900000",
+     "quantity": "0.007513",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "WDC"
+    },
+    {
+     "average_price": "11.579900",
+     "created_at": "2026-11-10T16:46:17.749236Z",
+     "cumulative_quantity": "0.184802",
+     "dollar_based_amount": {
+      "amount": "2.140000",
+      "currency_code": "USD"
+     },
+     "id": "6af34a59-37a1-4d48-b404-75106e975ba6",
+     "placed_agent": "agentic",
+     "price": "11.580000",
+     "quantity": "0.184802",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "LUNR"
+    },
+    {
+     "average_price": "30.624400",
+     "created_at": "2026-11-10T16:45:37.063075Z",
+     "cumulative_quantity": "0.082287",
+     "dollar_based_amount": {
+      "amount": "2.520000",
+      "currency_code": "USD"
+     },
+     "id": "6af34a31-48c9-4c98-b3ea-041d407cb464",
+     "placed_agent": "agentic",
+     "price": "30.610000",
+     "quantity": "0.082287",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "VIAV"
+    },
+    {
+     "average_price": "107.239900",
+     "created_at": "2026-11-10T15:14:28.862632Z",
+     "cumulative_quantity": "0.016971",
+     "dollar_based_amount": {
+      "amount": "1.820000",
+      "currency_code": "USD"
+     },
+     "id": "6af334d4-2be5-43a3-b4bc-a55a469046f1",
+     "placed_agent": "agentic",
+     "price": "107.210000",
+     "quantity": "0.016971",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ACGL"
+    },
+    {
+     "average_price": "25.449900",
+     "created_at": "2026-11-10T15:14:26.05292Z",
+     "cumulative_quantity": "0.074656",
+     "dollar_based_amount": {
+      "amount": "1.900000",
+      "currency_code": "USD"
+     },
+     "id": "6af334d1-0419-40bb-902d-706c879359a3",
+     "placed_agent": "agentic",
+     "price": "25.450000",
+     "quantity": "0.074656",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "KIM"
+    },
+    {
+     "average_price": "131.925200",
+     "created_at": "2026-11-10T15:14:23.500774Z",
+     "cumulative_quantity": "0.014402",
+     "dollar_based_amount": {
+      "amount": "1.900000",
+      "currency_code": "USD"
+     },
+     "id": "6af334cf-1f08-4e13-8350-9a00d03e2c00",
+     "placed_agent": "agentic",
+     "price": "131.830000",
+     "quantity": "0.014402",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SJM"
+    },
+    {
+     "average_price": "602.229400",
+     "created_at": "2026-11-10T15:14:20.852778Z",
+     "cumulative_quantity": "0.003171",
+     "dollar_based_amount": {
+      "amount": "1.910000",
+      "currency_code": "USD"
+     },
+     "id": "6af334cc-57cb-461f-bc99-4d26570a23ab",
+     "placed_agent": "agentic",
+     "price": "603.160000",
+     "quantity": "0.003171",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "LITE"
+    },
+    {
+     "average_price": "108.499900",
+     "created_at": "2026-11-10T15:14:18.072471Z",
+     "cumulative_quantity": "0.018064",
+     "dollar_based_amount": {
+      "amount": "1.960000",
+      "currency_code": "USD"
+     },
+     "id": "6af334ca-16a8-4851-bbde-3f346b430f7e",
+     "placed_agent": "agentic",
+     "price": "108.420000",
+     "quantity": "0.018064",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "USFD"
+    },
+    {
+     "average_price": "296.640200",
+     "created_at": "2026-11-10T15:14:15.014755Z",
+     "cumulative_quantity": "0.006607",
+     "dollar_based_amount": {
+      "amount": "1.960000",
+      "currency_code": "USD"
+     },
+     "id": "6af334c6-7cc4-4922-8be9-e532543d3718",
+     "placed_agent": "agentic",
+     "price": "296.590000",
+     "quantity": "0.006607",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TXN"
+    },
+    {
+     "average_price": "81.245000",
+     "created_at": "2026-11-10T15:14:12.006574Z",
+     "cumulative_quantity": "0.024247",
+     "dollar_based_amount": {
+      "amount": "1.970000",
+      "currency_code": "USD"
+     },
+     "id": "6af334c3-0e60-4084-9f69-c6a4fa1efe43",
+     "placed_agent": "agentic",
+     "price": "81.260000",
+     "quantity": "0.024247",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "APH"
+    },
+    {
+     "average_price": "21.969900",
+     "created_at": "2026-11-10T15:14:09.276587Z",
+     "cumulative_quantity": "0.090578",
+     "dollar_based_amount": {
+      "amount": "1.990000",
+      "currency_code": "USD"
+     },
+     "id": "6af334c1-4bfb-4cbb-976a-5fe412c2aae9",
+     "placed_agent": "agentic",
+     "price": "21.970000",
+     "quantity": "0.090578",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "HRL"
+    },
+    {
+     "average_price": "110.326700",
+     "created_at": "2026-11-10T15:13:54.686062Z",
+     "cumulative_quantity": "0.018037",
+     "dollar_based_amount": {
+      "amount": "1.990000",
+      "currency_code": "USD"
+     },
+     "id": "6af334b2-f488-45e2-8106-92add5418fb2",
+     "placed_agent": "agentic",
+     "price": "110.290000",
+     "quantity": "0.018037",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "PFGC"
+    },
+    {
+     "average_price": "219.917400",
+     "created_at": "2026-11-10T15:13:52.138899Z",
+     "cumulative_quantity": "0.009048",
+     "dollar_based_amount": {
+      "amount": "1.990000",
+      "currency_code": "USD"
+     },
+     "id": "6af334b0-d43d-4d00-8ffc-90a824fb3812",
+     "placed_agent": "agentic",
+     "price": "219.790000",
+     "quantity": "0.009048",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TEL"
+    },
+    {
+     "average_price": "243.663800",
+     "created_at": "2026-11-10T15:13:49.334503Z",
+     "cumulative_quantity": "0.008249",
+     "dollar_based_amount": {
+      "amount": "2.010000",
+      "currency_code": "USD"
+     },
+     "id": "6af334ad-a026-43bb-9214-20d0771b3fc8",
+     "placed_agent": "agentic",
+     "price": "243.790000",
+     "quantity": "0.008249",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "IBM"
+    },
+    {
+     "average_price": "10.982600",
+     "created_at": "2026-11-10T15:13:46.519753Z",
+     "cumulative_quantity": "0.183016",
+     "dollar_based_amount": {
+      "amount": "2.010000",
+      "currency_code": "USD"
+     },
+     "id": "6af334aa-0a00-4938-a7b7-7498d214cc25",
+     "placed_agent": "agentic",
+     "price": "10.970000",
+     "quantity": "0.183016",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TRLV"
+    },
+    {
+     "average_price": "65.740000",
+     "created_at": "2026-11-10T15:13:43.629191Z",
+     "cumulative_quantity": "0.030879",
+     "dollar_based_amount": {
+      "amount": "2.030000",
+      "currency_code": "USD"
+     },
+     "id": "6af334a7-7fa3-4d36-a7cf-cce17cb7cee5",
+     "placed_agent": "agentic",
+     "price": "65.740000",
+     "quantity": "0.030879",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MDLZ"
+    },
+    {
+     "average_price": "377.279900",
+     "created_at": "2026-11-10T15:13:40.759475Z",
+     "cumulative_quantity": "0.005380",
+     "dollar_based_amount": {
+      "amount": "2.030000",
+      "currency_code": "USD"
+     },
+     "id": "6af334a4-403c-4664-a639-6b9b8ec36735",
+     "placed_agent": "agentic",
+     "price": "377.170000",
+     "quantity": "0.005380",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TSLA"
+    },
+    {
+     "average_price": "334.197700",
+     "created_at": "2026-11-10T15:13:38.010121Z",
+     "cumulative_quantity": "0.006193",
+     "dollar_based_amount": {
+      "amount": "2.070000",
+      "currency_code": "USD"
+     },
+     "id": "6af334a1-dd57-4ff3-9a88-bcc6ff6d619b",
+     "placed_agent": "agentic",
+     "price": "333.920000",
+     "quantity": "0.006193",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GE"
+    },
+    {
+     "average_price": "171.029900",
+     "created_at": "2026-11-10T15:13:35.143777Z",
+     "cumulative_quantity": "0.012103",
+     "dollar_based_amount": {
+      "amount": "2.070000",
+      "currency_code": "USD"
+     },
+     "id": "6af3349f-ccc9-47e2-90de-8085d0efdb22",
+     "placed_agent": "agentic",
+     "price": "171.000000",
+     "quantity": "0.012103",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "HSY"
+    },
+    {
+     "average_price": "233.489900",
+     "created_at": "2026-11-10T15:13:32.656675Z",
+     "cumulative_quantity": "0.009122",
+     "dollar_based_amount": {
+      "amount": "2.130000",
+      "currency_code": "USD"
+     },
+     "id": "6af3349c-0456-4e16-96ca-463b7e924ea6",
+     "placed_agent": "agentic",
+     "price": "233.080000",
+     "quantity": "0.009122",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "RMD"
+    },
+    {
+     "average_price": "223.058300",
+     "created_at": "2026-11-10T15:13:30.137518Z",
+     "cumulative_quantity": "0.009683",
+     "dollar_based_amount": {
+      "amount": "2.160000",
+      "currency_code": "USD"
+     },
+     "id": "6af3349a-e42b-4696-982a-382fd301a5bd",
+     "placed_agent": "agentic",
+     "price": "223.080000",
+     "quantity": "0.009683",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "COHR"
+    },
+    {
+     "average_price": "913.094600",
+     "created_at": "2026-11-10T15:13:27.650029Z",
+     "cumulative_quantity": "0.002376",
+     "dollar_based_amount": {
+      "amount": "2.170000",
+      "currency_code": "USD"
+     },
+     "id": "6af33497-6ec7-4f68-8ed0-44bb31dcd308",
+     "placed_agent": "agentic",
+     "price": "912.810000",
+     "quantity": "0.002376",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "REGN"
+    },
+    {
+     "average_price": "212.729900",
+     "created_at": "2026-11-10T15:13:24.736023Z",
+     "cumulative_quantity": "0.010341",
+     "dollar_based_amount": {
+      "amount": "2.200000",
+      "currency_code": "USD"
+     },
+     "id": "6af33494-8c3e-42b9-827a-cdea1ef2c3b1",
+     "placed_agent": "agentic",
+     "price": "212.440000",
+     "quantity": "0.010341",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "BDX"
+    },
+    {
+     "average_price": "221.729900",
+     "created_at": "2026-11-10T15:13:21.166854Z",
+     "cumulative_quantity": "0.009967",
+     "dollar_based_amount": {
+      "amount": "2.210000",
+      "currency_code": "USD"
+     },
+     "id": "6af33491-d5c6-445b-8d81-35d923af834a",
+     "placed_agent": "agentic",
+     "price": "221.560000",
+     "quantity": "0.009967",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CTAS"
+    },
+    {
+     "average_price": "77.545000",
+     "created_at": "2026-11-10T15:13:18.347287Z",
+     "cumulative_quantity": "0.029531",
+     "dollar_based_amount": {
+      "amount": "2.290000",
+      "currency_code": "USD"
+     },
+     "id": "6af3348e-c4f0-47cf-bdc3-acfdf131abd4",
+     "placed_agent": "agentic",
+     "price": "77.510000",
+     "quantity": "0.029531",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SYY"
+    },
+    {
+     "average_price": "894.760000",
+     "created_at": "2026-11-10T15:13:15.815324Z",
+     "cumulative_quantity": "0.002592",
+     "dollar_based_amount": {
+      "amount": "2.320000",
+      "currency_code": "USD"
+     },
+     "id": "6af3348b-3207-4926-aa2d-49883ac2ac82",
+     "placed_agent": "agentic",
+     "price": "894.620000",
+     "quantity": "0.002592",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SNDK"
+    },
+    {
+     "average_price": "230.956600",
+     "created_at": "2026-11-10T15:13:12.871647Z",
+     "cumulative_quantity": "0.010045",
+     "dollar_based_amount": {
+      "amount": "2.320000",
+      "currency_code": "USD"
+     },
+     "id": "6af33488-ce53-4022-bd99-49946add310a",
+     "placed_agent": "agentic",
+     "price": "230.750000",
+     "quantity": "0.010045",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SPG"
+    },
+    {
+     "average_price": "109.279900",
+     "created_at": "2026-11-10T15:13:09.853488Z",
+     "cumulative_quantity": "0.021504",
+     "dollar_based_amount": {
+      "amount": "2.350000",
+      "currency_code": "USD"
+     },
+     "id": "6af33485-ee92-4f58-8e98-fd3a0ff827f7",
+     "placed_agent": "agentic",
+     "price": "109.250000",
+     "quantity": "0.021504",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ABT"
+    },
+    {
+     "average_price": "226.447600",
+     "created_at": "2026-11-10T15:13:06.846333Z",
+     "cumulative_quantity": "0.010554",
+     "dollar_based_amount": {
+      "amount": "2.390000",
+      "currency_code": "USD"
+     },
+     "id": "6af33482-2ea2-4e9f-b627-321f7ac5332d",
+     "placed_agent": "agentic",
+     "price": "226.100000",
+     "quantity": "0.010554",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "DRI"
+    },
+    {
+     "average_price": "103.259900",
+     "created_at": "2026-11-10T15:13:03.989112Z",
+     "cumulative_quantity": "0.023532",
+     "dollar_based_amount": {
+      "amount": "2.430000",
+      "currency_code": "USD"
+     },
+     "id": "6af3347f-b69c-4b16-b09c-aaa3e722452e",
+     "placed_agent": "agentic",
+     "price": "103.180000",
+     "quantity": "0.023532",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "EW"
+    },
+    {
+     "average_price": "114.137200",
+     "created_at": "2026-11-10T15:13:00.681604Z",
+     "cumulative_quantity": "0.021640",
+     "dollar_based_amount": {
+      "amount": "2.470000",
+      "currency_code": "USD"
+     },
+     "id": "6af3347c-31d9-42be-b2ab-fc1eb130fb61",
+     "placed_agent": "agentic",
+     "price": "114.070000",
+     "quantity": "0.021640",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "GLW"
+    },
+    {
+     "average_price": "739.459900",
+     "created_at": "2026-11-10T15:12:58.134901Z",
+     "cumulative_quantity": "0.003367",
+     "dollar_based_amount": {
+      "amount": "2.490000",
+      "currency_code": "USD"
+     },
+     "id": "6af3347a-66c1-45d3-87b4-b441d8b61637",
+     "placed_agent": "agentic",
+     "price": "739.510000",
+     "quantity": "0.003367",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MU"
+    },
+    {
+     "average_price": "542.826300",
+     "created_at": "2026-11-10T15:12:54.905701Z",
+     "cumulative_quantity": "0.004605",
+     "dollar_based_amount": {
+      "amount": "2.500000",
+      "currency_code": "USD"
+     },
+     "id": "6af33476-aa1e-49a5-8c39-67c7ae8c30b2",
+     "placed_agent": "agentic",
+     "price": "542.790000",
+     "quantity": "0.004605",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MSFT"
+    },
+    {
+     "average_price": "157.779900",
+     "created_at": "2026-11-10T15:12:52.157536Z",
+     "cumulative_quantity": "0.016605",
+     "dollar_based_amount": {
+      "amount": "2.620000",
+      "currency_code": "USD"
+     },
+     "id": "6af33474-60cd-4041-bb2c-cd5dabab65ac",
+     "placed_agent": "agentic",
+     "price": "157.550000",
+     "quantity": "0.016605",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "EXR"
+    },
+    {
+     "average_price": "146.879900",
+     "created_at": "2026-11-10T15:12:48.928529Z",
+     "cumulative_quantity": "0.017973",
+     "dollar_based_amount": {
+      "amount": "2.640000",
+      "currency_code": "USD"
+     },
+     "id": "6af33470-38ce-4906-9503-ccae3b6be87e",
+     "placed_agent": "agentic",
+     "price": "146.870000",
+     "quantity": "0.017973",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MRK"
+    },
+    {
+     "average_price": "41.677700",
+     "created_at": "2026-11-10T15:12:46.114064Z",
+     "cumulative_quantity": "0.064063",
+     "dollar_based_amount": {
+      "amount": "2.670000",
+      "currency_code": "USD"
+     },
+     "id": "6af3346e-bc40-4165-9c14-32590d4f353a",
+     "placed_agent": "agentic",
+     "price": "41.680000",
+     "quantity": "0.064063",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "DRAM"
+    },
+    {
+     "average_price": "47.121800",
+     "created_at": "2026-11-10T15:12:43.150048Z",
+     "cumulative_quantity": "0.057934",
+     "dollar_based_amount": {
+      "amount": "2.730000",
+      "currency_code": "USD"
+     },
+     "id": "6af3346b-087e-46cd-9356-db0a17d6e1a6",
+     "placed_agent": "agentic",
+     "price": "47.140000",
+     "quantity": "0.057934",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "FLKR"
+    },
+    {
+     "average_price": "499.108600",
+     "created_at": "2026-11-10T15:12:40.592233Z",
+     "cumulative_quantity": "0.005610",
+     "dollar_based_amount": {
+      "amount": "2.800000",
+      "currency_code": "USD"
+     },
+     "id": "6af33468-9ea5-4cd3-90f1-8dd766a004cf",
+     "placed_agent": "agentic",
+     "price": "498.590000",
+     "quantity": "0.005610",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "STX"
+    },
+    {
+     "average_price": "155.354700",
+     "created_at": "2026-11-10T15:12:37.642624Z",
+     "cumulative_quantity": "0.018731",
+     "dollar_based_amount": {
+      "amount": "2.910000",
+      "currency_code": "USD"
+     },
+     "id": "6af33465-5d11-4015-b9fc-416309d9d387",
+     "placed_agent": "agentic",
+     "price": "155.350000",
+     "quantity": "0.018731",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "VT"
+    },
+    {
+     "average_price": "35.048700",
+     "created_at": "2026-11-10T15:12:34.785098Z",
+     "cumulative_quantity": "0.083027",
+     "dollar_based_amount": {
+      "amount": "2.910000",
+      "currency_code": "USD"
+     },
+     "id": "6af33462-3449-48d0-8bb5-56b159f9a71e",
+     "placed_agent": "agentic",
+     "price": "35.090000",
+     "quantity": "0.083027",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "QTOP"
+    },
+    {
+     "average_price": "197.529900",
+     "created_at": "2026-11-10T15:12:32.20015Z",
+     "cumulative_quantity": "0.014782",
+     "dollar_based_amount": {
+      "amount": "2.920000",
+      "currency_code": "USD"
+     },
+     "id": "6af33460-22c8-45b7-8086-e8ab5122a0b5",
+     "placed_agent": "agentic",
+     "price": "197.480000",
+     "quantity": "0.014782",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "VRT"
+    },
+    {
+     "average_price": "60.959900",
+     "created_at": "2026-11-10T15:11:50.256059Z",
+     "cumulative_quantity": "0.048556",
+     "dollar_based_amount": {
+      "amount": "2.960000",
+      "currency_code": "USD"
+     },
+     "id": "6af33436-4d43-4d80-a527-fd55cf2eb172",
+     "placed_agent": "agentic",
+     "price": "60.950000",
+     "quantity": "0.048556",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "XLG"
+    },
+    {
+     "average_price": "679.159900",
+     "created_at": "2026-11-10T15:11:48.449322Z",
+     "cumulative_quantity": "0.004402",
+     "dollar_based_amount": {
+      "amount": "2.990000",
+      "currency_code": "USD"
+     },
+     "id": "6af33434-c487-411c-b5f8-79d6601078eb",
+     "placed_agent": "agentic",
+     "price": "679.140000",
+     "quantity": "0.004402",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "QQQ"
+    },
+    {
+     "average_price": "98.750000",
+     "created_at": "2026-11-10T15:11:47.078043Z",
+     "cumulative_quantity": "0.031696",
+     "dollar_based_amount": {
+      "amount": "3.130000",
+      "currency_code": "USD"
+     },
+     "id": "6af33433-6175-4c77-a964-9d6f4cf5da64",
+     "placed_agent": "agentic",
+     "price": "98.740000",
+     "quantity": "0.031696",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CSCO"
+    },
+    {
+     "average_price": "33.559900",
+     "created_at": "2026-11-10T15:11:45.663595Z",
+     "cumulative_quantity": "0.094159",
+     "dollar_based_amount": {
+      "amount": "3.160000",
+      "currency_code": "USD"
+     },
+     "id": "6af33431-3eba-4db2-8c62-1bd57c18f08d",
+     "placed_agent": "agentic",
+     "price": "33.550000",
+     "quantity": "0.094159",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TOPT"
+    },
+    {
+     "average_price": "109.913100",
+     "created_at": "2026-11-10T15:11:44.137047Z",
+     "cumulative_quantity": "0.030114",
+     "dollar_based_amount": {
+      "amount": "3.310000",
+      "currency_code": "USD"
+     },
+     "id": "6af33430-dcb2-486e-8e8a-d5285334710a",
+     "placed_agent": "agentic",
+     "price": "109.900000",
+     "quantity": "0.030114",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "LULU"
+    },
+    {
+     "average_price": "522.629900",
+     "created_at": "2026-11-10T15:11:42.544399Z",
+     "cumulative_quantity": "0.006352",
+     "dollar_based_amount": {
+      "amount": "3.320000",
+      "currency_code": "USD"
+     },
+     "id": "6af3342e-3fd7-4ef1-9983-c7bca1cb56a8",
+     "placed_agent": "agentic",
+     "price": "522.800000",
+     "quantity": "0.006352",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MSI"
+    },
+    {
+     "average_price": "244.669900",
+     "created_at": "2026-11-10T15:11:40.922371Z",
+     "cumulative_quantity": "0.013691",
+     "dollar_based_amount": {
+      "amount": "3.350000",
+      "currency_code": "USD"
+     },
+     "id": "6af3342c-a6d5-431e-bab4-a6f01b6bda12",
+     "placed_agent": "agentic",
+     "price": "244.290000",
+     "quantity": "0.013691",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "WELL"
+    },
+    {
+     "average_price": "256.227900",
+     "created_at": "2026-11-10T15:11:39.22689Z",
+     "cumulative_quantity": "0.013620",
+     "dollar_based_amount": {
+      "amount": "3.490000",
+      "currency_code": "USD"
+     },
+     "id": "6af3342b-320e-4739-94cb-0892115bb6be",
+     "placed_agent": "agentic",
+     "price": "256.060000",
+     "quantity": "0.013620",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "DGX"
+    },
+    {
+     "average_price": "366.496500",
+     "created_at": "2026-11-10T15:11:37.80218Z",
+     "cumulative_quantity": "0.009959",
+     "dollar_based_amount": {
+      "amount": "3.650000",
+      "currency_code": "USD"
+     },
+     "id": "6af33429-30a1-4d7c-8330-6429f070f2a1",
+     "placed_agent": "agentic",
+     "price": "366.250000",
+     "quantity": "0.009959",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "LH"
+    },
+    {
+     "average_price": "12.607000",
+     "created_at": "2026-11-10T15:11:36.226373Z",
+     "cumulative_quantity": "0.306179",
+     "dollar_based_amount": {
+      "amount": "3.860000",
+      "currency_code": "USD"
+     },
+     "id": "6af33428-ca24-4a76-9902-cb66a7378c18",
+     "placed_agent": "agentic",
+     "price": "12.610000",
+     "quantity": "0.306179",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "RGTI"
+    },
+    {
+     "average_price": "62.939900",
+     "created_at": "2026-11-10T15:11:34.555587Z",
+     "cumulative_quantity": "0.062440",
+     "dollar_based_amount": {
+      "amount": "3.930000",
+      "currency_code": "USD"
+     },
+     "id": "6af33426-f637-420f-b61b-43fc5811934c",
+     "placed_agent": "agentic",
+     "price": "62.930000",
+     "quantity": "0.062440",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "NFLX"
+    },
+    {
+     "average_price": "332.259700",
+     "created_at": "2026-11-10T15:11:32.987364Z",
+     "cumulative_quantity": "0.012008",
+     "dollar_based_amount": {
+      "amount": "3.990000",
+      "currency_code": "USD"
+     },
+     "id": "6af33424-146d-4b2a-9b9c-20dae8341575",
+     "placed_agent": "agentic",
+     "price": "331.970000",
+     "quantity": "0.012008",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "PSA"
+    },
+    {
+     "average_price": "7.779900",
+     "created_at": "2026-11-10T15:11:31.402045Z",
+     "cumulative_quantity": "0.573272",
+     "dollar_based_amount": {
+      "amount": "4.460000",
+      "currency_code": "USD"
+     },
+     "id": "6af33423-9f1d-4dce-a540-f0a42a7832ae",
+     "placed_agent": "agentic",
+     "price": "7.780000",
+     "quantity": "0.573272",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "BTX"
+    },
+    {
+     "average_price": "21.439900",
+     "created_at": "2026-11-10T15:11:29.492225Z",
+     "cumulative_quantity": "0.212221",
+     "dollar_based_amount": {
+      "amount": "4.550000",
+      "currency_code": "USD"
+     },
+     "id": "6af33421-4b44-42b5-9534-867a3e4b8eb1",
+     "placed_agent": "agentic",
+     "price": "21.180000",
+     "quantity": "0.212221",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "RVI"
+    },
+    {
+     "average_price": "585.249900",
+     "created_at": "2026-11-10T15:11:27.921242Z",
+     "cumulative_quantity": "0.009226",
+     "dollar_based_amount": {
+      "amount": "5.400000",
+      "currency_code": "USD"
+     },
+     "id": "6af3341f-07e2-414b-bb14-a2a5c91c022c",
+     "placed_agent": "agentic",
+     "price": "584.700000",
+     "quantity": "0.009226",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "CAT"
+    },
+    {
+     "average_price": "10.649900",
+     "created_at": "2026-11-10T15:11:26.248927Z",
+     "cumulative_quantity": "0.574653",
+     "dollar_based_amount": {
+      "amount": "6.120000",
+      "currency_code": "USD"
+     },
+     "id": "6af3341e-5fc9-4ea2-a092-4d9236f29935",
+     "placed_agent": "agentic",
+     "price": "10.640000",
+     "quantity": "0.574653",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "QBTS"
+    },
+    {
+     "average_price": "96.952600",
+     "created_at": "2026-11-10T15:11:24.500801Z",
+     "cumulative_quantity": "0.068899",
+     "dollar_based_amount": {
+      "amount": "6.680000",
+      "currency_code": "USD"
+     },
+     "id": "6af3341c-58da-4c7e-8cc0-c722439cf437",
+     "placed_agent": "agentic",
+     "price": "96.730000",
+     "quantity": "0.068899",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SATA"
+    },
+    {
+     "average_price": "6.599900",
+     "created_at": "2026-11-10T15:11:22.917859Z",
+     "cumulative_quantity": "1.224260",
+     "dollar_based_amount": {
+      "amount": "8.080000",
+      "currency_code": "USD"
+     },
+     "id": "6af3341a-3b1a-49d5-bef9-784a4e2f8af7",
+     "placed_agent": "agentic",
+     "price": "6.600000",
+     "quantity": "1.224260",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "QUBT"
+    },
+    {
+     "average_price": "39.909900",
+     "created_at": "2026-11-10T15:11:21.292082Z",
+     "cumulative_quantity": "0.203959",
+     "dollar_based_amount": {
+      "amount": "8.140000",
+      "currency_code": "USD"
+     },
+     "id": "6af33419-de25-4cba-81fa-39d491fba209",
+     "placed_agent": "agentic",
+     "price": "39.910000",
+     "quantity": "0.203959",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "AAAU"
+    },
+    {
+     "average_price": "173.399900",
+     "created_at": "2026-11-10T15:11:19.812632Z",
+     "cumulative_quantity": "0.047808",
+     "dollar_based_amount": {
+      "amount": "8.290000",
+      "currency_code": "USD"
+     },
+     "id": "6af33417-c1bd-4314-bb45-4d0780bf9e92",
+     "placed_agent": "agentic",
+     "price": "173.390000",
+     "quantity": "0.047808",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "NVDA"
+    },
+    {
+     "average_price": "10.889900",
+     "created_at": "2026-11-09T18:00:33.381539Z",
+     "cumulative_quantity": "0.609739",
+     "dollar_based_amount": {
+      "amount": "6.640000",
+      "currency_code": "USD"
+     },
+     "id": "6af20a41-7402-4ba8-adcf-edb53c4f9a43",
+     "placed_agent": "agentic",
+     "price": "10.880000",
+     "quantity": "0.609739",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TRLV"
+    },
+    {
+     "average_price": "59.345800",
+     "created_at": "2026-11-09T15:27:22.357483Z",
+     "cumulative_quantity": "0.020557",
+     "dollar_based_amount": {
+      "amount": "1.220000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e65a-c1c0-43f0-9521-ef1680adea75",
+     "placed_agent": "agentic",
+     "price": "59.350000",
+     "quantity": "0.020557",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "TSN"
+    },
+    {
+     "average_price": "291.060300",
+     "created_at": "2026-11-09T15:27:08.229793Z",
+     "cumulative_quantity": "0.004397",
+     "dollar_based_amount": {
+      "amount": "1.280000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e64c-4e30-4277-bf12-1b4dd87f0d70",
+     "placed_agent": "agentic",
+     "price": "291.080000",
+     "quantity": "0.004397",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ABBV"
+    },
+    {
+     "average_price": "109.409900",
+     "created_at": "2026-11-09T15:26:52.052213Z",
+     "cumulative_quantity": "0.013435",
+     "dollar_based_amount": {
+      "amount": "1.470000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e63b-5ed8-4d19-aba4-68180d596afa",
+     "placed_agent": "agentic",
+     "price": "109.340000",
+     "quantity": "0.013435",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "ABT"
+    },
+    {
+     "average_price": "66.909900",
+     "created_at": "2026-11-09T15:26:30.995991Z",
+     "cumulative_quantity": "0.023016",
+     "dollar_based_amount": {
+      "amount": "1.540000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e626-b8c5-4388-8c50-6e91fde56f12",
+     "placed_agent": "agentic",
+     "price": "66.890000",
+     "quantity": "0.023016",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "KR"
+    },
+    {
+     "average_price": "1061.979900",
+     "created_at": "2026-11-09T15:26:12.892875Z",
+     "cumulative_quantity": "0.001459",
+     "dollar_based_amount": {
+      "amount": "1.550000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e614-def4-4fc0-888d-fa54ed08b3b9",
+     "placed_agent": "agentic",
+     "price": "1060.280000",
+     "quantity": "0.001459",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MCK"
+    },
+    {
+     "average_price": "21.918400",
+     "created_at": "2026-11-09T15:26:00.477546Z",
+     "cumulative_quantity": "0.072085",
+     "dollar_based_amount": {
+      "amount": "1.580000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e608-72bd-451b-b5d9-c59b0eacd89b",
+     "placed_agent": "agentic",
+     "price": "21.920000",
+     "quantity": "0.072085",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "HRL"
+    },
+    {
+     "average_price": "65.689900",
+     "created_at": "2026-11-09T15:25:46.422356Z",
+     "cumulative_quantity": "0.031816",
+     "dollar_based_amount": {
+      "amount": "2.090000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e5fa-2c4d-4792-b3c5-c03003d614a0",
+     "placed_agent": "agentic",
+     "price": "65.680000",
+     "quantity": "0.031816",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "MDLZ"
+    },
+    {
+     "average_price": "233.463400",
+     "created_at": "2026-11-09T15:25:34.607168Z",
+     "cumulative_quantity": "0.010579",
+     "dollar_based_amount": {
+      "amount": "2.470000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e5ee-ac68-414a-a7aa-5f09356a845d",
+     "placed_agent": "agentic",
+     "price": "233.360000",
+     "quantity": "0.010579",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "RMD"
+    },
+    {
+     "average_price": "96.470700",
+     "created_at": "2026-11-09T15:25:20.487397Z",
+     "cumulative_quantity": "0.032548",
+     "dollar_based_amount": {
+      "amount": "3.140000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e5e0-2617-48e3-9a72-d7ff2e7bd653",
+     "placed_agent": "agentic",
+     "price": "96.420000",
+     "quantity": "0.032548",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "SATA"
+    },
+    {
+     "average_price": "170.870000",
+     "created_at": "2026-11-09T15:25:02.280261Z",
+     "cumulative_quantity": "0.048282",
+     "dollar_based_amount": {
+      "amount": "8.250000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e5ce-929a-4a40-9daa-147658c45004",
+     "placed_agent": "agentic",
+     "price": "170.660000",
+     "quantity": "0.048282",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "HSY"
+    },
+    {
+     "average_price": "178.179900",
+     "created_at": "2026-11-09T15:23:34.014634Z",
+     "cumulative_quantity": "0.049725",
+     "dollar_based_amount": {
+      "amount": "8.860000",
+      "currency_code": "USD"
+     },
+     "id": "6af1e575-c783-403d-a639-366afc1c295a",
+     "placed_agent": "agentic",
+     "price": "178.140000",
+     "quantity": "0.049725",
+     "side": "buy",
+     "state": "filled",
+     "symbol": "NVDA"
+    }
+   ]
+  }
+ ],
+ "snapshot_at": "2026-11-11T09:46:00-05:00",
+ "trading_day": "2026-11-09"
+}
