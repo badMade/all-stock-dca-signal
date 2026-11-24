@@ -1516,6 +1516,13 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "109417000000",
         "000020",
         "0000000000",
+        # Real SEC EDGAR accession-number pieces for four Apple filings (one filed by
+        # agent CIK 0001308179) in dca-sizing-signals/tests/fixtures/edgar_acceptance_aapl.json
+        # and the backtest-protocol phase A guards that read it -- filing ids, not accounts.
+        "000008",
+        "000018",
+        "000079",
+        "0001308179",
         # NVIDIA SEC CIK, accession-number pieces and capex amounts in
         # tests/test_scan_capex_deltas.py's XBRL fixture, not brokerage accounts.
         "1045810",
@@ -1587,6 +1594,9 @@ _ALLOWED = {
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-07.json",
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-10.json",
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_count_mismatch.json",
+    # Real (not synthetic) raw NVDA daily bars recorded from Robinhood 2026-11-23 for the backtest
+    # protocol's bar-quarantine guard: the account-shaped runs are share volumes.
+    "dca-sizing-signals/tests/prices/fixtures/robinhood_nvda_raw_2024-06-05_13.json",
     # Holds a microsecond-precision timestamp literal (.500000) in an assertion.
     "dca-sizing-signals/tests/prices/test_alpaca_provider.py",
     # Real Polymarket responses captured 2026-11-13 (docs/adr-prediction-markets.md, Phase 5a): unix-second

@@ -109,7 +109,7 @@ OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",
         "scripts.export_octopus_ledger", "scripts.publish_octopus_sizing",
         "scripts.run_90day_prediction_experiment", "scripts.run_phase4_backtest",
-        "scripts.sequestered_truth_comparator",
+        "scripts.sequestered_truth_comparator", "scripts.budget_exhaustion_count",
     )),
     ("utilities", "Dev tools & utilities", (
         "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues",

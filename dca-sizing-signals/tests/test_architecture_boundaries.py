@@ -44,7 +44,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # resolve against the package root rather than the wider repo root.
 # overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
 _OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
-                 "kalman_signals"}
+                 "kalman_signals", "inventory_signals", "mc_research"}
 
 # package directory name -> names it must never import
 FORBIDDEN_IMPORTS: dict[str, set[str]] = {
@@ -54,28 +54,43 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # (docs/adr-overnight-futures-tracker.md, D3) -- and unlike comovement_signals, not even
     # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
     "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
-                      "kalman_signals", "near_close_dca"},
+                      "inventory_signals", "kalman_signals", "near_close_dca"},
     "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
-                         "kalman_signals", "near_close_dca"},
+                         "inventory_signals", "kalman_signals", "near_close_dca"},
     "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
-                          "kalman_signals", "near_close_dca"},
+                          "inventory_signals", "kalman_signals", "near_close_dca"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                           "overnight_futures", "kalman_signals", "near_close_dca"},
+                           "overnight_futures", "inventory_signals", "kalman_signals", "near_close_dca"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                           "market_data_ingest", "overnight_futures", "kalman_signals", "near_close_dca"},
+                           "market_data_ingest", "overnight_futures", "inventory_signals", "kalman_signals",
+                           "near_close_dca"},
     # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
     # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
     # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
     # any suggester. dca_shared_interfaces is the only sibling it may import.
     "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                          "market_data_ingest", "kalman_signals", "near_close_dca"},
+                          "market_data_ingest", "inventory_signals", "kalman_signals", "near_close_dca"},
+    # Inventory reservation (docs/inventory_reservation_suggester.md): same two-way rule as
+    # comovement_signals. Inputs arrive from the caller, so it needs no ingest layer and no
+    # other suggester; only SizingAdjustmentReader may ever learn it exists.
+    "inventory_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                          "market_data_ingest", "overnight_futures", "mc_research", "kalman_signals",
+                          "near_close_dca"},
+    # Research-only Monte Carlo harness (docs/mc_variance_reduction.md): paths are simulated
+    # in-package and strategies take tiers as arguments, so it needs no suggester, no ingest
+    # layer and no live module. Stdlib-only is pinned separately in tests/mc_research/.
+    "mc_research": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
+                    "market_data_ingest", "overnight_futures", "inventory_signals", "kalman_signals",
+                    "near_close_dca",
+                    "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters"},
     # Shadow-only residual-dip signal (docs/adr-kalman-residual-dip-shadow.md, D3): rows arrive
     # from the caller, cluster members included, so it needs no other signal package and not
     # the ingest layer. dca_shared_interfaces is the only sibling it may import.
     "kalman_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                       "market_data_ingest", "overnight_futures", "near_close_dca"},
+                       "market_data_ingest", "overnight_futures", "inventory_signals", "mc_research",
+                       "near_close_dca"},
 }
 
 
@@ -158,8 +173,8 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     shared = this_package_root / "dca_shared_interfaces"
     assert shared.exists(), "dca_shared_interfaces/ not found next to tests/ -- check package layout"
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
-                 "market_data_ingest", "comovement_signals", "overnight_futures", "kalman_signals",
-                 "near_close_dca"}
+                 "market_data_ingest", "comovement_signals", "overnight_futures", "inventory_signals",
+                 "kalman_signals", "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden
@@ -294,3 +309,30 @@ def test_kalman_signals_has_no_sizing_path() -> None:
 def test_kalman_signals_is_packaged() -> None:
     pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
     assert f'"{_KALMAN}*"' in pyproject, f'add "{_KALMAN}*" to [tool.setuptools.packages.find] include'
+
+
+# --- mc_research (docs/mc_variance_reduction.md) ----------------------------------------------
+#
+# Same shape as the overnight_futures block: registration alone would pass vacuously if the
+# package vanished, so pin existence, packaging, and that nothing live ever imports it.
+
+_MC = "mc_research"
+
+
+def test_mc_research_package_exists_and_is_packaged() -> None:
+    package_dir = _resolve_package_dir(_MC)
+    assert package_dir is not None and package_dir.parent == PACKAGE_ROOT, f"{_MC}/ must live in {PACKAGE_ROOT}"
+    assert (package_dir / "__init__.py").is_file(), f"{_MC}/__init__.py is missing"
+    pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
+    assert f'"{_MC}*"' in pyproject, f'add "{_MC}*" to [tool.setuptools.packages.find] include'
+
+
+def test_live_side_never_imports_mc_research() -> None:
+    """Simulation results are research evidence only: no repo-root module (the core, the three
+    entry points, sizing_adjustment_reader.py) may import the harness."""
+    root_modules = sorted(REPO_ROOT.glob("*.py"))
+    assert (REPO_ROOT / "sizing_adjustment_reader.py") in root_modules, (
+        f"sizing_adjustment_reader.py not found at REPO_ROOT={REPO_ROOT}; point DCA_REPO_ROOT at the repo root"
+    )
+    violations = [str(_display_path(f)) for f in root_modules if _MC in _imported_module_names(f)]
+    assert not violations, f"live-side modules import {_MC}: {violations}"
