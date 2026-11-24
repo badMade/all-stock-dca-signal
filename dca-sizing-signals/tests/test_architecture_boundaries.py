@@ -44,7 +44,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # resolve against the package root rather than the wider repo root.
 # overnight_futures/ joins them under docs/adr-overnight-futures-tracker.md (D3).
 # factor_signals/ joins them under docs/adr-factor-residual-dip-signals.md.
-_OWN_PACKAGES = {"connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
+_OWN_PACKAGES = {"kalman_signals", "connector_signals", "market_data_ingest", "comovement_signals", "overnight_futures",
                  "factor_signals", "inventory_signals", "mc_research", "residual_reversal",
                  "cost_basis_backtest"}
 
@@ -57,45 +57,46 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # SizingAdjustmentReader may learn it exists (D2), which the core-side test below pins.
     "ml_forecaster": {"wondrous_octopus", "connector_signals", "comovement_signals", "overnight_futures",
                       "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
-                      "near_close_dca"},
+                      "near_close_dca", "kalman_signals"},
     "wondrous_octopus": {"ml_forecaster", "connector_signals", "comovement_signals", "overnight_futures",
                          "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
-                         "near_close_dca"},
+                         "near_close_dca", "kalman_signals"},
     "connector_signals": {"ml_forecaster", "wondrous_octopus", "comovement_signals", "overnight_futures",
                           "factor_signals", "inventory_signals", "residual_reversal", "cost_basis_backtest",
-                          "near_close_dca"},
+                          "near_close_dca", "kalman_signals"},
     "market_data_ingest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                            "overnight_futures", "factor_signals", "inventory_signals", "residual_reversal",
-                           "cost_basis_backtest", "near_close_dca"},
+                           "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure co-movement signals (docs/adr-comovement-signals.md): prices arrive as rows from
     # the caller, so it needs neither the ingest layer nor any other suggester.
     "comovement_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals",
                            "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
-                           "residual_reversal", "cost_basis_backtest", "near_close_dca"},
+                           "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure overnight gap computation (docs/adr-overnight-futures-tracker.md, D3): rows arrive
     # from the caller, exactly as in comovement_signals, so it needs neither the ingest layer
     # (market_data_ingest/futures/ writes the store; this package never reads it directly) nor
     # any suggester. dca_shared_interfaces is the only sibling it may import.
     "overnight_futures": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                           "market_data_ingest", "factor_signals", "inventory_signals", "residual_reversal",
-                          "cost_basis_backtest", "near_close_dca"},
+                          "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Pure factor decomposition (docs/adr-factor-residual-dip-signals.md): rows arrive from
     # the caller, as in comovement_signals, and the two-way rule applies. It may not import
     # comovement_signals even to reuse its returns contract -- it carries its own copy.
     "factor_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                        "market_data_ingest", "overnight_futures", "inventory_signals", "mc_research",
-                       "residual_reversal", "cost_basis_backtest", "near_close_dca"},
+                       "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Inventory reservation (docs/inventory_reservation_suggester.md): same two-way rule as
     # comovement_signals. Inputs arrive from the caller, so it needs no ingest layer and no
     # other suggester; only SizingAdjustmentReader may ever learn it exists.
     "inventory_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                           "market_data_ingest", "overnight_futures", "factor_signals", "mc_research",
-                          "residual_reversal", "cost_basis_backtest", "near_close_dca"},
+                          "residual_reversal", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Research-only Monte Carlo harness (docs/mc_variance_reduction.md): paths are simulated
     # in-package and strategies take tiers as arguments, so it needs no suggester, no ingest
     # layer and no live module. Stdlib-only is pinned separately in tests/mc_research/.
     "mc_research": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
-                    "market_data_ingest", "overnight_futures", "inventory_signals", "factor_signals", "near_close_dca",
+                    "market_data_ingest", "overnight_futures", "inventory_signals", "factor_signals",
+                    "near_close_dca", "kalman_signals",
                     "sizing_adjustment_reader", "dca_ladder_core", "dca_runner", "run_dca", "dca_live_adapters",
                     "residual_reversal", "cost_basis_backtest"},
     # Sector-ETF residual reversal (docs/adr-residual-reversal-suggester.md): rows arrive
@@ -103,14 +104,20 @@ FORBIDDEN_IMPORTS: dict[str, set[str]] = {
     # own OLS/OU math rather than reusing factor_signals' betas.
     "residual_reversal": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                           "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
-                          "mc_research", "cost_basis_backtest", "near_close_dca"},
+                          "mc_research", "cost_basis_backtest", "near_close_dca", "kalman_signals"},
     # Offline cost-basis backtest harness (docs/adr-cost-basis-backtest-harness.md): it replays
     # a candidate through duck typing and a caller-supplied factory, so it imports no
     # suggester, and it reads the Phase 0 ledger only as plain dict rows, so it does not
     # import market_data_ingest either. Two-way: no other package may import it.
     "cost_basis_backtest": {"ml_forecaster", "wondrous_octopus", "connector_signals", "comovement_signals",
                             "market_data_ingest", "overnight_futures", "factor_signals", "inventory_signals",
-                            "mc_research", "residual_reversal", "near_close_dca"},
+                            "mc_research", "residual_reversal", "near_close_dca", "kalman_signals"},
+    # Shadow-only residual-dip signal (docs/adr-kalman-residual-dip-shadow.md, D3): rows arrive
+    # from the caller, cluster members included, so it needs no other signal package and not
+    # the ingest layer. dca_shared_interfaces is the only sibling it may import.
+    "kalman_signals": {"ml_forecaster", "wondrous_octopus", "connector_signals", "market_data_ingest",
+                       "comovement_signals", "overnight_futures", "factor_signals", "inventory_signals",
+                       "mc_research", "residual_reversal", "cost_basis_backtest", "near_close_dca"},
 }
 
 
@@ -195,7 +202,7 @@ def test_dca_shared_interfaces_has_no_forbidden_imports() -> None:
     forbidden = {"ml_forecaster", "wondrous_octopus", "connector_signals",
                  "market_data_ingest", "comovement_signals", "overnight_futures", "factor_signals",
                  "inventory_signals", "residual_reversal", "cost_basis_backtest",
-                 "near_close_dca"}
+                 "kalman_signals", "near_close_dca"}
     violations = []
     for py_file in shared.rglob("*.py"):
         hit = _imported_module_names(py_file) & forbidden
@@ -272,6 +279,64 @@ def test_overnight_futures_is_packaged() -> None:
     packages.find works from a checkout and ImportErrors from an installed wheel."""
     pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
     assert f'"{_OVERNIGHT}*"' in pyproject, f'add "{_OVERNIGHT}*" to [tool.setuptools.packages.find] include'
+
+
+# --- kalman_signals (docs/adr-kalman-residual-dip-shadow.md) ---------------------------------
+#
+# Same four guarantees as overnight_futures above, for the same reason: registering the
+# package in FORBIDDEN_IMPORTS alone would pass vacuously if it went missing.
+
+_KALMAN = "kalman_signals"
+
+
+def test_kalman_signals_package_exists() -> None:
+    package_dir = _resolve_package_dir(_KALMAN)
+    assert package_dir is not None, f"{_KALMAN}/ not found under {PACKAGE_ROOT}"
+    assert package_dir.parent == PACKAGE_ROOT
+    assert (package_dir / "__init__.py").is_file()
+
+
+def test_kalman_signals_is_forbidden_to_every_other_package() -> None:
+    missing = sorted(pkg for pkg, forbidden in FORBIDDEN_IMPORTS.items()
+                     if pkg != _KALMAN and _KALMAN not in forbidden)
+    assert not missing, f"{_KALMAN} is not forbidden to: {missing}"
+
+
+def test_live_side_never_imports_kalman_signals() -> None:
+    """ADR D3: no repo-root module, sizing_adjustment_reader.py included, imports it."""
+    root_modules = sorted(REPO_ROOT.glob("*.py"))
+    assert (REPO_ROOT / "sizing_adjustment_reader.py") in root_modules, (
+        f"sizing_adjustment_reader.py not found at REPO_ROOT={REPO_ROOT}; point DCA_REPO_ROOT at the repo root"
+    )
+    violations = [str(_display_path(f)) for f in root_modules if _KALMAN in _imported_module_names(f)]
+    assert not violations, f"live-side modules import {_KALMAN}: {violations}"
+
+
+def test_kalman_signals_has_no_sizing_path() -> None:
+    """ADR D2: shadow functions only -- no SizingSuggester/SizingSuggestion/SuggestionPublisher,
+    no suggest()/publish(). A SizingSuggester wrapper needs its own ADR after the D7 gate."""
+    package_dir = _resolve_package_dir(_KALMAN)
+    assert package_dir is not None
+    banned_names = {"SizingSuggester", "SuggestionPublisher", "SizingSuggestion"}
+    banned_defs = {"suggest", "publish"}
+    violations: list[str] = []
+    for py_file in package_dir.rglob("*.py"):
+        tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                hit = {alias.name for alias in node.names} & banned_names
+                if hit:
+                    violations.append(f"{_display_path(py_file)} imports {sorted(hit)}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in banned_defs:
+                violations.append(f"{_display_path(py_file)}:{node.lineno} defines {node.name}()")
+            elif isinstance(node, ast.Attribute) and node.attr in banned_names:
+                violations.append(f"{_display_path(py_file)}:{node.lineno} references {node.attr}")
+    assert not violations, f"{_KALMAN} grew a sizing path:\n" + "\n".join(violations)
+
+
+def test_kalman_signals_is_packaged() -> None:
+    pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text()
+    assert f'"{_KALMAN}*"' in pyproject, f'add "{_KALMAN}*" to [tool.setuptools.packages.find] include'
 
 
 # --- factor_signals (docs/adr-factor-residual-dip-signals.md) --------------------------------
