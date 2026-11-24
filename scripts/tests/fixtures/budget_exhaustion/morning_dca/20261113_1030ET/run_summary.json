@@ -1,0 +1,38 @@
+{
+ "broker": "robinhood",
+ "counts": {
+  "submitted": 0
+ },
+ "dry_run": false,
+ "error_class": "output_cap_exceeded",
+ "generated_at": "2026-11-13T15:40:51Z",
+ "order_submit_status": "not_submitted_error",
+ "orders_submitted_count": 0,
+ "run_classification": {
+  "account_number_redacted": true,
+  "afternoon_live_cron_id": "10ce362c",
+  "cron_id": "42173154",
+  "execution_broker": "robinhood",
+  "manual_run": false,
+  "preauthorized_direct_place": true,
+  "run_id": "morning_live_20261113_1030ET",
+  "run_origin": "scheduled",
+  "run_type": "morning_dca_live",
+  "same_day_required": true,
+  "scheduled_for_et": "10:30",
+  "scheduled_window_end_et": "10:35",
+  "scheduled_window_start_et": "10:25",
+  "state_schema_version": "morning-live-v2-preauthorized",
+  "stream": "morning",
+  "supersedes_cron_id": null,
+  "trades": true,
+  "trading_day": "2026-11-13",
+  "triggered_at_utc": "2026-11-13T15:40:08+00:00",
+  "valid_afternoon_evidence": false,
+  "valid_morning_evidence": true,
+  "valid_scheduled_evidence": true
+ },
+ "run_id": "morning_live_20261113_1030ET",
+ "status": "ABORT_GATE6_HISTORY_INCOMPLETE",
+ "trading_day": "2026-11-13"
+}

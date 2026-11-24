@@ -1,0 +1,9 @@
+{
+ "dropped": {
+  "daily_cap": 75,
+  "price_recovered": 0,
+  "spread_over_1pct": 0
+ },
+ "eligible_count": 82,
+ "notes": "Stress tier (68 signals >=3x). Weekly cap binding: week spend 936.03 before this slot; effective weekly cap 1000 using conservative rollover reserve 100 (prior-week unused >=~118). 7 orders placed, 61.10 total, all filled. Gate 6.5 zeroed AVGO, ANET, TSM (ALREADY_MET_OR_OVERFILLED); NVDA 1.10 and GS 1.76 resized top-ups (GS not placed). 62 lower-priority candidates never evaluated by Gate 6.5; APH BTX TXN GS QTOP QQQ TOPT XLG VT RVI skipped at weekly cap boundary (APH 10.00 first not fitting remaining 2.87). Orders from earlier slots (0935, 1030) counted as prior allocation. history completeness: baseline_merge day sha 37d6eab1.. week sha 3458ea12.. ; per-order tradability_checked_at conservative lower bound 15:39:34 ET. Order plan emitted."
+}
