@@ -1,7 +1,8 @@
 # ADR: Kalman residual-dip score as a shadow-only signal
 
-- **Status:** Proposed (2026-11-23). Nothing is implemented. Accepting it authorizes Phase 1 below
-  and nothing else.
+- **Status:** Accepted (2026-11-23, operator "Accept, build Phase 1"; every open question takes its
+  proposed default). Acceptance authorizes Phase 1 below and nothing else. Not wired into any live
+  path.
 - **Scope:** research and shadow logging only, inside `dca-sizing-signals/`. The stdlib-only core,
   the ladder, `config/`, the live prompts, `sizing_adjustment_reader.py` and all three entry points
   (`run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy, `dca_runner.py`) are untouched. Nothing
@@ -37,7 +38,7 @@
 | Count the Q/R grid as trials | The Phase 0 ledger has a `trials` table (`market_data_ingest/ledger/store.py`) | Every Q/R setting tried is recorded there (D7) |
 | Live intraday SPY quotes at each slot | Not wired anywhere; whether the live executors can quote SPY each slot is unverified | Phase 1 is offline only. Live shadow logging (Phase 2) waits until that is checked |
 
-## Decision (proposed)
+## Decision
 
 ### D1. Purpose: classify the dip, do not size it
 
@@ -127,7 +128,7 @@ whose inputs are dated after its `as_of`.
   not change the universe.
 - Results take months to mean anything. Until D7 passes this is a logging cost with no payoff.
 
-## Open questions (proposed defaults in brackets)
+## Open questions (resolved 2026-11-23 to the defaults in brackets)
 
 1. Market factor: SPY, or a universe-weighted mean return? [SPY]
 2. Label thresholds: `idiosyncratic_dip` when intraday `z_resid <= -2` and the factor move is above
