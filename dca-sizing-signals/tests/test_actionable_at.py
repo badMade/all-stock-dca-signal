@@ -1,10 +1,8 @@
 """Backtest protocol item 4: an ``actionable_at`` on one ET exchange calendar (next session after acceptance).
 
 Phase A guard, written BEFORE the implementation (docs/backtest-gap-audit.md row 4,
-docs/adr-backtest-protocol.md). Every test here is xfail(strict=True) until
-``market_data_ingest.exchange_calendar`` exists. Once it does, a passing test turns into a strict XPASS
-failure, so the marker has to be removed in the same change that makes the guard real. Run with
-``--runxfail`` to see the real failures now.
+docs/adr-backtest-protocol.md). It ran xfail(strict=True) until
+``market_data_ingest.exchange_calendar`` landed; the marker came off in that change.
 
 The contract these tests define:
 
@@ -35,12 +33,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    raises=(ImportError, AttributeError, AssertionError, TypeError),
-    reason="phase A guard: market_data_ingest.exchange_calendar not implemented yet (backtest protocol item 4)",
-)
 
 ET = ZoneInfo("America/New_York")
 REPO_ROOT = Path(__file__).resolve().parents[2]

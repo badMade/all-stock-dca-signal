@@ -1,9 +1,8 @@
 """Backtest protocol item 6: anomalous inputs are quarantined, never interpolated, and give no price.
 
 Phase A guard, written BEFORE the implementation (docs/backtest-gap-audit.md row 6,
-docs/adr-backtest-protocol.md). Every test here is xfail(strict=True) until the quarantine exists, and
-turns into a strict XPASS failure once it passes, so the marker goes in the change that makes the guard
-real.
+docs/adr-backtest-protocol.md). The pure check (``bar_anomalies``) is implemented and its tests run
+plainly. The three store tests stay xfail(strict=True); see the note above them.
 
 Today ``validate_bars`` checks each bar on its own (prices/validate.py:32-56): positive prices, high >=
 low and so on. A raw close that falls 90% overnight passes, because nothing compares a bar with the
@@ -34,12 +33,6 @@ from datetime import date, datetime, timezone
 import pytest
 
 from .conftest import load_fixture
-
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    raises=(ImportError, AttributeError, AssertionError, TypeError),
-    reason="phase A guard: bar quarantine not implemented yet (backtest protocol item 6)",
-)
 
 RAW = load_fixture("robinhood_nvda_raw_2024-06-05_13.json")
 SPLIT_EX = date(2024, 6, 10)
@@ -117,8 +110,22 @@ def test_ordinary_real_sessions_are_not_flagged():
 
 
 # --- the store ------------------------------------------------------------------------------------------
+#
+# The pure check above is implemented. Wiring it into PriceStore.ingest_daily_bars is held for an
+# operator decision: a hard reject at ingest conflicts with the store's existing contract that a split
+# may be learned AFTER the bars crossing it (test_store_point_in_time.py's
+# test_known_at_hides_a_split_we_learned_about_later and the NVDA split tests ingest bars first), and
+# breaks 24 existing tests. A strict xfail keeps the contract visible until that is settled.
+# ``pytest.fail.Exception`` is listed because ``pytest.raises`` reports "DID NOT RAISE" with it.
+
+store_pending = pytest.mark.xfail(
+    strict=True,
+    raises=(AssertionError, pytest.fail.Exception),
+    reason="phase A item 6 store wiring held: ingest-time reject vs learn-a-split-later contract",
+)
 
 
+@store_pending
 def test_an_anomalous_batch_lands_in_quarantine_and_nowhere_else(store, staging_dir):
     store.ingest_daily_bars(_bars(last=date(2024, 6, 7)), run_id="clean", as_of=AS_OF, staging_dir=staging_dir)
     with pytest.raises(_errors().AnomalousBarsError):
@@ -134,6 +141,7 @@ def test_an_anomalous_batch_lands_in_quarantine_and_nowhere_else(store, staging_
     assert "1208.88" in rows[0]["reason"]
 
 
+@store_pending
 def test_the_same_batch_is_accepted_once_the_split_is_known(store, staging_dir):
     store.ingest_corporate_actions([_split()], run_id="actions", as_of=AS_OF, staging_dir=staging_dir)
     store.ingest_daily_bars(_bars(last=date(2024, 6, 7)), run_id="clean", as_of=AS_OF, staging_dir=staging_dir)
@@ -145,6 +153,7 @@ def test_the_same_batch_is_accepted_once_the_split_is_known(store, staging_dir):
     assert _quarantine(store, "SELECT count(*) AS n FROM quarantined_bars")[0]["n"] == 0
 
 
+@store_pending
 def test_a_quarantined_session_gives_no_price_rather_than_a_neighbours(store, staging_dir):
     store.ingest_daily_bars(_bars(last=date(2024, 6, 7)), run_id="clean", as_of=AS_OF, staging_dir=staging_dir)
     with pytest.raises(_errors().AnomalousBarsError):
