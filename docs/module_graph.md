@@ -84,7 +84,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.refresh_active_ticker_histories` | 199 | 1 |
 | `scripts.refresh_market_open_candidates` | 154 | 0 |
 | `scripts.reshape_order_pages` | 281 | 1 |
-| `scripts.robinhood_payload` | 1097 | 23 |
+| `scripts.robinhood_payload` | 1104 | 23 |
 | `scripts.run_90day_prediction_experiment` | 422 | 2 |
 | `scripts.run_ledger` | 305 | 0 |
 | `scripts.run_phase4_backtest` | 10 | 0 |
@@ -161,7 +161,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_order_plan` | 1137 | 6 | 9 | 2 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_runner`, `near_close_dca`, `scripts.validate_native_placement` |
 | `dca_paths` | 219 | 1 | 58 | 1 | `dca_env` |
 | `dca_provenance` | 156 | 1 | 0 | 0 | `dca_fileio` |
-| `dca_rec_models` | 395 | 0 | 11 | 0 | |
+| `dca_rec_models` | 405 | 0 | 11 | 0 | |
 | `dca_rec_publish` | 265 | 2 | 3 | 0 | `dca_net_utils`, `dca_rec_models` |
 | `dca_rec_store` | 277 | 5 | 8 | 0 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_rec_models`, `scripts.validate_native_placement` |
 | `dca_recommender` | 323 | 16 | 2 | 0 | `dca_config`, `dca_market_sources`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_risk`, `dca_runner`, +8 more |
@@ -267,7 +267,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.refresh_active_ticker_histories` | 199 | 1 | 0 | 1 | `dca_ticker_paths` |
 | `scripts.refresh_market_open_candidates` | 154 | 4 | 0 | 0 | `dca_config`, `market_open_dca`, `near_close_dca`, `scripts.stream_candidates` |
 | `scripts.reshape_order_pages` | 281 | 7 | 0 | 1 | `dca_config`, `dca_fileio`, `dca_runner`, `scripts.account_arg`, `scripts.assemble_order_pages`, `scripts.broker_reconciliation`, `scripts.same_day_top_up_gate` |
-| `scripts.robinhood_payload` | 1097 | 19 | 0 | 23 | `dca_config`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, `dca_rec_store`, +11 more |
+| `scripts.robinhood_payload` | 1104 | 19 | 0 | 23 | `dca_config`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, `dca_rec_store`, +11 more |
 | `scripts.run_90day_prediction_experiment` | 422 | 1 | 0 | 2 | `scripts.sequestered_truth_comparator` |
 | `scripts.run_classification` | 4511 | 4 | 13 | 27 | `dca_fileio`, `dca_paths`, `scripts.broker_reconciliation`, `scripts.same_day_pointer` |
 | `scripts.run_ledger` | 305 | 1 | 0 | 0 | `scripts.file_lock` |
@@ -284,7 +284,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.sequestered_truth_comparator` | 900 | 0 | 2 | 0 | |
 | `scripts.shard_heartbeat` | 133 | 0 | 0 | 0 | |
 | `scripts.slot_attribution` | 36 | 3 | 1 | 1 | `dca_paths`, `scripts.run_classification`, `scripts.verify_schedule` |
-| `scripts.slot_status` | 325 | 5 | 5 | 2 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_rec_publish`, `scripts.file_lock` |
+| `scripts.slot_status` | 331 | 5 | 5 | 2 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_rec_publish`, `scripts.file_lock` |
 | `scripts.slot_status_watch` | 107 | 3 | 0 | 0 | `dca_paths`, `scripts.slot_status`, `scripts.verify_schedule` |
 | `scripts.snapshot_cycle` | 328 | 14 | 0 | 2 | `dca_config`, `dca_fileio`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, +6 more |
 | `scripts.stream_candidates` | 1967 | 5 | 8 | 3 | `dca_config`, `dca_runner`, `morning_dca`, `near_close_dca`, `scripts.generate_buy_candidates` |

@@ -230,10 +230,45 @@ def test_raw_url_points_at_the_public_signal_repository():
         "https://raw.githubusercontent.com/badMade/all-stock-dca-signal/slot-status/slot_status.json")
 
 
-@pytest.mark.parametrize("repository", ["", "badMade", "badMade/x/y", "bad Made/x", "../x/y"])
+@pytest.mark.parametrize("repository", ["", "badMade", "badMade/x/y", "bad Made/x", "../x/y", "badMade/."])
 def test_raw_url_refuses_a_malformed_repository(repository):
     with pytest.raises(ValueError):
         ss.raw_url("slot-status", repository)
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "",
+        "../other/main",
+        "a/../b",
+        "./slot-status",
+        "slot-status/.",
+        "slot-status?x=1",
+        "slot-status#frag",
+        "slot-status@evil",
+        "/slot-status",
+        "slot-status/",
+        "slot status",
+    ],
+)
+def test_raw_url_refuses_a_malformed_branch(branch):
+    with pytest.raises(ValueError):
+        ss.raw_url(branch, "badMade/all-stock-dca-signal")
+
+
+def test_raw_url_allows_nested_branch_names():
+    assert ss.raw_url("signals/slot-status", "badMade/all-stock-dca-signal") == (
+        "https://raw.githubusercontent.com/badMade/all-stock-dca-signal/signals/slot-status/slot_status.json"
+    )
+
+
+def test_load_settings_rejects_duplicate_json_keys(tmp_path):
+    (tmp_path / "slot_status.json").write_text(
+        '{"enabled": false, "enabled": true, "branch": "slot-status"}', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        ss.load_settings(tmp_path)
 
 
 def test_the_checked_in_config_publishes_to_the_public_signal_repository():
