@@ -13,6 +13,7 @@ one, so the history stays intact.
 | `2026-07-17-live-reliability/` | Reliability fixes applied 2026-07-17 to align the version-controlled schedule manifest with live scheduler state for the three pre-authorized live tasks. |
 | `2026-07-23-live-reliability-fixes/` | Supersedes the 2026-06-29 audit's schedule/stream assumptions: records the switch from the single `ce16ba6b` task to four Robinhood-only scheduled streams plus a read-only monitor, and a same-day recovery changelog. |
 | `2026-11-24-kalman-phase1/` | Inputs and trial rows for the Kalman residual-dip Phase 1 backtest (`docs/adr-kalman-residual-dip-shadow.md`): point-in-time clusters, yfinance earnings dates, ledger `trials` rows. Research only. |
+| `2026-11-24-residual-reversal-cost-basis/` | First real-data run of the cost-basis harness: residual_reversal against a point-in-time daily replay of the 3:30 PM ladder, a draft (unreviewed) sector-ETF map, three pre-declared variants. Promotion failed; results in `docs/research/2026-11-24-residual-reversal-cost-basis-results.md`. Research only. |
 
 | `composite-rank/` | Not a dated snapshot: a maintained, read-only daily ranking tool (weighted multi-period ROI, low-volatility tilt, rank-movement history) run by the scheduled task `daily-composite-rank`. See its `README.md` and `RUNBOOK.md`. |
 
