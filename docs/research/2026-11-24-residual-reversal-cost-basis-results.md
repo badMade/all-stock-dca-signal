@@ -109,11 +109,12 @@ monotone. The run's limitations (survivor-biased universe, unreviewed sector map
 a simplified daily baseline) could move the numbers by a few basis points, which is the size of
 everything measured. They do not change the conclusion: there is no evidence here to wire it.
 
-## What was not done
+## What was and was not done
 
-- **Trials not ingested.** Each variant's `trials` row is in the report JSON (`trial_row`), but
-  no ledger was written. Ingesting needs the operator's approval, as in
-  `analysis/2026-11-24-kalman-phase1/record_trials.py`.
+- **Trials ingested 2026-11-24** with the operator's approval: three rows (`rr-cb-2026-11-24-default`,
+  `-slope_0.05`, `-slope_0.2`) in the Phase 0 ledger (`cron_tracking/goal_snapshot/ledger.duckdb`,
+  experiment `residual_reversal_cost_basis`, run id `rr-cost-basis-2026-11-24`). Any later variant
+  of this experiment deflates against `trial_count` starting from 3.
 - **The report JSON is not committed** (generated output, as for the Kalman Phase 1 run).
 - **No re-run with a reviewed sector map, an 8-K/earnings source, or a dated universe.** Those
   would be the next steps only if there were a reason to revisit the suggester.
