@@ -1,10 +1,14 @@
 # ADR: Budget-neutral residual-reversal sizing suggester (sector-ETF OU s-score)
 
-- **Status:** Proposed (2026-11-23). Research only. Builds Priorities 2 and 3 of the
-  operator-supplied report "Applying Stat-Arb and Pairs-Trading Ideas to all-stock-dca"
-  (2026-11-23). It extends the 2026-11-01 operator decision recorded in
-  `docs/adr-comovement-signals.md`: use pairs and co-movement ideas as **signals**, never as
-  a pairs strategy.
+- **Status:** Tested and failed (2026-11-24). Research only; **nothing gets wired live.**
+  Proposed 2026-11-23. Nine walk-forward cost-basis runs (see "Results") found no
+  cost-basis improvement distinguishable from zero and no monotone score buckets out of
+  sample, so the report's promotion test failed every time. The package stays in the repo as
+  research code; reopening it needs a new trial, counted against the nine already recorded.
+  Builds Priorities 2 and 3 of the operator-supplied report "Applying Stat-Arb and
+  Pairs-Trading Ideas to all-stock-dca" (2026-11-23). It extends the 2026-11-01 operator
+  decision recorded in `docs/adr-comovement-signals.md`: use pairs and co-movement ideas as
+  **signals**, never as a pairs strategy.
 - **Scope:** a new package, `dca-sizing-signals/residual_reversal/`. It publishes bounded,
   unscored suggestions through the existing `SizingSuggester` / `SuggestionPublisher`
   boundary to its own file, `residual_reversal_suggestions.json`. Nothing in the live path
@@ -82,15 +86,59 @@ or a failed budget-neutral self-check.
 - **Regime or crowding modulation.** The report's Priority 4 (shrinking the tilt cap in
   turbulent regimes, never flipping its sign) belongs in `SizingAdjustmentReader`, the one
   component allowed to combine suggesters. This package stays regime-blind.
-- **Backtest harness.** The report's Priority 1 is not built. Before anyone proposes live
-  wiring, the suggester must be scored by a walk-forward, cost-basis comparison against the
-  current graded baseline. The Phase 0 outcome ledger
-  (`docs/adr-outcome-ledger-pit-harness.md`) is the intended place for that. The report's
-  promotion test still applies: forward tilt-dollar returns must be monotone in s-score
-  bucket out of sample.
+- **Backtest harness.** Built since as `dca-sizing-signals/cost_basis_backtest/`
+  (`docs/adr-cost-basis-backtest-harness.md`); its results are below.
 - **Intraday top-up threshold.** The report's Priority 5 is not built.
 - **Sector mapping.** The ETF for each ticker is supplied by the caller. No mapping is added
   to `config/`.
+
+## Results (2026-11-24)
+
+Every run used `ResidualReversalConfig` defaults unless named, the binding in
+`dca-sizing-signals/tests/cost_basis_backtest/_binding.py`, and the cost-basis harness. All nine
+were accepted: no lookahead flags, budget-neutral every session, and in the six runs that
+checked it a zero-signal replay matched the baseline exactly (0.0 bp). Cost-basis improvement is
+the paired per-ticker mean, out of sample; positive means the suggester paid less.
+
+| Run | Baseline | Benchmark | Costs | OOS window | Cost-basis bp (t) | Terminal wealth bp | Promotion |
+|---|---|---|---|---|---|---|---|
+| default (slope 0.1) | graded-ladder replay | draft sector map | 0 bp | 2024-01-02 on | +1.43 (1.03) | +0.6 | failed: buckets not monotone |
+| slope 0.05 | graded-ladder replay | draft sector map | 0 bp | 2024-01-02 on | +0.73 (1.05) | +0.3 | failed: not monotone |
+| slope 0.2 | graded-ladder replay | draft sector map | 0 bp | 2024-01-02 on | +2.06 (1.02) | −0.4 | failed: not monotone |
+| proxy_qqq | flat $1 | QQQ | 3 bp | 2024-01-02 on | +1.0 (0.89) | −1.8 | failed: not monotone |
+| proxy_vt | flat $1 | VT | 3 bp | 2024-01-02 on | +0.8 (0.56) | −5.2 | failed: not monotone |
+| proxy_sector | flat $1 | sector map, SPY fallback | 3 bp | 2024-01-02 on | +1.0 (0.82) | −1.1 | failed: not monotone |
+| live_qqq | 515 live scheduled fills | QQQ | 3 bp | 2026-11-02 on | −0.2 (−0.17) | 0.0 | failed: buckets under 30 points |
+| live_vt | 515 live scheduled fills | VT | 3 bp | 2026-11-02 on | +0.5 (0.70) | −0.1 | failed: under 30 points |
+| live_sector | 515 live scheduled fills | sector map, SPY fallback | 3 bp | 2026-11-02 on | +0.04 (0.05) | −0.8 | failed: under 30 points |
+
+- **Graded-ladder runs** (`analysis/2026-11-24-residual-reversal-cost-basis/`, write-up in
+  `docs/research/2026-11-24-residual-reversal-cost-basis-results.md`): 1,480 sessions,
+  2021-01-04 to 2026-11-23, 75,359 replayed 3:30 PM ladder buys ($277,028). Out of sample the
+  tilt dollars returned −3 to −10 bp over 5 to 20 sessions and the hit rate was 50%. Across the
+  three variants the deflated Sharpe ratio was 0.60 (bar 0.95) and PBO 0.60.
+- **Proxy runs:** the same 1,480 sessions with $1 per active ticker per session, Adj Close.
+  Hit rate 50 to 51% at every horizon. Over the whole proxy_sector period the 20-session bucket
+  means ran +58, +45, +10, −8, −5.5 bp (nearly monotone), but out of sample they were −4, +24,
+  +31, +17, +31: the in-sample shape did not hold.
+- **Live runs:** the 528 scheduled fills from 2026-10-05 to 2026-11-24 ($1,838), of which 515
+  had archive prices, over 20 sessions. Too short to say anything: every bucket is under 30
+  points.
+
+**Limits of the evidence**, none of which turns a failure into a pass:
+
+- **Survivor-biased universe:** every run uses today's active ticker list.
+- **Baselines are proxies.** The graded-ladder replay is daily and leaves out the 60-minute
+  trend filter, budget caps, the other six slots and no-buy windows. The flat-$1 proxy is not the
+  graded ladder at all.
+- **Hand-made sector maps:** two slightly different ones, neither reviewed
+  (`analysis/2026-11-24-residual-reversal-cost-basis/sector_map_draft.json`, and a variant that
+  sends funds and unclassified names to SPY).
+- **Only 7 weeks of live fills**, too few for a test.
+- **No corporate-event guard:** no offline point-in-time 8-K or earnings source was supplied.
+
+All nine runs are trials of one experiment, `residual_reversal_cost_basis`, in the Phase 0
+ledger's `trials` table, so a retry's deflated Sharpe starts from `trial_count = 9`.
 
 ## Verification
 
