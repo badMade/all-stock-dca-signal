@@ -158,6 +158,7 @@ def test_a_bad_entry_is_not_skipped_while_good_ones_are_honoured():
 # --- the real checkout file -----------------------------------------------------------------
 
 HARVEST_TICKERS = {"DFTX", "RGTI", "LITE", "CBRS", "VCX", "INTC", "SNDK"}
+OPEN_ENDED_TICKERS = {"RVI"}
 
 
 def _real() -> dict:
@@ -166,10 +167,11 @@ def _real() -> dict:
 
 def test_real_config_blocks_the_seven_harvest_tickers_through_2026_12_21():
     cfg = _real()
-    assert set(cfg["no_buy"]) == HARVEST_TICKERS
+    # RVI is a separate open-ended operator block (2026-11-24, until 2099-12-31), not part of the harvest.
+    assert set(cfg["no_buy"]) == HARVEST_TICKERS | OPEN_ENDED_TICKERS
     assert no_buy_blocked_tickers(cfg, date(2026, 11, 20)) == HARVEST_TICKERS
-    assert no_buy_blocked_tickers(cfg, date(2026, 12, 21)) == HARVEST_TICKERS
-    assert no_buy_blocked_tickers(cfg, date(2026, 12, 22)) == frozenset()
+    assert no_buy_blocked_tickers(cfg, date(2026, 12, 21)) == HARVEST_TICKERS | OPEN_ENDED_TICKERS
+    assert no_buy_blocked_tickers(cfg, date(2026, 12, 22)) == OPEN_ENDED_TICKERS
 
 
 def test_real_config_keeps_the_harvest_tickers_active_for_tracking():
@@ -182,7 +184,8 @@ def test_real_config_entries_start_unreleased_and_carry_a_reason():
     for symbol, entry in _real()["no_buy"].items():
         assert entry["released_on"] is None, f"{symbol} should start unreleased"
         assert entry["reason"].strip(), f"{symbol} needs a reason"
-        assert entry["blocked_on"] == "2026-11-20"
+        expected = "2026-11-24" if symbol in OPEN_ENDED_TICKERS else "2026-11-20"
+        assert entry["blocked_on"] == expected
 
 
 def test_a_symbol_outside_active_or_in_excluded_is_still_just_a_blocklist_entry():
