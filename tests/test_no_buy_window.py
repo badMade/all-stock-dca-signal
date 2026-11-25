@@ -158,20 +158,34 @@ def test_a_bad_entry_is_not_skipped_while_good_ones_are_honoured():
 # --- the real checkout file -----------------------------------------------------------------
 
 HARVEST_TICKERS = {"DFTX", "RGTI", "LITE", "CBRS", "VCX", "INTC", "SNDK"}
-OPEN_ENDED_TICKERS = {"RVI"}
 
 
 def _real() -> dict:
     return json.loads(REAL_TICKERS_JSON.read_bytes())
 
 
+def _harvest_only(cfg: dict) -> dict:
+    """The real config with its ``no_buy`` block narrowed to the seven harvest entries.
+
+    The operator adds other blocks to the same file on their own schedule (2026-11-24: an open-ended RVI
+    block for its wide bid/ask spread). Those are not this window's business, so the harvest assertions
+    below run on the harvest entries alone instead of pinning the whole block to exactly seven names --
+    the earlier ``set(cfg["no_buy"]) == HARVEST_TICKERS`` turned every such config edit into a red suite.
+    """
+    return {**cfg, "no_buy": {sym: e for sym, e in cfg["no_buy"].items() if sym in HARVEST_TICKERS}}
+
+
 def test_real_config_blocks_the_seven_harvest_tickers_through_2026_12_21():
     cfg = _real()
-    # RVI is a separate open-ended operator block (2026-11-24, until 2099-12-31), not part of the harvest.
-    assert set(cfg["no_buy"]) == HARVEST_TICKERS | OPEN_ENDED_TICKERS
-    assert no_buy_blocked_tickers(cfg, date(2026, 11, 20)) == HARVEST_TICKERS
-    assert no_buy_blocked_tickers(cfg, date(2026, 12, 21)) == HARVEST_TICKERS | OPEN_ENDED_TICKERS
-    assert no_buy_blocked_tickers(cfg, date(2026, 12, 22)) == OPEN_ENDED_TICKERS
+    assert HARVEST_TICKERS <= set(cfg["no_buy"]), "every harvest ticker must still have its entry"
+    harvest = _harvest_only(cfg)
+    assert no_buy_blocked_tickers(harvest, date(2026, 11, 19)) == frozenset()
+    assert no_buy_blocked_tickers(harvest, date(2026, 11, 20)) == HARVEST_TICKERS
+    assert no_buy_blocked_tickers(harvest, date(2026, 12, 21)) == HARVEST_TICKERS
+    assert no_buy_blocked_tickers(harvest, date(2026, 12, 22)) == frozenset()
+    # And the whole real file (other blocks included) still blocks all seven through the last day.
+    assert HARVEST_TICKERS <= no_buy_blocked_tickers(cfg, date(2026, 12, 21))
+    assert not (no_buy_blocked_tickers(cfg, date(2026, 12, 22)) & HARVEST_TICKERS)
 
 
 def test_real_config_keeps_the_harvest_tickers_active_for_tracking():
@@ -181,11 +195,13 @@ def test_real_config_keeps_the_harvest_tickers_active_for_tracking():
 
 
 def test_real_config_entries_start_unreleased_and_carry_a_reason():
+    # Every entry in the real file carries a reason; the 2026-11-20 sale date and "still unreleased" are
+    # facts about the harvest entries only (another block starts on its own date and may be released early).
     for symbol, entry in _real()["no_buy"].items():
-        assert entry["released_on"] is None, f"{symbol} should start unreleased"
         assert entry["reason"].strip(), f"{symbol} needs a reason"
-        expected = "2026-11-24" if symbol in OPEN_ENDED_TICKERS else "2026-11-20"
-        assert entry["blocked_on"] == expected
+    for symbol, entry in _harvest_only(_real())["no_buy"].items():
+        assert entry["released_on"] is None, f"{symbol} should start unreleased"
+        assert entry["blocked_on"] == "2026-11-20"
 
 
 def test_a_symbol_outside_active_or_in_excluded_is_still_just_a_blocklist_entry():

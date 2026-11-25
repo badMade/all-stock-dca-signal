@@ -38,20 +38,38 @@ from near_close_dca import (
 )
 
 HARVEST = {"DFTX", "RGTI", "LITE", "CBRS", "VCX", "INTC", "SNDK"}
-# RVI: open-ended operator block (2026-11-24, until 2099-12-31) that outlives the harvest window.
-OPEN_ENDED = {"RVI"}
-BLOCKED_IN_WINDOW = HARVEST | OPEN_ENDED
 PERMANENT_EXCLUDED = {"QBUT", "KVUE"}
-IN_WINDOW = date(2026, 11, 24)  # first day both the harvest block and the open-ended RVI block apply
+IN_WINDOW = date(2026, 11, 23)  # the first trading day after the sales
 LAST_BLOCKED_DAY = date(2026, 12, 21)
 FIRST_FREE_DAY = date(2026, 12, 22)
+
+
+def _other_blocks(on: date) -> frozenset:
+    """The real config's NON-harvest ``no_buy`` entries that are live on ``on``.
+
+    These tests pin the seven 2026-11-20 harvest tickers. The operator adds further blocks to the same file
+    on their own schedule (2026-11-24: an open-ended RVI block for its wide spread), and those are not this
+    window's business -- pinning the whole set to exactly ``HARVEST`` turned every such config edit into a
+    red suite. So the expected set is ``HARVEST`` (inside the window) plus whatever else the real file blocks
+    that day, computed from the non-harvest entries alone through the same pure rule; the harvest tickers
+    themselves are still checked exactly, in and out of the window.
+    """
+    cfg = json.loads((get_config_dir() / "tickers.json").read_text())
+    others = {sym: entry for sym, entry in cfg.get("no_buy", {}).items() if sym not in HARVEST}
+    return dca_config.no_buy_blocked_tickers({**cfg, "no_buy": others}, on)
+
+
+def _blocked(loaded: dict) -> frozenset:
+    """``load_tickers`` omits the key when nothing is blocked; read that as the empty set."""
+    return loaded.get("no_buy_tickers", frozenset())
 
 
 # --- the shared loader: surfaces the set, leaves the universe alone ---------------------------
 
 
 def test_loader_surfaces_the_blocked_set_inside_the_window():
-    assert load_tickers(get_config_dir(), today=IN_WINDOW)["no_buy_tickers"] == frozenset(BLOCKED_IN_WINDOW)
+    blocked = _blocked(load_tickers(get_config_dir(), today=IN_WINDOW))
+    assert blocked == frozenset(HARVEST) | _other_blocks(IN_WINDOW)
 
 
 def test_loader_leaves_the_universe_and_the_excluded_set_untouched():
@@ -63,27 +81,33 @@ def test_loader_leaves_the_universe_and_the_excluded_set_untouched():
 
 
 def test_loader_blocks_through_the_last_day_and_resumes_after_it():
-    assert load_tickers(get_config_dir(), today=LAST_BLOCKED_DAY)["no_buy_tickers"] == frozenset(BLOCKED_IN_WINDOW)
-    assert load_tickers(get_config_dir(), today=FIRST_FREE_DAY)["no_buy_tickers"] == frozenset(OPEN_ENDED)
+    last = _blocked(load_tickers(get_config_dir(), today=LAST_BLOCKED_DAY))
+    assert last == frozenset(HARVEST) | _other_blocks(LAST_BLOCKED_DAY)
+    free = _blocked(load_tickers(get_config_dir(), today=FIRST_FREE_DAY))
+    assert not (free & HARVEST), "every harvest ticker must be buyable again on 2026-12-22"
+    assert free == _other_blocks(FIRST_FREE_DAY)
 
 
 def test_loader_blocks_nothing_before_the_sale_date():
-    assert "no_buy_tickers" not in load_tickers(get_config_dir(), today=date(2026, 11, 19))
+    before = date(2026, 11, 19)
+    assert _blocked(load_tickers(get_config_dir(), today=before)) == _other_blocks(before)
+    assert not (_blocked(load_tickers(get_config_dir(), today=before)) & HARVEST)
 
 
 def test_loader_default_clock_is_read_through_the_today_seam(monkeypatch):
     monkeypatch.setattr(dca_config, "_today_et", lambda: IN_WINDOW)
-    assert load_tickers(get_config_dir())["no_buy_tickers"] == frozenset(BLOCKED_IN_WINDOW)
+    assert _blocked(load_tickers(get_config_dir())) == frozenset(HARVEST) | _other_blocks(IN_WINDOW)
     monkeypatch.setattr(dca_config, "_today_et", lambda: FIRST_FREE_DAY)
-    assert load_tickers(get_config_dir())["no_buy_tickers"] == frozenset(OPEN_ENDED)
+    assert _blocked(load_tickers(get_config_dir())) == _other_blocks(FIRST_FREE_DAY)
 
 
 def test_strategy_config_uses_the_runs_own_clock_not_the_hosts():
-    inside = load_strategy_config(get_config_dir(), now=datetime(2026, 11, 24, 15, 30))
-    assert inside.no_buy_tickers == frozenset(BLOCKED_IN_WINDOW)
+    inside = load_strategy_config(get_config_dir(), now=datetime(2026, 11, 23, 15, 30))
+    assert inside.no_buy_tickers == frozenset(HARVEST) | _other_blocks(IN_WINDOW)
     assert HARVEST <= set(inside.tickers) and not (HARVEST & set(inside.excluded_tickers))
     after = load_strategy_config(get_config_dir(), now=datetime(2026, 12, 22, 15, 30))
-    assert after.no_buy_tickers == frozenset(OPEN_ENDED)
+    assert after.no_buy_tickers == _other_blocks(FIRST_FREE_DAY)
+    assert not (after.no_buy_tickers & HARVEST)
     assert tuple(after.tickers) == tuple(inside.tickers)
 
 
@@ -124,7 +148,7 @@ def test_stream_configs_carry_the_blocked_set_and_keep_the_universe(monkeypatch,
     free = loader(get_config_dir(), **kwargs)
     monkeypatch.setattr(dca_config, "_today_et", lambda: IN_WINDOW)
     config = loader(get_config_dir(), **kwargs)
-    assert config.no_buy_tickers == frozenset(BLOCKED_IN_WINDOW)
+    assert config.no_buy_tickers == frozenset(HARVEST)
     assert tuple(config.tickers) == tuple(free.tickers)
     assert config.excluded_tickers == free.excluded_tickers
 
@@ -252,8 +276,8 @@ def test_runner_blocked_tickers_do_not_count_toward_tier_selection():
 
 
 def test_runner_helper_reads_the_block_at_call_time():
-    assert dca_runner._no_buy_blocked(IN_WINDOW) == frozenset(BLOCKED_IN_WINDOW)
-    assert dca_runner._no_buy_blocked(FIRST_FREE_DAY) == frozenset(OPEN_ENDED)
+    assert dca_runner._no_buy_blocked(IN_WINDOW) == frozenset(HARVEST) | _other_blocks(IN_WINDOW)
+    assert dca_runner._no_buy_blocked(FIRST_FREE_DAY) == _other_blocks(FIRST_FREE_DAY)
 
 
 # --- the plan builders and validators refuse a blocked symbol like an excluded one -----------

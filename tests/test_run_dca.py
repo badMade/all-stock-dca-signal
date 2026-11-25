@@ -37,8 +37,12 @@ def _now_for_slot(slot, day: tuple[int, int, int] = (2026, 7, 6)):
 
 
 def _demo_config():
-    # Approve the demo trading day regardless of the bundled window.
-    return load_strategy_config(approved_test_dates=frozenset({_now().date()}))
+    # Approve the demo trading day regardless of the bundled window. ``now=_now()`` pins the
+    # config's run-dated inputs (the tickers.json ``no_buy`` window above all) to the same
+    # 2026-07-06 day these tests run on. Without it the loader read the HOST clock: from
+    # 2026-11-20 the seven harvest tickers (and from 2026-11-24 the open-ended RVI block) came
+    # back blocked for a July run, and their ``no_buy_window`` skips broke the cap-gate pins.
+    return load_strategy_config(approved_test_dates=frozenset({_now().date()}), now=_now())
 
 
 def test_demo_runtime():
@@ -8569,10 +8573,8 @@ def test_run_slot_stops_at_the_shared_daily_order_count_cap(tmp_path):
 
     capped_reasons, capped_state = _candidate_skip_reasons("capped", already_booked=True)
     # Whole-share tickers (e.g. BYDDY) only accumulate and never reach the cap
-    # gate, so they are the one tolerated non-cap reason; a no_buy_window ticker (RVI,
-    # open-ended block from 2026-11-24) is refused before the cap gate for the same reason.
-    tolerated = lambda r: str(r).startswith("whole-share:") or r == "no_buy_window"  # noqa: E731
-    assert {r for r in capped_reasons if not tolerated(r)} == {"cap would be exceeded"}
+    # gate, so they are the one tolerated non-cap reason.
+    assert {r for r in capped_reasons if not str(r).startswith("whole-share:")} == {"cap would be exceeded"}
     assert capped_state["counts"]["submitted"] == 0
     assert capped_state["completion_reason"] == "blocked_before_spread_gate"
 
