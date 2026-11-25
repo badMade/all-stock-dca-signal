@@ -5303,7 +5303,7 @@ class MorningDCAExecutor(DCAExecutor):
                     return False
                 try:
                     amount = float(val)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return False
                 return math.isfinite(amount) and amount > 0
 
@@ -6278,7 +6278,7 @@ class MorningDCAExecutor(DCAExecutor):
                 else:
                     try:
                         amount_float = float(amount)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         amount_float = math.nan
                 # Reject inf/-inf/nan for the same reason as the CSV cross-check
                 # below: an infinite amount would seed infinite cap spend. A
@@ -6821,10 +6821,10 @@ class MorningDCAExecutor(DCAExecutor):
                     raw_dup_amt = (dup_order or {}).get("dollar_amount") or (dup_order or {}).get("notional")
                     dup_amount = (
                         float(raw_dup_amt)
-                        if raw_dup_amt
+                        if raw_dup_amt and not isinstance(raw_dup_amt, bool)
                         else prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                     )
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                 if dup_amount is None or not math.isfinite(dup_amount) or dup_amount <= 0:
                     dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
@@ -7854,7 +7854,7 @@ class MorningDCAExecutor(DCAExecutor):
                         continue
                     try:
                         amt_float = float(amt)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                     # float() also accepts "Infinity"/"NaN" -- inf > 0 is
                     # True, so an infinite amount passed the positivity
@@ -9165,9 +9165,9 @@ class MorningDCAExecutor(DCAExecutor):
                         continue
                     try:
                         _cf_float = float(_cf_amt)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
-                    if _cf_float > 0:
+                    if math.isfinite(_cf_float) and _cf_float > 0:
                         carried_forward_total += _cf_float
                 if carried_forward_total > 0:
                     self._own_recorded_scheduled[trading_day] = (

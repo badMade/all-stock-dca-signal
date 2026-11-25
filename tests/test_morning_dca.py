@@ -14933,3 +14933,50 @@ def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
     assert "dca-runner-1030-2026-07-08-AAPL" in asked[0]
     assert "morning-dca-manual-2026-07-08-AAPL" not in asked[0]
 
+
+def test_morning_executor_persisted_and_duplicate_amount_guards(tmp_path):
+    """Oversized ints, booleans, and non-finite strings in persisted/duplicate
+    order amounts must fail closed rather than raise OverflowError, coerce True
+    to $1.00, or poison _own_recorded_scheduled to Infinity."""
+    ex = _live_executor(tmp_path, ("NVDA",))
+    now = _now_live()  # Wednesday 2026-07-08
+    tue_dir = Path(ex.state_root) / "20260707_1030ET"
+    tue_dir.mkdir(parents=True, exist_ok=True)
+    overflow_row = {"ticker": "NVDA", "status": "submitted", "planned_amount_usd": 10**400}
+    (tue_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "tue-overflow", "trading_day": "2026-07-07", "buy_candidates": [overflow_row]}),
+        encoding="utf-8",
+    )
+    ex._seed_ledger_from_prior_runs(now)
+    assert ex._cap_seed_scan_incomplete is True
+    (tue_dir / "run_state.json").unlink()
+    ex._cap_seed_scan_incomplete = False
+    ex._cap_seed_scan_incomplete_paths.clear()
+
+    slot_dir = ex.run_state_dir(now)
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    (slot_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "wed-prior", "trading_day": "2026-07-08", "buy_candidates": [overflow_row]}),
+        encoding="utf-8",
+    )
+
+    class _BoolDupBroker(_TopUpBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "dup-1", "dollar_amount": True}
+
+    top_up = TopUpOutcome("NVDA", 4.0, 90.0, 2.0, 95.0, "prior-1", "afternoon", 2.0, "top_up_allowed", False)
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal("NVDA")], date(2026, 7, 8), _BoolDupBroker(), {"NVDA": top_up}, 180.0, 900.0
+    )
+    assert outcomes["NVDA"]["submitted_amount_usd"] == ex.config.max_per_order_usd
+
+    ex._seeded_prior_run_ids.add("wed-prior")
+    inf_row = {"ticker": "AMD", "status": "submitted", "planned_amount_usd": "Infinity"}
+    (slot_dir / "run_state.json").write_text(
+        json.dumps({"run_id": "wed-prior", "trading_day": "2026-07-08", "buy_candidates": [inf_row, overflow_row]}),
+        encoding="utf-8",
+    )
+    ex.run(now, DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0}), broker=_TopUpBroker())
+    assert math.isfinite(ex._own_recorded_scheduled.get(date(2026, 7, 8), 0.0))
+
+
