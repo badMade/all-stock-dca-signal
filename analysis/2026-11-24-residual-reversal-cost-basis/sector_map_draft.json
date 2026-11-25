@@ -1,16 +1,17 @@
 {
-  "version": "2026-11-24-draft",
-  "status": "draft, NOT reviewed",
+  "version": "2026-11-24-r1",
+  "status": "reviewed by the operator 2026-11-24 for this backtest only; still not the committed config table",
+  "review_changes": "2026-11-24: SNDK moved from SMH to XLK (GICS technology hardware). The three graded-ladder runs used the pre-review map, version 2026-11-24-draft, which had SNDK on SMH.",
   "description": "Ticker -> sector ETF for the 2026-11-24 residual-reversal cost-basis backtest only. Assigned by hand from each company's GICS sector as the author understood it on 2026-11-24, not from SEC SIC codes, so it is NOT the committed, reviewed table docs/adr-factor-residual-dip-signals.md rule 4 asks for. Semiconductors and memory map to SMH rather than XLK because XLK is dominated by three mega-caps. null means no ETF is assigned: funds, ETFs, and tickers the author could not classify with confidence. The suggester guards a null ticker as no_benchmark (multiplier 1.0), so it still buys at the baseline. The map is today's classification applied to every past session, so a past reclassification (for example MA and the other payment companies moving from XLK to XLF in 2023) is not point in time.",
   "etf_by_ticker": {
     "ASML": "SMH", "AMAT": "SMH", "AMD": "SMH", "MRVL": "SMH", "STM": "SMH", "TSM": "SMH",
     "AVGO": "SMH", "NVDA": "SMH", "INTC": "SMH", "MU": "SMH", "TXN": "SMH", "QCOM": "SMH",
-    "GFS": "SMH", "SNDK": "SMH",
+    "GFS": "SMH",
 
     "MSFT": "XLK", "AAPL": "XLK", "IBM": "XLK", "CSCO": "XLK", "ANET": "XLK", "FFIV": "XLK",
     "APH": "XLK", "TEL": "XLK", "GLW": "XLK", "MSI": "XLK", "CIEN": "XLK", "VIAV": "XLK",
     "STX": "XLK", "WDC": "XLK", "COHR": "XLK", "LITE": "XLK", "QBTS": "XLK", "RGTI": "XLK",
-    "QUBT": "XLK",
+    "QUBT": "XLK", "SNDK": "XLK",
 
     "GOOGL": "XLC", "GOOG": "XLC", "NFLX": "XLC", "IRDM": "XLC",
 

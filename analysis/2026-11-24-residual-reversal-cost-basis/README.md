@@ -8,7 +8,7 @@ Nothing here is read by the strategy. The report JSON is written outside the rep
 | File | What it is |
 | --- | --- |
 | `run_cost_basis_backtest.py` | Loads the archive, replays the 3:30 PM ladder point in time as the baseline (`dca_ladder_core`), runs the three pre-declared variants through the harness, and writes one report JSON with each variant's summary, its `trials` row (the three rows were ingested into the Phase 0 ledger on 2026-11-24) and the deflated Sharpe / PBO comparison. No network. |
-| `sector_map_draft.json` | Ticker to sector ETF, assigned by hand on 2026-11-24. **Draft, not reviewed**: not the committed table `docs/adr-factor-residual-dip-signals.md` rule 4 asks for. |
+| `sector_map_draft.json` | Ticker to sector ETF, assigned by hand and reviewed by the operator on 2026-11-24 (SNDK moved to XLK after the runs). Still not the committed table `docs/adr-factor-residual-dip-signals.md` rule 4 asks for. |
 | `test_run_cost_basis_backtest.py` | Offline checks of the ladder replay and the CSV loader. |
 
 Run from the repo root (it lives here, not in `dca-sizing-signals/`, because it imports

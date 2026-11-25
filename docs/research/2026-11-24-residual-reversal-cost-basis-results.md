@@ -19,8 +19,9 @@ PYTHONPATH=.:dca-sizing-signals python analysis/2026-11-24-residual-reversal-cos
 - **Universe:** `config/tickers.json` `active` as of 2026-11-24 (122 symbols), so
   **survivor-biased**: names that were dropped or delisted are absent, and the harness labels
   the run that way.
-- **Sector map:** `sector_map_draft.json` (`2026-11-24-draft`), assigned by hand and **not
-  reviewed**. 102 tickers map to 10 ETFs (SMH, XLK, XLC, XLY, XLF, XLI, XLV, XLP, XLRE, XLU); the
+- **Sector map:** `sector_map_draft.json` (`2026-11-24-draft`), assigned by hand and not
+  reviewed at run time. The operator reviewed it afterwards and moved only SNDK, from SMH to XLK
+  (committed as `2026-11-24-r1`); one ticker out of 102 cannot move a result this far from the bar. 102 tickers map to 10 ETFs (SMH, XLK, XLC, XLY, XLF, XLI, XLV, XLP, XLRE, XLU); the
   20 funds and unclassified tickers are unmapped, so they buy at the baseline. Today's
   classification is applied to every past session.
 - **ETF data:** the archive had no sector-ETF histories. Full daily Yahoo history for SPY and 13
