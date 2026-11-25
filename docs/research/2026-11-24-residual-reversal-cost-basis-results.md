@@ -114,7 +114,9 @@ everything measured. They do not change the conclusion: there is no evidence her
 - **Trials ingested 2026-11-24** with the operator's approval: three rows (`rr-cb-2026-11-24-default`,
   `-slope_0.05`, `-slope_0.2`) in the Phase 0 ledger (`cron_tracking/goal_snapshot/ledger.duckdb`,
   experiment `residual_reversal_cost_basis`, run id `rr-cost-basis-2026-11-24`). Any later variant
-  of this experiment deflates against `trial_count` starting from 3.
+  of this experiment deflates against its `trial_count`. Six more runs by another session (flat-$1
+  proxy and live-fill baselines) were added the same day, so the count is 9; they are tabulated in
+  `docs/adr-residual-reversal-suggester.md`, "Results".
 - **The report JSON is not committed** (generated output, as for the Kalman Phase 1 run).
 - **No re-run with a reviewed sector map, an 8-K/earnings source, or a dated universe.** Those
   would be the next steps only if there were a reason to revisit the suggester.
