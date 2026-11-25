@@ -1,6 +1,8 @@
 # Octopus band scorecard and calibrator evaluation
 
-Status: proposed. Rock 1 is implemented on PR #2300 and not merged.
+Status: proposed. (2026-11-24 audit: Rocks 1 to 4 are in the code: the interval score and breach sides in
+`wondrous-octopus/metrics.py`, `band_uncertainty.py`, `trust_scorecard.py` and `synthetic_truth.py`.
+Rock 5, the calibrator replay, waits on open questions 1 and 2.)
 
 ## Context
 

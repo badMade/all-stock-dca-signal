@@ -959,6 +959,26 @@ def upsert_shadow_ml(path, runs):
     return len(rows)
 
 
+def upsert_shadow_adr_price(path, run_date, records):
+    """Merge one day's ``adr_price`` surrogate ranking into ``shadow_adr_price_history.csv`` (same columns as
+    ``backfill-history`` output, so ``grade`` reads it directly); returns the row count. Shadow only: the surrogate
+    is logged beside the composite and never touches the score, the trade list or the proposal."""
+    path = Path(path)
+    day = run_date.isoformat()
+    rows = [r for r in read_history(path) if r["date"] != day]
+    size = len(records)
+    for ticker, rec in sorted(records.items(), key=lambda kv: kv[1]["rank"]):
+        rows.append({"date": day, "ticker": ticker, "score": f"{rec['score']:.3f}", "rank": str(rec["rank"]),
+                     "universe_size": str(size), "vol": f"{rec['vol']:.4f}", "max_dd": f"{rec['max_dd']:.4f}",
+                     "eligible": "1" if rec["eligible"] else "0"})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def ml_scorecard(ml_rows, history_rows, series_by_ticker, horizon_days=ML_HORIZON_DAYS):
     """Per run date: rank correlation of ml-forecaster's tilt and of the composite score with the realised return over
     the next ``horizon_days`` calendar days (only dates whose horizon has fully elapsed in the price data)."""
@@ -1248,6 +1268,12 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
         upsert_shadow(data_dir / "shadow_octopus_history.csv", octopus, pcts)
     if ml_runs:
         upsert_shadow_ml(data_dir / "shadow_ml_history.csv", ml_runs)
+    summary_extra = {}
+    if args.universe == "archive":
+        # Shadow challenger: the price-only ADR surrogate, ranked over the same archive and logged for later grading.
+        adr_records, _ = score_universe_adr_price(series, as_of, params["liquidity"])
+        summary_extra["shadow_adr_price_rows"] = upsert_shadow_adr_price(
+            data_dir / "shadow_adr_price_history.csv", as_of, adr_records)
     trade = build_trade_list(records, held, params)
     write_trade_list(run_dir, data_dir / "trade_list_history.csv", as_of, records, trade, params)
     tickers_config = _load_json(Path(args.config_dir) / "tickers.json", {})
@@ -1269,7 +1295,7 @@ def run_once(args, tickers, held, names, sectors, series, as_of):
                "above_threshold": above, "threshold": args.threshold, "no_price_history": len(missing),
                "not_scored_or_stale": len(stale), "eligible": sum(1 for r in records.values() if r.get("eligible", True)),
                "trade_list": len(trade), "params_version": params["version"],
-               "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"])}
+               "proposal_add": len(proposal["add"]), "proposal_stop_buying": len(proposal["stop_buying"]), **summary_extra}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # read by the console page
     return {**summary, "run_dir": str(run_dir)}
 
@@ -1394,6 +1420,47 @@ def read_scores_csv(path):
     """{date: {ticker: score}} and eligibility from a generic ``date,ticker,score[,eligible]`` export (e.g. the
     dynamic-universe scorer's ``universe_scores`` table)."""
     return scores_from_history(read_history(path))
+
+
+def blend_scores(parts, weights):
+    """Weighted blend of several rankings, date by date. ``parts`` is a list of ``(scores_by_date, eligible_by_date)``
+    as ``read_scores_csv`` returns. Each ranking is first turned into percentiles over its own eligible pool (the two
+    score scales differ), then averaged with ``weights`` (normalised). A name must be scored by every ranking on that
+    date and is eligible only when every ranking calls it eligible. Returns (scores_by_date, eligible_by_date)."""
+    total = float(sum(weights))
+    if total <= 0 or len(parts) != len(weights) or any(w < 0 for w in weights):
+        raise ValueError("weights must be non-negative, sum above zero, one per input")
+    out, out_elig = {}, {}
+    for day in sorted(set.intersection(*(set(sc) for sc, _ in parts))):
+        pct = []
+        for scores, eligible in parts:
+            elig = eligible.get(day)
+            pct.append(pooled_percentiles(scores[day], {t: (elig is None or t in elig) for t in scores[day]}))
+        names = set.intersection(*(set(p) for p in pct))
+        out[day] = {t: sum(w * p[t] for w, p in zip(weights, pct, strict=True)) / total for t in names}
+        out_elig[day] = {t for t in names if all(el.get(day) is None or t in el[day] for _, el in parts)}
+    return out, out_elig
+
+
+def cmd_blend_history(args):
+    """Blend two or more score-history CSVs (e.g. composite + adr_price backfills) into one gradable CSV."""
+    parts = [read_scores_csv(path) for path in args.inputs]
+    weights = args.weights or [1.0] * len(parts)
+    scores, eligible = blend_scores(parts, weights)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows = 0
+    with out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["date", "ticker", "score", "rank", "eligible"])
+        writer.writeheader()
+        for day in sorted(scores):
+            ranked = sorted(scores[day], key=lambda t: (-scores[day][t], t))
+            for rank, ticker in enumerate(ranked, 1):
+                writer.writerow({"date": day, "ticker": ticker, "score": f"{scores[day][ticker]:.3f}", "rank": rank,
+                                 "eligible": "1" if ticker in eligible[day] else "0"})
+                rows += 1
+    print(json.dumps({"dates": len(scores), "rows": rows, "out": str(out), "weights": weights}))
+    return 0
 
 
 def trading_days(series_by_ticker, start, end, min_share=0.5):
@@ -1610,6 +1677,11 @@ def build_parser():
                     help="composite (default) or adr_price: a price-only surrogate of the dynamic-universe ADR's "
                          "momentum + low-vol factors, for side-by-side grading only")
     bh.set_defaults(func=cmd_backfill_history)
+    bl = sub.add_parser("blend-history", help="blend score-history CSVs by eligible-pool percentile, for grading only")
+    bl.add_argument("--inputs", nargs="+", required=True, help="date,ticker,score[,eligible] CSVs to blend")
+    bl.add_argument("--weights", type=float, nargs="+", default=None, help="one weight per input (default equal)")
+    bl.add_argument("--out", required=True, help="output CSV (not history.csv)")
+    bl.set_defaults(func=cmd_blend_history)
     gr = sub.add_parser("grade", help="rank IC, quintile spread, top-N edge, turnover and cost drag by horizon")
     gr.add_argument("--horizons", type=int, nargs="+", default=list(GRADE_HORIZONS), help="calendar days ahead")
     gr.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)

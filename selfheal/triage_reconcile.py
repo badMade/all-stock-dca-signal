@@ -32,6 +32,7 @@ __all__ = [
     "CHECKS_GREEN",
     "CHECKS_PENDING",
     "CHECKS_RED",
+    "OPERATOR_CONFIRMED_PRS",
     "PROGRESS_BRANCH_ONLY",
     "PROGRESS_CLOSED_UNMERGED",
     "PROGRESS_LABELS",
@@ -62,6 +63,12 @@ APPROVED = "Approved"
 
 #: The branch a repair for ``Key`` is pushed to.
 BRANCH_PREFIX = "selfheal/"
+
+#: Operator-confirmed fix PRs, ``Key -> PR number``, for a merged fix whose title, head ref and body never name its
+#: Key (2026-11-23: the three rows the digest skipped every run). Empty by default; an entry is a reviewed code change,
+#: so the confirmation is version-controlled and cannot be set from the Notion row alone. It only takes effect when the
+#: row's own ``PR number`` agrees with it and that PR is in the fetched list, so a stale entry never invents a fix.
+OPERATOR_CONFIRMED_PRS: dict[str, int] = {}
 
 #: Check status as the caller maps it. Anything else is refused, not guessed.
 CHECKS_GREEN = "green"
@@ -270,6 +277,7 @@ def match_git_evidence(
     issues: Iterable[Mapping[str, object]],
     recorded_pr_number: int | None = None,
     recorded_commit_url: str | None = None,
+    confirmed_pr_number: int | None = None,
     shallow: bool = False,
     commit_present: Mapping[str, bool] | None = None,
 ) -> GitEvidence:
@@ -307,6 +315,11 @@ def match_git_evidence(
             When it is among ``commits`` and its message still cites the key,
             it wins over any other match, so a newer commit that merely
             discusses the key never displaces the real fix commit.
+        confirmed_pr_number: The operator-confirmed fix PR for this Key
+            (:data:`OPERATOR_CONFIRMED_PRS`), if any. Used only when nothing else matched, ``recorded_pr_number``
+            equals it, and that PR is among ``prs``; then it counts as the matched PR even though it never cites
+            the Key. Any other combination leaves the row ``recorded_pr_unconfirmed``, so a confirmation that
+            disagrees with the row, or names a PR that was not fetched, never produces a fix.
         shallow: Whether the caller's repository is shallow.
         commit_present: Per-SHA results of ``git cat-file -e <sha>^{commit}``,
             queried by the caller for recorded commits. Never infer absence from
@@ -344,7 +357,9 @@ def match_git_evidence(
     # Those are kept in ``mentioned_in`` so the operator can still see them. Newest wins within each group.
     about: list[PullRequestRef] = []
     cited: list[PullRequestRef] = []
+    every_pr: list[PullRequestRef] = []
     for ref, head_ref, title, searchable in (_parse_pr(raw, repo_url) for raw in prs):
+        every_pr.append(ref)
         if head_ref == expected_branch or _mentions(key, title):
             about.append(ref)
         elif _mentions(key, searchable):
@@ -356,6 +371,14 @@ def match_git_evidence(
         pr = next((ref for ref in cited if ref.number == recorded_pr_number), None)
         if pr is not None:
             cited = [ref for ref in cited if ref.number != recorded_pr_number]
+    # The operator's confirmation is the last resort, after text evidence and the body-citation fallback, and it needs
+    # the row to record the same PR. It is validated like the recorded number so a typo cannot slip through.
+    if confirmed_pr_number is not None and (isinstance(confirmed_pr_number, bool) or not isinstance(confirmed_pr_number, int)):
+        raise EvidenceError("confirmed_pr_number must be an integer")
+    if pr is None and confirmed_pr_number is not None and confirmed_pr_number == recorded_pr_number:
+        pr = next((ref for ref in every_pr if ref.number == confirmed_pr_number), None)
+        if pr is not None:
+            cited = [ref for ref in cited if ref.number != confirmed_pr_number]
     mentioned_in = max(cited, key=lambda ref: ref.number, default=None)
 
     if recorded_commit_url is not None and not isinstance(recorded_commit_url, str):

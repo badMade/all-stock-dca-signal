@@ -8,7 +8,7 @@ with its own `pyproject.toml` and `tests/`, following the same conventions.
 
 ## What this is
 
-Four packages that only depend on each other in one direction, enforced by both the
+The packages here only depend on each other in one direction, enforced by both the
 type system and a CI test, not by convention alone:
 
 | Package | Role |
@@ -16,6 +16,12 @@ type system and a CI test, not by convention alone:
 | `dca_shared_interfaces/` | The neutral contracts (`ForecastProvider`, `SizingSuggester`, `SizingSuggestion`) and the reusable fail-closed guarded-publish base class. Depends on nothing else in this repo. |
 | `connector_signals/` | A concrete `SizingSuggester` sourced from Robinhood-connector-obtained market data. Implements `dca_shared_interfaces.forecasting.SizingSuggester`. |
 | `comovement_signals/` | Research-only co-movement signals 1 (cluster concentration cap) and 2 (correlated selloff detector) from `docs/adr-comovement-signals.md`. Pure stdlib functions over caller-supplied close rows; two `SizingSuggester` wrappers; publishes only its own two files. Signals 3 to 5 are shadow/log-only functions (not suggesters) that append to their own JSON-lines files. Not wired into any live path. |
+| `kalman_signals/` | Shadow-only Kalman residual-dip signal from `docs/adr-kalman-residual-dip-shadow.md` (accepted 2026-11-23, Phase 1 offline). Time-varying (alpha, beta) vs the market and the ticker's co-movement cluster; logs a standardized intraday residual and a dip label to its own JSONL file. Not a `SizingSuggester`; nothing on the live side imports it. |
+| `factor_signals/` | Research-only factor (APT) decomposition from `docs/adr-factor-residual-dip-signals.md`. F1: point-in-time, Blume-shrunk market and orthogonalized-sector betas over caller-supplied close rows. F2: a read-only factor exposure report (portfolio beta, sector weights and loadings, factor variance share) for caller-named books. Not a suggester yet; not wired into any live path. |
+| `inventory_signals/` | Research-only, shrink-only `InventoryReservationSuggester` (`docs/inventory_reservation_suggester.md`): an overweight name (cost basis over target) gets a smaller multiplier in [0.25, 1.0] and a deeper top-up discount (`max_buy_price`), scaled by the forecast variance left in the day. Inputs from an injected loader; fails closed; publishes only `inventory_reservation_suggestions.json`. Shadow mode: nothing live reads it. |
+| `mc_research/` | Research-only Monte Carlo harness with variance reduction (`docs/mc_variance_reduction.md`): named seeded streams, path-first GBM generator, estimators that always return mean/SE/CI/n/n_eff (plain, antithetic, control variate, CRN paired difference, importance sampling with a fail-closed ESS floor), and flat-vs-graded DCA runners scored on terminal wealth. Stdlib only; imports nothing else here and nothing live imports it. |
+| `residual_reversal/` | Research-only, budget-neutral sector-ETF residual-reversal suggester (`docs/adr-residual-reversal-suggester.md`): OLS beta on a caller-mapped ETF, OU s-score of the cumulated residual, a bounded [0.75, 1.25] tilt renormalised so the day's dollars are unchanged, and a fail-closed relationship-break guard. Publishes only `residual_reversal_suggestions.json`. Not wired into any live path. |
+| `cost_basis_backtest/` | Research-only, offline walk-forward harness (`docs/adr-cost-basis-backtest-harness.md`): replays the graded baseline and a candidate suggester on the same cash flows and scores paired per-ticker cost-basis improvement, with lookahead rejection, an out-of-sample score-bucket promotion test, deflated Sharpe and PBO. Stdlib only, imports no suggester, writes nothing. Not wired into any live path. |
 | `market_data_ingest/` | The one place in this repo allowed to make network calls: fetches fundamentals, options/IV, index, and earnings data from external sources and writes versioned, point-in-time-stamped local files. `ml_forecaster/` and `wondrous_octopus/` never import this -- only `connector_signals/` does. |
 
 ## What this does NOT do
@@ -67,7 +73,7 @@ file under `dca-sizing-signals/` changes (plus the weekday scheduled run). It in
 (operator decision 2026-11-01: pairs and co-movement as signals, not a pairs strategy).
 
 | Step | Function | Default |
-|---|---|---|
+| --- | --- | --- |
 | Returns | `returns_matrix(close_rows, as_of)`: daily log returns. Rows after `as_of`, rows on `as_of` not marked `final: True` (a forming intraday bar), and `interpolated` rows are ignored; a date counts as a session only when half the listed tickers have a close on it | 252-session window; fewer than 120 returns = singleton |
 | Clusters | `build_clusters(matrix)`: average linkage on 1 - correlation, ties broken by ticker | cut 0.5; pairs need 120 shared sessions |
 | Signal 1 | `cluster_cap_suggestions(...)`: scale an over-cap cluster (2+ members) to the cap | 35% of the day's budget; multiplier floor 0.25 |
@@ -100,7 +106,7 @@ its `as_of`. Each line has `as_of`, `inputs_known_at`, `signal`, `payload`, `liv
 and a SHA-256 `content_hash`; an identical line is not appended twice.
 
 | Signal | Function | Default | Shadow file |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 3 Pair breakdown | `pair_breakdown_shadow(close_rows, as_of)`: pairs with 2-year correlation >= 0.70; flag when the 60-session rolling correlation is strictly below the pair's 2-year 10th percentile (of the earlier rolling values) for 5 sessions; suggests `hold_1x` for both | 504-session lookback, 252 shared returns, 100 reference values | `comovement_pair_breakdown_shadow.jsonl` |
 | 4 Cheaper-leg tilt (speculative) | `cheaper_leg_tilt_shadow(close_rows, as_of, pairs=None, pair_dollars=None)`: pairs with formation correlation >= 0.75; OLS of log A on log B over the 252 closes before the evaluation close only; weight A = clip(0.5 - 0.15 z, 0.2, 0.8) | leg A = alphabetically first | `comovement_tilt_shadow.jsonl` |
 | 5 Rotation log | `rotation_log_shadow(close_rows, as_of, staples, semis)`: mean log return of the caller's staples group minus the semis group, plus its 20-session rolling mean | every group member must have a return | `comovement_rotation_log.jsonl` |
@@ -109,6 +115,103 @@ and a SHA-256 `content_hash`; an identical line is not appended twice.
 from comovement_signals import ShadowWriter, pair_breakdown_shadow, write_shadow_result
 result = pair_breakdown_shadow(close_rows, as_of)
 write_shadow_result(result, ShadowWriter(Path("research/shadow")))  # a failed result writes nothing
+```
+
+## Kalman residual-dip signal (shadow only, Phase 1)
+
+`kalman_signals/` implements Phase 1 of `docs/adr-kalman-residual-dip-shadow.md`. Research
+basis: `docs/research/2026-11-23-kalman-filters.md`.
+
+| Piece | What it does |
+|---|---|
+| `kalman_filter.py` | 2-state (alpha, beta) random-walk regression on plain floats; prior innovation; predict-only step for missing sessions; q picked from a 3-value grid by one-step predictive log-likelihood; `steady_state_gain()` pins the research's EMA-equivalence table |
+| `residual_dip.py` | `residual_dip_shadow(inputs, as_of)`: fits and filters through the prior session, scores the as-of session, splits z into overnight and intraday, labels `idiosyncratic_dip` / `cluster_selloff` / `market_selloff` / `none`. Fails closed with a reason per skipped ticker |
+| `shadow.py` | `ShadowWriter`: appends only `kalman_residual_dip_shadow.jsonl`, refuses a `config/` directory, dedupes by content hash, `live_effect: "none"` |
+| `backtest.py`, `backtest_cli.py` | Monthly-refit walk-forward and the ADR D7 report (calibration pooled and per volatility regime, date-clustered forward returns by intraday-z bucket and by label, earnings-window flags, trials) |
+
+```bash
+python -m kalman_signals.backtest_cli --history-dir ../ticker_data --market SPY --market-file <dir>/SPY.csv \
+    --clusters <members.json> --earnings <earnings_dates.json> \
+    --non-equity QQQ,VT,XLG,AAAU --start 2024-01-02 --end 2026-11-20 --out-json /tmp/k.json --out-md /tmp/k.md
+python -m pytest tests/kalman -q
+```
+
+The managed archive has no SPY, so `--market-file` points at a SPY CSV kept outside it. `--clusters`
+and `--earnings` inputs are built by the scripts in `analysis/2026-11-24-kalman-phase1/`. Results of
+both rounds: `docs/research/2026-11-23-kalman-phase1-results.md`.
+
+## Residual reversal (research only)
+
+`residual_reversal/` implements `docs/adr-residual-reversal-suggester.md`. It is the long-only,
+budget-neutral version of sector-relative stat-arb. It never shorts and never changes the day's
+total, and it only moves the marginal dollar from residually rich names to residually cheap ones.
+
+| Step | Default |
+|---|---|
+| Beta of ticker on its sector ETF (OLS with intercept) | last 90 aligned daily log returns |
+| OU fit of the cumulated residual (AR(1)) | newest 60 residuals; tradable only when `b < exp(-1/30)` |
+| s-score `(X_now - m) / sigma_eq` | no cross-sectional centring |
+| Raw tilt | 1.0 while `abs(s) < 1.25`, else `clip(1 - 0.1 s, 0.75, 1.25)` |
+| Budget neutrality | one common shift across unguarded tickers; the publisher re-checks it |
+
+A ticker trips the break guard on any of: short or stale history, no ETF, R² < 0.25, no mean
+reversion, half-life > 3x its trailing 20-day median, or a point-in-time 8-K 1.01/2.01/5.01 or
+earnings event. A guarded ticker gets **no** suggestion, so the reader keeps its base tier.
+Inputs come from `load_inputs(asof)` (`ResidualReversalInputs`: close rows, proposed buys,
+`benchmark_by_ticker`, optional `CorporateEvent`s). Anything malformed fails the whole run
+closed. The suggestions are unscored (`eval_metric_mae = +inf`; the file records `"mae": null`)
+until the Phase 0 ledger scores them against the graded baseline.
+
+```python
+from residual_reversal import ResidualReversalSuggester, publish_outcome, residual_reversal_publisher
+outcome = ResidualReversalSuggester(load_inputs).evaluate(asof)
+publish_outcome(outcome, residual_reversal_publisher(Path("research/suggestions")))  # failed/all-guarded: writes nothing
+```
+
+```bash
+python -m pytest tests/residual_reversal -q
+```
+
+## Cost-basis backtest harness (research only)
+
+`cost_basis_backtest/` implements `docs/adr-cost-basis-backtest-harness.md`. It replays the
+graded baseline and a candidate side by side on the same cash flows, and asks one question:
+does the candidate lower the price paid per share? It is stdlib only, writes nothing, and
+imports no suggester. A candidate is adapted by duck typing.
+
+- **Point in time.** The decision for session t sees closes before t and events with
+  `known_at` before t. An 8-K enters on its filed date. Both arms fill at the t close and pay
+  the same one-way buy cost.
+- **Rejected, not scored.** A candidate that asks the view for t or later is rejected, even if
+  it catches the error, and so is one that returns a malformed decision. A candidate that peeks
+  around the view trips an IC canary and cannot promote.
+- **Metrics.** The primary metric is paired per-ticker cost-basis improvement in bp. The others:
+  terminal wealth per dollar, forward return of the tilt dollars at 5, 10 and 20 sessions and
+  to the end, hit rate, worst rolling 63-session underperformance, turnover, and forward
+  residual returns by score bucket. The promotion test is strict out-of-sample monotonicity of
+  those buckets.
+- **Overfitting.** `compare_variants` gives the deflated Sharpe ratio, counting every trial
+  (pass the ledger's `trial_count`), and the CSCV PBO.
+- **Ledger seams.** `baseline_from_ledger_fills(store.fills())` reads scheduled fills only.
+  `trial_row(result, ...)` goes to `store.ingest_trials`.
+
+```python
+from cost_basis_backtest import BacktestConfig, SuggesterCandidate, run_backtest
+from residual_reversal import ResidualReversalInputs, ResidualReversalSuggester
+
+def build(view, buys):  # the view is the only data the suggester may close over
+    tickers = sorted(set(buys) | {benchmarks[t] for t in buys})
+    return ResidualReversalSuggester(lambda asof: ResidualReversalInputs(
+        view.close_rows(tickers, lookback_sessions=125), dict(buys), benchmarks,
+        view.events_by_ticker(sorted(buys))))
+
+result = run_backtest(SuggesterCandidate("residual_reversal", build), close_rows, baseline_buys,
+                      events_by_ticker=events, config=BacktestConfig(oos_start=oos, buy_cost_bps=3.0))
+result.summary()["metrics"]["periods"]["out_of_sample"]["cost_basis"]["aggregate"]
+```
+
+```bash
+python -m pytest tests/cost_basis_backtest -q
 ```
 
 ## Price source (Massive + Alpaca)
@@ -120,7 +223,7 @@ end-of-day failover and the intraday last-trade source. The Yahoo history alread
 `docs/adr-price-source-massive-alpaca.md`. It is suggestion-only: nothing in the live DCA
 paths imports it, and the ladder and sizing logic are unchanged.
 
-### Install
+### Install (price source)
 
 ```bash
 cd dca-sizing-signals
@@ -135,7 +238,7 @@ stdlib-only core.
 ### Environment variables
 
 | Variable | Needed for | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `MASSIVE_API_KEY` | daily job, PoC | Sent as an `Authorization: Bearer` header, never in a URL |
 | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY` | daily job (calendar, failover), intraday, PoC | Sent as `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers. The calendar uses the paper trading API |
 | `DCA_PRICE_DB` | optional | DuckDB path. Default `<repo>/data/backfill.duckdb` (gitignored, as is `data/staging/`) |
@@ -177,7 +280,7 @@ works too: `SELECT * FROM adjusted_bars(DATE '2024-06-01', TIMESTAMP '9999-12-31
 ### Troubleshooting
 
 | Symptom (run record `error_class` / `code`) | Meaning and fix |
-|---|---|
+| --- | --- |
 | `IncompleteBatchError` / `no_baseline` | Fewer than 20 stored Massive sessions. Run oldest-first with `--bootstrap` until 20 exist |
 | `IncompleteBatchError` / `below_median` | Massive returned under 90% of the usual row count. The fallback was tried; rerun later. The job re-pulls T-1..T-5 every night |
 | `IncompleteBatchError` / `empty_open_session` | No bars on a day the calendar says was open. Usually the job ran too early; rerun after 20:00 ET |
@@ -197,7 +300,7 @@ store. It is not wired into live sizing, makes no network or broker calls, and n
 live DCA paths imports it. Callers pass already-fetched plain dicts to `LedgerStore.ingest_*`.
 
 | Table | Holds |
-|---|---|
+| --- | --- |
 | `market_sessions` | The trading calendar that horizons count in |
 | `fills`, `baseline_fills` | Live fills (`run_kind` = `scheduled` / `manual`) and the 1x counterfactual per slot decision |
 | `outcomes` | Price at t+N sessions per fill and baseline row, `scored` or `unscored` (never zero) |
@@ -238,6 +341,17 @@ with LedgerStore("data/backfill.duckdb") as ledger:
 
 Tests: `python -m pytest tests/ledger` (offline, synthetic hand-computed fixtures).
 
+**Loading fills from run artifacts** (`market_data_ingest/ledger/run_ingest.py`). Reads a
+cron-tracking tree (never writes it) and appends `fills` and flat-1x `baseline_fills`. It joins
+each run directory's order list and candidates (attribution) with broker order rows pooled from
+every `orders_pages*.json` in the tree, because a run's own pages are a snapshot taken during the run
+and can miss some of its own orders. Orders it cannot prove are skipped with a reason, never stored as zero:
+
+```bash
+python -m market_data_ingest.ledger.run_ingest --root "$DCA_CRON_TRACKING_ROOT" \
+    --db data/backfill.duckdb [--orders-file later_full_pull.json] --json
+```
+
 ### Cash-secured put shadow log (research only, never trades)
 
 `market_data_ingest/ledger/csp_shadow.py` implements the **proposed** ADR
@@ -248,7 +362,7 @@ append-only tables (`csp_shadow_entries`, `csp_shadow_settlements`) via
 `ensure_csp_schema(con)`, under the same rules as the ledger.
 
 | Function | Does |
-|---|---|
+| --- | --- |
 | `select_candidates(...)` | At most one put per active ticker per session: 25-45 days, delta -0.30 to -0.15, spread <= 10% of mid, strike <= ladder buy price, collateral <= 10% of the account per contract and <= 25% in total, none in a sector above 30%, none in a tax-loss pause. Stale, future or non-finite data drops the row with a reason |
 | `record_shadow_entries(con, ...)` | Entries at the **bid** (`entry_price = bid` is also a schema check) |
 | `settle(...)` | OTM expires (premium kept); ITM assigned at strike (cost = strike - premium); early close at the **ask**; unknown price = `unscored`; ex-dividend and deep-ITM flags |

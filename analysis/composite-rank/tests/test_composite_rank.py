@@ -737,3 +737,51 @@ def test_backfill_history_adr_price_model_writes_a_gradable_csv(tmp_path, capsys
     scores, eligible = cr.read_scores_csv(out)
     assert scores and len(next(iter(scores.values()))) == 12
     assert not (data / "history.csv").exists()  # the live history is never touched
+
+
+def test_archive_run_logs_the_adr_price_surrogate_as_a_shadow_without_changing_the_list(tmp_path):
+    data, archive, cfg = tmp_path / "data", tmp_path / "archive", tmp_path / "cfg"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    cfg.mkdir()
+    series = {f"T{i:02d}": _drift_series(0.002 * (i - 5) / 5, 0.001 + 0.0005 * (i % 3)) for i in range(12)}
+    (data / "inputs" / "watchlist.json").write_text(json.dumps(list(series)))
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(
+        {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)] for t, s in series.items()}))
+    args = ["--data-dir", str(data), "--archive-dir", str(archive), "--config-dir", str(cfg), "--universe"]
+    assert cr.main(args + ["archive", "run", "--as-of", "2026-09-01"]) == 0
+    shadow = data / "shadow_adr_price_history.csv"
+    scores, _ = cr.read_scores_csv(shadow)
+    assert len(scores["2026-09-01"]) == 12
+    cr.main(args + ["archive", "run", "--as-of", "2026-09-01"])  # re-running a date replaces it, never duplicates
+    assert len(cr.read_history(shadow)) == 12
+    assert "shadow_adr_price_rows" in json.loads((data / "runs" / "2026-09-01" / "summary.json").read_text())
+    assert cr.main(args + ["all", "run", "--as-of", "2026-09-01", "--allow-active-archive"]) == 0
+    assert len(cr.read_history(shadow)) == 12  # non-archive universes do not write the shadow
+
+
+def test_blend_scores_averages_eligible_pool_percentiles_and_intersects_names():
+    a = ({"d": {"X": 10.0, "Y": 20.0, "Z": 30.0}}, {"d": {"X", "Y", "Z"}})
+    b = ({"d": {"X": 3.0, "Y": 2.0, "Z": 1.0}}, {"d": {"X", "Y", "Z"}})  # opposite order
+    extra = ({"d": {"X": 3.0, "Y": 2.0, "Z": 1.0, "W": 9.0}}, {"d": {"X", "Y", "Z", "W"}})
+    assert set(cr.blend_scores([a, extra], [1, 1])[0]["d"]) == {"X", "Y", "Z"}  # W is scored by only one ranking
+    blended, eligible = cr.blend_scores([a, b], [1, 1])
+    assert blended["d"]["X"] == pytest.approx(blended["d"]["Z"])  # opposite rankings cancel
+    heavy, _ = cr.blend_scores([a, b], [3, 1])
+    assert heavy["d"]["Z"] > heavy["d"]["X"]  # the first ranking dominates
+    only_a = ({"d": {"X": 1.0, "Y": 2.0}}, {"d": {"X"}})  # Y ineligible in this ranking
+    _, elig = cr.blend_scores([only_a, a], [1, 1])
+    assert elig["d"] == {"X"}
+    with pytest.raises(ValueError):
+        cr.blend_scores([a, b], [1])
+
+
+def test_blend_history_command_writes_a_gradable_csv(tmp_path, capsys):
+    one, two, out = tmp_path / "a.csv", tmp_path / "b.csv", tmp_path / "blend.csv"
+    one.write_text("date,ticker,score,eligible\n" + "".join(f"2026-01-05,T{i},{i},1\n" for i in range(5)))
+    two.write_text("date,ticker,score,eligible\n" + "".join(f"2026-01-05,T{i},{-i},{0 if i == 4 else 1}\n"
+                                                           for i in range(5)))
+    assert cr.main(["blend-history", "--inputs", str(one), str(two), "--out", str(out)]) == 0
+    assert '"dates": 1' in capsys.readouterr().out
+    scores, eligible = cr.read_scores_csv(out)
+    assert len(scores["2026-01-05"]) == 5 and "T4" not in eligible["2026-01-05"]

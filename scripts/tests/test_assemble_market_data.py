@@ -123,6 +123,45 @@ def test_a_multi_symbol_response_and_split_pages_assemble_the_same_as_one_per_sy
     assert json.loads(one.read_bytes()) == json.loads(two.read_bytes())
 
 
+def _split_parts(directory, raw):
+    """One small part file per raw response, named to sort in fetch order (the Perplexity step 4 form)."""
+    directory.mkdir()
+    n = 0
+    for kind in ("historicals", "daily", "quotes"):
+        for response in raw.get(kind, []):
+            n += 1
+            (directory / f"raw_{n:03d}.json").write_text(json.dumps({kind: [response]}))
+
+
+def test_part_files_in_a_directory_or_listed_assemble_the_same_as_one_raw_file(tmp_path, capsys):
+    raw = raw_bundle(TAPE)
+    _, _, whole = _assemble(tmp_path, capsys, raw, out_name="whole.json")
+    parts = tmp_path / "raw_parts"
+    _split_parts(parts, raw)
+    for name, args in (("dir.json", [str(parts)]), ("list.json", [str(p) for p in sorted(parts.iterdir())])):
+        out = tmp_path / name
+        assert amd.main(["--trading-day", DAY, "--raw", *args, "--out", str(out)]) == 0
+        capsys.readouterr()
+        assert json.loads(out.read_bytes()) == json.loads(whole.read_bytes())
+
+
+@pytest.mark.parametrize("part", [{}, {"bogus": []}, {"quotes": {}}, [1]])
+def test_a_malformed_part_file_fails_closed_and_writes_nothing(tmp_path, capsys, part):
+    parts = tmp_path / "raw_parts"
+    _split_parts(parts, raw_bundle(TAPE))
+    (parts / "raw_999.json").write_text(json.dumps(part))
+    out = tmp_path / "market.json"
+    assert amd.main(["--trading-day", DAY, "--raw", str(parts), "--out", str(out)]) == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "FAILED" and not out.exists()
+
+
+def test_an_empty_part_directory_fails_closed(tmp_path, capsys):
+    (tmp_path / "raw_parts").mkdir()
+    out = tmp_path / "market.json"
+    assert amd.main(["--trading-day", DAY, "--raw", str(tmp_path / "raw_parts"), "--out", str(out)]) == 2
+    assert not out.exists()
+
+
 # ---------------------------------------------------------------------------
 # It feeds the primary's generator and the answer is right
 # ---------------------------------------------------------------------------

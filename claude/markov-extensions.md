@@ -18,7 +18,7 @@ Dependency: item 1 needs a calibrated item 2. Item 1 stays shadow-only until ite
 ### Gate before building either
 
 Opportunity sizing (read-only): count sessions where a later scheduled slot saw a buyable dip while the day's remaining budget could not fund the buy the ladder would have made (global ladder from `config/sizing_ladder.json`: 1x to 8x on drop vs prior close, times $2 strictly below the prior low or $1 below the close only). Counted separately for both dip kinds, at all four daily caps.
-First estimate (global ladder only): `dca-sizing-signals/market_data_ingest/ledger/opportunity.py`, spec revision 2 approved and passing (31 tests). Faithful replay with per-ticker ladders, top-up guard and kill switch: `docs/adr-budget-exhaustion-replay.md` (proposed, six open questions). Handoff: `HANDOFF_budget_exhaustion_opportunity.md`.
+First estimate (global ladder only): `dca-sizing-signals/market_data_ingest/ledger/opportunity.py`, spec revision 2 approved and passing (31 tests). Faithful replay with per-ticker ladders, top-up guard and kill switch: `docs/adr-budget-exhaustion-replay.md` (accepted 2026-11-23, revision 3, implemented as `python -m scripts.budget_exhaustion_count`). Handoff: `HANDOFF_budget_exhaustion_opportunity.md`.
 If the count is near zero, both items drop down the roadmap.
 
 Known limits of the count: the day's budget tier is not stored in the ledger, so the report runs once per cap ($180/$240/$300/$360); per-ticker calibrated ladders, the ML nudge and the kill-switch cap are not replayed; quotes come from `intraday_quotes`, so coverage starts when that table started filling.
@@ -48,5 +48,5 @@ None of these changes the dollars bought on a given day.
 
 Decided 2026-11-23: run at all four caps; count both dip kinds; report is a CLI only; no global-ladder-only shortcut for the final number (replay per the ADR).
 
-1. The six open questions in `docs/adr-budget-exhaustion-replay.md`.
+1. The open questions in `docs/adr-budget-exhaustion-replay.md`: all seven answered 2026-11-23.
 2. Note: "Tier A/B/C" in category 1 is shorthand from the 2026-11-21 deep dive. The live ladder is the 1x-8x drop ladder; item 2's chain states must be redefined on it before that work starts.
