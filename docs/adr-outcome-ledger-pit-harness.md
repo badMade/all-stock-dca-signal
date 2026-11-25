@@ -2,6 +2,14 @@
 
 - **Status:** Accepted (2026-11-03, operator "accept all"; open questions take their proposed defaults). Open questions carry proposed defaults; the operator
   authorized implementation in draft PRs on those defaults, which stay overridable until accepted.
+- **Implementation status (2026-11-24 audit):** the storage is built: every Decision 3 table and the
+  point-in-time macros are in `dca-sizing-signals/market_data_ingest/ledger/store.py`, and the
+  Verification tests (lookahead, account literals, manual-run exclusion) are in
+  `dca-sizing-signals/tests/ledger/`. The run-artifact loader for `fills` and `baseline_fills`
+  is `market_data_ingest/ledger/run_ingest.py` (draft PR #2425). Not built yet: loaders for
+  `accounts`, `tax_lots` and `trials`; backtest macros that join `adjusted_bars` with EDGAR facts
+  by filing date; the dated index-membership source (open question 1); the weekly
+  counterfactual review (Decision 6); the timing check.
 - **Scope:** research and reporting only. The stdlib-only core, the ladder, `config/`, and all
   three entry points (`run_dca.run_slot()`, the `MorningDCAExecutor` hierarchy,
   `dca_runner.py`) are untouched. Nothing here writes live sizing or places orders.
@@ -87,8 +95,9 @@ implementation PRs that use them say so.
   live executor does. It stays read-only and alias-keyed.
 - Adds tables to a store that is itself still Proposed; if the price-source ADR changes
   location or schema, this ADR follows it.
-- CI: `dca-sizing-signals` has no CI job, and agents may not edit `.github/workflows/`. Tests
-  run through `scripts/local_ci.sh` until the operator adds a job.
+- CI: when this ADR was written `dca-sizing-signals` had no CI job. It now has one
+  (`Lint & test (dca-sizing-signals)` in `.github/workflows/ci.yml`), and `scripts/local_ci.sh`
+  runs the same tests locally.
 
 ## Verification
 

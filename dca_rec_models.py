@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -59,9 +60,15 @@ def _is_ticker(value: Any) -> bool:
 def _finite(value: Any, name: str, *, optional: bool = False) -> float | None:
     if value is None and optional:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
-    return float(value)
+    try:
+        numeric = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be a finite number")
+    return numeric
 
 
 def _json_copy(value: Any) -> Any:
@@ -113,12 +120,16 @@ class MarketSnapshot:
         if not isinstance(sides, dict):
             raise ValueError("quote_sides must be an object")
         for ticker, pair in sides.items():
-            if not _is_ticker(ticker) or (pair is not None and (
-                not isinstance(pair, list) or len(pair) != 2 or any(
-                    isinstance(side, bool) or not isinstance(side, (int, float)) or not math.isfinite(side)
-                    for side in pair
+            try:
+                bad_pair = pair is not None and (
+                    not isinstance(pair, list) or len(pair) != 2 or any(
+                        isinstance(side, bool) or not isinstance(side, (int, float)) or not math.isfinite(side)
+                        for side in pair
+                    )
                 )
-            )):
+            except OverflowError:
+                bad_pair = True
+            if not _is_ticker(ticker) or bad_pair:
                 raise ValueError("invalid quote_sides")
 
     def to_json(self) -> dict[str, Any]:
@@ -219,6 +230,19 @@ class Recommendation:
         return cls(obj["ticker"], amount, obj["ref_id"])
 
 
+# A carried universe is at most this many symbols (docs/adr-backup-planner-daily-universe.md).
+MAX_CARRIED_UNIVERSE = 100
+
+
+def _universe_hash(tickers: tuple[str, ...]) -> str:
+    """sha256 over the sorted, de-duplicated tickers joined by newlines plus a trailing newline.
+
+    The same rule as ``dca_order_plan.universe_hash``, restated because that module imports this one's world;
+    ``tests/test_dca_rec_models.py`` pins the two together.
+    """
+    return hashlib.sha256(("\n".join(sorted(set(tickers))) + "\n").encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class RecommendationSet:
     trading_day: date
@@ -235,6 +259,10 @@ class RecommendationSet:
     # 1x is still safe to place after other slots' spend engages the switch. None = an unstamped (older) set; the
     # backup fails closed on it. Optional on the wire so readers of older payloads still parse.
     sizing_guard: dict[str, float] | None = None
+    # The day's buy list, sorted, when the set carries it (docs/adr-backup-planner-daily-universe.md). The list changes
+    # daily, so the backup planner cannot rely on a copy bundled at build time. When present it must hash to
+    # ``universe_hash`` and every item must be in it. None = an older set that carries no list.
+    universe: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         _valid_day(self.trading_day)
@@ -259,6 +287,16 @@ class RecommendationSet:
         tickers = [item.ticker for item in self.items]
         if len(tickers) != len(set(tickers)):
             raise ValueError("items cannot repeat a ticker")
+        if self.universe is not None:
+            universe = self.universe
+            if not isinstance(universe, tuple) or not universe or len(universe) > MAX_CARRIED_UNIVERSE:
+                raise ValueError(f"universe must be a non-empty tuple of at most {MAX_CARRIED_UNIVERSE} tickers")
+            if not all(_is_ticker(t) for t in universe) or list(universe) != sorted(set(universe)):
+                raise ValueError("universe must be sorted, unique tickers that match the ticker contract")
+            if self.universe_hash != _universe_hash(universe):
+                raise ValueError("universe_hash does not match the carried universe")
+            if any(t not in set(universe) for t in tickers):
+                raise ValueError("every recommended ticker must be in the carried universe")
         # This boundary is deliberately price-blind; even future fields must not leak to buyers.
         if _price_keys({"items": [item.to_json() for item in self.items]}):
             raise ValueError("recommendation contains a forbidden price field")
@@ -270,6 +308,8 @@ class RecommendationSet:
                 "items": [item.to_json() for item in self.items]}
         if self.sizing_guard is not None:
             data["sizing_guard"] = _json_copy(self.sizing_guard)
+        if self.universe is not None:
+            data["universe"] = list(self.universe)
         if _price_keys(data):
             raise ValueError("recommendation contains a forbidden price field")
         return data
@@ -277,15 +317,17 @@ class RecommendationSet:
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> RecommendationSet:
         required = {"schema_version", "trading_day", "as_of", "slot", "source", "ladder_version", "universe_hash", "items"}
-        # sizing_guard is the one optional key: absent on a set written before the stamp existed.
-        optional = {"sizing_guard"} & set(value) if isinstance(value, dict) else set()
+        # sizing_guard and universe are the optional keys: absent on a set written before they existed.
+        optional = {"sizing_guard", "universe"} & set(value) if isinstance(value, dict) else set()
         obj = _object(value, required | optional)
         if not isinstance(obj["items"], list):
             raise ValueError("items must be a list")
+        if "universe" in obj and not isinstance(obj["universe"], list):
+            raise ValueError("universe must be a list")
         items = tuple(Recommendation.from_json(item) for item in obj["items"])
         return cls(_day(obj["trading_day"]), _time(obj["as_of"]), obj["slot"], obj["source"],
                    obj["ladder_version"], obj["universe_hash"], items, obj["schema_version"],
-                   obj.get("sizing_guard"))
+                   obj.get("sizing_guard"), tuple(obj["universe"]) if "universe" in obj else None)
 
 
 @dataclass(frozen=True)

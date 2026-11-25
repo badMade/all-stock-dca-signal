@@ -15,6 +15,10 @@ Usage::
     python3 backup_planner.pyz assemble-market-data --trading-day 2026-10-07 --raw raw.json --out market.json
     python3 -m scripts.assemble_market_data         --trading-day 2026-10-07 --raw raw.json --out market.json
 
+``--raw`` may also be several files, or a directory (its ``*.json`` files, sorted by name), each holding any subset of
+the three lists below; they are concatenated in order. Save each broker response to its own small part file
+(``raw_001.json`` ...) when one ``raw.json`` would be too large to write in one go.
+
 ``--raw`` is ``{"historicals": [<raw response>, ...], "daily": [<raw response>, ...], "quotes": [<raw response>, ...]}``.
 ``historicals`` are the 5-minute ``get_equity_historicals`` responses, ``daily`` the same tool with ``interval=day``
 (the previous completed session's bar), ``quotes`` the ``get_equity_quotes`` responses. A response may carry one
@@ -59,7 +63,7 @@ import sys
 import tempfile
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 MIN_PYTHON = (3, 11)  # mirrors ``requires-python`` in pyproject.toml, scripts/backup_planner.py and the .pyz bootstrap
@@ -103,17 +107,61 @@ def _reject_constant(token: str) -> Any:
     raise ValueError(f"non-finite constant {token}")
 
 
-def _read_raw(path: Path) -> dict[str, list[Any]]:
+_RAW_KINDS = ("historicals", "daily", "quotes")
+
+
+def _load_json(path: Path) -> Any:
     if not path.is_file():
         raise _Refused("raw_missing", path.name)
     try:
-        document = json.loads(
+        return json.loads(
             path.read_bytes(), object_pairs_hook=dca_config._reject_duplicate_keys, parse_constant=_reject_constant
         )
     except (OSError, ValueError) as exc:
         raise _Refused("raw_corrupt", f"{path.name}: {type(exc).__name__}") from exc
-    if not isinstance(document, dict) or not all(isinstance(document.get(k), list) for k in ("historicals", "quotes")):
-        raise _Refused("raw_corrupt", "expected an object with 'historicals' and 'quotes' lists")
+
+
+def _expand_parts(paths: Sequence[Path]) -> list[Path]:
+    """Files to read, in order: a directory stands for its ``*.json`` files, sorted by name (not recursive).
+
+    2026-11-13: the Perplexity backup could not write one ``raw.json`` holding every raw 5-minute response for the
+    whole universe (the file was too large for a single write, and the run stalled while the agent chunked it by
+    hand). Each broker response can now be saved as its own small part file and passed here, so no single file has
+    to be large and nothing has to be merged or retyped by hand.
+    """
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            found = sorted(p for p in path.iterdir() if p.suffix == ".json" and p.is_file())
+            if not found:
+                raise _Refused("raw_empty", f"{path.name}: no .json part files")
+            files.extend(found)
+        else:
+            files.append(path)
+    return files
+
+
+def _read_raw(path: Path | Sequence[Path]) -> dict[str, list[Any]]:
+    paths = [path] if isinstance(path, Path) else list(path)
+    files = _expand_parts(paths)
+    if not files:
+        raise _Refused("raw_missing", "no raw files given")
+    if len(files) == 1 and len(paths) == 1 and not paths[0].is_dir():
+        # The original single-file form keeps its strict shape: both lists present.
+        document = _load_json(files[0])
+        if not isinstance(document, dict) or not all(isinstance(document.get(k), list) for k in ("historicals", "quotes")):
+            raise _Refused("raw_corrupt", "expected an object with 'historicals' and 'quotes' lists")
+    else:
+        # Part files: each is the same shape with any subset of the three lists; they are concatenated in file order.
+        document = {kind: [] for kind in _RAW_KINDS}
+        for file in files:
+            part = _load_json(file)
+            if not isinstance(part, dict) or not part or any(k not in _RAW_KINDS for k in part):
+                raise _Refused("raw_corrupt", f"{file.name}: expected an object with only {', '.join(_RAW_KINDS)} lists")
+            for kind, responses in part.items():
+                if not isinstance(responses, list):
+                    raise _Refused("raw_corrupt", f"{file.name}: '{kind}' must be a list")
+                document[kind].extend(responses)
     if not document["historicals"] and not document["quotes"]:
         raise _Refused("raw_empty", "no raw responses to assemble")
     daily = document.get("daily", [])
@@ -279,7 +327,8 @@ def _report(status: str, **fields: Any) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--trading-day", required=True, help="YYYY-MM-DD (America/New_York).")
-    parser.add_argument("--raw", required=True, type=Path, help="Raw responses file; see the module docstring.")
+    parser.add_argument("--raw", required=True, type=Path, nargs="+",
+                        help="Raw responses file(s) or a directory of part files; see the module docstring.")
     parser.add_argument("--out", required=True, type=Path, help="Where to write the payload.")
     parser.add_argument("--config-dir", type=Path, default=None)
     args = parser.parse_args(argv)

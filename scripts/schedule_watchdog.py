@@ -372,6 +372,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = audit_day(day, now, root=root)
     rows = flagged_rows(report)
     report["error_slots"] = [row["slot_id"] for row in error_outcome_rows(report)]
+    # Keep the evidence verdict distinct; 2026-11-19 13:30 output_cap_exceeded verified cleanly.
+    report["verify_schedule_ok"] = report["ok"]
+    report["ok"] = report["ok"] and not report["error_slots"]
 
     if rows and not args.no_alert_file:
         written = write_watchdog_alert_files(report, root=root)

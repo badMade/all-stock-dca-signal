@@ -1664,3 +1664,83 @@ def test_rank_ic_pass_path_still_blocks_weak_or_unreliable_ic(ics):
 
 def test_no_rank_ic_at_all_keeps_the_old_mae_gate():
     assert _blocked_by_baseline(_eval_summary(3.9))
+
+
+# --- rank-IC incumbent comparison (2026-11-24) -----------------------------------------------------------------
+# A candidate admitted only through the rank-IC pass path is compared with the incumbent on rank IC, not on the
+# incumbent's MAE skill ratio -- but only against an incumbent that itself failed the MAE baseline.
+
+_IC_PASSING = (0.03, 0.04, 0.05, 0.02, 0.04)  # mean 0.036, every fold > 0
+
+
+def _window_ic_folds(*ics):
+    return [
+        {
+            "model_rank_ic": ic,
+            "test_start": _DEFAULT_TEST_WINDOW[0],
+            "test_end": _DEFAULT_TEST_WINDOW[1],
+            "test_row_fingerprint": _DEFAULT_TEST_ROW_FINGERPRINT,
+        }
+        for ic in ics
+    ]
+
+
+def _incumbent(mae, baseline, **extra):
+    return {
+        "status": "active",
+        "horizon_trading_days": 5,
+        "eval_metric": {
+            "mae": mae,
+            "baseline_zero_mae": baseline,
+            "baseline_mean_mae": baseline,
+            "universe": ["AAPL"],
+            **extra,
+        },
+    }
+
+
+def _reasons_vs(current, ics=_IC_PASSING, mae=3.9):
+    summary = _eval_summary(mae, folds=_window_ic_folds(*ics))
+    return publish.blocking_reasons(
+        new_mae=mae,
+        eval_summary=summary,
+        current=current,
+        new_horizon_trading_days=5,
+        new_evaluation_universe=["AAPL"],
+    )
+
+
+def test_rank_ic_candidate_replaces_an_incumbent_that_never_beat_the_mae_baseline():
+    # Incumbent MAE 3.9 vs baseline 3.7 (skill ratio > 1) and no recorded rank IC: nothing to beat on MAE.
+    assert _reasons_vs(_incumbent(3.9, 3.7)) == []
+
+
+def test_rank_ic_candidate_must_beat_the_incumbents_recorded_rank_ic():
+    blocked = _reasons_vs(_incumbent(3.9, 3.7, model_rank_ic=0.05))
+    assert any("mean rank IC" in r for r in blocked)
+    assert _reasons_vs(_incumbent(3.9, 3.7, model_rank_ic=0.03)) == []
+
+
+def test_rank_ic_candidate_never_displaces_an_incumbent_that_beat_the_mae_baseline():
+    # Incumbent MAE 3.0 beats its baseline 3.7: the full MAE comparison still applies and blocks the candidate.
+    assert _reasons_vs(_incumbent(3.0, 3.7)) != []
+
+
+def test_a_weak_rank_ic_candidate_still_gets_no_incumbent_exemption():
+    weak = _reasons_vs(_incumbent(3.9, 3.7), ics=(0.05, -0.01, 0.06, 0.05, 0.04))
+    assert any("naive walk-forward baseline" in r for r in weak)
+
+
+def test_guarded_publish_persists_the_mean_rank_ic_for_the_next_retrain(tmp_path):
+    config_path = tmp_path / "incumbent.json"
+    result = publish.guarded_publish(
+        adjustments={"AAPL": 1.1},
+        eval_summary=_eval_summary(3.9, folds=_window_ic_folds(*_IC_PASSING)),
+        model_version="2026-11-24-ridge-v1",
+        config_path=config_path,
+        history_dir=tmp_path / "history",
+        generated_at=datetime(2026, 11, 24, tzinfo=timezone.utc),
+        evaluation_universe=["AAPL"],
+    )
+    assert result["status"] == "published", result
+    assert json.loads(config_path.read_bytes())["eval_metric"]["model_rank_ic"] == pytest.approx(0.036)

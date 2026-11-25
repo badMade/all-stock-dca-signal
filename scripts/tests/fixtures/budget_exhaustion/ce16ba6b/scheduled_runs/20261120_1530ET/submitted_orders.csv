@@ -1,0 +1,8 @@
+ticker,order_id,submitted_amount_usd,status
+MU,6b00b041-09e5-47b3-b247-cccfd4ac016a,10.0,filled
+AMD,6b00b05d-6613-4815-9248-11f87e67be7b,10.0,filled
+NVDA,6b00b073-43d3-45e4-987a-724f06c2c318,1.1,filled
+DRAM,6b00b08b-e757-4ff5-8ba2-594da2674417,10.0,filled
+RGTI,6b00b0a4-522e-44bf-8ed2-e3e01a229ad5,10.0,filled
+AMAT,6b00b0c3-3259-4116-aff3-427539825ffb,10.0,filled
+QUBT,6b00b0e2-7068-47e9-9623-6c29908b66db,10.0,filled

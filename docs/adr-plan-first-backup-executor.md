@@ -3,6 +3,14 @@
 Status: proposed (2026-10-06); D4 amended 2026-10-22 (Normal-only, trim to fit). Phase 1 of a six-phase change; no code is implemented by this
 document. Operator approval is required before Phase 2 (tests).
 
+Implementation status (2026-11-24 audit): the line above is the original Phase 1 status. The amendments
+below record later operator decisions, and Phases 2 to 5 are now in code (`dca_order_plan.py`,
+`scripts/emit_order_plan.py`, `scripts/backup_planner.py`, `dca_execution_router.py`,
+`scripts/local_heartbeat.py`, `scripts/slot_status.py`). Still open: no live-mirror prompt calls
+`scripts/local_heartbeat.py start`, `beat` or `finish` (the routing amendment's "not yet done"),
+no result of the D6 broker `ref_id` dedup test is recorded, and repasting the Perplexity prompts
+stays an operator step.
+
 ## Context
 
 Claude on the Mac Studio is the primary executor for seven slots (09:35, 10:30, 11:30, 12:30,
@@ -126,7 +134,8 @@ Mapping to existing fields (`scripts/stream_candidates.py:1363`): `notional_usd`
   extracts the config to a temp directory, overrides any host `DCA_CONFIG_DIR`, and fails closed with one JSON
   document on a too-old Python. The `dca_ladder_core` extraction (PR 1624) was the first step but the shipped
   file runs the real modules. The built file is not committed (`dist/` is gitignored); how it reaches the
-  Perplexity sandbox is still undecided.
+  Perplexity sandbox is still undecided. (2026-11-24 audit: the zipapp `backup_planner.pyz` at the repo root is
+  committed; only `dist/` is ignored.)
 - **Safety gate (2026-10-08), all seven slots.** `compute --market-data FILE --deployed-last-7d-usd N` runs the
   slot's Gate 5 (`scripts.generate_buy_candidates.generate_candidates` for 15:30,
   `scripts.stream_candidates` for the other six) and plans exactly the placeable BUYs it

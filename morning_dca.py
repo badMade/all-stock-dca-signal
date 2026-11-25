@@ -71,6 +71,7 @@ from dca_config import (
     READ_ONLY_ACCOUNT,
     InvalidAccountNumberError,
     MissingConfigEnvError,
+    _config_float,
     _reject_duplicate_keys,
     get_config_dir,
     load_approved_dates,
@@ -531,6 +532,9 @@ class MorningConfig:
 
     tickers: Sequence[str] = field(default_factory=lambda: tuple(ACTIVE_TICKERS))
     excluded_tickers: frozenset[str] = field(default_factory=lambda: frozenset(EXCLUDED_TICKERS))
+    # Dated wash-sale pauses in force (config/tickers.json "no_buy", docs/adr-no-buy-window.md); see
+    # StrategyConfig.no_buy_tickers. A listed ticker is still scored but its signal never becomes a BUY.
+    no_buy_tickers: frozenset[str] = frozenset()
     base_buy_amount_usd: float = 2.0
     # Reduced first-allocation base ($1) used when the price is below the prior
     # close but not below the prior regular-session low. See
@@ -1332,6 +1336,64 @@ def resolved_count_breakers(config_dir_path: Path) -> dict:
     return resolved
 
 
+def _stream_nonneg_float(raw: Any, field_name: str) -> float:
+    """Parse a finite non-negative float from stream config, rejecting bools, strings, and overflow."""
+    val = _config_float(raw, field=field_name)
+    if not math.isfinite(val) or val < 0:
+        raise ValueError(f"{field_name} must be a finite non-negative number, got {raw!r}")
+    return val
+
+
+def _stream_nonneg_int(raw: Any, field_name: str) -> int:
+    """Parse a non-negative integer from stream config, rejecting booleans and non-integers."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer, got {raw!r}")
+    return raw
+
+
+def _parse_stream_sizing_and_budget(
+    raw: Dict[str, Any], *, daily_cap_key: str, weekly_cap_key: str, source_label: str
+) -> Dict[str, Any]:
+    """Fail-closed parser for stream sizing_ladder, budget_ledger caps, and trend_min_bars."""
+    out: Dict[str, Any] = {}
+    if "trend_min_bars" in raw:
+        out["trend_min_bars"] = _stream_nonneg_int(raw["trend_min_bars"], f"{source_label}.trend_min_bars")
+    sizing = raw.get("sizing_ladder", {})
+    if not isinstance(sizing, dict):
+        raise ValueError(f"{source_label}.sizing_ladder must be a JSON object")
+    if "base_amount_usd" in sizing:
+        out["base_buy_amount_usd"] = _stream_nonneg_float(sizing["base_amount_usd"], f"{source_label}.base_amount_usd")
+    if "base_amount_below_close_usd" in sizing:
+        out["base_buy_amount_below_close_usd"] = _stream_nonneg_float(
+            sizing["base_amount_below_close_usd"], f"{source_label}.base_amount_below_close_usd"
+        )
+    if "no_buy_below_pct" in sizing:
+        out["minimum_drop_vs_previous_close"] = (
+            _stream_nonneg_float(sizing["no_buy_below_pct"], f"{source_label}.no_buy_below_pct") / 100.0
+        )
+    if "tiers" in sizing:
+        raw_tiers = sizing["tiers"]
+        if not isinstance(raw_tiers, list):
+            raise ValueError(f"{source_label}.sizing_ladder.tiers must be a list")
+        tiers: List[Tuple[float, float]] = []
+        for idx, tier in enumerate(raw_tiers):
+            if not isinstance(tier, dict) or "min_drop_pct" not in tier or "multiplier" not in tier:
+                raise ValueError(f"{source_label}.sizing_ladder.tiers[{idx}] must have min_drop_pct and multiplier")
+            tiers.append((
+                _stream_nonneg_float(tier["min_drop_pct"], f"{source_label}.tiers[{idx}].min_drop_pct") / 100.0,
+                _stream_nonneg_float(tier["multiplier"], f"{source_label}.tiers[{idx}].multiplier"),
+            ))
+        out["sizing_tiers"] = tuple(tiers)
+    budget = raw.get("budget_ledger", {})
+    if not isinstance(budget, dict):
+        raise ValueError(f"{source_label}.budget_ledger must be a JSON object")
+    if daily_cap_key in budget:
+        out["morning_daily_cap_usd"] = _stream_nonneg_float(budget[daily_cap_key], f"{source_label}.{daily_cap_key}")
+    if weekly_cap_key in budget:
+        out["morning_weekly_cap_usd"] = _stream_nonneg_float(budget[weekly_cap_key], f"{source_label}.{weekly_cap_key}")
+    return out
+
+
 def load_morning_config(
     config_dir=None,
     *,
@@ -1447,7 +1509,8 @@ def load_morning_config(
     }
 
     try:
-        raw = json.loads(cfg_path.read_bytes())
+        # Reject duplicate JSON keys so parameter pollution cannot silently override caps or live switch.
+        raw = json.loads(cfg_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
         # Same as the config-missing fallback above: an unreadable
@@ -1456,6 +1519,8 @@ def load_morning_config(
             **approved_date_overrides,
             **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
+    if not isinstance(raw, dict):
+        raise ValueError(f"{cfg_path} must contain a JSON object, got {type(raw).__name__}")
 
     # The bundled artifact_paths / prior_allocation_roots
     # values are absolute paths under the default cron_tracking tree, and they
@@ -1466,23 +1531,16 @@ def load_morning_config(
     raw = rebase_bundled_roots_in(raw)
 
     kwargs: dict[str, Any] = dict(approved_date_overrides)
-
-    sizing = raw.get("sizing_ladder", {})
-    if "base_amount_usd" in sizing:
-        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
-    if "base_amount_below_close_usd" in sizing:
-        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
-    if "no_buy_below_pct" in sizing:
-        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
-    if "tiers" in sizing:
-        tiers = tuple((float(t["min_drop_pct"]) / 100.0, float(t["multiplier"])) for t in sizing["tiers"])
-        kwargs["sizing_tiers"] = tiers
+    kwargs.update(
+        _parse_stream_sizing_and_budget(
+            raw,
+            daily_cap_key="morning_daily_cap_usd",
+            weekly_cap_key="morning_weekly_cap_usd",
+            source_label="morning_dca.json",
+        )
+    )
 
     budget = raw.get("budget_ledger", {})
-    if "morning_daily_cap_usd" in budget:
-        kwargs["morning_daily_cap_usd"] = float(budget["morning_daily_cap_usd"])
-    if "morning_weekly_cap_usd" in budget:
-        kwargs["morning_weekly_cap_usd"] = float(budget["morning_weekly_cap_usd"])
     # budget_ledger.bootstrap (added Jul 20 2026): the live task persists a
     # budget_ledger.json snapshot under its own output directory using this
     # configured filename, bootstrapping it from the caps above when absent
@@ -1491,8 +1549,6 @@ def load_morning_config(
     if isinstance(ledger_files, list) and ledger_files:
         kwargs["budget_ledger_filename"] = str(ledger_files[0])
 
-    if "trend_min_bars" in raw:
-        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
     if "live_execution_enabled" in raw:
         kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
             raw["live_execution_enabled"], source_label="morning"
@@ -1585,6 +1641,8 @@ def load_morning_config(
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MorningConfig(**kwargs)
@@ -1667,7 +1725,8 @@ def load_stream_config(
         return config_cls(**base_overrides)
 
     try:
-        raw = json.loads(cfg_path.read_bytes())
+        # Reject duplicate JSON keys so parameter pollution cannot silently override caps or live switch.
+        raw = json.loads(cfg_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using %s defaults", cfg_path, exc, config_cls.__name__)
         return config_cls(**base_overrides)
@@ -1693,33 +1752,20 @@ def load_stream_config(
     raw = rebase_bundled_roots_in(raw)
 
     kwargs: Dict[str, Any] = dict(base_overrides)
-
-    if "trend_min_bars" in raw:
-        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
     # Master placement switch. Absent means enabled, matching MorningConfig's
     # default, so an existing stream's config gains nothing by omission.
     if "live_execution_enabled" in raw:
         kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
             raw["live_execution_enabled"], source_label=source_label
         )
-
-    sizing = raw.get("sizing_ladder", {})
-    if "base_amount_usd" in sizing:
-        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
-    if "base_amount_below_close_usd" in sizing:
-        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
-    if "no_buy_below_pct" in sizing:
-        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
-    if "tiers" in sizing:
-        kwargs["sizing_tiers"] = tuple(
-            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"])) for t in sizing["tiers"]
+    kwargs.update(
+        _parse_stream_sizing_and_budget(
+            raw,
+            daily_cap_key=daily_cap_key,
+            weekly_cap_key=weekly_cap_key,
+            source_label=source_label,
         )
-
-    budget = raw.get("budget_ledger", {})
-    if daily_cap_key in budget:
-        kwargs["morning_daily_cap_usd"] = float(budget[daily_cap_key])
-    if weekly_cap_key in budget:
-        kwargs["morning_weekly_cap_usd"] = float(budget[weekly_cap_key])
+    )
 
     live_task = raw.get("live_task", {})
     if "broker_account" in live_task:
@@ -1785,6 +1831,8 @@ def load_stream_config(
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return config_cls(**kwargs)
@@ -4168,6 +4216,28 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Evaluation ----------------------------------------------------------
     def evaluate_signal(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
+        """Score one ticker, then veto its BUY if it is inside a dated ``no_buy`` window.
+
+        The ladder runs unchanged so the row keeps its prices and drop for tracking; only the action is
+        withdrawn (NO_ACTION, zero multiplier and amount) and the would-be BUY recorded in ``reason`` and
+        ``warnings``. Every path that places or publishes morning-family orders goes through this method
+        (the four executors, ``scripts/stream_candidates``), so one veto here covers them all. See
+        ``docs/adr-no-buy-window.md``.
+        """
+        signal = self._evaluate_signal_unfiltered(ticker, now, data)
+        if signal.action != Action.BUY or ticker not in self.config.no_buy_tickers:
+            return signal
+        return replace(
+            signal,
+            action=Action.NO_ACTION,
+            reason=f"no_buy_window: wash-sale pause; ladder said BUY at {signal.multiplier:g}x ({signal.reason})",
+            multiplier=0.0,
+            hypothetical_amount_usd=0.0,
+            execution_status=None,
+            warnings=(*signal.warnings, "no_buy_window"),
+        )
+
+    def _evaluate_signal_unfiltered(self, ticker: str, now: datetime, data: Any) -> MorningSignal:
         """Grade one ticker's morning weakness vs. yesterday's close.
 
         Uses the provider's previous-close bar and the latest completed intraday
@@ -5233,7 +5303,7 @@ class MorningDCAExecutor(DCAExecutor):
                     return False
                 try:
                     amount = float(val)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return False
                 return math.isfinite(amount) and amount > 0
 
@@ -6208,7 +6278,7 @@ class MorningDCAExecutor(DCAExecutor):
                 else:
                     try:
                         amount_float = float(amount)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         amount_float = math.nan
                 # Reject inf/-inf/nan for the same reason as the CSV cross-check
                 # below: an infinite amount would seed infinite cap spend. A
@@ -6751,10 +6821,10 @@ class MorningDCAExecutor(DCAExecutor):
                     raw_dup_amt = (dup_order or {}).get("dollar_amount") or (dup_order or {}).get("notional")
                     dup_amount = (
                         float(raw_dup_amt)
-                        if raw_dup_amt
+                        if raw_dup_amt and not isinstance(raw_dup_amt, bool)
                         else prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                     )
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                 if dup_amount is None or not math.isfinite(dup_amount) or dup_amount <= 0:
                     dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
@@ -7784,7 +7854,7 @@ class MorningDCAExecutor(DCAExecutor):
                         continue
                     try:
                         amt_float = float(amt)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                     # float() also accepts "Infinity"/"NaN" -- inf > 0 is
                     # True, so an infinite amount passed the positivity
@@ -9095,9 +9165,9 @@ class MorningDCAExecutor(DCAExecutor):
                         continue
                     try:
                         _cf_float = float(_cf_amt)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
-                    if _cf_float > 0:
+                    if math.isfinite(_cf_float) and _cf_float > 0:
                         carried_forward_total += _cf_float
                 if carried_forward_total > 0:
                     self._own_recorded_scheduled[trading_day] = (

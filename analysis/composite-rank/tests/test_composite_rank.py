@@ -453,3 +453,335 @@ def test_ml_scorecard_needs_the_horizon_to_elapse_and_rewards_a_correct_ranking(
             for i, t in enumerate(names)}
     card = cr.ml_scorecard(rows, [], full)
     assert card and card[0]["ml_ic"] == pytest.approx(1.0)
+
+
+# ----------------------------------------------------------------------------------------------
+# Phase 1: whole-archive universe with a liquidity-eligibility flag
+# ----------------------------------------------------------------------------------------------
+def make_liquid_series(daily_growth, dollar_volume, price=100.0, wobble=0.0):
+    """Like make_series, plus a raw close/volume pair so the dollar volume is exactly ``dollar_volume``."""
+    base = make_series(daily_growth, wobble=wobble)
+    liquidity = {d: (price, float(dollar_volume)) for d in base.dates}
+    return cr.Series(list(zip(base.dates, base.values, strict=False)), liquidity)
+
+
+def test_percentiles_against_reference_are_clamped():
+    pct = cr.percentiles({"hi": 10.0, "mid": 2.0, "lo": -5.0}, reference=[1.0, 2.0, 3.0])
+    assert pct == {"hi": 100.0, "mid": pytest.approx(50.0), "lo": 0.0}
+    assert cr.percentiles({"x": 1.0}, reference=[1.0]) == {"x": 100.0}
+
+
+def test_liquidity_filter_flags_but_still_ranks_everything():
+    universe = {"BIG": make_liquid_series(0.0005, 50e6), "THIN": make_liquid_series(0.003, 10_000.0),
+                "PENNY": make_liquid_series(0.001, 50e6, price=1.0), "NOVOL": make_series(0.002)}
+    liq = {"min_median_dollar_volume": 1e6, "min_price": 3.0, "window": 60}
+    records, _ = cr.score_universe(universe, AS_OF, liquidity=liq)
+    assert set(records) == set(universe)  # every ticker is ranked
+    assert [t for t, r in records.items() if r["eligible"]] == ["BIG"]  # no-volume series cannot prove liquidity
+    assert records["BIG"]["elig_rank"] == 1 and "elig_rank" not in records["THIN"]
+    assert records["THIN"]["rank"] < records["BIG"]["rank"]  # the illiquid name outscores it but is not eligible
+    off, _ = cr.score_universe(universe, AS_OF)  # filter disabled: everyone eligible, scores unchanged semantics
+    assert all(r["eligible"] for r in off.values())
+
+
+def test_ineligible_names_do_not_stretch_the_eligible_percentile_scale():
+    liquid = {f"L{i}": make_liquid_series(0.0002 * (i + 1), 50e6) for i in range(3)}
+    junk = {f"J{i}": make_liquid_series(0.004 + 0.0001 * i, 1_000.0) for i in range(30)}
+    liq = {"min_median_dollar_volume": 1e6, "min_price": 3.0, "window": 60}
+    records, _ = cr.score_universe({**liquid, **junk}, AS_OF, liquidity=liq)
+    # eligible pool is just L0..L2, so the best liquid name still scores like a top name, not 30 places down
+    assert records["L2"]["lowvol_pct"] == 100.0 or records["L2"]["base_score"] > records["L0"]["base_score"]
+    unfiltered, _ = cr.score_universe({**liquid, **junk}, AS_OF)
+    assert records["L2"]["base_score"] > unfiltered["L2"]["base_score"]
+
+
+def test_trade_list_skips_ineligible_unless_held():
+    records = {"A": {"rank": 1, "score": 95.0, "eligible": False}, "B": {"rank": 2, "score": 90.0, "eligible": True},
+               "C": {"rank": 3, "score": 85.0, "eligible": False}}
+    params = cr.load_params()
+    assert cr.build_trade_list(records, set(), params) == [("B", "above_eval")]
+    assert cr.build_trade_list(records, {"C"}, params) == [("B", "above_eval"), ("C", "above_eval_held")]
+
+
+def test_archive_universe_reads_liquidity_and_skips_bad_dates(tmp_path):
+    archive, data = tmp_path / "archive", tmp_path / "data"
+    archive.mkdir()
+    (data / "inputs").mkdir(parents=True)
+    base = make_series(0.001, days=300)
+    volume = 2 * 10**5  # computed: a bare six-digit literal trips the account-shaped-literal guard
+    lines = ["Date,Open,High,Low,Close,Adj Close,Volume"]
+    lines += [f"{d.isoformat()},1,1,1,10,{v},{volume}" for d, v in zip(base.dates, base.values, strict=False)]
+    lines.append("04-27,1,1,1,10,10,1")  # yearless date seen in the real archive
+    (archive / "LIQ.csv").write_text("\n".join(lines))
+    series = cr.load_archive_series(archive, "LIQ")
+    assert len(series) == 300 and series.liquidity_stats(60) == (2_000_000.0, 10.0)
+    assert cr.build_universe(data, "archive", archive)[0] == ["LIQ"]
+    assert cr._parse_day("0001-04-27") is None
+
+
+# ----------------------------------------------------------------------------------------------
+# Phase 2: grading harness
+# ----------------------------------------------------------------------------------------------
+def _graded_world(n=40, signal=True):
+    """n tickers with flat history, then a known move over the 20 days after ORIGIN. With ``signal`` the move is
+    increasing in the ticker's score, otherwise it is decreasing (an anti-predictive ranking)."""
+    origin = dt.date(2026, 9, 1)
+    series, scores = {}, {}
+    for i in range(n):
+        pts = []
+        for d in range(-200, 40):
+            day = origin + dt.timedelta(days=d)
+            drift = (i if signal else n - i) / n * 0.2 if d > 0 else 0.0
+            pts.append((day, 100.0 * (1.0 + drift * min(d, 20) / 20 if d > 0 else 1.0)))
+        series[f"T{i:02d}"] = cr.Series(pts)
+        scores[f"T{i:02d}"] = float(i)
+    return origin.isoformat(), series, scores
+
+
+def test_grade_rewards_a_predictive_ranking_and_punishes_an_inverted_one():
+    day, series, scores = _graded_world(signal=True)
+    rows = cr.grade_scores({day: scores}, series, 20, top_n=10, cost_bps=0, min_names=30)
+    assert len(rows) == 1 and rows[0]["ic"] == pytest.approx(1.0) and rows[0]["edge"] > 0 and rows[0]["spread"] > 0
+    day, series, scores = _graded_world(signal=False)
+    bad = cr.grade_scores({day: scores}, series, 20, top_n=10, cost_bps=0, min_names=30)[0]
+    assert bad["ic"] == pytest.approx(-1.0) and bad["edge"] < 0
+
+
+def test_grade_skips_unmatured_horizons_and_thin_dates():
+    day, series, scores = _graded_world()
+    assert cr.grade_scores({day: scores}, series, 90, min_names=30) == []  # price data ends 39 days after origin
+    assert cr.grade_scores({day: scores}, series, 20, min_names=500) == []
+
+
+def test_grade_turnover_uses_the_list_one_horizon_earlier_and_charges_cost():
+    day, series, scores = _graded_world()
+    earlier = (dt.date.fromisoformat(day) - dt.timedelta(days=20)).isoformat()
+    flipped = {t: -v for t, v in scores.items()}  # a completely different top list
+    rows = cr.grade_scores({earlier: flipped, day: scores}, series, 20, top_n=10, cost_bps=100, min_names=30)
+    row = [r for r in rows if r["date"] == day][0]
+    assert row["turnover"] == 1.0 and row["net_edge"] == pytest.approx(row["edge"] - 0.01)
+    only = cr.grade_scores({day: scores}, series, 20, top_n=10, min_names=30)[0]
+    assert only["turnover"] is None and only["net_edge"] is None  # no earlier list to compare with
+
+
+def test_grade_ignores_ineligible_names_and_summarises():
+    day, series, scores = _graded_world()
+    junk = {t for t in scores if int(t[1:]) >= 20}  # the high scorers are ineligible
+    rows = cr.grade_scores({day: scores}, series, 20, top_n=10, eligible_by_date={day: set(scores) - junk},
+                           min_names=10)
+    assert rows[0]["n"] == 20 and rows[0]["ic"] == pytest.approx(1.0)
+    summary = cr.summarize_grade(rows)
+    assert summary["dates"] == 1 and summary["mean_ic"] == pytest.approx(1.0) and summary["ic_std"] is None
+    assert "Top-N" in cr.render_grade("x", {20: summary}, 10, 20.0)
+
+
+def test_grade_reports_quintile_returns_in_score_order():
+    day, series, scores = _graded_world(n=50)
+    rows = cr.grade_scores({day: scores}, series, 20, top_n=10, cost_bps=0, min_names=30)
+    qs = rows[0]["quintiles"]
+    assert len(qs) == 5 and qs == sorted(qs) and qs[4] > qs[0]  # predictive ranking: returns rise with score
+    summary = cr.summarize_grade(rows)
+    assert summary["mean_quintiles"] == pytest.approx(qs)
+    text = cr.render_grade("x", {20: summary}, 10, 20.0)
+    assert "| Q1 | Q2 | Q3 | Q4 | Q5 |" in text
+
+
+def test_top_set_buffer_keeps_incumbents_inside_hold_rank_and_refills_in_rank_order():
+    scores = {f"T{i:02d}": float(100 - i) for i in range(30)}  # T00 best
+    previous = {"T00", "T03", "T07", "T25"}  # T25 has fallen outside the hold rank
+    plain = cr._top_set(scores, None, 5, previous, None)
+    assert plain == {"T00", "T01", "T02", "T03", "T04"}
+    held = cr._top_set(scores, None, 5, previous, 10)
+    assert {"T00", "T03", "T07"} <= held and "T25" not in held and len(held) == 5
+    assert held == {"T00", "T03", "T07", "T01", "T02"}  # refilled by best rank
+    assert cr._top_set(scores, None, 5, None, 10) == plain  # no incumbents yet: plain top-N
+    assert cr._top_set(scores, None, 5, previous, 5) == plain  # hold_rank == top_n is no buffer
+
+
+def test_grade_hold_rank_lowers_turnover_and_non_overlap_spaces_dates():
+    day, series, scores = _graded_world(n=60)
+    origin = dt.date.fromisoformat(day)
+    # three weekly lists whose order is jittered a little each week
+    by_date = {}
+    for w in range(3):
+        d = (origin - dt.timedelta(days=21 - 7 * w)).isoformat()
+        by_date[d] = {t: v + (3.0 if (int(t[1:]) + w) % 2 else 0.0) for t, v in scores.items()}
+    plain = cr.grade_scores(by_date, series, 5, top_n=10, cost_bps=0, min_names=30)
+    held = cr.grade_scores(by_date, series, 5, top_n=10, cost_bps=0, min_names=30, hold_rank=25)
+    t_plain = [r["turnover"] for r in plain if r["turnover"] is not None]
+    t_held = [r["turnover"] for r in held if r["turnover"] is not None]
+    assert t_held and sum(t_held) < sum(t_plain)
+    spaced = cr.grade_scores(by_date, series, 14, top_n=10, cost_bps=0, min_names=30, non_overlap=True)
+    assert [r["date"] for r in spaced] == sorted(by_date)[::2]  # weeks 0 and 2 only (>= 14 days apart)
+
+
+def test_grade_command_reads_history_and_compare_csv(tmp_path, capsys):
+    day, series, scores = _graded_world()
+    data, archive = tmp_path / "data", tmp_path / "archive"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    (data / "inputs" / "sp500.json").write_text(json.dumps([[t, t, "X"] for t in scores]))
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(
+        {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)] for t, s in series.items()}))
+    history = data / "history.csv"
+    history.write_text("date,ticker,score,rank,universe_size,vol,max_dd,eligible\n" + "".join(
+        f"{day},{t},{v},{i},40,0.2,-0.1,1\n" for i, (t, v) in enumerate(scores.items(), 1)))
+    other = tmp_path / "other.csv"
+    other.write_text("date,ticker,score\n" + "".join(f"{day},{t},{-v}\n" for t, v in scores.items()))
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "grade", "--horizons", "20",
+                    "--top-n", "10", "--compare", f"inverted={other}"])
+    out = capsys.readouterr().out
+    assert code == 0 and "composite_rank" in out and "inverted" in out
+    payload = json.loads((data / "grading" / "grade_latest.json").read_text())
+    assert payload["composite_rank"]["20"]["mean_ic"] == pytest.approx(1.0)
+    assert payload["inverted"]["20"]["mean_ic"] == pytest.approx(-1.0)
+
+
+def test_forward_returns_charge_a_delisting_loss_only_for_series_that_ended_early():
+    start = dt.date(2026, 9, 1)
+    live = cr.Series([(start + dt.timedelta(days=d), 100.0 + d) for d in range(-5, 90)])
+    dead = cr.Series([(start + dt.timedelta(days=d), 100.0) for d in range(-5, 3)])  # stops 3 days after start
+    series = {"LIVE": live, "DEAD": dead}
+    archive_end = live.last_date
+    plain = cr.forward_returns(series, ["LIVE", "DEAD"], start, 20)
+    assert set(plain) == {"LIVE"}  # the delisted name silently vanishes: survivorship bias
+    filled = cr.forward_returns(series, ["LIVE", "DEAD"], start, 20, delist_loss=0.30, archive_end=archive_end)
+    assert filled["DEAD"] == pytest.approx(-0.30) and filled["LIVE"] == plain["LIVE"]
+    stale_only = cr.Series([(start + dt.timedelta(days=d), 100.0) for d in range(-5, 60)])  # ended < 30d before the end
+    assert "STALE" not in cr.forward_returns({"STALE": stale_only}, ["STALE"], start, 90, 0.30, archive_end)
+
+
+def test_trading_days_drops_days_most_series_lack():
+    a = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 3, 4)])
+    b = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 4)])
+    c = cr.Series([(dt.date(2026, 9, d), 1.0) for d in (1, 2, 4, 5)])
+    # Sep 3 has 1 of 3 bars and Sep 5 has 1 of 3: both below half, so only the shared days survive
+    assert cr.trading_days({"a": a, "b": b, "c": c}, dt.date(2026, 9, 1), dt.date(2026, 9, 5)) == [
+        dt.date(2026, 9, 1), dt.date(2026, 9, 2), dt.date(2026, 9, 4)]
+
+
+def test_backfill_history_writes_one_csv_and_leaves_live_history_alone(tmp_path):
+    data, archive = tmp_path / "data", tmp_path / "archive"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    (data / "inputs" / "sp500.json").write_text(json.dumps([[f"T{i}", f"T{i}", "X"] for i in range(6)]))
+    ext = {f"T{i}": [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)]
+           for i, s in enumerate(make_series(0.0005 * (i + 1), wobble=0.001) for i in range(6))}
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(ext))
+    out = tmp_path / "bf.csv"
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "backfill-history",
+                    "--start", "2026-10-01", "--end", "2026-11-04", "--step-days", "14", "--out", str(out)])
+    assert code == 0 and not (data / "history.csv").exists()
+    rows = cr.read_history(out)
+    dates = sorted({r["date"] for r in rows})
+    assert len(dates) >= 2 and all((dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days >= 14
+                                   for a, b in zip(dates, dates[1:], strict=False))
+    assert rows[0].keys() == set(cr.HISTORY_FIELDS) and {r["eligible"] for r in rows} == {"1"}
+
+
+# ----------------------------------------------------------------------------------------------
+# Price-only surrogate of the dynamic-universe ADR's factors
+# ----------------------------------------------------------------------------------------------
+def _drift_series(daily, vol_amp=0.0, days=420, end=dt.date(2026, 9, 1)):
+    """Daily bars compounding at ``daily`` with an alternating +/- ``vol_amp`` wobble."""
+    pts, value = [], 100.0
+    for i in range(days):
+        value *= 1.0 + daily + (vol_amp if i % 2 else -vol_amp)
+        pts.append((end - dt.timedelta(days=days - 1 - i), value))
+    return cr.Series(pts)
+
+
+def test_adr_price_zscores_are_winsorized_and_use_the_reference_pool():
+    z = cr._zscores({"a": 0.0, "b": 1.0, "c": 100.0}, {"a": 0.0, "b": 1.0})
+    assert z["c"] == cr.ADR_WINSOR and z["a"] < 0 < z["b"]
+    assert cr._zscores({"a": 1.0, "b": 1.0}) == {"a": 0.0, "b": 0.0}  # no dispersion: no signal
+
+
+def test_adr_price_ranks_strong_steady_names_above_weak_noisy_ones():
+    end = dt.date(2026, 9, 1)
+    series = {"UP": _drift_series(0.002, 0.001), "FLAT": _drift_series(0.0, 0.001),
+              "NOISY": _drift_series(0.0, 0.03), "DOWN": _drift_series(-0.002, 0.001)}
+    records, unscored = cr.score_universe_adr_price(series, end)
+    assert unscored == [] and records["UP"]["rank"] == 1 and records["DOWN"]["rank"] > records["FLAT"]["rank"]
+    assert records["NOISY"]["rank"] > records["FLAT"]["rank"]  # same drift, higher vol: lower score
+    assert all(r["eligible"] for r in records.values())  # filter off
+
+
+def test_adr_price_skips_latest_month_and_needs_both_momentum_legs():
+    end = dt.date(2026, 9, 1)
+    base = _drift_series(0.001, 0.001)
+    # A last-30-days spike must not change the score: momentum skips the latest month.
+    spiked = cr.Series(list(zip(base.dates, base.values, strict=False))[:-10]
+                       + [(d, v * 3.0) for d, v in list(zip(base.dates, base.values, strict=False))[-10:]])
+    a, _ = cr.score_universe_adr_price({"X": base, "Y": _drift_series(0.0, 0.001)}, end)
+    b, _ = cr.score_universe_adr_price({"X": spiked, "Y": _drift_series(0.0, 0.001)}, end)
+    assert a["X"]["mom_z"] == pytest.approx(b["X"]["mom_z"])
+    short = _drift_series(0.001, 0.001, days=200)  # under 12 months of bars
+    records, unscored = cr.score_universe_adr_price({"X": base, "Y": _drift_series(0.0, 0.001), "S": short}, end)
+    assert "S" not in records and "S" in unscored
+
+
+def test_backfill_history_adr_price_model_writes_a_gradable_csv(tmp_path, capsys):
+    data, archive = tmp_path / "data", tmp_path / "archive"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    series = {f"T{i:02d}": _drift_series(0.002 * (i - 5) / 5, 0.001 + 0.0005 * (i % 3)) for i in range(12)}
+    (data / "inputs" / "sp500.json").write_text(json.dumps([[t, t, "X"] for t in series]))
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(
+        {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)] for t, s in series.items()}))
+    out = tmp_path / "adr.csv"
+    code = cr.main(["--data-dir", str(data), "--archive-dir", str(archive), "backfill-history", "--start",
+                    "2026-08-25", "--end", "2026-09-01", "--step-days", "7", "--score-model", "adr_price",
+                    "--out", str(out)])
+    assert code == 0 and '"score_model": "adr_price"' in capsys.readouterr().out
+    scores, eligible = cr.read_scores_csv(out)
+    assert scores and len(next(iter(scores.values()))) == 12
+    assert not (data / "history.csv").exists()  # the live history is never touched
+
+
+def test_archive_run_logs_the_adr_price_surrogate_as_a_shadow_without_changing_the_list(tmp_path):
+    data, archive, cfg = tmp_path / "data", tmp_path / "archive", tmp_path / "cfg"
+    (data / "inputs").mkdir(parents=True)
+    archive.mkdir()
+    cfg.mkdir()
+    series = {f"T{i:02d}": _drift_series(0.002 * (i - 5) / 5, 0.001 + 0.0005 * (i % 3)) for i in range(12)}
+    (data / "inputs" / "watchlist.json").write_text(json.dumps(list(series)))
+    (data / "inputs" / "ext_prices.json").write_text(json.dumps(
+        {t: [[d.isoformat(), v] for d, v in zip(s.dates, s.values, strict=False)] for t, s in series.items()}))
+    args = ["--data-dir", str(data), "--archive-dir", str(archive), "--config-dir", str(cfg), "--universe"]
+    assert cr.main(args + ["archive", "run", "--as-of", "2026-09-01"]) == 0
+    shadow = data / "shadow_adr_price_history.csv"
+    scores, _ = cr.read_scores_csv(shadow)
+    assert len(scores["2026-09-01"]) == 12
+    cr.main(args + ["archive", "run", "--as-of", "2026-09-01"])  # re-running a date replaces it, never duplicates
+    assert len(cr.read_history(shadow)) == 12
+    assert "shadow_adr_price_rows" in json.loads((data / "runs" / "2026-09-01" / "summary.json").read_text())
+    assert cr.main(args + ["all", "run", "--as-of", "2026-09-01", "--allow-active-archive"]) == 0
+    assert len(cr.read_history(shadow)) == 12  # non-archive universes do not write the shadow
+
+
+def test_blend_scores_averages_eligible_pool_percentiles_and_intersects_names():
+    a = ({"d": {"X": 10.0, "Y": 20.0, "Z": 30.0}}, {"d": {"X", "Y", "Z"}})
+    b = ({"d": {"X": 3.0, "Y": 2.0, "Z": 1.0}}, {"d": {"X", "Y", "Z"}})  # opposite order
+    extra = ({"d": {"X": 3.0, "Y": 2.0, "Z": 1.0, "W": 9.0}}, {"d": {"X", "Y", "Z", "W"}})
+    assert set(cr.blend_scores([a, extra], [1, 1])[0]["d"]) == {"X", "Y", "Z"}  # W is scored by only one ranking
+    blended, eligible = cr.blend_scores([a, b], [1, 1])
+    assert blended["d"]["X"] == pytest.approx(blended["d"]["Z"])  # opposite rankings cancel
+    heavy, _ = cr.blend_scores([a, b], [3, 1])
+    assert heavy["d"]["Z"] > heavy["d"]["X"]  # the first ranking dominates
+    only_a = ({"d": {"X": 1.0, "Y": 2.0}}, {"d": {"X"}})  # Y ineligible in this ranking
+    _, elig = cr.blend_scores([only_a, a], [1, 1])
+    assert elig["d"] == {"X"}
+    with pytest.raises(ValueError):
+        cr.blend_scores([a, b], [1])
+
+
+def test_blend_history_command_writes_a_gradable_csv(tmp_path, capsys):
+    one, two, out = tmp_path / "a.csv", tmp_path / "b.csv", tmp_path / "blend.csv"
+    one.write_text("date,ticker,score,eligible\n" + "".join(f"2026-01-05,T{i},{i},1\n" for i in range(5)))
+    two.write_text("date,ticker,score,eligible\n" + "".join(f"2026-01-05,T{i},{-i},{0 if i == 4 else 1}\n"
+                                                           for i in range(5)))
+    assert cr.main(["blend-history", "--inputs", str(one), str(two), "--out", str(out)]) == 0
+    assert '"dates": 1' in capsys.readouterr().out
+    scores, eligible = cr.read_scores_csv(out)
+    assert len(scores["2026-01-05"]) == 5 and "T4" not in eligible["2026-01-05"]

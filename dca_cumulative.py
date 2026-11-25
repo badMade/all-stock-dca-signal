@@ -394,6 +394,7 @@ class CumulativeCreditLedger:
         symbol = ticker.strip().upper()
         if not symbol:
             raise ValueError("ticker is required for a cumulative credit")
+        additional_credit_usd = _require_non_negative_amount(additional_credit_usd)
         day_dir = self.root / trading_day
         state_path = day_dir / "ledger.json"
         lock_path = day_dir / "ledger.lock"
@@ -629,6 +630,11 @@ class CumulativeCreditLedger:
         symbol = ticker.strip().upper()
         if not symbol:
             raise ValueError("ticker is required for a cumulative credit")
+        outstanding_credit_usd = _require_non_negative_amount(outstanding_credit_usd)
+        expected_settled_credit_usd = _require_non_negative_amount(expected_settled_credit_usd)
+        expected_outstanding_credit_usd = _require_non_negative_amount(expected_outstanding_credit_usd)
+        if expected_pending_usd is not None:
+            expected_pending_usd = _require_non_negative_amount(expected_pending_usd)
         dedup_key = f"preserve:{symbol}:{idempotency_key}"
         day_dir = self.root / trading_day
         state_path = day_dir / "ledger.json"
@@ -969,6 +975,8 @@ class CumulativeCreditLedger:
         compare-and-swap").
         """
         symbol = ticker.strip().upper()
+        if observed_amount_usd is not None:
+            observed_amount_usd = _require_non_negative_amount(observed_amount_usd)
         day_dir = self.root / trading_day
         state_path = day_dir / "ledger.json"
         lock_path = day_dir / "ledger.lock"
@@ -1062,7 +1070,7 @@ class CumulativeCreditLedger:
         provenance under one lock so a later retry can reconcile the credit.
         """
         symbol = ticker.strip().upper()
-        amount = round(discarded_amount_usd, 2)
+        amount = round(_require_non_negative_amount(discarded_amount_usd), 2)
         if not symbol or amount <= 0:
             return False
         day_dir = self.root / trading_day
@@ -1168,6 +1176,9 @@ class CumulativeCreditLedger:
         symbol = ticker.strip().upper()
         if not symbol:
             raise ValueError("ticker is required to settle a cumulative credit")
+        submitted_amount_usd = _require_non_negative_amount(submitted_amount_usd)
+        if already_debited_usd is not None:
+            already_debited_usd = _require_non_negative_amount(already_debited_usd)
         # Broker adapters are not guaranteed to normalize identifiers. Keep
         # the canonicalization at the ledger boundary so original-placement
         # and duplicate-recovery callers cannot persist two spellings of the
@@ -1433,14 +1444,22 @@ class CumulativeCreditLedger:
                 "events": [],
             }
         try:
-            state = json.loads(path.read_bytes())
-        except (OSError, json.JSONDecodeError) as exc:
+            state = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        except (OSError, ValueError) as exc:
             raise ValueError(f"could not read cumulative credit ledger {path}") from exc
         if (
             not isinstance(state, dict)
+            or isinstance(state.get("version"), bool)
             or state.get("version") != 1
             or state.get("trading_day") != trading_day
-            or not isinstance(state.get("pending_usd_by_ticker"), dict)
+            or not _valid_pending_map(state.get("pending_usd_by_ticker"))
+            or (
+                "minimum_order_pending_usd_by_ticker" in state
+                and not _valid_pending_map(state.get("minimum_order_pending_usd_by_ticker"))
+            )
+            or not (isinstance(state.get("recorded_idempotency_keys", {}), dict) and all(_valid_idempotency_entry(k, v) for k, v in state.get("recorded_idempotency_keys", {}).items()))
+            or not _valid_non_negative_int(state.get("next_sequence", 0))
+            or not _valid_non_negative_int(state.get("revision", 0))
             or not isinstance(state.get("events"), list)
         ):
             raise ValueError(f"invalid cumulative credit ledger {path}")
@@ -1476,12 +1495,61 @@ class CumulativeCreditLedger:
         return state
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _valid_non_negative_number(value: Any) -> bool:
+    """Return True only for finite, non-negative JSON numbers (rejecting bools and oversized ints)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def _valid_non_negative_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _require_non_negative_amount(value: Any) -> float:
+    if not _valid_non_negative_number(value):
+        raise ValueError(f"credit amounts must be finite, non-negative numbers, got {value!r}")
+    return float(value)
+
+
+def _valid_pending_map(mapping: Any) -> bool:
+    return isinstance(mapping, dict) and all(_valid_non_negative_number(v) for v in mapping.values())
+
+
+def _valid_idempotency_entry(key: Any, entry: Any) -> bool:
+    if not isinstance(key, str) or not isinstance(entry, dict) or not _valid_non_negative_int(entry.get("sequence", 0)):
+        return False
+    if key.startswith("preserve:"):
+        return (
+            all(_valid_non_negative_number(entry.get(f)) for f in ("pending_before_usd", "incremental_credit_usd", "pending_after_usd"))
+            and _valid_non_negative_number(entry.get("settled_credit_usd", 0.0))
+            and isinstance(entry.get("consumed_by_settlement", False), bool)
+        )
+    return all(_valid_non_negative_number(entry.get(f)) for f in _DECISION_FIELDS[:4]) and isinstance(entry.get("final_session"), bool)
+
+
 def _money(value: float | Decimal | int | str) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
+    if isinstance(value, bool):
+        raise ValueError("credit amounts must be numeric")
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("credit amounts must be numeric") from exc
+    except OverflowError as exc:
+        raise ValueError("credit amounts must be finite") from exc
     if not math.isfinite(numeric):
         raise ValueError("credit amounts must be finite")
     return max(Decimal("0"), Decimal(str(numeric))).quantize(CENT, rounding=ROUND_HALF_UP)

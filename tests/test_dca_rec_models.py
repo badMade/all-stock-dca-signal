@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 import dca_runner
+from dca_order_plan import universe_hash
 from dca_rec_models import (
     SLOT_IDS,
     BrokerState,
@@ -226,3 +227,93 @@ def test_broker_state_redacts_the_account_throughout_an_assembler_shaped_envelop
     # The in-memory broker evidence is untouched: assembly still needs the real account.
     assert state.orders_envelope["account_number"] == "sensitive-account"
     assert state.orders_envelope["pages"][1]["data"]["data"]["account_number"] == "sensitive-account"
+
+
+# --- the carried universe (docs/adr-backup-planner-daily-universe.md, accepted 2026-11-20) ----------------------
+# A daily-changing buy list cannot live only inside the backup planner's bundle. A set may therefore CARRY the day's
+# sorted list. When it does, the list must hash to ``universe_hash`` (the same rule as dca_order_plan.universe_hash),
+# stay within 100 canonical symbols, and every recommended ticker must be in it. Absent = an older set, unchanged.
+
+
+def universe_names(count):
+    return tuple(f"S{chr(65 + i // 26)}{chr(65 + i % 26)}" for i in range(count))
+
+
+def with_universe(universe, items=(), **overrides):
+    base = replace(rec_set(items), universe=universe, universe_hash=universe_hash(universe))
+    return replace(base, **overrides) if overrides else base
+
+
+def test_the_universe_round_trips_and_is_optional_on_the_wire():
+    carried = with_universe(("AAA", "BBB", "SPY"), [rec()])
+    assert carried.to_json()["universe"] == ["AAA", "BBB", "SPY"]
+    assert RecommendationSet.from_json(carried.to_json()) == carried
+    # An older payload without the key still parses, with no carried list.
+    assert "universe" not in rec_set().to_json()
+    assert RecommendationSet.from_json(rec_set().to_json()).universe is None
+
+
+def test_a_set_may_carry_both_a_universe_and_a_sizing_guard():
+    both = with_universe(("AAA", "SPY"), [rec()], sizing_guard={"max_multiplier": 2.0, "deployed_7d_usd": 5.0})
+    assert RecommendationSet.from_json(both.to_json()) == both
+
+
+def test_a_carried_universe_must_hash_to_the_sets_universe_hash():
+    with pytest.raises(ValueError, match="universe_hash"):
+        replace(rec_set(), universe=("AAA", "BBB"), universe_hash="not-the-hash")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(("BBB", "AAA"), id="unsorted"),
+        pytest.param(("AAA", "AAA"), id="duplicate"),
+        pytest.param(("aaa",), id="lowercase"),
+        pytest.param(("AAA", ""), id="blank"),
+        pytest.param((), id="empty"),
+        pytest.param(("AAA", 7), id="not_a_string"),
+        pytest.param(["AAA", "BBB"], id="a_list_not_a_tuple"),
+        pytest.param(universe_names(101), id="more_than_100_symbols"),
+    ],
+)
+def test_a_malformed_universe_is_refused(bad):
+    with pytest.raises(ValueError, match="universe"):
+        replace(rec_set(), universe=bad, universe_hash="x")
+
+
+def test_exactly_100_symbols_is_allowed():
+    names = universe_names(100)
+    assert with_universe(names).universe == names
+
+
+def test_a_recommended_ticker_outside_the_carried_universe_is_refused():
+    with pytest.raises(ValueError, match="universe"):
+        with_universe(("AAA", "BBB"), [rec("SPY")])
+
+
+def test_from_json_refuses_a_universe_that_is_not_a_list_and_a_tampered_hash():
+    carried = with_universe(("AAA", "SPY"), [rec()])
+    wire = carried.to_json()
+    with pytest.raises(ValueError, match="universe"):
+        RecommendationSet.from_json({**wire, "universe": "AAA,SPY"})
+    with pytest.raises(ValueError, match="universe_hash"):
+        RecommendationSet.from_json({**wire, "universe_hash": "tampered"})
+
+
+def test_oversized_integer_in_finite_and_quote_sides_raises_value_error_not_overflow():
+    huge = 10**400
+    with pytest.raises(ValueError, match="finite number"):
+        Recommendation("SPY", huge, UUID)
+    with pytest.raises(ValueError, match="finite number"):
+        BrokerState(DAY, STAMP, "acct", {}, huge)
+    with pytest.raises(ValueError, match="finite number"):
+        ExpectedPrice("SPY", huge, 101.0, None, 1.2, 0.99, 15.0)
+    with pytest.raises(ValueError, match="invalid quote_sides"):
+        MarketSnapshot(DAY, STAMP, "robinhood_agent_fetch", PAYLOAD, {"SPY": [huge, 100.0]})
+
+
+
+def test_from_json_still_refuses_any_other_unknown_key():
+    wire = with_universe(("AAA", "SPY"), [rec()]).to_json()
+    with pytest.raises(ValueError):
+        RecommendationSet.from_json({**wire, "extra": 1})

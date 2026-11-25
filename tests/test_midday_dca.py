@@ -1788,3 +1788,26 @@ def test_load_midday_config_with_an_unresolvable_account_pins_none_and_warns(tmp
 
     with pytest.raises(MissingConfigEnvError):
         load_midday_config(str(tmp_path), allow_unpinned_account=False)
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "match"),
+    [
+        ('{"live_execution_enabled": false, "live_execution_enabled": true}', "duplicate"),
+        ('{"budget_ledger": {"midday_daily_cap_usd": Infinity}}', "finite"),
+        (f'{{"budget_ledger": {{"midday_weekly_cap_usd": {10**400}}}}}', "finite"),
+        ('{"budget_ledger": {"midday_daily_cap_usd": true}}', "boolean"),
+        ('{"sizing_ladder": {"base_amount_usd": -2.0}}', "non-negative"),
+        ('{"trend_min_bars": true}', "non-negative integer"),
+    ],
+)
+def test_load_midday_config_rejects_malformed_stream_config_values(tmp_path, raw_text, match):
+    (tmp_path / "midday_dca.json").write_text(raw_text, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_midday_config(str(tmp_path), allow_unpinned_account=True)
+
+
+def test_load_midday_config_non_object_json_fails_closed_to_shadow_mode(tmp_path):
+    (tmp_path / "midday_dca.json").write_text("[]", encoding="utf-8")
+    cfg = load_midday_config(str(tmp_path), allow_unpinned_account=True)
+    assert cfg.live_execution_enabled is False

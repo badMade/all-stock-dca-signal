@@ -45,6 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 from dca_config import (
     InvalidAccountNumberError,
     MissingConfigEnvError,
+    _reject_duplicate_keys,
     get_config_dir,
     load_per_ticker_sizing,
     load_tickers,
@@ -60,6 +61,7 @@ from morning_dca import (
     _append_dated_manual_override_cap_seed_roots,
     _coerce_live_execution_enabled,
     _load_approved_dates_fail_closed,
+    _parse_stream_sizing_and_budget,
     default_prior_allocation_roots,
     load_max_per_order_usd,
     resolved_count_breakers,
@@ -228,11 +230,20 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     }
 
     try:
-        raw = json.loads(cfg_path.read_bytes())
+        # Reject duplicate JSON keys so parameter pollution cannot silently override caps or live switch.
+        raw = json.loads(cfg_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
         # Fail closed to shadow mode -- see the not-exists branch above for why
         # an unreadable config must never reach live broker placement.
+        return MiddayConfig(**approved_date_overrides, live_execution_enabled=False)
+
+    if not isinstance(raw, dict):
+        _log.warning(
+            "%s did not contain a JSON object (got %s); using MiddayConfig defaults",
+            cfg_path,
+            type(raw).__name__,
+        )
         return MiddayConfig(**approved_date_overrides, live_execution_enabled=False)
 
     # See load_morning_config: bundled absolute artifact paths follow
@@ -240,9 +251,6 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     raw = rebase_bundled_roots_in(raw)
 
     kwargs: Dict[str, Any] = dict(approved_date_overrides)
-    if "trend_min_bars" in raw:
-        kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
-
     # Master placement switch. Deliberately defaults to True (MiddayConfig's
     # inherited default) when the key is absent from an OTHERWISE READABLE
     # config, unlike load_stream_config's shadow-first streams: midday is a
@@ -254,30 +262,14 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
             raw["live_execution_enabled"], source_label="midday_dca.json"
         )
-
-    sizing = raw.get("sizing_ladder", {})
-    if "base_amount_usd" in sizing:
-        kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
-    # Mirrors load_morning_config: without this, an operator-configured
-    # base_amount_below_close_usd silently has no effect on the midday stream and
-    # below-close-only midday orders fall back to MiddayConfig's hardcoded $1
-    # default regardless of what the config says (Codex review: "Route the
-    # reduced base through the midday configuration").
-    if "base_amount_below_close_usd" in sizing:
-        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
-    if "no_buy_below_pct" in sizing:
-        kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
-    if "tiers" in sizing:
-        kwargs["sizing_tiers"] = tuple(
-            (float(t["min_drop_pct"]) / 100.0, float(t["multiplier"]))
-            for t in sizing["tiers"]
+    kwargs.update(
+        _parse_stream_sizing_and_budget(
+            raw,
+            daily_cap_key="midday_daily_cap_usd",
+            weekly_cap_key="midday_weekly_cap_usd",
+            source_label="midday_dca.json",
         )
-
-    budget = raw.get("budget_ledger", {})
-    if "midday_daily_cap_usd" in budget:
-        kwargs["morning_daily_cap_usd"] = float(budget["midday_daily_cap_usd"])
-    if "midday_weekly_cap_usd" in budget:
-        kwargs["morning_weekly_cap_usd"] = float(budget["midday_weekly_cap_usd"])
+    )
 
     live_task = raw.get("live_task", {})
     if "broker_account" in live_task:
@@ -385,6 +377,8 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    if "no_buy_tickers" in ticker_cfg:
+        kwargs["no_buy_tickers"] = ticker_cfg["no_buy_tickers"]
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MiddayConfig(**kwargs)

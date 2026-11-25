@@ -1,7 +1,8 @@
-# ADR (proposed): simultaneous-start guard
+# ADR: simultaneous-start guard
 
 Status: APPROVED by the operator 2026-10-17 (B + C + A, one PR, operator runs the ref_id acceptance test). See "Implementation status" at the end.
-Keys: `duplicate_fills`, `competing_executor`. Operator approval required before implementation.
+Keys: `duplicate_fills`, `competing_executor`. (2026-11-24 audit: the mechanism is delivered and off by default;
+no caller outside the tests passes `refetch_orders_fn` or `slot_claim_root` to `dca_runner.execute_plan` yet.)
 
 ## Problem
 

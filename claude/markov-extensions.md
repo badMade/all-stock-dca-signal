@@ -1,0 +1,52 @@
+# Markov extensions: two categories
+
+Status: proposed. Research and planning only. Nothing here touches live sizing.
+Date: 2026-11-23
+Builds on: the 2026-11-21 Markov deep dive (regime detection, intraday tier chain, stress simulation) and the proposed RegimeSuggester ADR.
+
+## Category 1: could change how many dollars get bought per day
+
+Both stay suggest-only. They reach sizing only through `SizingSuggester` / `ForecastProvider` and `SizingAdjustmentReader`, after shadow mode and the evaluation gate.
+
+| # | Type | Problem it fixes | What it suggests | Success metric |
+|---|---|---|---|---|
+| 1 | MDP cash pacing (dynamic programming over tier, slot, cash left, regime) | Budget is spent slot by slot with no forward view, so a later Tier B/C dip can find the day's cash already gone | A reserve fraction per slot | Average cost basis and terminal value per dollar vs fixed 0%, 25%, 50% reserves, with block-bootstrap CIs |
+| 2 | Absorbing tier chain (intraday chain plus terminal states: filled at A, B, C, or day ended unfilled) | Top-up timing is guesswork | P(day ends at Tier B or C), expected slots until a deeper tier, a "wait vs buy now" flag | Brier score vs the Brownian barrier baseline, then dollars saved per top-up in shadow mode |
+
+Dependency: item 1 needs a calibrated item 2. Item 1 stays shadow-only until item 2 passes its Brier check.
+
+### Gate before building either
+
+Opportunity sizing (read-only): count sessions where a later scheduled slot saw a buyable dip while the day's remaining budget could not fund the buy the ladder would have made (global ladder from `config/sizing_ladder.json`: 1x to 8x on drop vs prior close, times $2 strictly below the prior low or $1 below the close only). Counted separately for both dip kinds, at all four daily caps.
+First estimate (global ladder only): `dca-sizing-signals/market_data_ingest/ledger/opportunity.py`, spec revision 2 approved and passing (31 tests). Faithful replay with per-ticker ladders, top-up guard and kill switch: `docs/adr-budget-exhaustion-replay.md` (accepted 2026-11-23, revision 3, implemented as `python -m scripts.budget_exhaustion_count`). Handoff: `HANDOFF_budget_exhaustion_opportunity.md`.
+If the count is near zero, both items drop down the roadmap.
+
+Known limits of the count: the day's budget tier is not stored in the ledger, so the report runs once per cap ($180/$240/$300/$360); per-ticker calibrated ladders, the ML nudge and the kill-switch cap are not replayed; quotes come from `intraday_quotes`, so coverage starts when that table started filling.
+
+## Category 2: improves decisions made around the system
+
+None of these changes the dollars bought on a given day.
+
+| # | Type | Decision it improves | Output | Success metric | Needs first |
+|---|---|---|---|---|---|
+| 3 | Migration matrix (ticker performance quintile, month to month) | Which tickers stay active under the 100-ticker cap | Persistence probability per quintile; promotion threshold | Active-list turnover; forward return of promoted vs demoted | Phase 3/4 dynamic-universe ADR |
+| 4 | Hidden semi-Markov model (explicit regime durations) | When to trust a regime signal | Expected remaining regime duration at detection | Share of signals with more than 10 trading days left; RegimeSuggester gate decides | RegimeSuggester baseline in shadow mode |
+| 5 | Continuous-time chain (rate matrix) | How many parameters the intraday chain needs | One generator matrix for any slot gap | Out-of-sample log loss vs the per-slot discrete chain; parameter stability | Same data as item 2; built as its variant |
+| 6 | Markov reward process (regime paths through the real rules) | What the goal odds are | P(hitting the 20% YoY goal) and drawdown spread for the goals GUI | Calibration of predicted P(goal) vs realized years | Regime model plus backtest harness |
+
+## Build order
+
+1. Opportunity-sizing query (gate for category 1)
+2. Item 2, absorbing chain
+3. Item 5, continuous-time variant (kept only if log loss beats item 2)
+4. Item 1, MDP
+5. Item 4, HSMM
+6. Item 6, reward process
+7. Item 3, migration matrix
+
+## Open questions
+
+Decided 2026-11-23: run at all four caps; count both dip kinds; report is a CLI only; no global-ladder-only shortcut for the final number (replay per the ADR).
+
+1. The open questions in `docs/adr-budget-exhaustion-replay.md`: all seven answered 2026-11-23.
+2. Note: "Tier A/B/C" in category 1 is shorthand from the 2026-11-21 deep dive. The live ladder is the 1x-8x drop ladder; item 2's chain states must be redefined on it before that work starts.

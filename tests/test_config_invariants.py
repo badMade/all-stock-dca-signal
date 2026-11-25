@@ -1516,6 +1516,13 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "109417000000",
         "000020",
         "0000000000",
+        # Real SEC EDGAR accession-number pieces for four Apple filings (one filed by
+        # agent CIK 0001308179) in dca-sizing-signals/tests/fixtures/edgar_acceptance_aapl.json
+        # and the backtest-protocol phase A guards that read it -- filing ids, not accounts.
+        "000008",
+        "000018",
+        "000079",
+        "0001308179",
         # NVIDIA SEC CIK, accession-number pieces and capex amounts in
         # tests/test_scan_capex_deltas.py's XBRL fixture, not brokerage accounts.
         "1045810",
@@ -1587,6 +1594,9 @@ _ALLOWED = {
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-07.json",
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-10.json",
     "dca-sizing-signals/tests/prices/fixtures/massive_grouped_count_mismatch.json",
+    # Real (not synthetic) raw NVDA daily bars recorded from Robinhood 2026-11-23 for the backtest
+    # protocol's bar-quarantine guard: the account-shaped runs are share volumes.
+    "dca-sizing-signals/tests/prices/fixtures/robinhood_nvda_raw_2024-06-05_13.json",
     # Holds a microsecond-precision timestamp literal (.500000) in an assertion.
     "dca-sizing-signals/tests/prices/test_alpaca_provider.py",
     # Real Polymarket responses captured 2026-11-13 (docs/adr-prediction-markets.md, Phase 5a): unix-second
@@ -5178,3 +5188,31 @@ def test_a_cve_id_suffix_is_not_an_account_but_a_nine_digit_one_still_is():
         match = _ACCOUNT_SHAPED.search(text)
         assert match is not None
         assert _is_cve_id_suffix(text, match) is expected, text
+
+
+# --- pinned (hand-held ETFs/funds/20-F filers kept in `active` outside the ranking) ---------------------
+
+
+def test_tickers_schema_accepts_a_pinned_list_of_canonical_symbols():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    document["pinned"] = [document["active"][0]]
+    jsonschema.validate(document, schema)
+
+
+@pytest.mark.parametrize("pinned", [["not-a-ticker"], ["AAPL", "AAPL"], "AAPL"])
+def test_tickers_schema_rejects_a_malformed_pinned_list(pinned):
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    document["pinned"] = pinned
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
+def test_pinned_names_are_active_and_never_excluded():
+    documented = _load("tickers.json")
+    pinned = set(documented.get("pinned", []))
+    assert pinned <= set(documented["active"]), "pinned must be a subset of active"
+    assert not pinned & set(documented.get("excluded", [])), "a pinned name cannot be excluded"

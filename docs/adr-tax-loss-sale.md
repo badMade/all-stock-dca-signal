@@ -95,3 +95,15 @@ tickers almost every trading day, so:
 
 Revert the PRs. Remove any pause entries by hand. Sales already placed cannot be rolled back,
 which is why every one needs an operator approval.
+
+## Update 2026-11-20
+
+Open question 4 is answered for the pause itself by `docs/adr-no-buy-window.md`: a dated `no_buy` block in
+`config/tickers.json`, enforced by the shared loader and `dca_runner`, with a recorded early release. The
+pre-sale lookback, the cross-account ledger and the candidate report in this ADR are still not built.
+
+Correction (2026-11-24 audit): a research-only library for the candidate report, eligibility, and the
+pre-sale lookback and post-sale pause windows exists in
+`dca-sizing-signals/market_data_ingest/ledger/tax_loss.py` (tests in
+`dca-sizing-signals/tests/ledger/test_tax_loss.py`). Nothing feeds it data or runs it yet, and the
+cross-account lot feed is still not built.

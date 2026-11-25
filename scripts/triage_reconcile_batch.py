@@ -147,6 +147,8 @@ def _decide(
     issues: Sequence[Mapping[str, Any]],
     shallow: bool,
     commit_present: Mapping[str, bool],
+    evidence_by_key: dict[str, tr.GitEvidence] | None = None,
+    audit_not_run: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     decision: dict[str, Any] = {"key": key, "action": "update" if row is not None else "create"}
     row = row or {}
@@ -163,11 +165,20 @@ def _decide(
             issues=issues,
             recorded_pr_number=recorded_pr,
             recorded_commit_url=recorded_commit,
+            confirmed_pr_number=tr.OPERATOR_CONFIRMED_PRS.get(key),
             shallow=shallow,
             commit_present=commit_present,
         )
     except tr.EvidenceError as exc:
+        if audit_not_run is not None:
+            audit_not_run.append({"key": key, "reason": str(exc)})
         return {**decision, "action": "skip", "skip_reason": f"EvidenceError: {exc}"}
+
+    # Keep the typed evidence alongside the legacy flattened decision. The 2026-11-02 cycle built
+    # tr.audit_unsupported_fixes but never wired it into a caller; on 2026-11-19 this side map lets the
+    # batch audit the exact evidence even when a later guard skips writes (recorded PR or shallow commit).
+    if evidence_by_key is not None:
+        evidence_by_key[key] = evidence
 
     progress = tr.derive_progress(evidence)
     decision["progress"] = progress
@@ -243,10 +254,17 @@ def reconcile(
     kwargs = dict(
         branches=branches, prs=prs, commits=commits, issues=issues, shallow=shallow, commit_present=commit_present or {}
     )
-    decisions = [_decide(row, key, **kwargs) for key, row in by_key.items()]
+    evidence_by_key: dict[str, tr.GitEvidence] = {}
+    audit_not_run: list[dict[str, str]] = []
+    decisions = [
+        _decide(row, key, **kwargs, evidence_by_key=evidence_by_key, audit_not_run=audit_not_run)
+        for key, row in by_key.items()
+    ]
     for key in dict.fromkeys(candidates):
         if key not in by_key:
-            decisions.append(_decide(None, key, **kwargs))
+            decisions.append(
+                _decide(None, key, **kwargs, evidence_by_key=evidence_by_key, audit_not_run=audit_not_run)
+            )
     for decision in decisions:
         decision["approved"] = decision["key"] in approved
     counts = {
@@ -258,6 +276,53 @@ def reconcile(
         "progress_notes_kept": sum(bool(d.get("progress_note_kept")) for d in decisions),
         "progress_regressions_blocked": sum(bool(d.get("progress_regression_blocked")) for d in decisions),
     }
+    # audit_unsupported_fixes predates this batch (2026-11-02) and intentionally remains pure. Give it copies:
+    # Notion's PR cell may be '#10' or a repository PR URL, and the audit contract accepts only int/None.
+    # Empty defaults satisfy its text-cell validation for sparse batch callers without changing their rows.
+    audit_rows: list[dict[str, Any]] = []
+    audit_not_run_keys = {item["key"] for item in audit_not_run}
+    for row in rows:
+        # A Key whose evidence match raised has no GitEvidence: auditing it would read as "no PR, commit or issue" and
+        # call a malformed row unsupported. It stays in audit_not_run only (Same Page round 1, finding 1).
+        if row.get("Key") in audit_not_run_keys:
+            continue
+        copy = dict(row)
+        try:
+            copy["PR number"] = _recorded_pr(row)
+        except tr.EvidenceError as exc:
+            key = str(row.get("Key", ""))
+            if key not in audit_not_run_keys:
+                audit_not_run.append({"key": key, "reason": str(exc)})
+                audit_not_run_keys.add(key)
+            continue
+        for column in ("Progress", "Proposed plan"):
+            if not isinstance(copy.get(column), str):
+                copy[column] = ""
+        audit_rows.append(copy)
+    unsupported_fixes = tr.audit_unsupported_fixes(audit_rows, evidence_by_key)
+    unsupported_fixes["audit_not_run"] = audit_not_run
+    rows_by_key = {row["Key"]: row for row in rows}
+    unsupported_with_recorded_evidence = []
+    unsupported_no_recorded_evidence = []
+    for key in unsupported_fixes["unsupported_approved_fix"]:
+        row = rows_by_key[key]
+        recorded_pr = _recorded_pr(row)
+        commit_url = row.get("Commit URL")
+        if recorded_pr is not None or (isinstance(commit_url, str) and bool(commit_url.strip())):
+            unsupported_with_recorded_evidence.append(key)
+        else:
+            unsupported_no_recorded_evidence.append(key)
+    unsupported_fixes["unsupported_with_recorded_evidence"] = unsupported_with_recorded_evidence
+    unsupported_fixes["unsupported_no_recorded_evidence"] = unsupported_no_recorded_evidence
+    for key in (
+        "unsupported_approved_fix",
+        "unsupported_with_recorded_evidence",
+        "unsupported_no_recorded_evidence",
+        "brief_acceptance_not_demonstrated",
+        "recorded_pr_not_found",
+        "audit_not_run",
+    ):
+        counts[key] = len(unsupported_fixes[key])
     approved_rows = [
         {"key": key, "progress_cell": by_key[key].get("Progress"), "derived": d.get("progress")}
         for d in decisions
@@ -268,6 +333,7 @@ def reconcile(
         "decisions": decisions,
         "approved": approved_rows,
         "approved_groups": approved_groups(approved_rows),
+        "unsupported_fixes": unsupported_fixes,
     }
 
 

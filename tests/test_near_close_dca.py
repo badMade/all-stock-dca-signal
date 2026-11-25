@@ -51667,3 +51667,24 @@ def test_bool_amounts_in_a_legacy_attribution_are_never_summed_as_numbers():
     assert result["submitted_amount_usd"] == 10.0
     assert result["planned_amount_usd"] == 10.0
     assert result["whole_share_quantity"] == 2.0
+
+
+def test_candidates_csv_header_unions_keys_across_rows(tmp_path):
+    """Regression (CI, test_cli_bare_defaults_to_demo, 2026-11-23): only candidates
+    the same-day top-up guard evaluated carry the guard columns, so a header taken
+    from row 0 alone made DictWriter raise on a later row with extra keys."""
+    import csv
+
+    from near_close_dca import _union_csv_fieldnames, _write_csv
+
+    rows = [
+        {"ticker": "AAA", "status": "skipped"},
+        {"ticker": "TRIN", "status": "filled", "top_up_guard_result": "none", "prior_same_day_amount": 5.0},
+    ]
+    assert _union_csv_fieldnames(rows) == ["ticker", "status", "top_up_guard_result", "prior_same_day_amount"]
+    assert _union_csv_fieldnames([]) == []
+    out = tmp_path / "buy_candidates.csv"
+    _write_csv(out, rows, fieldnames=_union_csv_fieldnames(rows))
+    with open(out, newline="", encoding="utf-8") as handle:
+        read = list(csv.DictReader(handle))
+    assert read[0]["top_up_guard_result"] == "" and read[1]["prior_same_day_amount"] == "5.0"

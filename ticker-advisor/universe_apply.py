@@ -172,6 +172,13 @@ def apply_proposal(
         raise ApplyRefused("unreadable_tickers", "tickers.json has no active list")
     if original["active"] != prior_active:
         raise ApplyRefused("stale_base", "the proposal was not built on the current active list")
+    pinned = original.get("pinned", [])
+    if not isinstance(pinned, list) or not all(isinstance(item, str) for item in pinned):
+        raise ApplyRefused("unreadable_tickers", "tickers.json's pinned must be a list of strings")
+    dropped_pins = sorted(set(pinned) - set(new_active))
+    if dropped_pins:
+        # Pinned names are hand-held: only the operator removes them, never a daily proposal.
+        raise ApplyRefused("drops_pinned_name", ", ".join(dropped_pins))
 
     bad = [t for t in new_active if not TICKER_SYMBOL_PATTERN.match(t)]
     if bad:

@@ -2,8 +2,12 @@
 
 - **Status:** In progress, operator-directed 2026-11-19. Implemented so far: the gated writer
   (`ticker-advisor/universe_apply.py`), the derived `ACTIVE_TICKERS`, and the strict daily top-100
-  engine mode. Not built: the data feed for ranking, the `launchd` job on the Mac, and the call
-  sites. Nothing yet applies a proposal to the live list. Open question 9 is unanswered.
+  engine mode. Since built (2026-11-22, confirmed in the 2026-11-24 audit): the data feed for ranking
+  (`dca-sizing-signals/market_data_ingest/build_fundamentals_snapshot.py`,
+  `ticker-advisor/daily_ranking.py`), the daily job `ticker-advisor/daily_universe_job.py` and its
+  template `deploy/launchd/com.all-stock-dca.universe-daily-ranking.plist.template`, which is not
+  yet loaded on the Mac. Nothing yet applies a proposal to the live list. Open question 9 was
+  answered by `docs/adr-backup-planner-daily-universe.md` (option 1, accepted 2026-11-20).
 - **Supersedes:** item 8 ("Suggest-only boundary") of `docs/adr-dynamic-universe.md`. Every other
   item of that ADR stays in force unless this one says otherwise.
 - **Scope:** who writes `config/tickers.json`, how the executor reads it, how the 122 current names
@@ -104,8 +108,11 @@ The operator wants the list maintained by the program, with every ticker ranked.
    them as an input from `universe_scores` and makes its own decision. Until that ADR is
    accepted, the "shares are never sold" rule stands, with only the exception already recorded in
    `docs/adr-tax-loss-sale.md`.
-9. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `symbol_corrections` and the
-   free-text notes are not written by the program in this ADR.
+9. **Hand-held fields stay hand-held.** `excluded`, `whole_share`, `pinned`, `symbol_corrections` and
+   the free-text notes are not written by the program in this ADR. `pinned` (operator-approved
+   2026-11-19, `docs/fundamentals_feed_scope.md`) lists ETFs, funds and filers with no us-gaap facts that
+   cannot be scored: they stay in `active` outside the ranking and count toward the cap of 100, and the
+   writer refuses any proposal that drops one.
 
 ## Open questions
 
@@ -115,11 +122,11 @@ The operator wants the list maintained by the program, with every ticker ranked.
 | 2 | Resolved 2026-11-19: strict top 100 each day, no buffer, a name enters on the first day it ranks in the top 100 (`UniverseConfig.strict_daily_top`) | The report lists daily entries and exits so boundary churn is visible, and a buffer can be added later if the operator wants one |
 | 3 | Where do ranks 101 and below live in `tickers.json`? They stay ranked but are not considered for buys | Move to a `bench` key outside `active`, so they keep a rank and history |
 | 4 | Where does the rank for each ticker get stored for reporting? | `universe_proposal.json` plus the DuckDB `universe_scores` table from the dynamic-universe ADR |
-| 5 | Who maintains `tickers.txt`, and how often does it refresh? The pool is only as current as that file | Read-only input. A stale or shrunken file (for example under 95% of the prior run's pool) rejects the proposal, as in the dynamic-universe ADR |
+| 5 | Who maintains `tickers.txt`, and how often does it refresh? Finding 2026-11-20: it was a one-time extraction (`README_FETCH_SYSTEM.md`: "Extracted list of 5,502 tickers"); nothing refreshes it, and the price-history fetcher reads it | Frozen for now (read-only input). Later a monthly Mac job proposes ADDITIONS only from the SEC ticker file, gated like the writer, never deletions. A stale or shrunken pool (under 95% of the prior run's) rejects the proposal. A name needs 252 sessions of history before it can rank, so additions must reach the price fetcher first |
 | 6 | Are ranks taken among buy-eligible names only, or among all names? | Among buy-eligible names; ineligible names are listed with a reason |
 | 7 | Resolved 2026-11-19: no limit on names changed per day. The "8 per day" figure in earlier drafts was copied from the quarterly swap limit of the dynamic-universe ADR and was never set by the operator | None. The engine's `max_swaps` safeguard must be neutralized (open question 8) |
 | 8 | Resolved 2026-11-19 and implemented: `UniverseConfig.strict_daily_top(100)` in `ticker-advisor/universe.py` gives one band (entry and keep rank 100), no tenure protection, sector and industry caps of 100 (so they never block a top-100 name), and `max_swaps` of `UNLIMITED_SWAPS`. A new setting `entry_requires_prior_review` (default true, so the quarterly mode is unchanged) is false there, so a name enters on the first day it ranks in the top 100, as the operator directed. The input safeguards (pool coverage, stale data, missing factors) and the 90 floor and 100 cap still apply | None. Sector and industry classification is still required for every add; names with no SIC classification are rejected as adds |
-| 9 | Nothing in the repo shows how the Mac checkout is kept in sync with `main` (no `git pull` step in the live prompt or docs). A daily in-place write also leaves `config/tickers.json` modified against git on the Mac, which can block or conflict with a later pull. How should that work? | Unanswered. Needs the operator: how the Mac checkout is updated today, and whether the program-written list should live in a gitignored file the executor reads instead of the tracked `tickers.json` |
+| 9 | How is the Mac checkout kept in sync, and how does a daily-changing list reach the backup planner? Findings 2026-11-20: (a) nothing pulls automatically: `docs/incident_2026-10-26_0935_unrecognized_orders.md` records the operator pulling by hand (`git pull --ff-only origin main`), and `scripts/planner_stamp_check.py` only fetches; (b) `backup_planner.pyz` BUNDLES `config/tickers.json` (`scripts/build_backup_planner.py`) and `scripts/backup_planner.py` refuses a plan whose `universe_hash` differs from it, so a list that changes daily makes the planner stale daily, and a stale planner refuses at step 0 | Needs the operator. Options: (1) the daily job writes the tracked `config/tickers.json` in the Mac checkout, uncommitted, and the backup planner is changed to take the universe from the Mac-built plan instead of its bundle (a separate ADR change to the plan-first backup); (2) the daily job commits the list to `main` and the planner is re-attached whenever it changes (daily re-paste, impractical); (3) backups keep `main`'s list, which can buy names that left the top 100 and is refused by the hash check. Recommended: option 1 |
 
 ## Consequences
 
