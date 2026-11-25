@@ -1,0 +1,43 @@
+{
+  "version": "2026-11-24-draft",
+  "status": "draft, NOT reviewed",
+  "description": "Ticker -> sector ETF for the 2026-11-24 residual-reversal cost-basis backtest only. Assigned by hand from each company's GICS sector as the author understood it on 2026-11-24, not from SEC SIC codes, so it is NOT the committed, reviewed table docs/adr-factor-residual-dip-signals.md rule 4 asks for. Semiconductors and memory map to SMH rather than XLK because XLK is dominated by three mega-caps. null means no ETF is assigned: funds, ETFs, and tickers the author could not classify with confidence. The suggester guards a null ticker as no_benchmark (multiplier 1.0), so it still buys at the baseline. The map is today's classification applied to every past session, so a past reclassification (for example MA and the other payment companies moving from XLK to XLF in 2023) is not point in time.",
+  "etf_by_ticker": {
+    "ASML": "SMH", "AMAT": "SMH", "AMD": "SMH", "MRVL": "SMH", "STM": "SMH", "TSM": "SMH",
+    "AVGO": "SMH", "NVDA": "SMH", "INTC": "SMH", "MU": "SMH", "TXN": "SMH", "QCOM": "SMH",
+    "GFS": "SMH", "SNDK": "SMH",
+
+    "MSFT": "XLK", "AAPL": "XLK", "IBM": "XLK", "CSCO": "XLK", "ANET": "XLK", "FFIV": "XLK",
+    "APH": "XLK", "TEL": "XLK", "GLW": "XLK", "MSI": "XLK", "CIEN": "XLK", "VIAV": "XLK",
+    "STX": "XLK", "WDC": "XLK", "COHR": "XLK", "LITE": "XLK", "QBTS": "XLK", "RGTI": "XLK",
+    "QUBT": "XLK",
+
+    "GOOGL": "XLC", "GOOG": "XLC", "NFLX": "XLC", "IRDM": "XLC",
+
+    "AMZN": "XLY", "TSLA": "XLY", "LULU": "XLY", "HLT": "XLY", "MAR": "XLY", "DRI": "XLY",
+    "EBAY": "XLY",
+
+    "MA": "XLF", "GS": "XLF", "JPM": "XLF", "EVR": "XLF", "TRV": "XLF", "ACGL": "XLF",
+    "EG": "XLF", "AIZ": "XLF", "CB": "XLF", "CINF": "XLF", "CPAY": "XLF",
+
+    "GE": "XLI", "CAT": "XLI", "VRT": "XLI", "RKLB": "XLI", "LUNR": "XLI", "GWW": "XLI",
+    "RSG": "XLI", "CTAS": "XLI", "VLTO": "XLI",
+
+    "ABBV": "XLV", "LLY": "XLV", "CVS": "XLV", "CAH": "XLV", "HCA": "XLV", "MRK": "XLV",
+    "RMD": "XLV", "DGX": "XLV", "CHE": "XLV", "ABT": "XLV", "MCK": "XLV", "BDX": "XLV",
+    "EW": "XLV", "LH": "XLV", "REGN": "XLV", "RPRX": "XLV",
+
+    "TSN": "XLP", "SJM": "XLP", "KR": "XLP", "HRL": "XLP", "PFGC": "XLP", "SYY": "XLP",
+    "HSY": "XLP", "USFD": "XLP", "MDLZ": "XLP", "CHD": "XLP", "CL": "XLP", "KO": "XLP",
+    "KDP": "XLP", "MO": "XLP",
+
+    "CCI": "XLRE", "KIM": "XLRE", "EXR": "XLRE", "WELL": "XLRE", "PSA": "XLRE", "SPG": "XLRE",
+
+    "ED": "XLU", "AWK": "XLU",
+
+    "DFTX": null, "TRIN": null, "AAAU": null, "SPCX": null, "DXYZ": null, "DRAM": null,
+    "CBRS": null, "BTX": null, "FLKR": null, "XLG": null, "TOPT": null, "QTOP": null,
+    "SATA": null, "GFUZ": null, "QQQ": null, "VT": null, "RVI": null, "VCX": null,
+    "TRLV": null, "MRSH": null
+  }
+}
